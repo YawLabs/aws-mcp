@@ -4,17 +4,10 @@ import { join } from "node:path";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { z } from "zod";
+import { getProfile, getRegion } from "../session.js";
 import { startSsoLogin, waitForLogin } from "../sso.js";
 
 type ToolResult = { ok: boolean; data?: unknown; error?: string; rawBody?: string };
-
-function defaultProfile(): string {
-  return process.env.AWS_PROFILE || "default";
-}
-
-function defaultRegion(): string {
-  return process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
-}
 
 /**
  * Best-effort read of any non-expired SSO token from the CLI cache. If the
@@ -88,8 +81,8 @@ export const authTools = [
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const { profile, region } = input as { profile?: string; region?: string };
-      const useProfile = profile || defaultProfile();
-      const useRegion = region || defaultRegion();
+      const useProfile = profile || getProfile();
+      const useRegion = region || getRegion();
 
       try {
         const client = new STSClient({
@@ -150,7 +143,7 @@ export const authTools = [
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const { profile } = input as { profile?: string };
-      const useProfile = profile || defaultProfile();
+      const useProfile = profile || getProfile();
       const result = await startSsoLogin(useProfile);
       if (!result.ok) {
         return {
@@ -201,8 +194,8 @@ export const authTools = [
         };
       }
 
-      const useProfile = profile || defaultProfile();
-      const useRegion = region || defaultRegion();
+      const useProfile = profile || getProfile();
+      const useRegion = region || getRegion();
       try {
         const client = new STSClient({
           region: useRegion,

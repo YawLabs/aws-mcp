@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { ZodObject, ZodRawShape } from "zod";
 import { authTools } from "./tools/auth.js";
+import { sessionTools } from "./tools/session.js";
 
 // Injected at build time by esbuild; falls back to reading package.json for tsc builds.
 declare const __VERSION__: string | undefined;
@@ -26,7 +27,10 @@ type Tool = {
   handler: (input: unknown) => Promise<unknown>;
 };
 
-const allTools: ReadonlyArray<Tool> = [...(authTools as unknown as ReadonlyArray<Tool>)];
+const allTools: ReadonlyArray<Tool> = [
+  ...(authTools as unknown as ReadonlyArray<Tool>),
+  ...(sessionTools as unknown as ReadonlyArray<Tool>),
+];
 
 const server = new McpServer({
   name: "@yawlabs/aws-mcp",
