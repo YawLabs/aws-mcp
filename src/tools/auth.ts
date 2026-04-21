@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { z } from "zod";
+import { classifyAuthError } from "../errors.js";
 import { getProfile, getRegion } from "../session.js";
 import { startSsoLogin, waitForLogin } from "../sso.js";
 
@@ -44,23 +45,6 @@ export function findCachedSsoToken(
     // no cache dir
   }
   return null;
-}
-
-export function classifyAuthError(err: unknown): { kind: "sso_expired" | "no_creds" | "other"; message: string } {
-  const message = err instanceof Error ? err.message : String(err);
-  const name = err instanceof Error ? err.name : "";
-  const blob = `${name}: ${message}`;
-
-  if (
-    /SSOTokenProviderFailure|sso.*session.*expired|token.*is.*expired|no cached sso token/i.test(blob) ||
-    name === "ExpiredTokenException"
-  ) {
-    return { kind: "sso_expired", message };
-  }
-  if (/CredentialsProviderError|could not load credentials|no identity/i.test(blob)) {
-    return { kind: "no_creds", message };
-  }
-  return { kind: "other", message };
 }
 
 export const authTools = [
