@@ -64,24 +64,48 @@ export function parseLoginOutput(text: string): { url: string | null; code: stri
 }
 
 /**
+ * Test-injection knobs. In production we always spawn the real `aws` binary
+ * with the default timeout. Tests override `command`/`prefixArgs` to point at
+ * a controlled fake (see src/testing/fake-aws.ts) and shrink `urlWaitMs` so
+ * timeout cases don't take 15 seconds.
+ */
+export interface SsoLoginOptions {
+  command?: string;
+  prefixArgs?: string[];
+  urlWaitMs?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
  * Spawn `aws sso login --no-browser`, wait for the URL + code to appear in
  * stdout, then return them. The subprocess keeps running in the background —
  * call `waitForLogin(sessionId)` to block until the user completes auth.
  */
-export function startSsoLogin(profile: string): Promise<LoginStartResult | LoginStartError> {
+export function startSsoLogin(
+  profile: string,
+  opts: SsoLoginOptions = {},
+): Promise<LoginStartResult | LoginStartError> {
+  const command = opts.command ?? "aws";
+  const prefixArgs = opts.prefixArgs ?? [];
+  const urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
+  const spawnEnv = opts.env;
+
   return new Promise((resolve) => {
-    const args = ["sso", "login", "--no-browser"];
+    const args = [...prefixArgs, "sso", "login", "--no-browser"];
     if (profile) {
       args.push("--profile", profile);
     }
 
     let proc: ChildProcess;
     try {
-      proc = spawn("aws", args, { stdio: ["ignore", "pipe", "pipe"] });
+      proc = spawn(command, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(spawnEnv ? { env: spawnEnv } : {}),
+      });
     } catch (err) {
       resolve({
         ok: false,
-        error: `Failed to spawn 'aws': ${err instanceof Error ? err.message : String(err)}. Is the AWS CLI installed and on PATH?`,
+        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}. Is the AWS CLI installed and on PATH?`,
       });
       return;
     }
@@ -102,11 +126,11 @@ export function startSsoLogin(profile: string): Promise<LoginStartResult | Login
         proc.kill();
         resolve({
           ok: false,
-          error: `Timed out after ${URL_WAIT_MS / 1000}s waiting for 'aws sso login' to print a verification URL. The AWS CLI may be misconfigured, or the profile '${profile}' may not be set up for SSO.`,
+          error: `Timed out after ${urlWaitMs / 1000}s waiting for 'aws sso login' to print a verification URL. The AWS CLI may be misconfigured, or the profile '${profile}' may not be set up for SSO.`,
           rawOutput: stdoutBuf + stderrBuf,
         });
       }
-    }, URL_WAIT_MS);
+    }, urlWaitMs);
 
     proc.stdout?.on("data", (chunk: Buffer) => {
       stdoutBuf += chunk.toString();
