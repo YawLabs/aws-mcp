@@ -48,9 +48,20 @@ interface LoginSession {
 
 const sessions = new Map<string, LoginSession>();
 
-const URL_RE = /https:\/\/device\.sso[.\w-]*\.amazonaws\.com\/[^\s]*/;
-const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
+// Exported for tests — these regexes are load-bearing when the aws CLI output
+// format shifts between versions, so they need direct coverage.
+export const URL_RE = /https:\/\/device\.sso[.\w-]*\.amazonaws\.com\/[^\s]*/;
+export const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
 const URL_WAIT_MS = 15_000;
+
+export function parseLoginOutput(text: string): { url: string | null; code: string | null } {
+  const urlMatch = text.match(URL_RE);
+  const codeMatch = text.match(CODE_RE);
+  return {
+    url: urlMatch ? urlMatch[0] : null,
+    code: codeMatch ? codeMatch[1] : null,
+  };
+}
 
 /**
  * Spawn `aws sso login --no-browser`, wait for the URL + code to appear in

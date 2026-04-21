@@ -21,10 +21,13 @@ function defaultRegion(): string {
  * user has tokens for multiple SSO start URLs this picks the first valid one,
  * which may not match the requested profile — we return it as a hint only.
  * For a single-org setup (most common) it's accurate.
+ *
+ * Exported with an optional `cacheDir` argument so tests can point it at a tmpdir.
  */
-function findCachedSsoToken(): { expiresAt: string; minutesLeft: number; startUrl?: string } | null {
+export function findCachedSsoToken(
+  cacheDir: string = join(homedir(), ".aws", "sso", "cache"),
+): { expiresAt: string; minutesLeft: number; startUrl?: string } | null {
   try {
-    const cacheDir = join(homedir(), ".aws", "sso", "cache");
     const files = readdirSync(cacheDir).filter((f) => f.endsWith(".json"));
     const now = Date.now();
     for (const f of files) {
@@ -50,7 +53,7 @@ function findCachedSsoToken(): { expiresAt: string; minutesLeft: number; startUr
   return null;
 }
 
-function classifyAuthError(err: unknown): { kind: "sso_expired" | "no_creds" | "other"; message: string } {
+export function classifyAuthError(err: unknown): { kind: "sso_expired" | "no_creds" | "other"; message: string } {
   const message = err instanceof Error ? err.message : String(err);
   const name = err instanceof Error ? err.name : "";
   const blob = `${name}: ${message}`;
