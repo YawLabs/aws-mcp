@@ -5,7 +5,8 @@ import { sessionTools } from "./session.js";
 
 const setTool = sessionTools.find((t) => t.name === "aws_session_set");
 const getTool = sessionTools.find((t) => t.name === "aws_session_get");
-if (!setTool || !getTool) throw new Error("sessionTools missing expected entries");
+const clearTool = sessionTools.find((t) => t.name === "aws_session_clear");
+if (!setTool || !getTool || !clearTool) throw new Error("sessionTools missing expected entries");
 
 const savedEnv = { ...process.env };
 
@@ -73,6 +74,42 @@ describe("aws_session_set", () => {
     const r = (await setTool.handler({ region: "   " })) as { ok: boolean; error?: string };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /cannot be empty/);
+  });
+});
+
+describe("aws_session_clear", () => {
+  it("clears both when called with no args", async () => {
+    await setTool.handler({ profile: "override", region: "us-west-2" });
+    const r = (await clearTool.handler({})) as { ok: boolean; data: SessionData };
+    assert.equal(r.ok, true);
+    assert.equal(r.data.profile, "default");
+    assert.equal(r.data.region, "us-east-1");
+    assert.equal(r.data.profileSource, "default");
+    assert.equal(r.data.regionSource, "default");
+  });
+
+  it("clears only the profile when profile: true", async () => {
+    await setTool.handler({ profile: "override", region: "us-west-2" });
+    const r = (await clearTool.handler({ profile: true })) as { ok: boolean; data: SessionData };
+    assert.equal(r.data.profile, "default");
+    assert.equal(r.data.region, "us-west-2");
+    assert.equal(r.data.profileSource, "default");
+    assert.equal(r.data.regionSource, "session");
+  });
+
+  it("clears only the region when region: true", async () => {
+    await setTool.handler({ profile: "override", region: "us-west-2" });
+    const r = (await clearTool.handler({ region: true })) as { ok: boolean; data: SessionData };
+    assert.equal(r.data.profile, "override");
+    assert.equal(r.data.region, "us-east-1");
+  });
+
+  it("ignores profile: false / region: false (matches set semantics)", async () => {
+    await setTool.handler({ profile: "override", region: "us-west-2" });
+    const r = (await clearTool.handler({ profile: false, region: false })) as { ok: boolean; data: SessionData };
+    // Both explicit false means 'don't clear either'; session stays intact.
+    assert.equal(r.data.profile, "override");
+    assert.equal(r.data.region, "us-west-2");
   });
 });
 

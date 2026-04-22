@@ -34,6 +34,12 @@ export const callTools = [
         .describe(
           "Operation parameters as a JSON object (AWS API schema, PascalCase keys). E.g. {Bucket: 'foo', Key: 'bar'}.",
         ),
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "JMESPath expression to extract a subset of the response (passed as --query). E.g. 'Buckets[].Name', 'Reservations[].Instances[].{Id:InstanceId,State:State.Name}'. Dramatically reduces output size; reach for this whenever you only need a few fields.",
+        ),
       profile: z.string().optional().describe("Override session profile for this call."),
       region: z.string().optional().describe("Override session region for this call."),
       outputFormat: z
@@ -52,6 +58,7 @@ export const callTools = [
         service: string;
         operation: string;
         params?: Record<string, unknown>;
+        query?: string;
         profile?: string;
         region?: string;
         outputFormat?: "json" | "text" | "table" | "yaml";
@@ -61,6 +68,7 @@ export const callTools = [
         service: i.service,
         operation: i.operation,
         params: i.params,
+        query: i.query,
         profile: i.profile,
         region: i.region,
         outputFormat: i.outputFormat,

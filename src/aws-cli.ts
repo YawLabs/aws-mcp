@@ -54,6 +54,10 @@ export interface AwsCallOptions {
   profile?: string;
   region?: string;
   outputFormat?: "json" | "text" | "table" | "yaml";
+  // JMESPath expression passed through --query. Filters/extracts server-side
+  // in the CLI before our 5 MB cap kicks in; a well-chosen query on
+  // list-objects-v2 can shrink a 4 MB response to a 2 KB one.
+  query?: string;
   timeoutMs?: number;
   // Additional CLI-level flags (not API params) to inject before --profile.
   // Internal callers only -- e.g. aws_paginate adds --max-items and
@@ -131,6 +135,9 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     "--region",
     region,
   ];
+  if (opts.query !== undefined && opts.query.trim().length > 0) {
+    args.push("--query", opts.query);
+  }
   if (opts.params !== undefined && Object.keys(opts.params).length > 0) {
     args.push("--cli-input-json", JSON.stringify(opts.params));
   }

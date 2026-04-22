@@ -38,6 +38,12 @@ export const paginateTools = [
         .record(z.string(), z.unknown())
         .optional()
         .describe("Operation parameters (PascalCase keys) passed via --cli-input-json."),
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "JMESPath expression to extract fields from each page (--query). Pagination still respects the raw response shape for NextToken -- --query only trims what the model sees.",
+        ),
       maxItems: z
         .number()
         .int()
@@ -57,6 +63,7 @@ export const paginateTools = [
         service: string;
         operation: string;
         params?: Record<string, unknown>;
+        query?: string;
         maxItems?: number;
         startingToken?: string;
         profile?: string;
@@ -73,6 +80,7 @@ export const paginateTools = [
         service: i.service,
         operation: i.operation,
         params: i.params,
+        query: i.query,
         profile: i.profile,
         region: i.region,
         outputFormat: "json",

@@ -190,6 +190,46 @@ describe("runAwsCall — argv construction", () => {
     assert.ok(argv.includes("sso"));
   });
 
+  it("passes --query when a query is provided", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query: "Buckets[].Name",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    const qIdx = argv.indexOf("--query");
+    assert.ok(qIdx >= 0, "expected --query to be present");
+    assert.equal(argv[qIdx + 1], "Buckets[].Name");
+  });
+
+  it("omits --query when not provided", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    assert.ok(!argv.includes("--query"));
+  });
+
+  it("omits --query when query is an empty/whitespace string", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query: "   ",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    assert.ok(!argv.includes("--query"));
+  });
+
   it("redacts --cli-input-json value in the returned displayCommand", async () => {
     const r = await runAwsCall({
       service: "iam",

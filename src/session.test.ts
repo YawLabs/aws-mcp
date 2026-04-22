@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { _resetSession, getProfile, getRegion, getSessionState, setProfile, setRegion } from "./session.js";
+import {
+  _resetSession,
+  clearProfile,
+  clearRegion,
+  getProfile,
+  getRegion,
+  getSessionState,
+  setProfile,
+  setRegion,
+} from "./session.js";
 
 // Restore env across tests so one test's mutation doesn't leak into another.
 const savedEnv = { ...process.env };
@@ -129,5 +138,36 @@ describe("_resetSession", () => {
     assert.equal(getProfile(), "session-prof");
     _resetSession();
     assert.equal(getProfile(), "env-prof");
+  });
+});
+
+describe("clearProfile / clearRegion", () => {
+  it("clearProfile only resets the profile override", () => {
+    setProfile("sess-prof");
+    setRegion("ap-south-1");
+    clearProfile();
+    assert.equal(getProfile(), "default");
+    assert.equal(getRegion(), "ap-south-1"); // untouched
+  });
+
+  it("clearRegion only resets the region override", () => {
+    setProfile("sess-prof");
+    setRegion("ap-south-1");
+    clearRegion();
+    assert.equal(getProfile(), "sess-prof"); // untouched
+    assert.equal(getRegion(), "us-east-1");
+  });
+
+  it("clear falls back to env when env is set", () => {
+    process.env.AWS_PROFILE = "env-prof";
+    setProfile("override");
+    clearProfile();
+    assert.equal(getProfile(), "env-prof");
+  });
+
+  it("clear on an already-unset override is a no-op", () => {
+    clearProfile();
+    clearProfile();
+    assert.equal(getProfile(), "default");
   });
 });

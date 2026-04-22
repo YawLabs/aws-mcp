@@ -16,9 +16,10 @@ Two things most AWS-from-assistant setups fumble:
 | `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity. |
 | `aws_session_set` | Set the default profile and/or region for the rest of this MCP session. "Switch to prod," "use us-west-2." |
 | `aws_session_get` | Show the current session defaults and where each value came from (`session`/`env`/`default`). |
+| `aws_session_clear` | Remove session profile/region overrides so env vars / defaults take over again. No args clears both. |
 | `aws_list_profiles` | List profiles configured in `~/.aws/config` -- names, regions, and SSO metadata. Use before switching profiles or when an SSO error names one you haven't seen. |
-| `aws_call` | Run any AWS API operation. `service: 's3api', operation: 'list-buckets'`, optional `params` as a PascalCase JSON object. Returns parsed JSON. |
-| `aws_paginate` | Fetch one page of a paginated list/describe operation. Returns `nextToken`/`hasMore`; call again with the token to continue. Use for large lists that would blow the 5 MB output cap. |
+| `aws_call` | Run any AWS API operation. `service: 's3api', operation: 'list-buckets'`, optional `params` (PascalCase JSON), optional `query` (JMESPath). Returns parsed JSON. |
+| `aws_paginate` | Fetch one page of a paginated list/describe operation. Supports `query` too. Returns `nextToken`/`hasMore`; call again with the token to continue. |
 
 ## Install
 

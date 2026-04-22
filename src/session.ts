@@ -33,6 +33,14 @@ export function setRegion(name: string): void {
   sessionRegion = name.trim();
 }
 
+export function clearProfile(): void {
+  sessionProfile = undefined;
+}
+
+export function clearRegion(): void {
+  sessionRegion = undefined;
+}
+
 export type SessionSource = "session" | "env" | "default";
 
 export interface SessionState {

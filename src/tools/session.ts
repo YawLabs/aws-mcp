@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getSessionState, setProfile, setRegion } from "../session.js";
+import { clearProfile, clearRegion, getSessionState, setProfile, setRegion } from "../session.js";
 
 type ToolResult = { ok: boolean; data?: unknown; error?: string };
 
@@ -53,6 +53,30 @@ export const sessionTools = [
     },
     inputSchema: z.object({}),
     handler: async (_input: unknown): Promise<ToolResult> => {
+      return { ok: true, data: getSessionState() };
+    },
+  },
+  {
+    name: "aws_session_clear",
+    description:
+      "Remove session-set profile and/or region overrides so subsequent calls fall back to env vars / defaults. No args clears both. Pass `profile: true` or `region: true` to clear just one. Use when the user says 'go back to the default profile,' 'unset the region,' or 'reset session.'",
+    annotations: {
+      title: "Clear session profile/region overrides",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: z.object({
+      profile: z.boolean().optional().describe("If true, clear the session profile override. Default false."),
+      region: z.boolean().optional().describe("If true, clear the session region override. Default false."),
+    }),
+    handler: async (input: unknown): Promise<ToolResult> => {
+      const { profile, region } = input as { profile?: boolean; region?: boolean };
+      // No flags = clear both. Explicit flags = clear selectively.
+      const clearBoth = profile === undefined && region === undefined;
+      if (clearBoth || profile === true) clearProfile();
+      if (clearBoth || region === true) clearRegion();
       return { ok: true, data: getSessionState() };
     },
   },
