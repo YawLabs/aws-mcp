@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { ZodObject, ZodRawShape } from "zod";
 import { authTools } from "./tools/auth.js";
+import { callTools } from "./tools/call.js";
 import { sessionTools } from "./tools/session.js";
 
 // Injected at build time by esbuild; falls back to reading package.json for tsc builds.
@@ -30,6 +31,7 @@ type Tool = {
 const allTools: ReadonlyArray<Tool> = [
   ...(authTools as unknown as ReadonlyArray<Tool>),
   ...(sessionTools as unknown as ReadonlyArray<Tool>),
+  ...(callTools as unknown as ReadonlyArray<Tool>),
 ];
 
 const server = new McpServer({
@@ -49,8 +51,13 @@ for (const tool of allTools) {
         const response = result as { ok: boolean; data?: unknown; error?: string; rawBody?: string };
 
         if (!response.ok) {
+          // Include rawBody (e.g. aws CLI stderr) in the error so the model can
+          // diagnose. Without it the caller only sees the one-line summary and
+          // has to guess at the actual AWS-side failure.
+          const baseError = `Error: ${response.error || "Unknown error"}`;
+          const errorText = response.rawBody ? `${baseError}\n\n${response.rawBody}` : baseError;
           return {
-            content: [{ type: "text" as const, text: `Error: ${response.error || "Unknown error"}` }],
+            content: [{ type: "text" as const, text: errorText }],
             isError: true,
           };
         }

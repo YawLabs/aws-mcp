@@ -63,6 +63,80 @@ async function main(): Promise<void> {
       return;
     }
 
+    // --- aws_call scenarios ---
+
+    case "call_json_success": {
+      process.stdout.write(
+        `${JSON.stringify({
+          Buckets: [
+            { Name: "bucket-1", CreationDate: "2024-01-01T00:00:00.000Z" },
+            { Name: "bucket-2", CreationDate: "2024-02-01T00:00:00.000Z" },
+          ],
+          Owner: { DisplayName: "me", ID: "abc123" },
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "call_empty_success": {
+      // Some operations (tag-role, put-*, etc.) succeed with empty stdout.
+      process.exit(0);
+      return;
+    }
+
+    case "call_nonjson_success": {
+      // aws can emit a plain scalar when --query is used, even with --output json.
+      process.stdout.write("some-plain-string\n");
+      process.exit(0);
+      return;
+    }
+
+    case "call_access_denied": {
+      process.stderr.write("An error occurred (AccessDenied) when calling the ListBuckets operation: Access Denied\n");
+      process.exit(255);
+      return;
+    }
+
+    case "call_sso_expired": {
+      process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+      process.exit(255);
+      return;
+    }
+
+    case "call_no_creds": {
+      process.stderr.write("Unable to locate credentials. You can configure credentials by running 'aws configure'.\n");
+      process.exit(255);
+      return;
+    }
+
+    case "call_slow": {
+      // Sleep longer than the test's timeoutMs to exercise the timeout path.
+      await sleep(5000);
+      process.stdout.write("{}\n");
+      process.exit(0);
+      return;
+    }
+
+    case "call_large": {
+      // Stream more than MAX_OUTPUT_BYTES (5 MB) so the parent kills us.
+      const oneMb = "x".repeat(1024 * 1024);
+      for (let i = 0; i < 8; i++) {
+        process.stdout.write(oneMb);
+        await sleep(10); // give parent a chance to read, hit the cap, and kill us
+      }
+      process.exit(0);
+      return;
+    }
+
+    case "call_echo_args": {
+      // Emit the full argv (minus node executable and script path) as JSON on
+      // stdout so tests can verify what flags runAwsCall actually assembled.
+      process.stdout.write(`${JSON.stringify({ argv: process.argv.slice(2) })}\n`);
+      process.exit(0);
+      return;
+    }
+
     default: {
       process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
       process.exit(2);
