@@ -66,6 +66,7 @@ interface LoginSession {
   stdoutBuf: string;
   stderrBuf: string;
   completion: Promise<LoginWaitResult>;
+  ttlTimer: NodeJS.Timeout;
 }
 
 const sessions = new Map<string, LoginSession>();
@@ -75,6 +76,10 @@ const sessions = new Map<string, LoginSession>();
 export const URL_RE = /https:\/\/device\.sso[.\w-]*\.amazonaws\.com\/[^\s]*/;
 export const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
 const URL_WAIT_MS = 15_000;
+// Cap on how long a session can sit unclaimed. Real SSO device-auth flows
+// complete in seconds-to-a-minute; 10 min is a forgiving upper bound that
+// still keeps a forgotten aws subprocess from pinning the server forever.
+const SESSION_TTL_MS = 10 * 60_000;
 
 export function parseLoginOutput(text: string): { url: string | null; code: string | null } {
   const urlMatch = text.match(URL_RE);
@@ -172,6 +177,18 @@ export function startSsoLogin(
         settled = true;
         clearTimeout(urlTimeout);
         const sessionId = randomUUID();
+        const ttlTimer = setTimeout(() => {
+          if (sessions.has(sessionId)) {
+            killProc(proc);
+            completionResolve({
+              ok: false,
+              exitCode: null,
+              error: `SSO login session expired after ${SESSION_TTL_MS / 60_000} minutes without aws_login_complete.`,
+            });
+            sessions.delete(sessionId);
+          }
+        }, SESSION_TTL_MS);
+        ttlTimer.unref();
         const session: LoginSession = {
           profile,
           proc,
@@ -180,6 +197,7 @@ export function startSsoLogin(
           stdoutBuf,
           stderrBuf,
           completion,
+          ttlTimer,
         };
         sessions.set(sessionId, session);
         resolve({
@@ -260,6 +278,7 @@ export async function waitForLogin(sessionId: string): Promise<LoginWaitResult> 
     const result = await session.completion;
     return result;
   } finally {
+    clearTimeout(session.ttlTimer);
     sessions.delete(sessionId);
   }
 }
@@ -267,7 +286,8 @@ export async function waitForLogin(sessionId: string): Promise<LoginWaitResult> 
 /** For tests — drop any in-flight sessions. Not exported via the MCP surface. */
 export function _clearSessions(): void {
   for (const session of sessions.values()) {
-    session.proc.kill();
+    clearTimeout(session.ttlTimer);
+    killProc(session.proc);
   }
   sessions.clear();
 }

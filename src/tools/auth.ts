@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
@@ -9,6 +9,11 @@ import { getProfile, getRegion } from "../session.js";
 import { startSsoLogin, waitForLogin } from "../sso.js";
 
 type ToolResult = { ok: boolean; data?: unknown; error?: string; rawBody?: string };
+
+// Real SSO cache files are a few KB (JWT + metadata). 64 KB is a generous
+// cap that still keeps a malformed or malicious giant file from blocking the
+// event loop on readFileSync.
+const MAX_SSO_CACHE_FILE_BYTES = 64 * 1024;
 
 /**
  * Best-effort read of any non-expired SSO token from the CLI cache. If the
@@ -26,7 +31,9 @@ export function findCachedSsoToken(
     const now = Date.now();
     for (const f of files) {
       try {
-        const contents = JSON.parse(readFileSync(join(cacheDir, f), "utf-8"));
+        const path = join(cacheDir, f);
+        if (statSync(path).size > MAX_SSO_CACHE_FILE_BYTES) continue;
+        const contents = JSON.parse(readFileSync(path, "utf-8"));
         if (contents.accessToken && contents.expiresAt) {
           const expiresAt = new Date(contents.expiresAt).getTime();
           if (expiresAt > now) {

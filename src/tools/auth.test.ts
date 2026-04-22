@@ -79,4 +79,15 @@ describe("findCachedSsoToken", () => {
     mkdirSync(join(cacheDir, "subdir"));
     assert.equal(findCachedSsoToken(cacheDir), null);
   });
+
+  it("skips .json files larger than the cap without blocking", () => {
+    // A pathological oversized file should not be parsed. Real tokens are a
+    // few KB; the cap is 64 KB. Write 128 KB and expect it ignored.
+    writeFileSync(join(cacheDir, "huge.json"), "x".repeat(128 * 1024));
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    writeFileSync(join(cacheDir, "good.json"), JSON.stringify({ accessToken: "t", expiresAt: future }));
+    const result = findCachedSsoToken(cacheDir);
+    assert.ok(result, "small valid token should still be found");
+    assert.equal(result.expiresAt, future);
+  });
 });
