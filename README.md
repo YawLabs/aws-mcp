@@ -1,8 +1,11 @@
 # @yawlabs/aws-mcp
 
-AWS MCP server focused on one pain point: **AWS SSO re-login from inside an AI assistant.**
+AWS MCP server for AI assistants: **call any AWS API, with first-class SSO re-login.**
 
-When your SSO token expires mid-session, `aws sso login` tries to open a browser from a subprocess — and on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. This server fixes that with the `--no-browser` device-code flow: the AI surfaces a short URL + code, you click once, done.
+Two things most AWS-from-assistant setups fumble:
+
+1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess — and on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. This server fixes that with the `--no-browser` device-code flow: the AI surfaces a short URL + code, you click once, done.
+2. **Every AWS API operation.** `aws_call` proxies the `aws` CLI directly — one tool covers the entire surface, no SDK bundling, no service-by-service tool sprawl.
 
 ## Tools
 
@@ -11,6 +14,9 @@ When your SSO token expires mid-session, `aws sso login` tries to open a browser
 | `aws_whoami` | Current identity (account, ARN) + SSO token expiry countdown. Call this first. |
 | `aws_login_start` | Start `aws sso login --no-browser`, returns a verification URL + 8-character code and a `sessionId`. |
 | `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity. |
+| `aws_session_set` | Set the default profile and/or region for the rest of this MCP session. "Switch to prod," "use us-west-2." |
+| `aws_session_get` | Show the current session defaults and where each value came from (`session`/`env`/`default`). |
+| `aws_call` | Run any AWS API operation. `service: 's3api', operation: 'list-buckets'`, optional `params` as a PascalCase JSON object. Returns parsed JSON. |
 
 ## Install
 

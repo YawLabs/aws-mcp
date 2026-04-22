@@ -1,7 +1,7 @@
 {
   "name": "@yawlabs/aws-mcp",
   "version": "0.1.0",
-  "description": "AWS MCP server — streamlines AWS SSO login from inside AI assistants (fixes the browser-won't-open problem)",
+  "description": "AWS MCP server — call any AWS API from AI assistants, with first-class SSO re-login (no more 'browser won't open' dead ends)",
   "license": "MIT",
   "author": "YawLabs <contact@yaw.sh>",
   "repository": {
