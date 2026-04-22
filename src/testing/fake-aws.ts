@@ -156,6 +156,27 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "logs_tail_ndjson": {
+      // 'aws logs tail --format json' emits one JSON object per line.
+      process.stdout.write(
+        `${JSON.stringify({ timestamp: "2026-04-21T00:00:00Z", logStreamName: "s1", message: "hello" })}\n${JSON.stringify(
+          {
+            timestamp: "2026-04-21T00:00:01Z",
+            logStreamName: "s1",
+            message: "world",
+          },
+        )}\n${JSON.stringify({ timestamp: "2026-04-21T00:00:02Z", logStreamName: "s2", message: "ok" })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "logs_tail_empty": {
+      // No events in the window -- empty stdout, exit 0.
+      process.exit(0);
+      return;
+    }
+
     default: {
       process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
       process.exit(2);
