@@ -137,6 +137,25 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "paginate_has_more": {
+      // Simulates a truncated page: CLI surfaces resume cursor as NextToken.
+      process.stdout.write(
+        `${JSON.stringify({
+          Buckets: [{ Name: "bucket-1" }, { Name: "bucket-2" }],
+          NextToken: "eyJuZXh0IjoiYWJjIn0=",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "paginate_last_page": {
+      // Final page: response omits NextToken.
+      process.stdout.write(`${JSON.stringify({ Buckets: [{ Name: "bucket-3" }] })}\n`);
+      process.exit(0);
+      return;
+    }
+
     default: {
       process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
       process.exit(2);

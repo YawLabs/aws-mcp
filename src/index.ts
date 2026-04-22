@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { ZodObject, ZodRawShape } from "zod";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
+import { paginateTools } from "./tools/paginate.js";
 import { profilesTools } from "./tools/profiles.js";
 import { sessionTools } from "./tools/session.js";
 
@@ -34,6 +35,7 @@ const allTools: ReadonlyArray<Tool> = [
   ...(sessionTools as unknown as ReadonlyArray<Tool>),
   ...(callTools as unknown as ReadonlyArray<Tool>),
   ...(profilesTools as unknown as ReadonlyArray<Tool>),
+  ...(paginateTools as unknown as ReadonlyArray<Tool>),
 ];
 
 const server = new McpServer({

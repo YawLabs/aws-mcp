@@ -55,6 +55,10 @@ export interface AwsCallOptions {
   region?: string;
   outputFormat?: "json" | "text" | "table" | "yaml";
   timeoutMs?: number;
+  // Additional CLI-level flags (not API params) to inject before --profile.
+  // Internal callers only -- e.g. aws_paginate adds --max-items and
+  // --starting-token here. Each entry is appended verbatim to argv.
+  extraFlags?: string[];
   // Test-injection knobs, mirrored from startSsoLogin. Not exposed via MCP.
   command?: string;
   prefixArgs?: string[];
@@ -119,6 +123,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     ...(opts.prefixArgs ?? []),
     opts.service,
     ...operationTokens,
+    ...(opts.extraFlags ?? []),
     "--output",
     outputFormat,
     "--profile",
