@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { runAwsCall, SAFE_NAME_RE } from "./aws-cli.js";
+import { redactDisplayArgs, runAwsCall, SAFE_NAME_RE, truncateForErrorMsg } from "./aws-cli.js";
 
 describe("SAFE_NAME_RE", () => {
   it("accepts typical kebab-case service/operation names", () => {
@@ -73,5 +73,42 @@ describe("runAwsCall — input validation (no spawn)", () => {
     assert.equal(r.ok, false);
     if (r.ok) return;
     assert.equal(r.kind, "bad_input");
+  });
+});
+
+describe("redactDisplayArgs", () => {
+  it("replaces the value after --cli-input-json with a length stub", () => {
+    const payload = JSON.stringify({ Password: "hunter2", Username: "admin" });
+    const args = ["s3api", "put-object", "--cli-input-json", payload, "--profile", "prod"];
+    const redacted = redactDisplayArgs(args);
+    assert.ok(!redacted.some((a) => a.includes("hunter2")), "password must not appear");
+    assert.ok(!redacted.some((a) => a.includes("admin")), "username must not appear");
+    assert.equal(redacted[3], `<redacted len=${payload.length}>`);
+    // Non-payload args pass through unchanged.
+    assert.deepEqual(redacted.slice(0, 3), ["s3api", "put-object", "--cli-input-json"]);
+    assert.deepEqual(redacted.slice(4), ["--profile", "prod"]);
+  });
+
+  it("returns the input unchanged when --cli-input-json is absent", () => {
+    const args = ["s3api", "list-buckets", "--profile", "prod"];
+    assert.deepEqual(redactDisplayArgs(args), args);
+  });
+
+  it("does not crash when --cli-input-json has no following token", () => {
+    const args = ["s3api", "list-buckets", "--cli-input-json"];
+    assert.deepEqual(redactDisplayArgs(args), args);
+  });
+});
+
+describe("truncateForErrorMsg", () => {
+  it("returns input unchanged when under cap", () => {
+    assert.equal(truncateForErrorMsg("short error"), "short error");
+  });
+
+  it("truncates and annotates long input", () => {
+    const huge = "x".repeat(10 * 1024);
+    const result = truncateForErrorMsg(huge);
+    assert.ok(result.length < huge.length);
+    assert.match(result, /\[truncated; \d+ bytes omitted\]/);
   });
 });

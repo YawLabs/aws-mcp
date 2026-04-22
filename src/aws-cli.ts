@@ -11,15 +11,41 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { type AuthErrorKind, classifyAuthError } from "./errors.js";
 import { getProfile, getRegion } from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
+// Cap the stderr we surface as an error message to avoid flooding the MCP
+// response. Full stderr still lands in rawStderr for diagnosis.
+const MAX_ERROR_MSG_BYTES = 8 * 1024;
+// How long to wait between SIGTERM and SIGKILL when a subprocess is hung.
+const KILL_ESCALATION_MS = 2_000;
 
 // Also defends against argv injection: leading-hyphen input like "--profile evil"
 // would otherwise become a flag to `aws`.
 export const SAFE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * --cli-input-json can carry secrets (IAM passwords, access keys, tags with
+ * PII). Keep the flag visible in displayCommand so users see the shape of
+ * what ran, but replace the JSON payload with a length stub.
+ */
+export function redactDisplayArgs(args: readonly string[]): string[] {
+  const out = [...args];
+  const idx = out.indexOf("--cli-input-json");
+  if (idx >= 0 && idx < out.length - 1) {
+    out[idx + 1] = `<redacted len=${out[idx + 1].length}>`;
+  }
+  return out;
+}
+
+export function truncateForErrorMsg(text: string): string {
+  if (text.length <= MAX_ERROR_MSG_BYTES) return text;
+  const omitted = text.length - MAX_ERROR_MSG_BYTES;
+  return `${text.slice(0, MAX_ERROR_MSG_BYTES)}\n\n[truncated; ${omitted} bytes omitted]`;
+}
 
 export interface AwsCallOptions {
   service: string;
@@ -105,7 +131,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   }
 
   const command = opts.command ?? "aws";
-  const displayCommand = [command, ...args].join(" ");
+  const displayCommand = [command, ...redactDisplayArgs(args)].join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;
@@ -132,6 +158,30 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     let timedOut = false;
     let tooLarge = false;
     let settled = false;
+    // Per-stream UTF-8 decoders so a multi-byte character split across two
+    // chunks doesn't decode to U+FFFD. AWS resource names / tags / S3 keys
+    // routinely contain non-ASCII.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+
+    const killProc = (): void => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // proc may already be dead
+      }
+      // SIGTERM is ignored on Windows; escalate if the process is still
+      // around after a short grace period.
+      setTimeout(() => {
+        if (!proc.killed && proc.exitCode === null) {
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // best effort
+          }
+        }
+      }, KILL_ESCALATION_MS).unref();
+    };
 
     const settle = (result: AwsCallResult): void => {
       if (settled) return;
@@ -143,7 +193,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       if (!killed) {
         killed = true;
         timedOut = true;
-        proc.kill();
+        killProc();
       }
     }, timeoutMs);
 
@@ -153,17 +203,17 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         if (!killed) {
           killed = true;
           tooLarge = true;
-          proc.kill();
+          killProc();
         }
         return;
       }
-      stdoutBuf += chunk.toString();
+      stdoutBuf += stdoutDecoder.write(chunk);
     });
 
     proc.stderr?.on("data", (chunk: Buffer) => {
       stderrBytes += chunk.length;
       if (stderrBytes > MAX_OUTPUT_BYTES) return;
-      stderrBuf += chunk.toString();
+      stderrBuf += stderrDecoder.write(chunk);
     });
 
     proc.on("error", (err) => {
@@ -178,6 +228,9 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
 
     proc.on("exit", (code) => {
       clearTimeout(timeoutHandle);
+      // Flush any incomplete multi-byte sequence held in the decoder.
+      stdoutBuf += stdoutDecoder.end();
+      stderrBuf += stderrDecoder.end();
 
       if (timedOut) {
         settle({
@@ -210,10 +263,10 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           errorMsg = `SSO session expired for profile '${profile}'. Call aws_login_start with profile='${profile}' to re-authenticate.`;
         } else if (classified.kind === "no_creds") {
           kind = "no_creds";
-          errorMsg = `No credentials found for profile '${profile}'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${stderrBuf.trim()}`;
+          errorMsg = `No credentials found for profile '${profile}'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${truncateForErrorMsg(stderrBuf.trim())}`;
         } else {
           kind = "nonzero_exit";
-          errorMsg = stderrBuf.trim() || `aws CLI exited with code ${code} and no stderr`;
+          errorMsg = truncateForErrorMsg(stderrBuf.trim()) || `aws CLI exited with code ${code} and no stderr`;
         }
         settle({
           ok: false,

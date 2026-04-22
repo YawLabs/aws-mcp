@@ -14,6 +14,28 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+
+const KILL_ESCALATION_MS = 2_000;
+
+function killProc(proc: ChildProcess): void {
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    // proc may already be dead
+  }
+  // SIGTERM is ignored on Windows; escalate if the process is still around
+  // after a short grace period.
+  setTimeout(() => {
+    if (!proc.killed && proc.exitCode === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // best effort
+      }
+    }
+  }, KILL_ESCALATION_MS).unref();
+}
 
 export interface LoginStartResult {
   ok: true;
@@ -119,11 +141,15 @@ export function startSsoLogin(
     const completion = new Promise<LoginWaitResult>((res) => {
       completionResolve = res;
     });
+    // Per-stream UTF-8 decoders so multi-byte chars split across chunks
+    // (possible in localized CLI output) don't decode to U+FFFD.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
 
     const urlTimeout = setTimeout(() => {
       if (!settled) {
         settled = true;
-        proc.kill();
+        killProc(proc);
         resolve({
           ok: false,
           error: `Timed out after ${urlWaitMs / 1000}s waiting for 'aws sso login' to print a verification URL. The AWS CLI may be misconfigured, or the profile '${profile}' may not be set up for SSO.`,
@@ -133,7 +159,7 @@ export function startSsoLogin(
     }, urlWaitMs);
 
     proc.stdout?.on("data", (chunk: Buffer) => {
-      stdoutBuf += chunk.toString();
+      stdoutBuf += stdoutDecoder.write(chunk);
       if (!urlSeen) {
         const m = stdoutBuf.match(URL_RE);
         if (m) urlSeen = m[0];
@@ -167,10 +193,12 @@ export function startSsoLogin(
     });
 
     proc.stderr?.on("data", (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
+      stderrBuf += stderrDecoder.write(chunk);
     });
 
     proc.on("exit", (code) => {
+      stdoutBuf += stdoutDecoder.end();
+      stderrBuf += stderrDecoder.end();
       const result: LoginWaitResult = {
         ok: code === 0,
         exitCode: code,

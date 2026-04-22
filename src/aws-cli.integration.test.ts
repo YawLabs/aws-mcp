@@ -189,6 +189,27 @@ describe("runAwsCall — argv construction", () => {
     assert.ok(argv.includes("configure"));
     assert.ok(argv.includes("sso"));
   });
+
+  it("redacts --cli-input-json value in the returned displayCommand", async () => {
+    const r = await runAwsCall({
+      service: "iam",
+      operation: "update-login-profile",
+      params: { UserName: "admin", Password: "hunter2-secret" },
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    // Subprocess still got the real payload -- safety fence is the displayed
+    // command, not the argv.
+    const { argv } = r.data as { argv: string[] };
+    assert.deepEqual(JSON.parse(argv[argv.indexOf("--cli-input-json") + 1]), {
+      UserName: "admin",
+      Password: "hunter2-secret",
+    });
+    // But r.command (what gets returned to the MCP client / model) must not.
+    assert.ok(!r.command.includes("hunter2-secret"), "secret leaked in displayCommand");
+    assert.match(r.command, /<redacted len=\d+>/);
+  });
 });
 
 describe("runAwsCall — failure paths", () => {
