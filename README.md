@@ -43,6 +43,42 @@ Or add to your MCP client config (e.g. `.mcp.json`):
 }
 ```
 
+## Example session
+
+You ask the assistant to check a staging bucket, but your SSO token just expired. What the assistant does (and what you see):
+
+```
+You:    "How many objects are in the staging-artifacts bucket right now?"
+
+Claude: (calls aws_whoami) -> SSO session expired for profile 'staging'.
+        (calls aws_login_start with profile='staging')
+        "Your SSO token expired. Open
+         https://device.sso.us-east-1.amazonaws.com/
+         and enter code: ABCD-EFGH
+         I'll wait."
+
+You:    *click, authenticate in your browser*
+
+Claude: (calls aws_login_complete with the sessionId)
+        (calls aws_call with service='s3api', operation='list-objects-v2',
+                         params={ Bucket: 'staging-artifacts' },
+                         query='KeyCount')
+        "There are 4,182 objects in staging-artifacts."
+```
+
+The SSO flow took one click. No "the browser didn't open, let me run it in a terminal" context switch.
+
+For a larger list where the response might exceed the 5 MB output cap, the assistant reaches for `aws_paginate`:
+
+```
+(calls aws_paginate with service='ec2', operation='describe-instances',
+                        maxItems=50,
+                        query='Reservations[].Instances[].{Id:InstanceId,State:State.Name}')
+-> returns one page + a nextToken; Claude calls again until hasMore=false
+```
+
+`query` (JMESPath) trims the response server-side -- a typical `describe-instances` result shrinks from megabytes to kilobytes when you only need two fields.
+
 ## Requirements
 
 - Node.js 18+
