@@ -14,6 +14,7 @@ Two things most AWS-from-assistant setups fumble:
 | `aws_whoami` | Current identity (account, ARN) + SSO token expiry countdown. Call this first. |
 | `aws_login_start` | Start `aws sso login --no-browser`, returns a verification URL + 8-character code and a `sessionId`. |
 | `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity. |
+| `aws_refresh_if_expiring_soon` | Check the cached SSO token and auto-start a refresh when < `thresholdMinutes` remain (default 10). One round-trip for "am I about to expire? if so, re-login." |
 | `aws_session_set` | Set the default profile and/or region for the rest of this MCP session. "Switch to prod," "use us-west-2." |
 | `aws_session_get` | Show the current session defaults and where each value came from (`session`/`env`/`default`). |
 | `aws_session_clear` | Remove session profile/region overrides so env vars / defaults take over again. No args clears both. |

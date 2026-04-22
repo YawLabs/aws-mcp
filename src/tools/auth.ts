@@ -215,4 +215,62 @@ export const authTools = [
       }
     },
   },
+  {
+    name: "aws_refresh_if_expiring_soon",
+    description:
+      "Proactive SSO token check. If the cached token has fewer than `thresholdMinutes` left (default 10), this kicks off aws_login_start and returns the verification URL + code in one round-trip. If plenty of time remains, returns `status: 'ok'` with the minutes left. Use at the start of a multi-step AWS workflow to avoid mid-session expiry.",
+    annotations: {
+      title: "Refresh SSO token if it's expiring soon",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: z.object({
+      thresholdMinutes: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Trigger refresh when the token has fewer than this many minutes left. Default 10."),
+      profile: z.string().optional().describe("AWS profile configured for SSO. Defaults to $AWS_PROFILE or 'default'."),
+    }),
+    handler: async (input: unknown): Promise<ToolResult> => {
+      const { thresholdMinutes, profile } = input as { thresholdMinutes?: number; profile?: string };
+      const threshold = thresholdMinutes ?? 10;
+      const useProfile = profile || getProfile();
+      const cachedToken = findCachedSsoToken();
+
+      if (cachedToken && cachedToken.minutesLeft >= threshold) {
+        return {
+          ok: true,
+          data: {
+            status: "ok",
+            minutesLeft: cachedToken.minutesLeft,
+            expiresAt: cachedToken.expiresAt,
+            profile: useProfile,
+          },
+        };
+      }
+
+      const loginResult = await startSsoLogin(useProfile);
+      if (!loginResult.ok) {
+        return { ok: false, error: loginResult.error, rawBody: loginResult.rawOutput };
+      }
+      return {
+        ok: true,
+        data: {
+          status: "refreshing",
+          reason: cachedToken
+            ? `Token has ${cachedToken.minutesLeft} min left (threshold ${threshold}).`
+            : "No cached SSO token found.",
+          sessionId: loginResult.sessionId,
+          profile: loginResult.profile,
+          verificationUrl: loginResult.verificationUrl,
+          userCode: loginResult.userCode,
+          instructions: `Open ${loginResult.verificationUrl} in your browser, enter code ${loginResult.userCode}, then call aws_login_complete with sessionId='${loginResult.sessionId}' to confirm.`,
+        },
+      };
+    },
+  },
 ] as const;

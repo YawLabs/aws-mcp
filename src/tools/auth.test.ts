@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { findCachedSsoToken } from "./auth.js";
+import { authTools, findCachedSsoToken } from "./auth.js";
 
 describe("findCachedSsoToken", () => {
   let cacheDir: string;
@@ -89,5 +89,27 @@ describe("findCachedSsoToken", () => {
     const result = findCachedSsoToken(cacheDir);
     assert.ok(result, "small valid token should still be found");
     assert.equal(result.expiresAt, future);
+  });
+});
+
+describe("aws_refresh_if_expiring_soon schema", () => {
+  const tool = authTools.find((t) => t.name === "aws_refresh_if_expiring_soon");
+  if (!tool) throw new Error("aws_refresh_if_expiring_soon not registered");
+
+  it("accepts an empty object (all defaults)", () => {
+    assert.equal(tool.inputSchema.safeParse({}).success, true);
+  });
+
+  it("accepts thresholdMinutes and profile", () => {
+    assert.equal(tool.inputSchema.safeParse({ thresholdMinutes: 15, profile: "prod" }).success, true);
+  });
+
+  it("rejects zero or negative thresholdMinutes", () => {
+    assert.equal(tool.inputSchema.safeParse({ thresholdMinutes: 0 }).success, false);
+    assert.equal(tool.inputSchema.safeParse({ thresholdMinutes: -5 }).success, false);
+  });
+
+  it("rejects non-integer thresholdMinutes", () => {
+    assert.equal(tool.inputSchema.safeParse({ thresholdMinutes: 5.5 }).success, false);
   });
 });
