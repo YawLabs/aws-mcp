@@ -193,12 +193,22 @@ export function startSsoLogin(
     });
 
     proc.on("error", (err) => {
+      // Also resolve `completion` so any waitForLogin caller that already has
+      // the sessionId doesn't hang forever when the subprocess errors after
+      // URL+code were emitted (settled=true, session registered).
+      const errorMsg = `Failed to run 'aws': ${err.message}. Is the AWS CLI installed and on PATH?`;
+      completionResolve({
+        ok: false,
+        exitCode: null,
+        error: errorMsg,
+        rawOutput: stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : ""),
+      });
       if (!settled) {
         settled = true;
         clearTimeout(urlTimeout);
         resolve({
           ok: false,
-          error: `Failed to run 'aws': ${err.message}. Is the AWS CLI installed and on PATH?`,
+          error: errorMsg,
         });
       }
     });
