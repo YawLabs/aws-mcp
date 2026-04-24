@@ -1,11 +1,31 @@
 # @yawlabs/aws-mcp
 
-AWS MCP server for AI assistants: **call any AWS API, with first-class SSO re-login.**
+A minimal AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in.**
+
+Not a comprehensive per-service AWS MCP. For typed tools per service (Lambda, DynamoDB, IAM, Bedrock, ...) use AWS Labs' fleet at [`awslabs/mcp`](https://github.com/awslabs/mcp). Reach for this package when you want a single `.mcp.json` entry that handles the common AWS cases — and closes the SSO re-auth gap AWS Labs' servers don't cover.
 
 Two things most AWS-from-assistant setups fumble:
 
 1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess — and on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. This server fixes that with the `--no-browser` device-code flow: the AI surfaces a short URL + code, you click once, done.
 2. **Every AWS API operation.** `aws_call` proxies the `aws` CLI directly — one tool covers the entire surface, no SDK bundling, no service-by-service tool sprawl.
+
+## When to reach for this vs AWS Labs' servers
+
+**Use `@yawlabs/aws-mcp` when:**
+
+- You want **one MCP entry** in `.mcp.json` that handles day-to-day AWS, not a fleet to configure per service.
+- You hit **SSO token expiry mid-session** on Windows (or anywhere `aws sso login`'s browser handoff drops). This is the specific gap this server was built for; AWS Labs' servers assume credentials are already present.
+- You need to call a **new or obscure AWS service** the day AWS adds it to the CLI — no waiting on a per-service MCP to ship.
+- Your stack is **Node/npm** and you don't want Python + `uvx` in the loop.
+- You want a **small footprint** — one esbuild bundle, no per-service SDK weight.
+
+**Use AWS Labs' per-service servers ([`awslabs/mcp`](https://github.com/awslabs/mcp)) when:**
+
+- You're doing **deep work in one service** (Lambda, DynamoDB, Bedrock, IAM, ...) and want typed, service-specific helpers (`lambda_invoke`, Bedrock KB retrieval, DynamoDB with type-marshalling, ...) that a generic CLI passthrough doesn't provide.
+- You need **data-plane operations** (streaming reads, inference, large binary I/O) where a typed SDK matters more than a CLI string.
+- **Enterprise compliance** requires first-party-only tooling.
+
+The two aren't mutually exclusive — this server can sit alongside AWS Labs' per-service servers in the same `.mcp.json` if your workflow wants both.
 
 ## Tools
 
@@ -23,6 +43,12 @@ Two things most AWS-from-assistant setups fumble:
 | `aws_call` | Run any AWS API operation. `service: 's3api', operation: 'list-buckets'`, optional `params` (PascalCase JSON), optional `query` (JMESPath). Returns parsed JSON. |
 | `aws_paginate` | Fetch one page of a paginated list/describe operation. Supports `query` too. Returns `nextToken`/`hasMore`; call again with the token to continue. |
 | `aws_logs_tail` | Fetch recent CloudWatch Logs events for a log group. Wraps `aws logs tail --format json` with `since`, `filterPattern`, and stream-name filters; returns events as a parsed array. |
+| `aws_resource_get` | Read an AWS resource via Cloud Control API by `typeName` + `identifier` (e.g. `AWS::Lambda::Function` + function name). Returns parsed Properties. |
+| `aws_resource_list` | List resources of a type via CCAPI, paginated. Returns `{identifier, properties}` per entry plus a `nextToken`/`hasMore`. |
+| `aws_resource_create` | Create an AWS resource via CCAPI. Async — returns a `RequestToken`; poll `aws_resource_status` until complete. |
+| `aws_resource_update` | Update an AWS resource via CCAPI using RFC 6902 JSON Patch. Async — returns a `RequestToken`; poll `aws_resource_status`. |
+| `aws_resource_delete` | Delete an AWS resource via CCAPI. Async — returns a `RequestToken`; poll `aws_resource_status`. Destructive; verify `identifier` first. |
+| `aws_resource_status` | Poll an async CCAPI request by `requestToken`. Returns the current ProgressEvent (PENDING / IN_PROGRESS / SUCCESS / FAILED / CANCEL_*). |
 
 ## Install
 

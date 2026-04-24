@@ -8,6 +8,7 @@ import { callTools } from "./tools/call.js";
 import { logsTools } from "./tools/logs.js";
 import { paginateTools } from "./tools/paginate.js";
 import { profilesTools } from "./tools/profiles.js";
+import { resourceTools } from "./tools/resource.js";
 import { sessionTools } from "./tools/session.js";
 import type { Tool } from "./tools/tool.js";
 
@@ -32,6 +33,7 @@ const allTools: readonly Tool[] = [
   ...paginateTools,
   ...assumeTools,
   ...logsTools,
+  ...resourceTools,
 ];
 
 const server = new McpServer({
