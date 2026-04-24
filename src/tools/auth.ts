@@ -6,25 +6,35 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { z } from "zod";
 import { classifyAuthError } from "../errors.js";
 import { getProfile, getRegion } from "../session.js";
-import { startSsoLogin, waitForLogin } from "../sso.js";
-
-type ToolResult = { ok: boolean; data?: unknown; error?: string; rawBody?: string };
+import { findActiveSessionByProfile, startSsoLogin, waitForLogin } from "../sso.js";
+import { resolveProfileStartUrl } from "./profiles.js";
+import type { Tool, ToolResult } from "./tool.js";
 
 // Real SSO cache files are a few KB (JWT + metadata). 64 KB is a generous
 // cap that still keeps a malformed or malicious giant file from blocking the
 // event loop on readFileSync.
 const MAX_SSO_CACHE_FILE_BYTES = 64 * 1024;
 
+export interface FindTokenOptions {
+  /**
+   * If set, only return tokens whose `startUrl` matches. Prevents the
+   * multi-org misread where the first valid token in the cache belongs to a
+   * different SSO instance than the profile the caller asked about.
+   */
+  startUrl?: string;
+}
+
 /**
- * Best-effort read of any non-expired SSO token from the CLI cache. If the
- * user has tokens for multiple SSO start URLs this picks the first valid one,
- * which may not match the requested profile — we return it as a hint only.
- * For a single-org setup (most common) it's accurate.
+ * Best-effort read of a non-expired SSO token from the CLI cache. When
+ * `startUrl` is supplied, only tokens belonging to that SSO instance are
+ * eligible — callers with a known profile should always pass it to avoid
+ * the multi-org hazard.
  *
  * Exported with an optional `cacheDir` argument so tests can point it at a tmpdir.
  */
 export function findCachedSsoToken(
   cacheDir: string = join(homedir(), ".aws", "sso", "cache"),
+  opts: FindTokenOptions = {},
 ): { expiresAt: string; minutesLeft: number; startUrl?: string } | null {
   try {
     const files = readdirSync(cacheDir).filter((f) => f.endsWith(".json"));
@@ -34,15 +44,15 @@ export function findCachedSsoToken(
         const path = join(cacheDir, f);
         if (statSync(path).size > MAX_SSO_CACHE_FILE_BYTES) continue;
         const contents = JSON.parse(readFileSync(path, "utf-8"));
-        if (contents.accessToken && contents.expiresAt) {
-          const expiresAt = new Date(contents.expiresAt).getTime();
-          if (expiresAt > now) {
-            return {
-              expiresAt: contents.expiresAt,
-              minutesLeft: Math.floor((expiresAt - now) / 60_000),
-              startUrl: contents.startUrl,
-            };
-          }
+        if (!contents.accessToken || !contents.expiresAt) continue;
+        if (opts.startUrl && contents.startUrl !== opts.startUrl) continue;
+        const expiresAt = new Date(contents.expiresAt).getTime();
+        if (expiresAt > now) {
+          return {
+            expiresAt: contents.expiresAt,
+            minutesLeft: Math.floor((expiresAt - now) / 60_000),
+            startUrl: contents.startUrl,
+          };
         }
       } catch {
         // skip malformed cache file
@@ -54,7 +64,21 @@ export function findCachedSsoToken(
   return null;
 }
 
-export const authTools = [
+/**
+ * Resolve a profile's SSO start URL by reading ~/.aws/config. Returns null
+ * if the config file isn't readable or the profile isn't SSO-backed; callers
+ * then fall back to the legacy "first valid token" behavior.
+ */
+function startUrlForProfile(profile: string): string | undefined {
+  try {
+    const text = readFileSync(join(homedir(), ".aws", "config"), "utf-8");
+    return resolveProfileStartUrl(text, profile) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const authTools: readonly Tool[] = [
   {
     name: "aws_whoami",
     description:
@@ -81,7 +105,7 @@ export const authTools = [
           credentials: fromNodeProviderChain({ profile: useProfile }),
         });
         const identity = await client.send(new GetCallerIdentityCommand({}));
-        const cachedToken = findCachedSsoToken();
+        const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
 
         return {
           ok: true,
@@ -135,6 +159,26 @@ export const authTools = [
     handler: async (input: unknown): Promise<ToolResult> => {
       const { profile } = input as { profile?: string };
       const useProfile = profile || getProfile();
+
+      // If a login is already in flight for this profile, surface its
+      // existing URL + code instead of spawning a second subprocess. A
+      // rapid-fire caller (common: refresh + start on the same tick) would
+      // otherwise leave two aws subprocesses racing for the same token cache.
+      const active = findActiveSessionByProfile(useProfile);
+      if (active) {
+        return {
+          ok: true,
+          data: {
+            sessionId: active.sessionId,
+            profile: active.profile,
+            verificationUrl: active.verificationUrl,
+            userCode: active.userCode,
+            reused: true,
+            instructions: `A login is already in progress for profile '${useProfile}'. Open ${active.verificationUrl} in your browser, enter code ${active.userCode}, then call aws_login_complete with sessionId='${active.sessionId}' to confirm.`,
+          },
+        };
+      }
+
       const result = await startSsoLogin(useProfile);
       if (!result.ok) {
         return {
@@ -193,7 +237,7 @@ export const authTools = [
           credentials: fromNodeProviderChain({ profile: useProfile }),
         });
         const identity = await client.send(new GetCallerIdentityCommand({}));
-        const cachedToken = findCachedSsoToken();
+        const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
         return {
           ok: true,
           data: {
@@ -239,7 +283,8 @@ export const authTools = [
       const { thresholdMinutes, profile } = input as { thresholdMinutes?: number; profile?: string };
       const threshold = thresholdMinutes ?? 10;
       const useProfile = profile || getProfile();
-      const cachedToken = findCachedSsoToken();
+      const startUrl = startUrlForProfile(useProfile);
+      const cachedToken = findCachedSsoToken(undefined, { startUrl });
 
       if (cachedToken && cachedToken.minutesLeft >= threshold) {
         return {
@@ -249,6 +294,26 @@ export const authTools = [
             minutesLeft: cachedToken.minutesLeft,
             expiresAt: cachedToken.expiresAt,
             profile: useProfile,
+          },
+        };
+      }
+
+      // Reuse an in-flight login for this profile rather than spawning a
+      // second aws sso login subprocess (two racing writers into the same
+      // token cache is a footgun).
+      const active = findActiveSessionByProfile(useProfile);
+      if (active) {
+        return {
+          ok: true,
+          data: {
+            status: "refreshing",
+            reason: "A login is already in progress for this profile.",
+            sessionId: active.sessionId,
+            profile: active.profile,
+            verificationUrl: active.verificationUrl,
+            userCode: active.userCode,
+            reused: true,
+            instructions: `Open ${active.verificationUrl} in your browser, enter code ${active.userCode}, then call aws_login_complete with sessionId='${active.sessionId}' to confirm.`,
           },
         };
       }
@@ -273,4 +338,4 @@ export const authTools = [
       };
     },
   },
-] as const;
+];

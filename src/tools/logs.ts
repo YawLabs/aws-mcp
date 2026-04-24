@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-
-type ToolResult = { ok: boolean; data?: unknown; error?: string; rawBody?: string };
+import type { Tool, ToolResult } from "./tool.js";
 
 /**
  * `aws logs tail` is a high-level CLI wrapper, not a raw API op. Its flags
@@ -20,15 +19,49 @@ const SINCE_RE = /^\d+[smhdw]$/i;
 // disallow a leading hyphen so an input like "--force" can't masquerade as
 // a flag when we append it to argv.
 const LOG_GROUP_RE = /^[.A-Za-z0-9_/#][.\-_/#A-Za-z0-9]{0,511}$/;
+// AWS log stream names: 1-512 chars, ':' and '*' disallowed by AWS. We also
+// reject leading '-' (argv-injection defense) and ASCII control characters.
+// Real-world stream names include slashes and brackets, e.g.
+// '2026/04/21/[$LATEST]abc' for Lambda — those must still match.
+const LOG_STREAM_NAME_RE = /^[^-:*\s][^:*]{0,511}$/;
+
+/**
+ * Validate a log stream name. Combines LOG_STREAM_NAME_RE (structural shape)
+ * with a control-character check that would otherwise require escapes Biome
+ * rejects in regex literals.
+ */
+export function isValidLogStreamName(name: string): boolean {
+  if (!LOG_STREAM_NAME_RE.test(name)) return false;
+  for (let i = 0; i < name.length; i++) {
+    if (name.charCodeAt(i) < 0x20) return false;
+  }
+  return true;
+}
 
 /**
  * `aws logs tail --format json` emits NDJSON (one event per line), not a
- * single JSON array. Parse each line and return an array of events; fall
- * back to the raw text if parsing fails.
+ * single JSON array. Normalize to an array regardless of how many events
+ * landed:
+ *
+ *   - null / undefined / empty string -> []
+ *   - already-parsed array           -> returned as-is
+ *   - already-parsed single object   -> [object]  (runAwsCall's JSON.parse
+ *                                                   will succeed when there's
+ *                                                   exactly one event)
+ *   - NDJSON string                  -> split lines, parse each, return array
+ *   - any line fails to parse        -> return the raw string unchanged, as a
+ *                                       diagnosis signal; callers render it as
+ *                                       eventCount=null to flag the failure
  */
-function parseLogsJsonOutput(raw: unknown): unknown {
-  if (typeof raw !== "string") return raw;
+function parseLogsJsonOutput(raw: unknown): unknown[] | string {
+  if (raw === null || raw === undefined) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "object") return [raw];
+  if (typeof raw !== "string") return [raw];
+
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return [];
+
   const events: unknown[] = [];
   for (const line of lines) {
     try {
@@ -40,7 +73,7 @@ function parseLogsJsonOutput(raw: unknown): unknown {
   return events;
 }
 
-export const logsTools = [
+export const logsTools: readonly Tool[] = [
   {
     name: "aws_logs_tail",
     description:
@@ -109,14 +142,22 @@ export const logsTools = [
           error: "Pass either logStreamNames or logStreamNamePrefix, not both (mirrors aws CLI).",
         };
       }
+      if (i.logStreamNames) {
+        for (const name of i.logStreamNames) {
+          if (!isValidLogStreamName(name)) {
+            return {
+              ok: false,
+              error: `Invalid logStreamName '${name}'. Must be 1-512 chars, not start with '-', and contain no ':', '*', or control characters.`,
+            };
+          }
+        }
+      }
 
       // aws logs tail expects the log group name as a positional before any
       // flags. We inject it as the first entry of extraFlags so runAwsCall
       // places it between the operation ('tail') and --format/--since/etc.
       // The leading-hyphen defense above blocks argv injection.
-      const extraFlags: string[] = [i.logGroupName, "--format", "json"];
-      if (i.since) extraFlags.push("--since", i.since);
-      else extraFlags.push("--since", "10m");
+      const extraFlags: string[] = [i.logGroupName, "--format", "json", "--since", i.since ?? "10m"];
       if (i.filterPattern) extraFlags.push("--filter-pattern", i.filterPattern);
       if (i.logStreamNames && i.logStreamNames.length > 0) {
         extraFlags.push("--log-stream-names", ...i.logStreamNames);
@@ -138,23 +179,27 @@ export const logsTools = [
       if (!result.ok) {
         return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
       }
-      // runAwsCall already tried JSON.parse on the whole stdout and fell back
-      // to returning the raw string (NDJSON fails as a single-object parse).
-      // Split and parse per line here.
-      const events = parseLogsJsonOutput(result.data);
+      // runAwsCall already tried JSON.parse on the whole stdout; for a single
+      // event that succeeds and data is an object, for multiple events it
+      // fails and data is the raw NDJSON string. parseLogsJsonOutput collapses
+      // both into an array (or a raw-string escape hatch when any line is
+      // malformed).
+      const parsed = parseLogsJsonOutput(result.data);
+      const events = parsed;
+      const eventCount = Array.isArray(parsed) ? parsed.length : null;
       return {
         ok: true,
         data: {
           command: result.command,
           logGroupName: i.logGroupName,
           since: i.since ?? "10m",
-          eventCount: Array.isArray(events) ? events.length : null,
+          eventCount,
           events,
         },
       };
     },
   },
-] as const;
+];
 
 // Exported for tests.
-export { LOG_GROUP_RE, parseLogsJsonOutput };
+export { LOG_GROUP_RE, LOG_STREAM_NAME_RE, parseLogsJsonOutput };

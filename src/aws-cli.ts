@@ -13,6 +13,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { type AuthErrorKind, classifyAuthError } from "./errors.js";
+import { killProc } from "./kill-proc.js";
 import { getProfile, getRegion } from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -20,8 +21,6 @@ const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
 // Cap the stderr we surface as an error message to avoid flooding the MCP
 // response. Full stderr still lands in rawStderr for diagnosis.
 const MAX_ERROR_MSG_BYTES = 8 * 1024;
-// How long to wait between SIGTERM and SIGKILL when a subprocess is hung.
-const KILL_ESCALATION_MS = 2_000;
 
 // Also defends against argv injection: leading-hyphen input like "--profile evil"
 // would otherwise become a flag to `aws`.
@@ -176,25 +175,6 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
 
-    const killProc = (): void => {
-      try {
-        proc.kill("SIGTERM");
-      } catch {
-        // proc may already be dead
-      }
-      // SIGTERM is ignored on Windows; escalate if the process is still
-      // around after a short grace period.
-      setTimeout(() => {
-        if (!proc.killed && proc.exitCode === null) {
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            // best effort
-          }
-        }
-      }, KILL_ESCALATION_MS).unref();
-    };
-
     const settle = (result: AwsCallResult): void => {
       if (settled) return;
       settled = true;
@@ -205,7 +185,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       if (!killed) {
         killed = true;
         timedOut = true;
-        killProc();
+        killProc(proc);
       }
     }, timeoutMs);
 
@@ -215,7 +195,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         if (!killed) {
           killed = true;
           tooLarge = true;
-          killProc();
+          killProc(proc);
         }
         return;
       }

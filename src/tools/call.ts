@@ -1,9 +1,8 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
+import type { Tool, ToolResult } from "./tool.js";
 
-type ToolResult = { ok: boolean; data?: unknown; error?: string; rawBody?: string };
-
-export const callTools = [
+export const callTools: readonly Tool[] = [
   {
     name: "aws_call",
     description:
@@ -90,4 +89,4 @@ export const callTools = [
       };
     },
   },
-] as const;
+];

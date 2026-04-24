@@ -6,8 +6,7 @@ import { z } from "zod";
 import { upsertProfile } from "../aws-credentials.js";
 import { classifyAuthError } from "../errors.js";
 import { getProfile, getRegion } from "../session.js";
-
-type ToolResult = { ok: boolean; data?: unknown; error?: string };
+import type { Tool, ToolResult } from "./tool.js";
 
 /**
  * Pick a target profile name. We prefix user-chosen names with 'mcp-' to
@@ -21,7 +20,7 @@ function resolveTargetProfile(input: { targetProfile?: string; sessionName: stri
   return `mcp-${input.sessionName}`;
 }
 
-export const assumeTools = [
+export const assumeTools: readonly Tool[] = [
   {
     name: "aws_assume_role",
     description:
@@ -124,4 +123,4 @@ export const assumeTools = [
       }
     },
   },
-] as const;
+];

@@ -15,27 +15,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { killProc } from "./kill-proc.js";
 
-const KILL_ESCALATION_MS = 2_000;
-
-function killProc(proc: ChildProcess): void {
-  try {
-    proc.kill("SIGTERM");
-  } catch {
-    // proc may already be dead
-  }
-  // SIGTERM is ignored on Windows; escalate if the process is still around
-  // after a short grace period.
-  setTimeout(() => {
-    if (!proc.killed && proc.exitCode === null) {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // best effort
-      }
-    }
-  }, KILL_ESCALATION_MS).unref();
-}
+// Matches aws-cli.ts — a runaway CLI shouldn't be able to balloon memory via
+// stderr. 5 MB is ample for any legit sso login session.
+const MAX_STDERR_BYTES = 5 * 1024 * 1024;
 
 export interface LoginStartResult {
   ok: true;
@@ -139,6 +123,7 @@ export function startSsoLogin(
 
     let stdoutBuf = "";
     let stderrBuf = "";
+    let stderrBytes = 0;
     let urlSeen: string | null = null;
     let codeSeen: string | null = null;
     let settled = false;
@@ -211,6 +196,8 @@ export function startSsoLogin(
     });
 
     proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > MAX_STDERR_BYTES) return;
       stderrBuf += stderrDecoder.write(chunk);
     });
 
@@ -259,6 +246,33 @@ export function startSsoLogin(
       }
     });
   });
+}
+
+export interface ActiveSession {
+  sessionId: string;
+  profile: string;
+  verificationUrl: string;
+  userCode: string;
+}
+
+/**
+ * Return the first live login session for `profile`, if any. Callers (e.g.
+ * aws_login_start, aws_refresh_if_expiring_soon) use this to avoid spawning a
+ * second `aws sso login` subprocess when one is already pending — they can
+ * just re-surface the existing URL + code.
+ */
+export function findActiveSessionByProfile(profile: string): ActiveSession | null {
+  for (const [sessionId, s] of sessions) {
+    if (s.profile === profile) {
+      return {
+        sessionId,
+        profile: s.profile,
+        verificationUrl: s.verificationUrl,
+        userCode: s.userCode,
+      };
+    }
+  }
+  return null;
 }
 
 /**

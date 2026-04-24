@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { _clearSessions, startSsoLogin, waitForLogin } from "./sso.js";
+import { _clearSessions, findActiveSessionByProfile, startSsoLogin, waitForLogin } from "./sso.js";
 
 // This test file compiles to dist/sso.integration.test.js and the fake lives
 // at dist/testing/fake-aws.js. Resolve relative to the compiled location.
@@ -115,5 +115,33 @@ describe("waitForLogin — session management", () => {
     const second = await waitForLogin(start.sessionId);
     assert.equal(second.ok, false);
     assert.match(second.error ?? "", /No active login session/);
+  });
+});
+
+describe("findActiveSessionByProfile — dedupe helper", () => {
+  it("returns null when no session is active for the profile", () => {
+    assert.equal(findActiveSessionByProfile("nobody"), null);
+  });
+
+  it("returns the live session's URL/code for the matching profile", async () => {
+    const start = await startSsoLogin("dedupe-profile", fakeOpts("happy", 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const active = findActiveSessionByProfile("dedupe-profile");
+    assert.ok(active, "expected an active session for dedupe-profile");
+    assert.equal(active.sessionId, start.sessionId);
+    assert.equal(active.verificationUrl, start.verificationUrl);
+    assert.equal(active.userCode, start.userCode);
+    // A different profile should NOT see this session.
+    assert.equal(findActiveSessionByProfile("some-other-profile"), null);
+    await waitForLogin(start.sessionId);
+  });
+
+  it("stops returning a session after waitForLogin resolves it", async () => {
+    const start = await startSsoLogin("transient-profile", fakeOpts("happy", 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    await waitForLogin(start.sessionId);
+    assert.equal(findActiveSessionByProfile("transient-profile"), null);
   });
 });

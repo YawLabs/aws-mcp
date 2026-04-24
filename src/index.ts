@@ -2,7 +2,6 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { ZodObject, ZodRawShape } from "zod";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
@@ -10,6 +9,7 @@ import { logsTools } from "./tools/logs.js";
 import { paginateTools } from "./tools/paginate.js";
 import { profilesTools } from "./tools/profiles.js";
 import { sessionTools } from "./tools/session.js";
+import type { Tool } from "./tools/tool.js";
 
 // Injected at build time by esbuild; falls back to reading package.json for tsc builds.
 declare const __VERSION__: string | undefined;
@@ -24,22 +24,14 @@ if (subcommand === "version" || subcommand === "--version") {
   process.exit(0);
 }
 
-type Tool = {
-  name: string;
-  description: string;
-  annotations: { readOnlyHint?: boolean };
-  inputSchema: ZodObject<ZodRawShape>;
-  handler: (input: unknown) => Promise<unknown>;
-};
-
-const allTools: ReadonlyArray<Tool> = [
-  ...(authTools as unknown as ReadonlyArray<Tool>),
-  ...(sessionTools as unknown as ReadonlyArray<Tool>),
-  ...(callTools as unknown as ReadonlyArray<Tool>),
-  ...(profilesTools as unknown as ReadonlyArray<Tool>),
-  ...(paginateTools as unknown as ReadonlyArray<Tool>),
-  ...(assumeTools as unknown as ReadonlyArray<Tool>),
-  ...(logsTools as unknown as ReadonlyArray<Tool>),
+const allTools: readonly Tool[] = [
+  ...authTools,
+  ...sessionTools,
+  ...callTools,
+  ...profilesTools,
+  ...paginateTools,
+  ...assumeTools,
+  ...logsTools,
 ];
 
 const server = new McpServer({
@@ -55,8 +47,7 @@ for (const tool of allTools) {
     tool.annotations,
     async (input: Record<string, unknown>) => {
       try {
-        const result = await (tool.handler as (input: unknown) => Promise<unknown>)(input);
-        const response = result as { ok: boolean; data?: unknown; error?: string; rawBody?: string };
+        const response = await tool.handler(input);
 
         if (!response.ok) {
           // Include rawBody (e.g. aws CLI stderr) in the error so the model can

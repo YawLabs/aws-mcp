@@ -1,9 +1,8 @@
 import { z } from "zod";
 import { clearProfile, clearRegion, getSessionState, setProfile, setRegion } from "../session.js";
+import type { Tool, ToolResult } from "./tool.js";
 
-type ToolResult = { ok: boolean; data?: unknown; error?: string };
-
-export const sessionTools = [
+export const sessionTools: readonly Tool[] = [
   {
     name: "aws_session_set",
     description:
@@ -80,4 +79,4 @@ export const sessionTools = [
       return { ok: true, data: getSessionState() };
     },
   },
-] as const;
+];

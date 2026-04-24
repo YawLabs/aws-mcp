@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { parseAwsConfig, profilesTools } from "./profiles.js";
+import { parseAwsConfig, profilesTools, resolveProfileStartUrl } from "./profiles.js";
 
 const listTool = profilesTools.find((t) => t.name === "aws_list_profiles");
 if (!listTool) throw new Error("profilesTools missing aws_list_profiles");
@@ -56,6 +56,32 @@ region = us-east-1
     assert.equal(profiles[0].name, "dev");
     assert.equal(profiles[0].ssoSession, "my-org");
     assert.equal(profiles[0].isSso, true);
+    // Start URL + region should be inherited from the referenced sso-session.
+    assert.equal(profiles[0].ssoStartUrl, "https://d-xxxxx.awsapps.com/start");
+    assert.equal(profiles[0].ssoRegion, "us-east-1");
+  });
+
+  it("prefers the profile's inline ssoStartUrl over the referenced sso-session's", () => {
+    const text = `
+[sso-session my-org]
+sso_start_url = https://session.awsapps.com/start
+
+[profile dev]
+sso_session = my-org
+sso_start_url = https://inline.awsapps.com/start
+`;
+    const [p] = parseAwsConfig(text);
+    assert.equal(p.ssoStartUrl, "https://inline.awsapps.com/start");
+  });
+
+  it("ignores sso_session refs pointing at a missing sso-session block", () => {
+    const text = `
+[profile dev]
+sso_session = missing-org
+`;
+    const [p] = parseAwsConfig(text);
+    assert.equal(p.ssoSession, "missing-org");
+    assert.equal(p.ssoStartUrl, undefined);
   });
 
   it("handles multiple profiles in one file", () => {
@@ -105,6 +131,37 @@ region = us-east-1
 
   it("returns an empty list on empty input", () => {
     assert.deepEqual(parseAwsConfig(""), []);
+  });
+});
+
+describe("resolveProfileStartUrl", () => {
+  it("returns the startUrl for an inline-sso profile", () => {
+    const text = `
+[profile dev]
+sso_start_url = https://d-xxxxx.awsapps.com/start
+sso_region = us-east-1
+`;
+    assert.equal(resolveProfileStartUrl(text, "dev"), "https://d-xxxxx.awsapps.com/start");
+  });
+
+  it("returns the startUrl for a profile referencing an sso-session", () => {
+    const text = `
+[sso-session my-org]
+sso_start_url = https://via-session.awsapps.com/start
+
+[profile dev]
+sso_session = my-org
+`;
+    assert.equal(resolveProfileStartUrl(text, "dev"), "https://via-session.awsapps.com/start");
+  });
+
+  it("returns null when the profile isn't SSO", () => {
+    const text = "[profile dev]\nregion = us-east-1\n";
+    assert.equal(resolveProfileStartUrl(text, "dev"), null);
+  });
+
+  it("returns null when the profile doesn't exist", () => {
+    assert.equal(resolveProfileStartUrl("[default]\n", "missing"), null);
   });
 });
 

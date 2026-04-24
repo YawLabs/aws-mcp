@@ -90,6 +90,29 @@ describe("findCachedSsoToken", () => {
     assert.ok(result, "small valid token should still be found");
     assert.equal(result.expiresAt, future);
   });
+
+  it("filters by startUrl when supplied (multi-org cache hygiene)", () => {
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    writeFileSync(
+      join(cacheDir, "org-a.json"),
+      JSON.stringify({ accessToken: "a", expiresAt: future, startUrl: "https://org-a.awsapps.com/start" }),
+    );
+    writeFileSync(
+      join(cacheDir, "org-b.json"),
+      JSON.stringify({ accessToken: "b", expiresAt: future, startUrl: "https://org-b.awsapps.com/start" }),
+    );
+    const matchA = findCachedSsoToken(cacheDir, { startUrl: "https://org-a.awsapps.com/start" });
+    assert.ok(matchA);
+    assert.equal(matchA.startUrl, "https://org-a.awsapps.com/start");
+
+    const matchB = findCachedSsoToken(cacheDir, { startUrl: "https://org-b.awsapps.com/start" });
+    assert.ok(matchB);
+    assert.equal(matchB.startUrl, "https://org-b.awsapps.com/start");
+
+    // A startUrl with no matching cache file returns null even though other
+    // valid tokens are present — prevents the multi-org misread.
+    assert.equal(findCachedSsoToken(cacheDir, { startUrl: "https://nobody.awsapps.com/start" }), null);
+  });
 });
 
 describe("aws_refresh_if_expiring_soon schema", () => {

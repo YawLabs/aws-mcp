@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-
-type ToolResult = { ok: boolean; data?: unknown; error?: string; rawBody?: string };
+import type { Tool, ToolResult } from "./tool.js";
 
 /**
  * When --max-items is passed and the underlying API truncates, the AWS CLI
@@ -17,7 +16,7 @@ export function extractNextToken(data: unknown): string | null {
   return null;
 }
 
-export const paginateTools = [
+export const paginateTools: readonly Tool[] = [
   {
     name: "aws_paginate",
     description:
@@ -104,4 +103,4 @@ export const paginateTools = [
       };
     },
   },
-] as const;
+];
