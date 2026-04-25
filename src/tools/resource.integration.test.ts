@@ -51,25 +51,24 @@ const commonOpts = (): { profile?: string; region?: string; timeoutMs: number } 
   timeoutMs: 30_000,
 });
 
-interface ProgressEvent {
-  OperationStatus: string;
-  ErrorCode?: string;
-  StatusMessage?: string;
-  Identifier?: string;
-  RequestToken: string;
-}
-
 interface MutationResult {
   ok: boolean;
-  data?: { progressEvent?: ProgressEvent };
+  data?: {
+    requestToken?: string | null;
+    operationStatus?: string | null;
+    identifier?: string | null;
+    errorCode?: string | null;
+    statusMessage?: string | null;
+    awaited?: { attempts: number; elapsedMs: number };
+  };
   error?: string;
 }
 
 interface TerminalState {
   operationStatus: string;
-  errorCode?: string;
-  statusMessage?: string;
-  identifier?: string;
+  errorCode?: string | null;
+  statusMessage?: string | null;
+  identifier?: string | null;
 }
 
 async function waitUntilTerminal(requestToken: string, maxMs = 60_000, pollMs = 1_000): Promise<TerminalState> {
@@ -77,14 +76,14 @@ async function waitUntilTerminal(requestToken: string, maxMs = 60_000, pollMs = 
   while (Date.now() < deadline) {
     const r = (await statusRes.handler({ requestToken, ...commonOpts() })) as MutationResult;
     if (!r.ok) throw new Error(`status polling failed: ${r.error}`);
-    const ev = r.data?.progressEvent;
-    if (!ev) throw new Error("progressEvent missing from status response");
-    if (ev.OperationStatus !== "IN_PROGRESS" && ev.OperationStatus !== "PENDING") {
+    const status = r.data?.operationStatus;
+    if (!status) throw new Error("operationStatus missing from status response");
+    if (status !== "IN_PROGRESS" && status !== "PENDING") {
       return {
-        operationStatus: ev.OperationStatus,
-        errorCode: ev.ErrorCode,
-        statusMessage: ev.StatusMessage,
-        identifier: ev.Identifier,
+        operationStatus: status,
+        errorCode: r.data?.errorCode,
+        statusMessage: r.data?.statusMessage,
+        identifier: r.data?.identifier,
       };
     }
     await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
@@ -108,8 +107,8 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
         ...commonOpts(),
       })) as MutationResult;
       assert.equal(create.ok, true, `create failed: ${create.error}`);
-      const createToken = create.data?.progressEvent?.RequestToken;
-      assert.ok(createToken, "create should return a RequestToken");
+      const createToken = create.data?.requestToken;
+      assert.ok(createToken, "create should return a top-level requestToken");
 
       const createDone = await waitUntilTerminal(createToken);
       assert.equal(
@@ -136,8 +135,8 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
         ...commonOpts(),
       })) as MutationResult;
       assert.equal(update.ok, true, `update failed: ${update.error}`);
-      const updateToken = update.data?.progressEvent?.RequestToken;
-      assert.ok(updateToken, "update should return a RequestToken");
+      const updateToken = update.data?.requestToken;
+      assert.ok(updateToken, "update should return a top-level requestToken");
       const updateDone = await waitUntilTerminal(updateToken);
       assert.equal(
         updateDone.operationStatus,
@@ -164,10 +163,48 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
             identifier: createdIdentifier,
             ...commonOpts(),
           })) as MutationResult;
-          const delToken = del.ok ? del.data?.progressEvent?.RequestToken : undefined;
+          const delToken = del.ok ? del.data?.requestToken : undefined;
           if (delToken) {
             await waitUntilTerminal(delToken).catch(() => undefined);
           }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+
+  it("create with awaitCompletion: true returns a terminal status in one call", async () => {
+    const paramName = `/aws-mcp-live-test-await/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let createdIdentifier: string | undefined;
+    try {
+      const create = (await createRes.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: paramName, Type: "String", Value: "awaited" },
+        awaitCompletion: true,
+        pollIntervalMs: 1_000,
+        maxWaitMs: 60_000,
+        ...commonOpts(),
+      })) as MutationResult;
+      assert.equal(create.ok, true, `awaited create failed: ${create.error}`);
+      assert.equal(
+        create.data?.operationStatus,
+        "SUCCESS",
+        `awaited create ended in ${create.data?.operationStatus} (${create.data?.errorCode ?? "?"})`,
+      );
+      assert.ok(create.data?.awaited, "awaited block should be present when awaitCompletion is true");
+      assert.ok((create.data?.awaited?.attempts ?? 0) >= 1);
+      createdIdentifier = create.data?.identifier ?? paramName;
+    } finally {
+      if (createdIdentifier) {
+        try {
+          await deleteRes.handler({
+            typeName: "AWS::SSM::Parameter",
+            identifier: createdIdentifier,
+            awaitCompletion: true,
+            maxWaitMs: 60_000,
+            ...commonOpts(),
+          });
         } catch {
           // ignore
         }

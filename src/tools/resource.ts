@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { runAwsCall } from "../aws-cli.js";
+import { type AwsCallResult, runAwsCall } from "../aws-cli.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -16,8 +16,15 @@ import type { Tool, ToolResult } from "./tool.js";
  * entries so they can't leak flags.
  *
  * Mutation verbs return a ProgressEvent with OperationStatus=IN_PROGRESS and a
- * RequestToken. Callers poll aws_resource_status with that token until the
- * status is SUCCESS, FAILED, or CANCEL_COMPLETE.
+ * RequestToken. By default we surface that event and let the caller poll via
+ * aws_resource_status. Pass `awaitCompletion: true` to have the server poll on
+ * the caller's behalf until the operation reaches SUCCESS / FAILED /
+ * CANCEL_COMPLETE -- one tool call covers the full lifecycle.
+ *
+ * Every CCAPI response also flat-promotes the most useful ProgressEvent fields
+ * (`requestToken`, `operationStatus`, `identifier`, `errorCode`,
+ * `statusMessage`, `retryAfter`) to the top level, alongside the raw event.
+ * That spares callers a second round-trip just to drill into the envelope.
  */
 
 // <Namespace>::<Service>::<Resource> where each segment is PascalCase
@@ -97,10 +104,226 @@ function validateOpaqueToken(token: string, fieldName: string): string | null {
   return null;
 }
 
+/**
+ * CCAPI ProgressEvent terminal states. Anything else (PENDING, IN_PROGRESS,
+ * CANCEL_IN_PROGRESS) is still in flight.
+ */
+export const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["SUCCESS", "FAILED", "CANCEL_COMPLETE"]);
+
+const DEFAULT_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_MAX_WAIT_MS = 5 * 60_000;
+const MIN_POLL_INTERVAL_MS = 500;
+const MAX_POLL_INTERVAL_MS = 30_000;
+const MIN_MAX_WAIT_MS = 1_000;
+const MAX_MAX_WAIT_MS = 30 * 60_000;
+
+export interface ProgressFields {
+  requestToken: string | null;
+  operationStatus: string | null;
+  identifier: string | null;
+  errorCode: string | null;
+  statusMessage: string | null;
+  retryAfter: string | null;
+}
+
+/**
+ * Pull the fields callers actually want off a raw ProgressEvent. Returns null
+ * for anything missing or non-string so the response shape is predictable.
+ */
+export function extractProgressFields(progressEvent: unknown): ProgressFields {
+  const pe = progressEvent && typeof progressEvent === "object" ? (progressEvent as Record<string, unknown>) : {};
+  const str = (k: string): string | null => {
+    const v = pe[k];
+    return typeof v === "string" && v.length > 0 ? v : null;
+  };
+  return {
+    requestToken: str("RequestToken"),
+    operationStatus: str("OperationStatus"),
+    identifier: str("Identifier"),
+    errorCode: str("ErrorCode"),
+    statusMessage: str("StatusMessage"),
+    retryAfter: str("RetryAfter"),
+  };
+}
+
+interface PollResult {
+  ok: boolean;
+  progressEvent: Record<string, unknown> | null;
+  command: string;
+  attempts: number;
+  elapsedMs: number;
+  error?: string;
+  rawBody?: string;
+}
+
+type AwsCaller = typeof runAwsCall | ((opts: Parameters<typeof runAwsCall>[0]) => Promise<AwsCallResult>);
+
+/**
+ * Loop `cloudcontrol get-resource-request-status` until the operation reaches
+ * a terminal state, runs out of budget, or the CLI errors. Honors the
+ * ProgressEvent.RetryAfter hint when present, otherwise paces with
+ * `pollIntervalMs`. Always caps the wait at the remaining maxWaitMs budget so
+ * we don't overshoot.
+ *
+ * Exposed with an injectable `awsCall` argument purely so unit tests can drive
+ * the loop with scripted responses; production code uses the default.
+ */
+export async function pollUntilTerminal(
+  opts: {
+    requestToken: string;
+    profile?: string;
+    region?: string;
+    timeoutMs?: number;
+    pollIntervalMs: number;
+    maxWaitMs: number;
+  },
+  awsCall: AwsCaller = runAwsCall,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<PollResult> {
+  const start = Date.now();
+  let attempts = 0;
+  let lastEvent: Record<string, unknown> | null = null;
+  let lastCommand = "";
+  while (true) {
+    attempts++;
+    const result = await awsCall({
+      service: "cloudcontrol",
+      operation: "get-resource-request-status",
+      profile: opts.profile,
+      region: opts.region,
+      timeoutMs: opts.timeoutMs,
+      outputFormat: "json",
+      extraFlags: ["--request-token", opts.requestToken],
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        progressEvent: lastEvent,
+        command: result.command ?? lastCommand,
+        attempts,
+        elapsedMs: Date.now() - start,
+        error: result.error,
+        rawBody: result.rawStderr ?? result.rawStdout,
+      };
+    }
+    lastCommand = result.command;
+    const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
+    lastEvent = raw?.ProgressEvent ?? null;
+    const status =
+      lastEvent && typeof lastEvent.OperationStatus === "string" ? (lastEvent.OperationStatus as string) : null;
+    if (status && TERMINAL_STATUSES.has(status)) {
+      return { ok: true, progressEvent: lastEvent, command: lastCommand, attempts, elapsedMs: Date.now() - start };
+    }
+    const elapsed = Date.now() - start;
+    if (elapsed >= opts.maxWaitMs) {
+      return {
+        ok: false,
+        progressEvent: lastEvent,
+        command: lastCommand,
+        attempts,
+        elapsedMs: elapsed,
+        error: `Polled for ${Math.round(elapsed / 1000)}s without reaching a terminal state (last status: ${status ?? "unknown"}). Increase maxWaitMs, or call aws_resource_status with requestToken='${opts.requestToken}' to keep checking.`,
+      };
+    }
+    let waitMs = opts.pollIntervalMs;
+    const retryAfterRaw =
+      lastEvent && typeof lastEvent.RetryAfter === "string" ? (lastEvent.RetryAfter as string) : null;
+    if (retryAfterRaw) {
+      const target = Date.parse(retryAfterRaw);
+      if (!Number.isNaN(target)) {
+        const ra = target - Date.now();
+        if (ra > 0) waitMs = ra;
+      }
+    }
+    waitMs = Math.min(waitMs, opts.maxWaitMs - elapsed);
+    if (waitMs > 0) await sleep(waitMs);
+  }
+}
+
+/**
+ * Shared mutation post-processing: flat-promote ProgressEvent fields, and
+ * (when awaitCompletion is set) poll until terminal so the caller doesn't
+ * have to. Either way, the raw `progressEvent` is preserved alongside the
+ * flat fields for callers that need extra context.
+ */
+async function buildMutationResponse(
+  initial: { command: string; data: unknown },
+  i: {
+    profile?: string;
+    region?: string;
+    timeoutMs?: number;
+    awaitCompletion?: boolean;
+    pollIntervalMs?: number;
+    maxWaitMs?: number;
+  },
+): Promise<ToolResult> {
+  const raw = initial.data as { ProgressEvent?: Record<string, unknown> } | null;
+  const progressEvent = raw?.ProgressEvent ?? null;
+  const fields = extractProgressFields(progressEvent);
+  const initialStatus = fields.operationStatus ?? "";
+  const alreadyTerminal = TERMINAL_STATUSES.has(initialStatus);
+
+  if (i.awaitCompletion && fields.requestToken && !alreadyTerminal) {
+    const polled = await pollUntilTerminal({
+      requestToken: fields.requestToken,
+      profile: i.profile,
+      region: i.region,
+      timeoutMs: i.timeoutMs,
+      pollIntervalMs: i.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+      maxWaitMs: i.maxWaitMs ?? DEFAULT_MAX_WAIT_MS,
+    });
+    if (!polled.ok) {
+      return { ok: false, error: polled.error ?? "Poll failed", rawBody: polled.rawBody };
+    }
+    const finalFields = extractProgressFields(polled.progressEvent);
+    return {
+      ok: true,
+      data: {
+        command: polled.command,
+        ...finalFields,
+        progressEvent: polled.progressEvent,
+        awaited: { attempts: polled.attempts, elapsedMs: polled.elapsedMs },
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    data: { command: initial.command, ...fields, progressEvent },
+  };
+}
+
 const baseFields = {
   profile: z.string().optional().describe("Override session profile for this call."),
   region: z.string().optional().describe("Override session region for this call."),
   timeoutMs: z.number().int().positive().optional().describe("Timeout in milliseconds. Default 60000."),
+};
+
+const awaitFields = {
+  awaitCompletion: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true, poll get-resource-request-status until the operation reaches SUCCESS / FAILED / CANCEL_COMPLETE and return the final ProgressEvent. Default false (returns immediately with IN_PROGRESS, caller polls via aws_resource_status).",
+    ),
+  pollIntervalMs: z
+    .number()
+    .int()
+    .min(MIN_POLL_INTERVAL_MS)
+    .max(MAX_POLL_INTERVAL_MS)
+    .optional()
+    .describe(
+      `Poll interval in ms when awaitCompletion is true (range ${MIN_POLL_INTERVAL_MS}-${MAX_POLL_INTERVAL_MS}). Default ${DEFAULT_POLL_INTERVAL_MS}. ProgressEvent.RetryAfter overrides when CCAPI returns one.`,
+    ),
+  maxWaitMs: z
+    .number()
+    .int()
+    .min(MIN_MAX_WAIT_MS)
+    .max(MAX_MAX_WAIT_MS)
+    .optional()
+    .describe(
+      `Maximum total wait in ms when awaitCompletion is true (range ${MIN_MAX_WAIT_MS}-${MAX_MAX_WAIT_MS}). Default ${DEFAULT_MAX_WAIT_MS}. On timeout, returns the last seen status with a hint to keep polling.`,
+    ),
 };
 
 export const resourceTools: readonly Tool[] = [
@@ -251,7 +474,7 @@ export const resourceTools: readonly Tool[] = [
   {
     name: "aws_resource_create",
     description:
-      "Create an AWS resource via Cloud Control API. Async: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a `RequestToken`. Poll aws_resource_status with the token until status is SUCCESS or FAILED. `desiredState` is the resource properties JSON matching the CloudFormation schema for `typeName`.",
+      "Create an AWS resource via Cloud Control API. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a `requestToken` (top-level) -- poll aws_resource_status with that token, or pass `awaitCompletion: true` to have the server poll for you and return the terminal event. `desiredState` is the resource properties JSON matching the CloudFormation schema for `typeName`.",
     annotations: {
       title: "Create an AWS resource (async via CCAPI)",
       readOnlyHint: false,
@@ -271,6 +494,7 @@ export const resourceTools: readonly Tool[] = [
         .optional()
         .describe("Idempotency token (max 128 chars). Prevents duplicate creation on retry."),
       ...baseFields,
+      ...awaitFields,
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const i = input as {
@@ -280,6 +504,9 @@ export const resourceTools: readonly Tool[] = [
         profile?: string;
         region?: string;
         timeoutMs?: number;
+        awaitCompletion?: boolean;
+        pollIntervalMs?: number;
+        maxWaitMs?: number;
       };
       const tnErr = validateTypeName(i.typeName);
       if (tnErr) return { ok: false, error: tnErr };
@@ -305,18 +532,14 @@ export const resourceTools: readonly Tool[] = [
         return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
       }
 
-      const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
-      return {
-        ok: true,
-        data: { command: result.command, progressEvent: raw?.ProgressEvent ?? null },
-      };
+      return buildMutationResponse({ command: result.command, data: result.data }, i);
     },
   },
 
   {
     name: "aws_resource_update",
     description:
-      "Update an AWS resource via Cloud Control API using RFC 6902 JSON Patch. Async: returns a ProgressEvent with OperationStatus=IN_PROGRESS. Poll aws_resource_status until complete. Typical patch: [{op: 'replace', path: '/MemorySize', value: 512}].",
+      "Update an AWS resource via Cloud Control API using RFC 6902 JSON Patch. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Typical patch: [{op: 'replace', path: '/MemorySize', value: 512}].",
     annotations: {
       title: "Update an AWS resource (async via CCAPI)",
       readOnlyHint: false,
@@ -340,6 +563,7 @@ export const resourceTools: readonly Tool[] = [
         .describe("RFC 6902 JSON Patch document (array of operations). At least one entry."),
       clientToken: z.string().optional().describe("Idempotency token (max 128 chars)."),
       ...baseFields,
+      ...awaitFields,
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const i = input as {
@@ -350,6 +574,9 @@ export const resourceTools: readonly Tool[] = [
         profile?: string;
         region?: string;
         timeoutMs?: number;
+        awaitCompletion?: boolean;
+        pollIntervalMs?: number;
+        maxWaitMs?: number;
       };
       const tnErr = validateTypeName(i.typeName);
       if (tnErr) return { ok: false, error: tnErr };
@@ -384,18 +611,14 @@ export const resourceTools: readonly Tool[] = [
         return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
       }
 
-      const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
-      return {
-        ok: true,
-        data: { command: result.command, progressEvent: raw?.ProgressEvent ?? null },
-      };
+      return buildMutationResponse({ command: result.command, data: result.data }, i);
     },
   },
 
   {
     name: "aws_resource_delete",
     description:
-      "Delete an AWS resource via Cloud Control API. Async: returns a ProgressEvent with OperationStatus=IN_PROGRESS. Poll aws_resource_status until complete. Destructive -- double-check `identifier` before calling.",
+      "Delete an AWS resource via Cloud Control API. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Destructive -- double-check `identifier` before calling.",
     annotations: {
       title: "Delete an AWS resource (async via CCAPI)",
       readOnlyHint: false,
@@ -408,6 +631,7 @@ export const resourceTools: readonly Tool[] = [
       identifier: z.string().min(1).describe("Primary identifier for the resource."),
       clientToken: z.string().optional().describe("Idempotency token (max 128 chars)."),
       ...baseFields,
+      ...awaitFields,
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const i = input as {
@@ -417,6 +641,9 @@ export const resourceTools: readonly Tool[] = [
         profile?: string;
         region?: string;
         timeoutMs?: number;
+        awaitCompletion?: boolean;
+        pollIntervalMs?: number;
+        maxWaitMs?: number;
       };
       const tnErr = validateTypeName(i.typeName);
       if (tnErr) return { ok: false, error: tnErr };
@@ -444,11 +671,7 @@ export const resourceTools: readonly Tool[] = [
         return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
       }
 
-      const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
-      return {
-        ok: true,
-        data: { command: result.command, progressEvent: raw?.ProgressEvent ?? null },
-      };
+      return buildMutationResponse({ command: result.command, data: result.data }, i);
     },
   },
 
@@ -487,9 +710,11 @@ export const resourceTools: readonly Tool[] = [
       }
 
       const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
+      const progressEvent = raw?.ProgressEvent ?? null;
+      const fields = extractProgressFields(progressEvent);
       return {
         ok: true,
-        data: { command: result.command, progressEvent: raw?.ProgressEvent ?? null },
+        data: { command: result.command, ...fields, progressEvent },
       };
     },
   },
