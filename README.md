@@ -107,7 +107,7 @@ For a larger list where the response might exceed the 5 MB output cap, the assis
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 22+
 - AWS CLI v2 installed and on `PATH` (for `aws sso login --no-browser`)
 - An AWS profile configured for SSO / IAM Identity Center in `~/.aws/config`
 

@@ -50,10 +50,25 @@ interface LoginSession {
   stdoutBuf: string;
   stderrBuf: string;
   completion: Promise<LoginWaitResult>;
-  ttlTimer: NodeJS.Timeout;
+  ttlTimer: NodeJS.Timeout | null;
+  // True once the subprocess has exited. A completed session still holds the
+  // wait result for waitForLogin to consume, but is excluded from
+  // findActiveSessionByProfile so a follow-up aws_login_start spawns fresh
+  // instead of re-surfacing stale URL+code.
+  completed: boolean;
 }
 
 const sessions = new Map<string, LoginSession>();
+
+/**
+ * Profile -> in-flight startSsoLogin promise. Guards against the race where
+ * two callers (e.g. aws_login_start + aws_refresh_if_expiring_soon firing on
+ * the same tick) both pass findActiveSessionByProfile -- which only sees
+ * sessions AFTER URL+code arrive, ~seconds later -- and each spawn their own
+ * `aws sso login` subprocess. With the dedupe map both await the same promise
+ * and only one subprocess ever runs.
+ */
+const pendingStarts = new Map<string, Promise<LoginStartResult | LoginStartError>>();
 
 // Exported for tests — these regexes are load-bearing when the aws CLI output
 // format shifts between versions, so they need direct coverage.
@@ -91,11 +106,28 @@ export interface SsoLoginOptions {
  * Spawn `aws sso login --no-browser`, wait for the URL + code to appear in
  * stdout, then return them. The subprocess keeps running in the background —
  * call `waitForLogin(sessionId)` to block until the user completes auth.
+ *
+ * Dedup guarantee: concurrent calls for the same profile receive the same
+ * pending Promise. Only one `aws sso login` subprocess ever spawns per
+ * profile per in-flight start.
  */
 export function startSsoLogin(
   profile: string,
   opts: SsoLoginOptions = {},
 ): Promise<LoginStartResult | LoginStartError> {
+  const pending = pendingStarts.get(profile);
+  if (pending) return pending;
+  const promise = doStartSsoLogin(profile, opts);
+  pendingStarts.set(profile, promise);
+  void promise.finally(() => {
+    if (pendingStarts.get(profile) === promise) {
+      pendingStarts.delete(profile);
+    }
+  });
+  return promise;
+}
+
+function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginStartResult | LoginStartError> {
   const command = opts.command ?? "aws";
   const prefixArgs = opts.prefixArgs ?? [];
   const urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
@@ -127,6 +159,10 @@ export function startSsoLogin(
     let urlSeen: string | null = null;
     let codeSeen: string | null = null;
     let settled = false;
+    // The session record is only registered once URL+code arrive. The exit
+    // handler reads it through this reference so it can clear ttlTimer and
+    // flip `completed` without having to look up by sessionId.
+    let registeredSession: LoginSession | null = null;
     let completionResolve: (r: LoginWaitResult) => void;
     const completion = new Promise<LoginWaitResult>((res) => {
       completionResolve = res;
@@ -163,7 +199,8 @@ export function startSsoLogin(
         clearTimeout(urlTimeout);
         const sessionId = randomUUID();
         const ttlTimer = setTimeout(() => {
-          if (sessions.has(sessionId)) {
+          const s = sessions.get(sessionId);
+          if (s && !s.completed) {
             killProc(proc);
             completionResolve({
               ok: false,
@@ -183,7 +220,9 @@ export function startSsoLogin(
           stderrBuf,
           completion,
           ttlTimer,
+          completed: false,
         };
+        registeredSession = session;
         sessions.set(sessionId, session);
         resolve({
           ok: true,
@@ -204,6 +243,16 @@ export function startSsoLogin(
     proc.on("exit", (code) => {
       stdoutBuf += stdoutDecoder.end();
       stderrBuf += stderrDecoder.end();
+      // Subprocess is gone -- the long TTL killswitch is no longer load-bearing.
+      // Mark the session completed so findActiveSessionByProfile stops handing
+      // out its (now stale) URL+code to follow-up aws_login_start callers.
+      if (registeredSession) {
+        if (registeredSession.ttlTimer) {
+          clearTimeout(registeredSession.ttlTimer);
+          registeredSession.ttlTimer = null;
+        }
+        registeredSession.completed = true;
+      }
       const result: LoginWaitResult = {
         ok: code === 0,
         exitCode: code,
@@ -229,6 +278,13 @@ export function startSsoLogin(
       // Also resolve `completion` so any waitForLogin caller that already has
       // the sessionId doesn't hang forever when the subprocess errors after
       // URL+code were emitted (settled=true, session registered).
+      if (registeredSession) {
+        if (registeredSession.ttlTimer) {
+          clearTimeout(registeredSession.ttlTimer);
+          registeredSession.ttlTimer = null;
+        }
+        registeredSession.completed = true;
+      }
       const errorMsg = `Failed to run 'aws': ${err.message}. Is the AWS CLI installed and on PATH?`;
       completionResolve({
         ok: false,
@@ -260,10 +316,14 @@ export interface ActiveSession {
  * aws_login_start, aws_refresh_if_expiring_soon) use this to avoid spawning a
  * second `aws sso login` subprocess when one is already pending — they can
  * just re-surface the existing URL + code.
+ *
+ * Completed sessions are excluded: once the subprocess has exited, the URL
+ * and code are stale; a follow-up start should spawn fresh rather than hand
+ * out a finished session's verification details.
  */
 export function findActiveSessionByProfile(profile: string): ActiveSession | null {
   for (const [sessionId, s] of sessions) {
-    if (s.profile === profile) {
+    if (s.profile === profile && !s.completed) {
       return {
         sessionId,
         profile: s.profile,
@@ -292,7 +352,7 @@ export async function waitForLogin(sessionId: string): Promise<LoginWaitResult> 
     const result = await session.completion;
     return result;
   } finally {
-    clearTimeout(session.ttlTimer);
+    if (session.ttlTimer) clearTimeout(session.ttlTimer);
     sessions.delete(sessionId);
   }
 }
@@ -300,8 +360,9 @@ export async function waitForLogin(sessionId: string): Promise<LoginWaitResult> 
 /** For tests — drop any in-flight sessions. Not exported via the MCP surface. */
 export function _clearSessions(): void {
   for (const session of sessions.values()) {
-    clearTimeout(session.ttlTimer);
+    if (session.ttlTimer) clearTimeout(session.ttlTimer);
     killProc(session.proc);
   }
   sessions.clear();
+  pendingStarts.clear();
 }

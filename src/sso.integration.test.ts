@@ -144,4 +144,53 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
     await waitForLogin(start.sessionId);
     assert.equal(findActiveSessionByProfile("transient-profile"), null);
   });
+
+  it("excludes completed sessions before waitForLogin is called", async () => {
+    // The 'happy' fake exits 200ms after emitting URL+code. Wait for the exit
+    // to fire (which marks completed=true) before querying.
+    const start = await startSsoLogin("post-exit-profile", fakeOpts("happy", 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    // While the subprocess is still alive, the session is active.
+    assert.ok(findActiveSessionByProfile("post-exit-profile"));
+    // Wait for the fake to exit (~200ms) plus a small margin.
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    // After exit but before waitForLogin: session is in the map but completed.
+    // findActiveSessionByProfile must skip it so a follow-up aws_login_start
+    // doesn't re-surface stale URL+code.
+    assert.equal(findActiveSessionByProfile("post-exit-profile"), null);
+    // waitForLogin still works -- the completion result is preserved.
+    const wait = await waitForLogin(start.sessionId);
+    assert.equal(wait.ok, true);
+  });
+});
+
+describe("startSsoLogin — concurrent dedup", () => {
+  it("two concurrent calls for the same profile share one subprocess", async () => {
+    const [a, b] = await Promise.all([
+      startSsoLogin("race-profile", fakeOpts("happy", 5000)),
+      startSsoLogin("race-profile", fakeOpts("happy", 5000)),
+    ]);
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true);
+    if (!a.ok || !b.ok) return;
+    // Same profile -> same in-flight promise -> same sessionId.
+    assert.equal(a.sessionId, b.sessionId);
+    assert.equal(a.verificationUrl, b.verificationUrl);
+    assert.equal(a.userCode, b.userCode);
+    await waitForLogin(a.sessionId);
+  });
+
+  it("a fresh start after the previous completes spawns a new subprocess", async () => {
+    const first = await startSsoLogin("re-spawn-profile", fakeOpts("happy", 5000));
+    assert.equal(first.ok, true);
+    if (!first.ok) return;
+    await waitForLogin(first.sessionId);
+    // Pending dedup map self-cleans on settle -- the next call must NOT reuse.
+    const second = await startSsoLogin("re-spawn-profile", fakeOpts("happy", 5000));
+    assert.equal(second.ok, true);
+    if (!second.ok) return;
+    assert.notEqual(first.sessionId, second.sessionId);
+    await waitForLogin(second.sessionId);
+  });
 });

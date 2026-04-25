@@ -156,6 +156,26 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "paginate_query_wrapped_has_more": {
+      // Simulates what the aws CLI emits for a wrapped query like
+      // {NextToken: NextToken, items: Buckets[].Name} on a truncated page.
+      process.stdout.write(
+        `${JSON.stringify({
+          NextToken: "eyJuZXh0IjoiYWJjIn0=",
+          items: ["bucket-1", "bucket-2"],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "paginate_query_wrapped_last_page": {
+      // Final page with a wrapped query: NextToken evaluates to null.
+      process.stdout.write(`${JSON.stringify({ NextToken: null, items: ["bucket-3"] })}\n`);
+      process.exit(0);
+      return;
+    }
+
     case "logs_tail_ndjson": {
       // 'aws logs tail --format json' emits one JSON object per line.
       process.stdout.write(
