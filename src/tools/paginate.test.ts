@@ -178,3 +178,84 @@ describe("aws_paginate handler — query+NextToken round-trip via fake-aws", () 
     assert.deepEqual(data.items, ["bucket-3"]);
   });
 });
+
+describe("aws_paginate handler — end-to-end via AWS_MCP_TEST_AWS_* env override", () => {
+  // The handler doesn't accept command/prefixArgs (would expose argv injection
+  // via MCP). The runAwsCall wrapper honors AWS_MCP_TEST_AWS_COMMAND and
+  // AWS_MCP_TEST_AWS_PREFIX_ARGS as a test-only fallback so we can drive the
+  // full handler -- including the wrap-on-the-way-in / unwrap-on-the-way-out
+  // path -- without exposing those knobs through the MCP surface. If a
+  // future regression swaps wrap and unwrap, this test catches it.
+  const beforeEachEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  };
+  const afterEachEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("handler wraps the user query, parses the wrapped response, and surfaces unwrapped items + nextToken", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "paginate_query_wrapped_has_more";
+      const r = (await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        query: "Buckets[].Name",
+        maxItems: 2,
+      })) as {
+        ok: boolean;
+        data?: { result?: unknown; nextToken?: string | null; hasMore?: boolean };
+      };
+      assert.equal(r.ok, true);
+      assert.deepEqual(r.data?.result, ["bucket-1", "bucket-2"]);
+      assert.equal(r.data?.nextToken, "eyJuZXh0IjoiYWJjIn0=");
+      assert.equal(r.data?.hasMore, true);
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("handler returns hasMore=false on the final page (NextToken=null inside the wrap)", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "paginate_query_wrapped_last_page";
+      const r = (await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        query: "Buckets[].Name",
+        maxItems: 2,
+      })) as {
+        ok: boolean;
+        data?: { result?: unknown; nextToken?: string | null; hasMore?: boolean };
+      };
+      assert.equal(r.ok, true);
+      assert.deepEqual(r.data?.result, ["bucket-3"]);
+      assert.equal(r.data?.nextToken, null);
+      assert.equal(r.data?.hasMore, false);
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("handler without query uses the raw response and reads top-level NextToken", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "paginate_has_more";
+      const r = (await tool.handler({ service: "s3api", operation: "list-buckets", maxItems: 2 })) as {
+        ok: boolean;
+        data?: { result?: { Buckets?: Array<{ Name: string }> }; nextToken?: string | null; hasMore?: boolean };
+      };
+      assert.equal(r.ok, true);
+      assert.deepEqual(r.data?.result?.Buckets, [{ Name: "bucket-1" }, { Name: "bucket-2" }]);
+      assert.equal(r.data?.nextToken, "eyJuZXh0IjoiYWJjIn0=");
+      assert.equal(r.data?.hasMore, true);
+    } finally {
+      afterEachEnv();
+    }
+  });
+});

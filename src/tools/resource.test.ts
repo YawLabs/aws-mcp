@@ -465,6 +465,24 @@ describe("pollUntilTerminal", () => {
     assert.equal(r.ok, false);
     assert.equal(r.error, "boom");
     assert.equal(r.rawBody, "stderr blob");
+    assert.equal(r.kind, "nonzero_exit");
+  });
+
+  it("propagates kind=sso_expired so buildMutationResponse can render a recovery hint", async () => {
+    const awsCall = async (): Promise<AwsCallResult> => ({
+      ok: false,
+      kind: "sso_expired",
+      error: "SSO session expired for profile 'p'.",
+      command: "aws cloudcontrol get-resource-request-status",
+      rawStderr: "Error loading SSO Token",
+    });
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 100, maxWaitMs: 5_000 },
+      awsCall,
+      async () => undefined,
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.kind, "sso_expired");
   });
 
   it("honors RetryAfter (overrides pollIntervalMs)", async () => {
@@ -489,6 +507,46 @@ describe("pollUntilTerminal", () => {
     // RetryAfter (~1000ms) should win over pollIntervalMs (100ms). Allow some
     // jitter in the date math by checking the floor only.
     assert.ok(sleeps[0] > 200, `expected sleep > pollIntervalMs (RetryAfter wins), got ${sleeps[0]}`);
+  });
+});
+
+describe("aws_resource_create handler — awaitCompletion mid-poll auth lapse (fake-aws)", () => {
+  const beforeEachEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  };
+  const afterEachEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("surfaces a structured re-login + aws_resource_status hint when SSO expires mid-poll", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_then_status_sso_expired";
+      const r = (await createResource.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 2000,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false);
+      // Recovery hint includes both the re-login pointer and the
+      // requestToken from the IN_PROGRESS response so the caller can check
+      // server-side state after re-authenticating.
+      assert.match(r.error ?? "", /SSO session expired/);
+      assert.match(r.error ?? "", /aws_login_start/);
+      assert.match(r.error ?? "", /tester/);
+      assert.match(r.error ?? "", /aws_resource_status/);
+      assert.match(r.error ?? "", /req-tok-abc/);
+    } finally {
+      afterEachEnv();
+    }
   });
 });
 

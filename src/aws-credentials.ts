@@ -11,6 +11,7 @@
  * On Unix we chmod 0o600 to match the AWS CLI's own behavior.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -103,12 +104,22 @@ function mergeProfileBody(existingBody: string, creds: AssumedCredentials): stri
   }
   const missingKeys = [...managedKeys].filter((k) => !seen.has(k));
   if (missingKeys.length > 0) {
-    // Drop trailing blank lines before appending, then restore one.
-    while (updated.length > 0 && updated[updated.length - 1].trim() === "") updated.pop();
+    // Capture the section's trailing blank-line suffix, append managed keys
+    // onto a clean tail, then restore the suffix verbatim. Users who placed
+    // blank lines BETWEEN this section and the next one (splitSections folds
+    // those into this section's body) shouldn't lose them just because we
+    // had to add a key. If there were no trailing blanks, default to a
+    // single newline so the next section's header doesn't butt up against
+    // our last key.
+    const trailingBlanks: string[] = [];
+    while (updated.length > 0 && updated[updated.length - 1].trim() === "") {
+      trailingBlanks.unshift(updated.pop() as string);
+    }
     for (const key of missingKeys) {
       updated.push(`${key} = ${(creds as unknown as Record<string, string>)[key]}`);
     }
-    updated.push("");
+    if (trailingBlanks.length === 0) trailingBlanks.push("");
+    updated.push(...trailingBlanks);
   }
   return updated.join("\n");
 }
@@ -141,7 +152,21 @@ export function upsertProfileIntoText(text: string, profile: string, creds: Assu
 export function upsertProfile(path: string, profile: string, creds: AssumedCredentials): void {
   const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
   const nextText = upsertProfileIntoText(existing, profile, creds);
-  const tmpPath = `${path}.tmp-${process.pid}`;
+  // Pid alone collides if two upsertProfile calls overlap in the same
+  // process (e.g. concurrent aws_assume_role). The randomUUID suffix makes
+  // tmpfiles unique per call so the second call's openSync(w) can't
+  // truncate the first's in-flight write.
+  //
+  // Residual race: two concurrent calls each finish their write and then
+  // both call renameSync(tmpPath, path). The second rename atomically
+  // replaces the first. For two callers updating the SAME profile the
+  // last-writer-wins outcome is the natural semantics. For two callers
+  // updating DIFFERENT profiles in the file at the same time, the second
+  // caller's read happened before the first caller's rename, so the first
+  // caller's profile changes are lost when the second rename lands. Fixing
+  // this needs a file lock or a single-writer queue; tracked as future
+  // work, not closed by the UUID suffix alone.
+  const tmpPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
   const fd = openSync(tmpPath, "w", 0o600);
   try {
     writeSync(fd, nextText);

@@ -14,8 +14,13 @@
 
 export type AuthErrorKind = "sso_expired" | "no_creds" | "other";
 
+// All gaps are bounded with `[^\n]{0,N}` so the regex can't span unrelated
+// log lines or run away on long stderr blobs that happen to mention both
+// "sso/session/token" and "expired/invalid" far apart. The 80/40-char
+// budgets are comfortably wider than every real CLI string seen in
+// errors.test.ts; tighten further if a benign false-positive shows up.
 const SSO_EXPIRED_RE =
-  /SSOTokenProviderFailure|sso.*session.*(expired|invalid)|token.*is.*expired|no cached sso token|error loading sso token/i;
+  /SSOTokenProviderFailure|SSO[^\n]{0,80}session[^\n]{0,80}(?:expired|invalid)|token[^\n]{0,40}is\s+expired|no cached sso token|error loading sso token/i;
 const NO_CREDS_RE = /CredentialsProviderError|could not load credentials|no identity|unable to locate credentials/i;
 
 export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message: string } {

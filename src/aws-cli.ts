@@ -13,7 +13,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { type AuthErrorKind, classifyAuthError } from "./errors.js";
-import { killProc } from "./kill-proc.js";
+import { killProc, procHasExited } from "./kill-proc.js";
 import { getProfile, getRegion } from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -95,6 +95,38 @@ export interface AwsCallFailure {
 
 export type AwsCallResult = AwsCallSuccess | AwsCallFailure;
 
+// Module-level dedupe set: warn once per malformed value so a misconfigured
+// dev env doesn't spam stderr on every aws call. Cleared per-process; tests
+// that intentionally exercise this path can stub the var afresh each time.
+const warnedMalformedPrefixArgs = new Set<string>();
+
+function parseTestPrefixArgs(raw: string | undefined): string[] | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    if (!warnedMalformedPrefixArgs.has(raw)) {
+      warnedMalformedPrefixArgs.add(raw);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[aws-mcp] AWS_MCP_TEST_AWS_PREFIX_ARGS is set but isn't valid JSON: ${msg}. Falling back to the real 'aws' binary.`,
+      );
+    }
+    return undefined;
+  }
+  if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
+    if (!warnedMalformedPrefixArgs.has(raw)) {
+      warnedMalformedPrefixArgs.add(raw);
+      console.warn(
+        `[aws-mcp] AWS_MCP_TEST_AWS_PREFIX_ARGS must parse to a string array; got ${typeof parsed === "object" ? JSON.stringify(parsed) : typeof parsed}. Falling back to the real 'aws' binary.`,
+      );
+    }
+    return undefined;
+  }
+  return parsed as string[];
+}
+
 function validateNames(service: string, operationTokens: string[]): string | null {
   if (!SAFE_NAME_RE.test(service)) {
     return `Invalid service '${service}'. Must be kebab-case alphanumeric (e.g. 's3api', 'ec2', 'lambda').`;
@@ -122,8 +154,23 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   const outputFormat = opts.outputFormat ?? "json";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+  // Test-only override path: handler-level tests (e.g. tools/paginate.test.ts)
+  // can't pass command/prefixArgs through the MCP-level handler signature, so
+  // we honor these env vars as a fallback. Never set in production -- the
+  // AWS_MCP_TEST_ prefix is unique enough that real env files won't collide.
+  // Malformed JSON or non-string-array values fall back to the default
+  // (real `aws` binary) rather than throwing, so a dev typo can't wedge
+  // every aws call with a SyntaxError that bypasses the AwsCallResult
+  // envelope. We do warn once per malformed value so the dev sees the
+  // typo instead of debugging a confusing "Failed to spawn 'aws'" later.
+  const envCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+  const envPrefixArgsRaw = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+  const envPrefixArgs = parseTestPrefixArgs(envPrefixArgsRaw);
+  const command = opts.command ?? envCommand ?? "aws";
+  const prefixArgs = opts.prefixArgs ?? envPrefixArgs ?? [];
+
   const args: string[] = [
-    ...(opts.prefixArgs ?? []),
+    ...prefixArgs,
     opts.service,
     ...operationTokens,
     ...(opts.extraFlags ?? []),
@@ -141,7 +188,6 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     args.push("--cli-input-json", JSON.stringify(opts.params));
   }
 
-  const command = opts.command ?? "aws";
   const displayCommand = [command, ...redactDisplayArgs(args)].join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
@@ -182,11 +228,17 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     };
 
     const timeoutHandle = setTimeout(() => {
-      if (!killed) {
-        killed = true;
-        timedOut = true;
-        killProc(proc);
-      }
+      // procHasExited closes the microsecond race where the subprocess exited
+      // cleanly in the last few microseconds with its 'exit' callback queued
+      // behind us in this same loop iteration -- libuv sets exitCode/signalCode
+      // synchronously BEFORE dispatching 'exit', so if either is populated we
+      // defer to the queued exit callback and a natural success isn't
+      // overwritten with a timeout error. See kill-proc.ts:procHasExited.
+      if (killed) return;
+      if (procHasExited(proc)) return;
+      killed = true;
+      timedOut = true;
+      killProc(proc);
     }, timeoutMs);
 
     proc.stdout?.on("data", (chunk: Buffer) => {

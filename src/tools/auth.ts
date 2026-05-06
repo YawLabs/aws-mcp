@@ -1,10 +1,8 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
-import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { z } from "zod";
-import { classifyAuthError } from "../errors.js";
+import { runAwsCall } from "../aws-cli.js";
 import { getProfile, getRegion } from "../session.js";
 import { findActiveSessionByProfile, startSsoLogin, waitForLogin } from "../sso.js";
 import { resolveProfileStartUrl } from "./profiles.js";
@@ -27,8 +25,10 @@ export interface FindTokenOptions {
 /**
  * Best-effort read of a non-expired SSO token from the CLI cache. When
  * `startUrl` is supplied, only tokens belonging to that SSO instance are
- * eligible — callers with a known profile should always pass it to avoid
- * the multi-org hazard.
+ * eligible -- callers with a known profile should always pass it to avoid
+ * the multi-org hazard. When multiple eligible tokens exist (a re-login
+ * leaves the previous one in the cache until it expires), returns the one
+ * with the LATEST `expiresAt` so callers see the freshest minutesLeft.
  *
  * Exported with an optional `cacheDir` argument so tests can point it at a tmpdir.
  */
@@ -39,6 +39,7 @@ export function findCachedSsoToken(
   try {
     const files = readdirSync(cacheDir).filter((f) => f.endsWith(".json"));
     const now = Date.now();
+    let best: { expiresAtIso: string; expiresAtMs: number; startUrl?: string } | null = null;
     for (const f of files) {
       try {
         const path = join(cacheDir, f);
@@ -46,17 +47,21 @@ export function findCachedSsoToken(
         const contents = JSON.parse(readFileSync(path, "utf-8"));
         if (!contents.accessToken || !contents.expiresAt) continue;
         if (opts.startUrl && contents.startUrl !== opts.startUrl) continue;
-        const expiresAt = new Date(contents.expiresAt).getTime();
-        if (expiresAt > now) {
-          return {
-            expiresAt: contents.expiresAt,
-            minutesLeft: Math.floor((expiresAt - now) / 60_000),
-            startUrl: contents.startUrl,
-          };
+        const expiresAtMs = new Date(contents.expiresAt).getTime();
+        if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) continue;
+        if (!best || expiresAtMs > best.expiresAtMs) {
+          best = { expiresAtIso: contents.expiresAt, expiresAtMs, startUrl: contents.startUrl };
         }
       } catch {
         // skip malformed cache file
       }
+    }
+    if (best) {
+      return {
+        expiresAt: best.expiresAtIso,
+        minutesLeft: Math.floor((best.expiresAtMs - now) / 60_000),
+        startUrl: best.startUrl,
+      };
     }
   } catch {
     // no cache dir
@@ -76,6 +81,52 @@ function startUrlForProfile(profile: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Run `aws sts get-caller-identity` for `profile` + `region` via runAwsCall.
+ * Returns the parsed identity (Account/UserId/Arn) on success, or the
+ * already-classified failure shape (sso_expired / no_creds / other) so
+ * callers can render the same fix-it hints aws_call uses.
+ *
+ * Perf tradeoff: this routes through the AWS CLI subprocess (~250-600 ms
+ * cold-start cost on each call) instead of the in-process @aws-sdk/client-sts
+ * (~30-100 ms warm). The price buys consistency -- aws_whoami's failure
+ * hints are now byte-identical to aws_call's, so an agent that sees
+ * "SSO session expired for profile X. Call aws_login_start..." gets the
+ * same recovery path regardless of which tool surfaced it. Callers that
+ * whoami before every action will feel the cost; for those, prefer
+ * caching the identity for the duration of an agent step.
+ */
+async function getCallerIdentity(
+  profile: string,
+  region: string,
+): Promise<
+  | { ok: true; account?: string; userId?: string; arn?: string }
+  | { ok: false; kind: string; error: string; rawBody?: string }
+> {
+  const result = await runAwsCall({
+    service: "sts",
+    operation: "get-caller-identity",
+    profile,
+    region,
+    outputFormat: "json",
+  });
+  if (!result.ok) {
+    return {
+      ok: false,
+      kind: result.kind,
+      error: result.error,
+      rawBody: result.rawStderr ?? result.rawStdout,
+    };
+  }
+  const data = (result.data ?? {}) as { Account?: unknown; UserId?: unknown; Arn?: unknown };
+  return {
+    ok: true,
+    account: typeof data.Account === "string" ? data.Account : undefined,
+    userId: typeof data.UserId === "string" ? data.UserId : undefined,
+    arn: typeof data.Arn === "string" ? data.Arn : undefined,
+  };
 }
 
 export const authTools: readonly Tool[] = [
@@ -99,53 +150,38 @@ export const authTools: readonly Tool[] = [
       const useProfile = profile || getProfile();
       const useRegion = region || getRegion();
 
-      try {
-        const client = new STSClient({
-          region: useRegion,
-          credentials: fromNodeProviderChain({ profile: useProfile }),
-        });
-        const identity = await client.send(new GetCallerIdentityCommand({}));
-        const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
-
-        return {
-          ok: true,
-          data: {
-            account: identity.Account,
-            userId: identity.UserId,
-            arn: identity.Arn,
-            profile: useProfile,
-            region: useRegion,
-            ssoToken: cachedToken
-              ? {
-                  expiresAt: cachedToken.expiresAt,
-                  minutesLeft: cachedToken.minutesLeft,
-                  startUrl: cachedToken.startUrl,
-                }
-              : null,
-          },
-        };
-      } catch (err) {
-        const classified = classifyAuthError(err);
-        if (classified.kind === "sso_expired") {
-          return {
-            ok: false,
-            error: `SSO session expired for profile '${useProfile}'. Call aws_login_start with profile='${useProfile}' to re-authenticate, or run 'aws sso login --profile ${useProfile}' in your terminal.`,
-          };
-        }
-        if (classified.kind === "no_creds") {
-          return {
-            ok: false,
-            error: `No credentials found for profile '${useProfile}'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${classified.message}`,
-          };
-        }
-        return { ok: false, error: classified.message };
+      const identity = await getCallerIdentity(useProfile, useRegion);
+      if (!identity.ok) {
+        // runAwsCall already shaped the error text for sso_expired / no_creds
+        // (matching what aws_call surfaces). Pass it through so this tool's
+        // hints stay consistent with every other tool's hints.
+        return { ok: false, error: identity.error, rawBody: identity.rawBody };
       }
+      const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
+
+      return {
+        ok: true,
+        data: {
+          account: identity.account,
+          userId: identity.userId,
+          arn: identity.arn,
+          profile: useProfile,
+          region: useRegion,
+          ssoToken: cachedToken
+            ? {
+                expiresAt: cachedToken.expiresAt,
+                minutesLeft: cachedToken.minutesLeft,
+                startUrl: cachedToken.startUrl,
+              }
+            : null,
+        },
+      };
     },
   },
   {
     name: "aws_login_start",
     description:
-      "Start an AWS SSO login via the device-code flow (no browser spawned from this process). Returns a verification URL and short code — surface these to the user so they can open the URL in their own browser and paste the code. After they auth, call aws_login_complete with the returned sessionId to confirm completion.",
+      "Start an AWS SSO login via the device-code flow (no browser spawned from this process). Returns a verification URL and short code -- surface these to the user so they can open the URL in their own browser and paste the code. After they auth, call aws_login_complete with the returned sessionId to confirm completion.",
     annotations: {
       title: "Start AWS SSO login (device code)",
       readOnlyHint: false,
@@ -231,32 +267,27 @@ export const authTools: readonly Tool[] = [
 
       const useProfile = profile || getProfile();
       const useRegion = region || getRegion();
-      try {
-        const client = new STSClient({
-          region: useRegion,
-          credentials: fromNodeProviderChain({ profile: useProfile }),
-        });
-        const identity = await client.send(new GetCallerIdentityCommand({}));
-        const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
-        return {
-          ok: true,
-          data: {
-            loggedIn: true,
-            account: identity.Account,
-            userId: identity.UserId,
-            arn: identity.Arn,
-            profile: useProfile,
-            region: useRegion,
-            ssoToken: cachedToken,
-          },
-        };
-      } catch (err) {
-        const classified = classifyAuthError(err);
+      const identity = await getCallerIdentity(useProfile, useRegion);
+      if (!identity.ok) {
         return {
           ok: false,
-          error: `Login subprocess succeeded but identity check failed: ${classified.message}`,
+          error: `Login subprocess succeeded but identity check failed: ${identity.error}`,
+          rawBody: identity.rawBody,
         };
       }
+      const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
+      return {
+        ok: true,
+        data: {
+          loggedIn: true,
+          account: identity.account,
+          userId: identity.userId,
+          arn: identity.arn,
+          profile: useProfile,
+          region: useRegion,
+          ssoToken: cachedToken,
+        },
+      };
     },
   },
   {

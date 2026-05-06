@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { type AwsCallResult, runAwsCall } from "../aws-cli.js";
+import { type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
+import { getProfile } from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -153,6 +154,12 @@ interface PollResult {
   attempts: number;
   elapsedMs: number;
   error?: string;
+  // Mirrors AwsCallFailureKind from runAwsCall when the underlying CLI call
+  // fails. buildMutationResponse uses this to enrich the message with a
+  // "re-login then check aws_resource_status with requestToken='X'" hint
+  // when the auth lapsed mid-flight; the mutation may still complete
+  // server-side regardless.
+  kind?: AwsCallFailureKind;
   rawBody?: string;
 }
 
@@ -203,6 +210,7 @@ export async function pollUntilTerminal(
         attempts,
         elapsedMs: Date.now() - start,
         error: result.error,
+        kind: result.kind,
         rawBody: result.rawStderr ?? result.rawStdout,
       };
     }
@@ -273,6 +281,19 @@ async function buildMutationResponse(
       maxWaitMs: i.maxWaitMs ?? DEFAULT_MAX_WAIT_MS,
     });
     if (!polled.ok) {
+      // Auth-class failures during the poll loop deserve a recovery hint that
+      // includes the requestToken: the underlying mutation may still
+      // complete server-side, so after re-logging in the caller can check
+      // its final state via aws_resource_status. Without this, the bare
+      // poll error buries the recovery path in stderr text.
+      if (polled.kind === "sso_expired" || polled.kind === "no_creds") {
+        const useProfile = i.profile ?? getProfile();
+        const reLoginHint =
+          polled.kind === "sso_expired"
+            ? `SSO session expired while awaiting completion. Call aws_login_start with profile='${useProfile}' to re-authenticate, then call aws_resource_status with requestToken='${fields.requestToken}' to check whether the mutation completed server-side.`
+            : `No credentials available while awaiting completion. After fixing credentials for profile '${useProfile}', call aws_resource_status with requestToken='${fields.requestToken}' to check whether the mutation completed server-side. Underlying error: ${polled.error}`;
+        return { ok: false, error: reLoginHint, rawBody: polled.rawBody };
+      }
       return { ok: false, error: polled.error ?? "Poll failed", rawBody: polled.rawBody };
     }
     const finalFields = extractProgressFields(polled.progressEvent);

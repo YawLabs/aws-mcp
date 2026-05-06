@@ -117,6 +117,24 @@ region = us-east-1
     assert.match(out, /aws_session_token = token-new-1/);
     assert.match(out, /region = us-east-1/);
   });
+
+  it("preserves the blank-line gap between the updated profile and the next section when keys are missing", () => {
+    // splitSections folds the blank lines between [mcp-dev] and [prod] into
+    // mcp-dev's body. When we have to APPEND missing managed keys, the merge
+    // must not collapse those trailing blanks -- the user expects [prod]
+    // not to get glued onto [mcp-dev]'s last key.
+    const existing = `[mcp-dev]
+aws_access_key_id = OLD
+
+
+[prod]
+aws_access_key_id = PROD-KEY
+`;
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    // Two blank lines (\n\n) survive between aws_session_token and [prod].
+    assert.match(out, /aws_session_token = token-new-1\n\n\n\[prod\]/);
+    assert.match(out, /aws_access_key_id = PROD-KEY/);
+  });
 });
 
 describe("upsertProfile — filesystem round-trip", () => {

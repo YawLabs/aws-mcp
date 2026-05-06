@@ -68,7 +68,17 @@ for (const tool of allTools) {
           content: [{ type: "text" as const, text }],
         };
       } catch (err) {
+        // The MCP response only carries the message; preserving the original
+        // stack to stderr means the operator sees what actually went wrong
+        // when the model's surfaced error text is too thin to debug from.
+        // Log only message + stack rather than the whole err object so any
+        // future handler that re-throws an AwsCallResult-shaped value (with
+        // rawStdout / rawStderr fields) doesn't dump those into operator
+        // stderr verbatim.
         const message = err instanceof Error ? err.message : String(err);
+        const stack = err instanceof Error ? err.stack : undefined;
+        console.error(`[aws-mcp] handler '${tool.name}' threw: ${message}`);
+        if (stack) console.error(stack);
         return {
           content: [{ type: "text" as const, text: `Error: ${message}` }],
           isError: true,

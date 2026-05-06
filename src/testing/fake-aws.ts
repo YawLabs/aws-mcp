@@ -197,6 +197,79 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "sts_caller_identity_success": {
+      // Mimics `aws sts get-caller-identity --output json`.
+      process.stdout.write(
+        `${JSON.stringify({
+          UserId: "AIDA1234EXAMPLE",
+          Account: "123456789012",
+          Arn: "arn:aws:iam::123456789012:user/Alice",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "ccapi_in_progress": {
+      // Mimics a cloudcontrol create/update/delete-resource initial response:
+      // operation accepted, IN_PROGRESS, with a RequestToken to poll.
+      process.stdout.write(
+        `${JSON.stringify({
+          ProgressEvent: {
+            TypeName: "AWS::SSM::Parameter",
+            Identifier: "/my/p",
+            RequestToken: "req-tok-abc",
+            OperationStatus: "IN_PROGRESS",
+            Operation: "CREATE",
+          },
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "ccapi_status_sso_expired": {
+      // Mimics `aws cloudcontrol get-resource-request-status` failing with
+      // the same SSO expiry stderr aws_call sees, so awaitCompletion
+      // surfaces the same hint.
+      process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+      process.exit(255);
+      return;
+    }
+
+    case "ccapi_create_then_status_sso_expired": {
+      // Routes a single AWS_MCP_FAKE_SCENARIO across the two CLI calls the
+      // create-with-awaitCompletion flow makes:
+      //   1) cloudcontrol create-resource         -> IN_PROGRESS (success)
+      //   2) cloudcontrol get-resource-request-status -> SSO expired
+      // Lets us drive the buildMutationResponse recovery-hint path through
+      // the real handler without two-step env-var juggling.
+      const argv = process.argv.slice(2);
+      if (argv.includes("create-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::SSM::Parameter",
+              Identifier: "/my/p",
+              RequestToken: "req-tok-abc",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "CREATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: ccapi_create_then_status_sso_expired hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
     default: {
       process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
       process.exit(2);

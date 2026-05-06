@@ -6,6 +6,15 @@
  * should inherit that choice without having to pass it explicitly. Env vars
  * (AWS_PROFILE, AWS_REGION) are the fallback; a per-session override sits on
  * top, reset only when the process exits.
+ *
+ * IMPORTANT: these values are MODULE-GLOBAL state, intentionally so. The MCP
+ * server is designed to host one stdio client per process -- if a future
+ * transport ever multiplexes multiple clients into a single process (HTTP,
+ * websockets), profile/region would bleed between them. Don't multiplex
+ * without first refactoring this state into a per-request context.
+ *
+ * Tests serialize via `_resetSession()` in afterEach, which is why the
+ * existing test parallelism doesn't trip the bleed.
  */
 
 let sessionProfile: string | undefined;

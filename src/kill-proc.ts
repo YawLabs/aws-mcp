@@ -11,6 +11,21 @@ import type { ChildProcess } from "node:child_process";
 
 export const KILL_ESCALATION_MS = 2_000;
 
+/**
+ * True if Node has populated the child's exit/signal codes -- i.e. libuv has
+ * processed the OS-level exit and the proc is dead from Node's point of view.
+ *
+ * Used as a guard against the race where a setTimeout (timeout in aws-cli.ts,
+ * TTL killswitch in sso.ts) fires in the same event-loop iteration as a
+ * queued 'exit' event: libuv sets proc.exitCode / proc.signalCode
+ * synchronously BEFORE dispatching the 'exit' event, so a timer that runs
+ * first in the timers phase can still detect that the proc is already gone
+ * and defer to the queued exit handler instead of double-handling.
+ */
+export function procHasExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null;
+}
+
 export function killProc(proc: ChildProcess, escalationMs: number = KILL_ESCALATION_MS): void {
   try {
     proc.kill("SIGTERM");

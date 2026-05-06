@@ -24,6 +24,10 @@ function fakeOpts(scenario: string, urlWaitMs = 500) {
   };
 }
 
+function fakeOptsWithTtl(scenario: string, sessionTtlMs: number, urlWaitMs = 500) {
+  return { ...fakeOpts(scenario, urlWaitMs), sessionTtlMs };
+}
+
 afterEach(() => {
   _clearSessions();
 });
@@ -162,6 +166,65 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
     // waitForLogin still works -- the completion result is preserved.
     const wait = await waitForLogin(start.sessionId);
     assert.equal(wait.ok, true);
+  });
+});
+
+describe("startSsoLogin — TTL killswitch", () => {
+  it("a stuck subprocess past the TTL is killed and the wait reports session expired", async () => {
+    // The 'happy' fake emits URL+code immediately, then sleeps 200ms before
+    // exiting 0. With sessionTtlMs=20ms the killswitch fires mid-sleep,
+    // SIGTERM lands, and the exit handler -- the SOLE writer of the
+    // completion result -- reports the expiry. Closes the prior race where
+    // the TTL handler resolved completion directly while the subprocess
+    // was simultaneously about to exit 0 with a successful token cache.
+    const start = await startSsoLogin("ttl-stuck-profile", fakeOptsWithTtl("happy", 20, 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    assert.equal(wait.ok, false);
+    assert.match(wait.error ?? "", /SSO login session expired/);
+  });
+
+  it("a subprocess that finishes BEFORE the TTL fires reports natural success (clearTimeout suppresses TTL)", async () => {
+    // 'happy' exits 0 at ~200ms; with sessionTtlMs=5000ms the exit handler
+    // fires first, clears the timer, and reports success. Verifies the
+    // killswitch isn't gratuitously punishing a normal-cadence login.
+    const start = await startSsoLogin("ttl-quick-profile", fakeOptsWithTtl("happy", 5000, 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    assert.equal(wait.ok, true);
+    assert.equal(wait.exitCode, 0);
+  });
+
+  it("a natural non-zero exit before TTL fires reports the natural error, not 'session expired'", async () => {
+    // Regression coverage for the new exit-handler logic. The exit handler
+    // is now the sole writer of the completion result and decides between
+    // three branches (expiry / success / natural error) based on
+    // ttlExpired and code. This test pins the natural-error branch:
+    //
+    //   'early_exit_failure' prints URL+code, writes "Error: connection
+    //   refused" to stderr, sleeps 50ms, then exits 1. With TTL=200ms,
+    //   the exit handler runs at ~50ms, clearTimeout suppresses the TTL,
+    //   ttlExpired stays false, and the wait result must report
+    //   "exited with code 1", NOT "session expired". A bug in the
+    //   ttlExpired logic (e.g. setting it on every exit) would surface
+    //   here as a misclassification.
+    //
+    // The microsecond TTL-vs-exit race window (proc.exitCode set but
+    // 'exit' event not yet dispatched when the TTL callback runs) is
+    // closed by the exitCode/signalCode guard in the TTL callback by
+    // inspection -- driving that exact ordering deterministically would
+    // require timer mocks. The aws-cli.ts:199-200 guard uses the same
+    // pattern and is similarly verified by inspection.
+    const start = await startSsoLogin("ttl-natural-fail-profile", fakeOptsWithTtl("early_exit_failure", 200, 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    assert.equal(wait.ok, false);
+    assert.equal(wait.exitCode, 1);
+    assert.doesNotMatch(wait.error ?? "", /session expired/i);
+    assert.match(wait.error ?? "", /exited with code 1/);
   });
 });
 

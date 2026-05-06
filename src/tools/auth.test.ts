@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { _resetSession } from "../session.js";
 import { authTools, findCachedSsoToken } from "./auth.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
 describe("findCachedSsoToken", () => {
   let cacheDir: string;
@@ -61,6 +66,31 @@ describe("findCachedSsoToken", () => {
     assert.equal(result.startUrl, "https://x.awsapps.com/start");
   });
 
+  it("returns the freshest valid token when several non-expired ones exist", () => {
+    // Re-login leaves the previous cache entry in place until it naturally
+    // expires. Without sorting we'd return whichever readdirSync surfaced
+    // first -- which is FS-defined, not lexicographic. Pin the contract:
+    // freshest expiresAt wins, regardless of filename.
+    const t1 = new Date(Date.now() + 1 * 3600_000).toISOString(); // +1h
+    const t2 = new Date(Date.now() + 2 * 3600_000).toISOString(); // +2h
+    const t3 = new Date(Date.now() + 3 * 3600_000).toISOString(); // +3h
+    writeFileSync(
+      join(cacheDir, "zzz-old.json"),
+      JSON.stringify({ accessToken: "a", expiresAt: t1, startUrl: "https://shared.awsapps.com/start" }),
+    );
+    writeFileSync(
+      join(cacheDir, "aaa-newer.json"),
+      JSON.stringify({ accessToken: "b", expiresAt: t3, startUrl: "https://shared.awsapps.com/start" }),
+    );
+    writeFileSync(
+      join(cacheDir, "mid.json"),
+      JSON.stringify({ accessToken: "c", expiresAt: t2, startUrl: "https://shared.awsapps.com/start" }),
+    );
+    const result = findCachedSsoToken(cacheDir, { startUrl: "https://shared.awsapps.com/start" });
+    assert.ok(result);
+    assert.equal(result.expiresAt, t3, "expected the latest expiresAt to win");
+  });
+
   it("ignores malformed JSON files without crashing", () => {
     writeFileSync(join(cacheDir, "broken.json"), "{ not json");
     const future = new Date(Date.now() + 3600_000).toISOString();
@@ -112,6 +142,55 @@ describe("findCachedSsoToken", () => {
     // A startUrl with no matching cache file returns null even though other
     // valid tokens are present — prevents the multi-org misread.
     assert.equal(findCachedSsoToken(cacheDir, { startUrl: "https://nobody.awsapps.com/start" }), null);
+  });
+});
+
+describe("aws_whoami handler — error path consistency with aws_call (fake-aws)", () => {
+  const tool = authTools.find((t) => t.name === "aws_whoami");
+  if (!tool) throw new Error("aws_whoami not registered");
+
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  });
+
+  it("returns the parsed identity on a successful sts get-caller-identity", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "sts_caller_identity_success";
+    const r = (await tool.handler({ profile: "tester", region: "us-east-1" })) as {
+      ok: boolean;
+      data?: { account?: string; userId?: string; arn?: string; profile?: string; region?: string };
+    };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.account, "123456789012");
+    assert.equal(r.data?.userId, "AIDA1234EXAMPLE");
+    assert.equal(r.data?.arn, "arn:aws:iam::123456789012:user/Alice");
+    assert.equal(r.data?.profile, "tester");
+    assert.equal(r.data?.region, "us-east-1");
+  });
+
+  it("surfaces the same SSO expiry hint that aws_call surfaces (consistency invariant)", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_sso_expired";
+    const r = (await tool.handler({ profile: "tester" })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /SSO session expired/);
+    assert.match(r.error ?? "", /tester/);
+    assert.match(r.error ?? "", /aws_login_start/);
+  });
+
+  it("surfaces the same no-creds hint that aws_call surfaces", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_no_creds";
+    const r = (await tool.handler({ profile: "tester" })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /No credentials found/);
+    assert.match(r.error ?? "", /tester/);
   });
 });
 
