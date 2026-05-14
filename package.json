@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/aws-mcp",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "AWS MCP server — call any AWS API from AI assistants, with first-class SSO re-login (no more 'browser won't open' dead ends)",
   "license": "MIT",
   "author": "YawLabs <contact@yaw.sh>",
@@ -36,14 +36,16 @@
     "lint:fix": "biome check --write src/",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {},
   "devDependencies": {
     "@aws-sdk/client-sts": "^3.700.0",
     "@aws-sdk/credential-providers": "^3.700.0",
     "@biomejs/biome": "^2.4.12",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/node": "^25.6.0",
+    "@types/turndown": "^5.0.6",
     "esbuild": "^0.28.0",
+    "node-html-parser": "^7.1.0",
+    "turndown": "^7.2.4",
     "typescript": "^6.0.3",
     "zod": "^4.3.6"
   },

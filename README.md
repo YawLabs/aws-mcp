@@ -1,24 +1,25 @@
 # @yawlabs/aws-mcp
 
-A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over hundreds of resource types, server-side scripting for batched workflows.**
+A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over hundreds of resource types, live docs lookup, server-side scripting for batched workflows.**
 
-Not a typed per-service AWS MCP and not the official AWS server. The two AWS-shaped MCPs to know about:
+It's an **alternative to AWS's official MCP server**, not a complement -- both call any AWS API, so running both just gives the model two redundant tools. Pick one. The honest comparison:
 
-- **[AWS MCP Server](https://aws.amazon.com/blogs/aws/the-aws-mcp-server-is-now-generally-available/)** -- AWS's hosted server (`uvx mcp-proxy-for-aws`). Strong on docs (`search_documentation`/`read_documentation`), server-side Python sandbox (`run_script`), and skills curated by AWS service teams. Requires Python + `uv`, routes through a proxy that bridges IAM SigV4 to OAuth.
-- **[`awslabs/mcp`](https://github.com/awslabs/mcp)** -- AWS Labs' fleet of typed per-service servers (Lambda invoke, Bedrock retrieval, DynamoDB with type-marshalling, ...). Each one is uvx-installed; rich helpers for the one service.
+- **[AWS MCP Server](https://aws.amazon.com/blogs/aws/the-aws-mcp-server-is-now-generally-available/)** -- AWS's hosted server (`uvx mcp-proxy-for-aws`). Strong on AWS-team-curated skills, a server-side Python sandbox (`run_script`), and days-fresh API coverage. Requires Python + `uv`, routes through a proxy that bridges IAM SigV4 to OAuth, and assumes your local credentials already work.
+- **`@yawlabs/aws-mcp`** (this server) -- Node/npm-only, runs locally. Wins on SSO re-login when `aws sso login`'s browser handoff drops (Windows especially), ergonomic CCAPI CRUD with dry-run diffs, multi-region fan-out, pre-flight IAM permission checks, and a JS scripting sandbox. Ships live AWS docs search + read so you don't need a second server for that.
 
-This server complements both. It can sit alongside them in the same `.mcp.json` -- a recommended docs companion is called out below.
+The one MCP that genuinely pairs with *either* choice is **[`awslabs/mcp`](https://github.com/awslabs/mcp)** -- AWS Labs' fleet of typed per-service servers (Lambda invoke, Bedrock retrieval, DynamoDB with type-marshalling). Those are per-service helpers, no overlap with a general AWS-API server.
 
-Four things this server tries to handle well:
+Five things this server tries to handle well:
 
 1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess -- on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + 8-character code, you click once, done. There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow. AWS's hosted server bridges IAM-to-OAuth via a local proxy; it doesn't help with the `aws sso login` browser-handoff failure.
 2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface -- including services AWS adds tomorrow -- with no SDK bundling and no service-by-service tool sprawl. `aws_paginate` handles paginated list/describe ops, `aws_multi_region` fans the same op out across N regions in parallel, and a JMESPath `query` parameter trims responses server-side (useful when a `describe-instances` result would otherwise blow past the 5 MB output cap).
 3. **Generic CRUD across services.** `aws_resource_*` (seven tools, including `aws_resource_diff` for dry-run previews) wraps AWS Cloud Control API, so the same lifecycle -- get / list / create / update / delete / status -- works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and a few hundred more. Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. CCAPI is control-plane only -- for data-plane ops (S3 reads, Lambda invokes, Bedrock inference, DynamoDB GetItem) drop down to `aws_call` or use a typed AWS Labs server.
-4. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet inside a constrained `node:vm` sandbox with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, and `aws.logsTail` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same shape as AWS's `run_script` (Python, sandboxed server-side) -- yours is JS-native and runs locally.
+4. **Live AWS docs.** `aws_docs_search` queries the same backend that powers the docs.aws.amazon.com search box; `aws_docs_read` fetches a doc page and returns it as paginated markdown. Lets the agent discover new services and look up exact parameter names without a second MCP server installed.
+5. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet inside a constrained `node:vm` sandbox with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, and `aws.logsTail` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same shape as AWS's `run_script` (Python, sandboxed server-side) -- yours is JS-native and runs locally.
 
-## Recommended companion: AWS Documentation MCP Server
+## Optional companion: AWS Labs per-service servers
 
-This server doesn't ship documentation lookup -- AWS Labs already has a focused server for that. Run them side by side:
+For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval, DynamoDB with type-marshalling -- add the relevant [`awslabs/mcp`](https://github.com/awslabs/mcp) server alongside this one. Those are per-service helpers with no tool-name overlap, so they pair cleanly:
 
 ```json
 {
@@ -27,15 +28,13 @@ This server doesn't ship documentation lookup -- AWS Labs already has a focused 
       "command": "npx",
       "args": ["-y", "@yawlabs/aws-mcp"]
     },
-    "aws-docs": {
+    "aws-lambda": {
       "command": "uvx",
-      "args": ["awslabs.aws-documentation-mcp-server@latest"]
+      "args": ["awslabs.lambda-mcp-server@latest"]
     }
   }
 }
 ```
-
-The docs server exposes search + read tools over current AWS docs and API references. Reach for it when the agent needs to discover services or look up parameters for an operation it hasn't seen before. Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/)).
 
 ## When to reach for this vs the other AWS MCPs
 
@@ -48,15 +47,14 @@ The docs server exposes search + read tools over current AWS docs and API refere
 | Multi-region fan-out in one call | **`@yawlabs/aws-mcp`** (`aws_multi_region`) |
 | Batch N tool calls into one round-trip (JS) | **`@yawlabs/aws-mcp`** (`aws_script`) |
 | Check IAM permissions before attempting an op | **`@yawlabs/aws-mcp`** (`aws_iam_simulate`) |
+| Live AWS docs search + read | **`@yawlabs/aws-mcp`** (`aws_docs_search` / `aws_docs_read`) |
 | Node/npm-only install (no Python) | **`@yawlabs/aws-mcp`** |
-| Current AWS docs lookup | **`awslabs.aws-documentation-mcp-server`** |
 | Sandboxed Python script execution server-side | **AWS MCP Server** (`run_script`) |
 | AWS-team-curated best-practice skills | **AWS MCP Server** (skills) |
 | Days-fresh API coverage via hosted endpoint | **AWS MCP Server** (`call_aws`) |
 | Typed per-service helpers (Lambda invoke, Bedrock KB, DynamoDB type-marshalling, ...) | **`awslabs/mcp`** (per-service servers) |
-| First-party-only enterprise compliance | **AWS MCP Server** + **`awslabs/mcp`** |
 
-The three can be installed simultaneously; nothing in their tool names collides.
+`@yawlabs/aws-mcp` and AWS's official server are an either/or -- pick the one whose tradeoffs fit. `awslabs/mcp` per-service servers pair cleanly with whichever you pick.
 
 ## Tools
 
@@ -84,6 +82,8 @@ The three can be installed simultaneously; nothing in their tool names collides.
 | `aws_multi_region` | Run the same AWS operation across N regions in parallel. Same shape as `aws_call` but takes `regions: string[]`. Returns `{region, ok, data?, error?}[]` with `okCount`/`errorCount`. Partial failure is expected (services aren't everywhere, perms may be region-scoped). |
 | `aws_script` | Run a short JS snippet that orchestrates the other tools and returns a combined result. Sandbox exposes `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.{get,list,create,update,delete,status}`, `aws.logsTail`, plus `JSON`/`Math`/`Date`/`console`. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise be N round-trips. Use `return <value>` to surface a result. Not a security sandbox -- treat the same as any other tool the model can call. |
 | `aws_iam_simulate` | Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide). Use BEFORE a risky operation to avoid a 403 -- pairs with the post-failure Suggestion from aws_call. Requires `iam:SimulatePrincipalPolicy` on the caller. |
+| `aws_docs_search` | Search live AWS documentation (the backend behind the docs.aws.amazon.com search box). Returns ranked `{title, url, summary, excerpt}`. Use to discover the right doc page for a service/API/concept the model may not know -- new services, recently changed APIs, exact parameter names. |
+| `aws_docs_read` | Fetch an `https://docs.aws.amazon.com/...html` page and return it as markdown. Strips nav/cookie-banner/feedback chrome. Long pages paginate via `startIndex` + `maxLength`; the response carries `hasMore` and `nextStartIndex`. Usually fed a url from `aws_docs_search`. |
 
 ## Install
 
