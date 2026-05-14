@@ -1,31 +1,61 @@
 # @yawlabs/aws-mcp
 
-A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over hundreds of resource types.**
+A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over hundreds of resource types, server-side scripting for batched workflows.**
 
-Not a typed per-service AWS MCP. For first-class helpers per service (Lambda invoke, Bedrock retrieval, DynamoDB with type-marshalling, ...) reach for AWS Labs' fleet at [`awslabs/mcp`](https://github.com/awslabs/mcp). The two are designed to coexist — this server can sit alongside AWS Labs' per-service servers in the same `.mcp.json`.
+Not a typed per-service AWS MCP and not the official AWS server. The two AWS-shaped MCPs to know about:
 
-Three things this server tries to handle well:
+- **[AWS MCP Server](https://aws.amazon.com/blogs/aws/the-aws-mcp-server-is-now-generally-available/)** -- AWS's hosted server (`uvx mcp-proxy-for-aws`). Strong on docs (`search_documentation`/`read_documentation`), server-side Python sandbox (`run_script`), and skills curated by AWS service teams. Requires Python + `uv`, routes through a proxy that bridges IAM SigV4 to OAuth.
+- **[`awslabs/mcp`](https://github.com/awslabs/mcp)** -- AWS Labs' fleet of typed per-service servers (Lambda invoke, Bedrock retrieval, DynamoDB with type-marshalling, ...). Each one is uvx-installed; rich helpers for the one service.
 
-1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess — on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + 8-character code, you click once, done. There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow.
-2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface — including services AWS adds tomorrow — with no SDK bundling and no service-by-service tool sprawl. `aws_paginate` handles paginated list/describe ops, and a JMESPath `query` parameter trims responses server-side (useful when a `describe-instances` result would otherwise blow past the 5 MB output cap).
-3. **Generic CRUD across services.** `aws_resource_*` (six tools) wraps AWS Cloud Control API, so the same lifecycle — get / list / create / update / delete / status — works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and a few hundred more. Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. CCAPI is control-plane only — for data-plane ops (S3 reads, Lambda invokes, Bedrock inference, DynamoDB GetItem) drop down to `aws_call` or use a typed AWS Labs server.
+This server complements both. It can sit alongside them in the same `.mcp.json` -- a recommended docs companion is called out below.
 
-## When to reach for this vs AWS Labs' servers
+Four things this server tries to handle well:
 
-**Use `@yawlabs/aws-mcp` when:**
+1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess -- on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + 8-character code, you click once, done. There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow. AWS's hosted server bridges IAM-to-OAuth via a local proxy; it doesn't help with the `aws sso login` browser-handoff failure.
+2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface -- including services AWS adds tomorrow -- with no SDK bundling and no service-by-service tool sprawl. `aws_paginate` handles paginated list/describe ops, `aws_multi_region` fans the same op out across N regions in parallel, and a JMESPath `query` parameter trims responses server-side (useful when a `describe-instances` result would otherwise blow past the 5 MB output cap).
+3. **Generic CRUD across services.** `aws_resource_*` (seven tools, including `aws_resource_diff` for dry-run previews) wraps AWS Cloud Control API, so the same lifecycle -- get / list / create / update / delete / status -- works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and a few hundred more. Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. CCAPI is control-plane only -- for data-plane ops (S3 reads, Lambda invokes, Bedrock inference, DynamoDB GetItem) drop down to `aws_call` or use a typed AWS Labs server.
+4. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet inside a constrained `node:vm` sandbox with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, and `aws.logsTail` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same shape as AWS's `run_script` (Python, sandboxed server-side) -- yours is JS-native and runs locally.
 
-- You want **one MCP entry** in `.mcp.json` for day-to-day AWS, not a fleet to configure per service.
-- You hit **SSO token expiry mid-session** on Windows (or anywhere `aws sso login`'s browser handoff drops). AWS Labs' servers assume credentials are already present.
-- You want **generic CRUD across many resource types** without configuring a separate MCP per service.
-- You need to call a **new or obscure AWS service** the day AWS adds it to the CLI — no waiting on a per-service MCP to ship.
-- Your stack is **Node/npm** and you'd rather not add Python + `uvx` to the loop.
-- You want a **small footprint** — one esbuild bundle, zero runtime dependencies, sub-second `npx -y` cold start.
+## Recommended companion: AWS Documentation MCP Server
 
-**Use AWS Labs' per-service servers ([`awslabs/mcp`](https://github.com/awslabs/mcp)) when:**
+This server doesn't ship documentation lookup -- AWS Labs already has a focused server for that. Run them side by side:
 
-- You're doing **deep work in one service** and want typed, service-specific helpers (`lambda_invoke`, Bedrock KB retrieval, DynamoDB with type-marshalling, ...) that a generic CLI passthrough or CCAPI wrapper doesn't provide.
-- You need **data-plane operations** (streaming reads, inference, large binary I/O) where a typed SDK matters more than a CLI string.
-- **Enterprise compliance** requires first-party-only tooling.
+```json
+{
+  "mcpServers": {
+    "aws": {
+      "command": "npx",
+      "args": ["-y", "@yawlabs/aws-mcp"]
+    },
+    "aws-docs": {
+      "command": "uvx",
+      "args": ["awslabs.aws-documentation-mcp-server@latest"]
+    }
+  }
+}
+```
+
+The docs server exposes search + read tools over current AWS docs and API references. Reach for it when the agent needs to discover services or look up parameters for an operation it hasn't seen before. Requires `uv` ([install](https://docs.astral.sh/uv/getting-started/installation/)).
+
+## When to reach for this vs the other AWS MCPs
+
+| Need | Best fit |
+|------|----------|
+| One config entry covering most of AWS | **`@yawlabs/aws-mcp`** |
+| SSO re-login on Windows / broken browser handoff | **`@yawlabs/aws-mcp`** (`aws_login_start` device-code flow) |
+| Generic CRUD across hundreds of resource types | **`@yawlabs/aws-mcp`** (`aws_resource_*`) |
+| Dry-run an update before applying it | **`@yawlabs/aws-mcp`** (`aws_resource_diff`) |
+| Multi-region fan-out in one call | **`@yawlabs/aws-mcp`** (`aws_multi_region`) |
+| Batch N tool calls into one round-trip (JS) | **`@yawlabs/aws-mcp`** (`aws_script`) |
+| Node/npm-only install (no Python) | **`@yawlabs/aws-mcp`** |
+| Current AWS docs lookup | **`awslabs.aws-documentation-mcp-server`** |
+| Sandboxed Python script execution server-side | **AWS MCP Server** (`run_script`) |
+| AWS-team-curated best-practice skills | **AWS MCP Server** (skills) |
+| Days-fresh API coverage via hosted endpoint | **AWS MCP Server** (`call_aws`) |
+| Typed per-service helpers (Lambda invoke, Bedrock KB, DynamoDB type-marshalling, ...) | **`awslabs/mcp`** (per-service servers) |
+| First-party-only enterprise compliance | **AWS MCP Server** + **`awslabs/mcp`** |
+
+The three can be installed simultaneously; nothing in their tool names collides.
 
 ## Tools
 
@@ -49,6 +79,9 @@ Three things this server tries to handle well:
 | `aws_resource_update` | Update an AWS resource via CCAPI using RFC 6902 JSON Patch. Same async + `awaitCompletion` shape as create. |
 | `aws_resource_delete` | Delete an AWS resource via CCAPI. Same async + `awaitCompletion` shape as create. Destructive — verify `identifier` first. |
 | `aws_resource_status` | Poll an async CCAPI request by `requestToken`. Returns the current state with `operationStatus`, `identifier`, `errorCode`, `statusMessage` flat-promoted (PENDING / IN_PROGRESS / SUCCESS / FAILED / CANCEL_*). |
+| `aws_resource_diff` | Dry-run a CCAPI update: fetches current state, simulates the JSON Patch in memory, returns `{before, after, changes[]}`. No mutation sent to AWS. Supports the add/remove/replace subset of RFC 6902 -- enough for the vast majority of CCAPI updates. Call before `aws_resource_update` when you want to verify the patch does what you expect. |
+| `aws_multi_region` | Run the same AWS operation across N regions in parallel. Same shape as `aws_call` but takes `regions: string[]`. Returns `{region, ok, data?, error?}[]` with `okCount`/`errorCount`. Partial failure is expected (services aren't everywhere, perms may be region-scoped). |
+| `aws_script` | Run a short JS snippet that orchestrates the other tools and returns a combined result. Sandbox exposes `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.{get,list,create,update,delete,status}`, `aws.logsTail`, plus `JSON`/`Math`/`Date`/`console`. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise be N round-trips. Use `return <value>` to surface a result. Not a security sandbox -- treat the same as any other tool the model can call. |
 
 ## Install
 
@@ -116,7 +149,48 @@ For "create this resource and tell me when it's ready," `aws_resource_create` wi
    and returns the terminal ProgressEvent in one call
 ```
 
-Same shape for `aws_resource_update` and `aws_resource_delete`. Drop `awaitCompletion` (or set it false) for the default fire-and-poll behavior — useful when you want to kick off a long-running update and check back later.
+Same shape for `aws_resource_update` and `aws_resource_delete`. Drop `awaitCompletion` (or set it false) for the default fire-and-poll behavior -- useful when you want to kick off a long-running update and check back later.
+
+For "preview the patch before applying":
+
+```
+(calls aws_resource_diff with
+   typeName='AWS::Lambda::Function',
+   identifier='my-fn',
+   patchDocument=[{op: 'replace', path: '/MemorySize', value: 1024}])
+-> returns { before: {MemorySize: 256, ...}, after: {MemorySize: 1024, ...},
+              changes: [{op: 'replace', path: '/MemorySize', before: 256, after: 1024}] }
+```
+
+No mutation is sent to AWS; the agent can verify the patch before invoking `aws_resource_update`.
+
+For batched workflows, `aws_script` collapses N tool calls into one:
+
+```
+(calls aws_script with code=`
+   const listed = await aws.resource.list({ typeName: "AWS::Lambda::Function" });
+   const big = [];
+   for (const r of listed.resources) {
+     const cfg = await aws.resource.get({
+       typeName: "AWS::Lambda::Function", identifier: r.identifier });
+     if (cfg.properties.MemorySize > 1024) {
+       big.push({ name: cfg.properties.FunctionName, mem: cfg.properties.MemorySize });
+     }
+   }
+   return big;
+`)
+-> one round-trip; the agent gets the filtered list without N intermediate tool calls
+```
+
+For multi-region reads:
+
+```
+(calls aws_multi_region with
+   service='ec2', operation='describe-instances',
+   regions=['us-east-1','us-west-2','eu-west-1'],
+   query='Reservations[].Instances[].InstanceId')
+-> {okCount: 3, errorCount: 0, results: [{region, ok, data}, ...]}
+```
 
 ## Requirements
 

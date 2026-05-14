@@ -1,0 +1,373 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { z } from "zod";
+import { buildPaginateAll, runScript, type ScriptHandlers, scriptTools } from "./script.js";
+import type { Tool } from "./tool.js";
+
+/**
+ * Values returned from the vm sandbox carry the vm realm's prototypes, not
+ * the outer realm's, so `assert.deepEqual` (strict) rejects them even when
+ * structurally identical. JSON round-trip strips the prototype so assertions
+ * compare plain values.
+ */
+function plain<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v));
+}
+
+const tool = scriptTools.find((t) => t.name === "aws_script");
+if (!tool) throw new Error("scriptTools missing aws_script");
+
+/**
+ * Build a fresh mock handler set per test. Each method records the calls it
+ * received and returns whatever the test scripted. Tests that don't supply a
+ * handler get a default that throws -- catching scripts that reach for tools
+ * the test didn't intend to mock.
+ */
+function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
+  handlers: ScriptHandlers;
+  calls: { method: string; input: unknown }[];
+} {
+  const calls: { method: string; input: unknown }[] = [];
+  const record = (method: string, fn: (input: unknown) => Promise<unknown>) => async (input: unknown) => {
+    calls.push({ method, input });
+    return fn(input);
+  };
+  const notImpl = (name: string) => async () => {
+    throw new Error(`mock: ${name} not stubbed`);
+  };
+  const defaults: ScriptHandlers = {
+    call: notImpl("call"),
+    paginate: notImpl("paginate"),
+    paginateAll: notImpl("paginateAll"),
+    logsTail: notImpl("logsTail"),
+    resource: {
+      get: notImpl("resource.get"),
+      list: notImpl("resource.list"),
+      create: notImpl("resource.create"),
+      update: notImpl("resource.update"),
+      delete: notImpl("resource.delete"),
+      status: notImpl("resource.status"),
+    },
+  };
+  const merged: ScriptHandlers = {
+    call: overrides.call ? record("call", overrides.call) : defaults.call,
+    paginate: overrides.paginate ? record("paginate", overrides.paginate) : defaults.paginate,
+    paginateAll: overrides.paginateAll
+      ? (record(
+          "paginateAll",
+          overrides.paginateAll as (input: unknown) => Promise<unknown>,
+        ) as ScriptHandlers["paginateAll"])
+      : defaults.paginateAll,
+    logsTail: overrides.logsTail ? record("logsTail", overrides.logsTail) : defaults.logsTail,
+    resource: {
+      get: overrides.resource?.get ? record("resource.get", overrides.resource.get) : defaults.resource.get,
+      list: overrides.resource?.list ? record("resource.list", overrides.resource.list) : defaults.resource.list,
+      create: overrides.resource?.create
+        ? record("resource.create", overrides.resource.create)
+        : defaults.resource.create,
+      update: overrides.resource?.update
+        ? record("resource.update", overrides.resource.update)
+        : defaults.resource.update,
+      delete: overrides.resource?.delete
+        ? record("resource.delete", overrides.resource.delete)
+        : defaults.resource.delete,
+      status: overrides.resource?.status
+        ? record("resource.status", overrides.resource.status)
+        : defaults.resource.status,
+    },
+  };
+  return { handlers: merged, calls };
+}
+
+describe("aws_script schema", () => {
+  it("accepts a minimal call with just code", () => {
+    const r = tool.inputSchema.safeParse({ code: "return 1;" });
+    assert.equal(r.success, true);
+  });
+
+  it("rejects empty code", () => {
+    const r = tool.inputSchema.safeParse({ code: "" });
+    assert.equal(r.success, false);
+  });
+
+  it("accepts an explicit timeoutMs", () => {
+    const r = tool.inputSchema.safeParse({ code: "return 1;", timeoutMs: 5000 });
+    assert.equal(r.success, true);
+  });
+
+  it("rejects timeoutMs above the 5-minute hard cap", () => {
+    const r = tool.inputSchema.safeParse({ code: "return 1;", timeoutMs: 10 * 60_000 });
+    assert.equal(r.success, false);
+  });
+});
+
+describe("runScript synchronous evaluation", () => {
+  it("returns the value of a `return` statement", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript({ code: "return 42;" }, handlers);
+    assert.equal(r.data, 42);
+  });
+
+  it("returns undefined when no explicit return", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript({ code: "1 + 1;" }, handlers);
+    assert.equal(r.data, undefined);
+  });
+
+  it("captures console.log lines into the logs array", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          console.log("hello", "world");
+          console.warn({ a: 1 });
+          return "done";
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "done");
+    assert.equal(r.logs.length, 2);
+    assert.ok(r.logs[0].includes("hello world"));
+    assert.ok(r.logs[1].includes('{"a":1}'));
+  });
+});
+
+describe("runScript with mocked AWS tools", () => {
+  it("invokes aws.call and returns the data", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      call: async (input) => ({
+        command: "aws s3api list-buckets",
+        result: { Buckets: [{ Name: input ? "b1" : "?" }] },
+      }),
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.call({ service: "s3api", operation: "list-buckets" });
+          return r.result.Buckets[0].Name;
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "b1");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "call");
+  });
+
+  it("propagates tool errors as thrown JS Errors caught by user try/catch", async () => {
+    const { handlers } = makeMockHandlers({
+      call: async () => {
+        throw new Error("AccessDenied");
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          try {
+            await aws.call({ service: "ec2", operation: "describe-instances" });
+            return "unreachable";
+          } catch (e) {
+            return "caught: " + e.message;
+          }
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "caught: AccessDenied");
+  });
+
+  it("chains multiple tool calls and aggregates results", async () => {
+    let getCount = 0;
+    const { handlers, calls } = makeMockHandlers({
+      resource: {
+        list: async () => ({
+          resources: [{ identifier: "fn1" }, { identifier: "fn2" }, { identifier: "fn3" }],
+        }),
+        get: async (input) => {
+          getCount++;
+          const id = (input as { identifier: string }).identifier;
+          return { properties: { FunctionName: id, MemorySize: getCount * 256 } };
+        },
+        create: async () => ({}),
+        update: async () => ({}),
+        delete: async () => ({}),
+        status: async () => ({}),
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          const listed = await aws.resource.list({ typeName: "AWS::Lambda::Function" });
+          const out = [];
+          for (const r of listed.resources) {
+            const cfg = await aws.resource.get({ typeName: "AWS::Lambda::Function", identifier: r.identifier });
+            if (cfg.properties.MemorySize > 256) out.push(cfg.properties.FunctionName);
+          }
+          return out;
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), ["fn2", "fn3"]);
+    // 1 list + 3 get
+    assert.equal(calls.length, 4);
+  });
+});
+
+describe("runScript sandbox isolation", () => {
+  it("does not expose require / process / fs / globalThis", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          const present = {
+            require: typeof require,
+            process: typeof process,
+            globalThis: typeof globalThis,
+            Buffer: typeof Buffer,
+            setTimeout: typeof setTimeout,
+          };
+          return present;
+        `,
+      },
+      handlers,
+    );
+    const present = plain(r.data) as Record<string, string>;
+    assert.equal(present.require, "undefined");
+    assert.equal(present.process, "undefined");
+    assert.equal(present.globalThis, "undefined");
+    assert.equal(present.Buffer, "undefined");
+    assert.equal(present.setTimeout, "undefined");
+  });
+
+  it("disables eval and new Function (codeGeneration.strings = false)", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          let evalBlocked = false;
+          try { eval("1+1"); } catch (e) { evalBlocked = true; }
+          let funcBlocked = false;
+          try { new Function("return 1")(); } catch (e) { funcBlocked = true; }
+          return { evalBlocked, funcBlocked };
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), { evalBlocked: true, funcBlocked: true });
+  });
+});
+
+describe("runScript paginateAll", () => {
+  it("loops aws_paginate until hasMore=false and concatenates items", async () => {
+    let page = 0;
+    const pageData = [
+      { result: ["a", "b"], nextToken: "t1", hasMore: true },
+      { result: ["c"], nextToken: "t2", hasMore: true },
+      { result: ["d", "e"], nextToken: null, hasMore: false },
+    ];
+    let paginateCalls = 0;
+    const fakePaginateTool: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+      handler: async () => {
+        paginateCalls++;
+        return { ok: true, data: pageData[page++] };
+      },
+    };
+    const { handlers } = makeMockHandlers();
+    const customHandlers: ScriptHandlers = {
+      ...handlers,
+      paginateAll: buildPaginateAll(fakePaginateTool),
+    };
+    const r = await runScript(
+      {
+        code: `
+          const all = await aws.paginateAll({ service: "s3api", operation: "list-objects-v2", query: "Contents[].Key" });
+          return all.items;
+        `,
+      },
+      customHandlers,
+    );
+    assert.deepEqual(plain(r.data), ["a", "b", "c", "d", "e"]);
+    assert.equal(paginateCalls, 3);
+  });
+
+  it("respects maxPages safety cap", async () => {
+    let paginateCalls = 0;
+    const fakePaginateTool: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+      handler: async () => {
+        paginateCalls++;
+        return { ok: true, data: { result: [paginateCalls], nextToken: `t${paginateCalls}`, hasMore: true } };
+      },
+    };
+    const { handlers } = makeMockHandlers();
+    const customHandlers: ScriptHandlers = {
+      ...handlers,
+      paginateAll: buildPaginateAll(fakePaginateTool),
+    };
+    const r = await runScript(
+      {
+        code: `
+          const all = await aws.paginateAll({
+            service: "s3api", operation: "list-objects-v2", maxPages: 3
+          });
+          return all.pages;
+        `,
+      },
+      customHandlers,
+    );
+    assert.equal(r.data, 3);
+    assert.equal(paginateCalls, 3);
+  });
+});
+
+describe("runScript timeouts", () => {
+  it("rejects an async wall-clock hang within timeoutMs", async () => {
+    // The mock resolves at 200ms, the script timeout fires at 100ms. The
+    // wall-clock timer wins; we assert on the rejection. We keep the mock
+    // delay short and ref'd so its pending Promise drains before the test
+    // returns -- node:test flags lingering pending promises as
+    // "cancelledByParent" otherwise.
+    const { handlers } = makeMockHandlers({
+      call: () => new Promise<unknown>((resolve) => setTimeout(() => resolve({ command: "", result: {} }), 200)),
+    });
+    let caught: Error | undefined;
+    try {
+      await runScript(
+        {
+          code: `await aws.call({ service: "s3api", operation: "list-buckets" }); return "unreachable";`,
+          timeoutMs: 100,
+        },
+        handlers,
+      );
+    } catch (e) {
+      caught = e as Error;
+    }
+    // Let the slow mock's Promise settle before returning so the script's
+    // dangling await drains. Cheaper than tracking timer handles.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.ok(caught, "expected runScript to throw on timeout");
+    assert.ok(caught.message.includes("timed out"), `expected timeout message, got: ${caught.message}`);
+  });
+
+  it("kills a synchronous infinite loop via vm timeout", async () => {
+    const handlerResult = await tool.handler({
+      code: "while (true) { /* no yield */ }",
+      timeoutMs: 200,
+    });
+    assert.equal(handlerResult.ok, false);
+    // vm sync-timeout surfaces as "Script execution timed out after Xms";
+    // our wall-clock Promise.race fallback would surface "Script timed out
+    // after Ns". Either path is acceptable -- we just need ok:false with a
+    // non-empty message.
+    assert.ok(handlerResult.error && handlerResult.error.length > 0);
+  });
+});

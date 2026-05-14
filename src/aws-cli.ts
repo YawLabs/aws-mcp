@@ -12,7 +12,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { type AuthErrorKind, classifyAuthError } from "./errors.js";
+import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { killProc, procHasExited } from "./kill-proc.js";
 import { getProfile, getRegion } from "./session.js";
 
@@ -310,7 +310,12 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           errorMsg = `No credentials found for profile '${profile}'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${truncateForErrorMsg(stderrBuf.trim())}`;
         } else {
           kind = "nonzero_exit";
-          errorMsg = truncateForErrorMsg(stderrBuf.trim()) || `aws CLI exited with code ${code} and no stderr`;
+          const baseMsg = truncateForErrorMsg(stderrBuf.trim()) || `aws CLI exited with code ${code} and no stderr`;
+          // Best-effort: pull a one-line "Suggestion: ..." onto the end when
+          // we recognize a common AWS error shape. The raw stderr stays in
+          // baseMsg untouched so the agent can still see the original text.
+          const parsed = parseAwsError(stderrBuf);
+          errorMsg = parsed.suggestion ? `${baseMsg}\n\nSuggestion: ${parsed.suggestion}` : baseMsg;
         }
         settle({
           ok: false,

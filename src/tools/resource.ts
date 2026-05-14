@@ -739,4 +739,281 @@ export const resourceTools: readonly Tool[] = [
       };
     },
   },
+
+  {
+    name: "aws_resource_diff",
+    description:
+      "Dry-run a CCAPI update: fetch the current resource state, simulate applying a JSON Patch in memory, and return before/after plus a flat list of changed paths. No mutation is sent to AWS. Use this before aws_resource_update to verify the patch does what you expect. Supports the add/remove/replace subset of RFC 6902 (covers the vast majority of CCAPI updates); 'move'/'copy'/'test' are not implemented and fail with a clear error.",
+    annotations: {
+      title: "Preview a CCAPI update without applying it",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: z.object({
+      typeName: z.string().describe("CloudFormation type name, e.g. 'AWS::Lambda::Function'."),
+      identifier: z.string().min(1).describe("Primary identifier for the resource."),
+      patchDocument: z
+        .array(
+          z.object({
+            op: z.enum(["add", "remove", "replace", "move", "copy", "test"]),
+            path: z.string(),
+            value: z.unknown().optional(),
+            from: z.string().optional(),
+          }),
+        )
+        .min(1)
+        .describe("RFC 6902 JSON Patch (the same shape aws_resource_update accepts)."),
+      ...baseFields,
+    }),
+    handler: async (input: unknown): Promise<ToolResult> => {
+      const i = input as {
+        typeName: string;
+        identifier: string;
+        patchDocument: JsonPatchOp[];
+        profile?: string;
+        region?: string;
+        timeoutMs?: number;
+      };
+      const tnErr = validateTypeName(i.typeName);
+      if (tnErr) return { ok: false, error: tnErr };
+      const idErr = validateIdentifier(i.identifier);
+      if (idErr) return { ok: false, error: idErr };
+
+      const getResult = await runAwsCall({
+        service: "cloudcontrol",
+        operation: "get-resource",
+        profile: i.profile,
+        region: i.region,
+        timeoutMs: i.timeoutMs,
+        outputFormat: "json",
+        extraFlags: ["--type-name", i.typeName, "--identifier", i.identifier],
+      });
+      if (!getResult.ok) {
+        return { ok: false, error: getResult.error, rawBody: getResult.rawStderr ?? getResult.rawStdout };
+      }
+      const raw = getResult.data as { ResourceDescription?: unknown } | null;
+      const parsed = parseResourceProperties(raw?.ResourceDescription);
+      const before = parsed.Properties;
+
+      let after: unknown;
+      try {
+        after = applyJsonPatch(before, i.patchDocument);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `Patch application failed: ${msg}` };
+      }
+
+      const changes = summarizePatch(i.patchDocument, before, after);
+
+      return {
+        ok: true,
+        data: {
+          command: getResult.command,
+          typeName: i.typeName,
+          identifier: parsed.Identifier ?? i.identifier,
+          before,
+          after,
+          changes,
+          changeCount: changes.length,
+        },
+      };
+    },
+  },
 ];
+
+/**
+ * RFC 6902 JSON Patch (subset) -- only add/remove/replace. move/copy/test
+ * are intentionally unimplemented; CCAPI updates use the basic three in
+ * practice and the move/copy semantics require extra round-trips through
+ * the path resolver that aren't worth the complexity for a preview tool.
+ */
+export interface JsonPatchOp {
+  op: "add" | "remove" | "replace" | "move" | "copy" | "test";
+  path: string;
+  value?: unknown;
+  from?: string;
+}
+
+/**
+ * Parse an RFC 6901 JSON Pointer into a token array. "/foo/bar" -> ["foo","bar"].
+ * Empty string is the root (returns []). Escapes: `~1` -> `/`, `~0` -> `~`,
+ * applied in that order.
+ */
+export function parseJsonPointer(pointer: string): string[] {
+  if (pointer === "") return [];
+  if (!pointer.startsWith("/")) {
+    throw new Error(`Invalid JSON Pointer '${pointer}': must start with '/' or be empty.`);
+  }
+  return pointer
+    .slice(1)
+    .split("/")
+    .map((t) => t.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+function clone<T>(v: T): T {
+  return v === undefined ? v : JSON.parse(JSON.stringify(v));
+}
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/**
+ * Apply a JSON Patch document to `original` and return a fresh deep-cloned
+ * result. Original is not mutated. Throws on bad paths, unimplemented ops,
+ * or array-bounds violations -- callers catch and translate.
+ */
+export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): unknown {
+  let doc = clone(original);
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    if (op.op === "move" || op.op === "copy" || op.op === "test") {
+      throw new Error(`op '${op.op}' at index ${i} is not implemented in aws_resource_diff (use add/remove/replace).`);
+    }
+    const tokens = parseJsonPointer(op.path);
+    if (tokens.length === 0) {
+      // Whole-document replace/add/remove.
+      if (op.op === "remove") {
+        throw new Error(`Cannot remove the document root at index ${i}.`);
+      }
+      doc = clone(op.value);
+      continue;
+    }
+    const parentTokens = tokens.slice(0, -1);
+    const lastToken = tokens[tokens.length - 1];
+
+    // Walk to the parent, creating nothing along the way -- if an
+    // intermediate segment is missing, the patch is malformed.
+    let parent: unknown = doc;
+    for (let t = 0; t < parentTokens.length; t++) {
+      const segment = parentTokens[t];
+      if (Array.isArray(parent)) {
+        const idx = Number.parseInt(segment, 10);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= parent.length) {
+          throw new Error(`Path '${op.path}' segment '${segment}' is out of array bounds at index ${i}.`);
+        }
+        parent = parent[idx];
+      } else if (isObj(parent)) {
+        if (!(segment in parent)) {
+          throw new Error(`Path '${op.path}' segment '${segment}' does not exist at index ${i}.`);
+        }
+        parent = parent[segment];
+      } else {
+        throw new Error(`Path '${op.path}' traverses a non-container value at index ${i}.`);
+      }
+    }
+
+    if (Array.isArray(parent)) {
+      // Array semantics: "-" means "after the last element"; otherwise the
+      // last token must be a non-negative integer.
+      if (lastToken === "-") {
+        if (op.op === "remove") {
+          throw new Error(`Cannot remove '-' (end-of-array) at index ${i}.`);
+        }
+        parent.push(clone(op.value));
+        continue;
+      }
+      const idx = Number.parseInt(lastToken, 10);
+      if (!Number.isInteger(idx) || idx < 0) {
+        throw new Error(`Path '${op.path}' has non-integer array index '${lastToken}' at index ${i}.`);
+      }
+      if (op.op === "add") {
+        if (idx > parent.length) {
+          throw new Error(`Add index ${idx} out of bounds for array of length ${parent.length} at index ${i}.`);
+        }
+        parent.splice(idx, 0, clone(op.value));
+      } else if (op.op === "remove") {
+        if (idx >= parent.length) {
+          throw new Error(`Remove index ${idx} out of bounds for array of length ${parent.length} at index ${i}.`);
+        }
+        parent.splice(idx, 1);
+      } else {
+        // replace
+        if (idx >= parent.length) {
+          throw new Error(`Replace index ${idx} out of bounds for array of length ${parent.length} at index ${i}.`);
+        }
+        parent[idx] = clone(op.value);
+      }
+    } else if (isObj(parent)) {
+      if (op.op === "remove") {
+        if (!(lastToken in parent)) {
+          throw new Error(`Cannot remove missing key '${lastToken}' at index ${i}.`);
+        }
+        delete parent[lastToken];
+      } else if (op.op === "replace") {
+        if (!(lastToken in parent)) {
+          throw new Error(`Cannot replace missing key '${lastToken}' at index ${i} (use 'add' to create it).`);
+        }
+        parent[lastToken] = clone(op.value);
+      } else {
+        // add: creates or overwrites
+        parent[lastToken] = clone(op.value);
+      }
+    } else {
+      throw new Error(`Path '${op.path}' parent is not a container at index ${i}.`);
+    }
+  }
+  return doc;
+}
+
+export interface PatchChange {
+  op: "add" | "remove" | "replace";
+  path: string;
+  before?: unknown;
+  after?: unknown;
+}
+
+/**
+ * Walk the patch and resolve the before/after value at each op's path so the
+ * agent gets a compact diff list without having to compare full Properties
+ * trees by hand. For ops we don't implement, the entry surfaces the op name
+ * verbatim with no before/after.
+ */
+export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, after: unknown): PatchChange[] {
+  const out: PatchChange[] = [];
+  for (const op of ops) {
+    if (op.op === "move" || op.op === "copy" || op.op === "test") {
+      // Surface as a no-op for visibility; applyJsonPatch already threw on
+      // these so we only reach this branch if a caller calls summarizePatch
+      // directly (e.g. for tests).
+      out.push({ op: "replace", path: op.path });
+      continue;
+    }
+    const beforeAt = resolvePointer(before, op.path);
+    const afterAt = resolvePointer(after, op.path);
+    out.push({ op: op.op, path: op.path, before: beforeAt, after: afterAt });
+  }
+  return out;
+}
+
+/**
+ * Resolve a JSON Pointer against a document, returning undefined for any
+ * missing segment. Used by summarizePatch to fetch before/after values
+ * without throwing on missing keys -- a 'remove' op naturally has no
+ * after value.
+ */
+export function resolvePointer(doc: unknown, pointer: string): unknown {
+  let tokens: string[];
+  try {
+    tokens = parseJsonPointer(pointer);
+  } catch {
+    return undefined;
+  }
+  let cur: unknown = doc;
+  for (const t of tokens) {
+    if (Array.isArray(cur)) {
+      if (t === "-") return undefined;
+      const idx = Number.parseInt(t, 10);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return undefined;
+      cur = cur[idx];
+    } else if (isObj(cur)) {
+      if (!(t in cur)) return undefined;
+      cur = cur[t];
+    } else {
+      return undefined;
+    }
+  }
+  return cur;
+}

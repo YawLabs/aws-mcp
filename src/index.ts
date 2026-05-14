@@ -6,9 +6,11 @@ import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
 import { logsTools } from "./tools/logs.js";
+import { multiRegionTools } from "./tools/multi-region.js";
 import { paginateTools } from "./tools/paginate.js";
 import { profilesTools } from "./tools/profiles.js";
 import { resourceTools } from "./tools/resource.js";
+import { scriptTools } from "./tools/script.js";
 import { sessionTools } from "./tools/session.js";
 import type { Tool } from "./tools/tool.js";
 
@@ -34,6 +36,8 @@ const allTools: readonly Tool[] = [
   ...assumeTools,
   ...logsTools,
   ...resourceTools,
+  ...multiRegionTools,
+  ...scriptTools,
 ];
 
 const server = new McpServer({
