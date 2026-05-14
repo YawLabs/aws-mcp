@@ -270,6 +270,69 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "iam_simulate_allow": {
+      // All requested actions allowed by a single matched statement.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "lambda:CreateFunction",
+              EvalResourceName: "*",
+              EvalDecision: "allowed",
+              MatchedStatements: [{ SourcePolicyId: "AdministratorAccess", SourcePolicyType: "IAM Policy" }],
+              MissingContextValues: [],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam_simulate_mixed": {
+      // Two actions: one allowed, one explicitDeny with a matched deny
+      // statement and a missing context value.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              EvalResourceName: "arn:aws:s3:::my-bucket/*",
+              EvalDecision: "allowed",
+              MatchedStatements: [{ SourcePolicyId: "ReadOnlyAccess", SourcePolicyType: "IAM Policy" }],
+            },
+            {
+              EvalActionName: "s3:DeleteObject",
+              EvalResourceName: "arn:aws:s3:::my-bucket/*",
+              EvalDecision: "explicitDeny",
+              MatchedStatements: [{ SourcePolicyId: "DenyDeletes", SourcePolicyType: "IAM Policy" }],
+              MissingContextValues: ["aws:RequestTag/Project"],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam_simulate_implicit_deny": {
+      // No matching statement at all -- the result is implicitDeny.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "ec2:TerminateInstances",
+              EvalResourceName: "*",
+              EvalDecision: "implicitDeny",
+              MatchedStatements: [],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     default: {
       process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
       process.exit(2);

@@ -47,6 +47,7 @@ The docs server exposes search + read tools over current AWS docs and API refere
 | Dry-run an update before applying it | **`@yawlabs/aws-mcp`** (`aws_resource_diff`) |
 | Multi-region fan-out in one call | **`@yawlabs/aws-mcp`** (`aws_multi_region`) |
 | Batch N tool calls into one round-trip (JS) | **`@yawlabs/aws-mcp`** (`aws_script`) |
+| Check IAM permissions before attempting an op | **`@yawlabs/aws-mcp`** (`aws_iam_simulate`) |
 | Node/npm-only install (no Python) | **`@yawlabs/aws-mcp`** |
 | Current AWS docs lookup | **`awslabs.aws-documentation-mcp-server`** |
 | Sandboxed Python script execution server-side | **AWS MCP Server** (`run_script`) |
@@ -82,6 +83,7 @@ The three can be installed simultaneously; nothing in their tool names collides.
 | `aws_resource_diff` | Dry-run a CCAPI update: fetches current state, simulates the JSON Patch in memory, returns `{before, after, changes[]}`. No mutation sent to AWS. Supports the add/remove/replace subset of RFC 6902 -- enough for the vast majority of CCAPI updates. Call before `aws_resource_update` when you want to verify the patch does what you expect. |
 | `aws_multi_region` | Run the same AWS operation across N regions in parallel. Same shape as `aws_call` but takes `regions: string[]`. Returns `{region, ok, data?, error?}[]` with `okCount`/`errorCount`. Partial failure is expected (services aren't everywhere, perms may be region-scoped). |
 | `aws_script` | Run a short JS snippet that orchestrates the other tools and returns a combined result. Sandbox exposes `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.{get,list,create,update,delete,status}`, `aws.logsTail`, plus `JSON`/`Math`/`Date`/`console`. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise be N round-trips. Use `return <value>` to surface a result. Not a security sandbox -- treat the same as any other tool the model can call. |
+| `aws_iam_simulate` | Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide). Use BEFORE a risky operation to avoid a 403 -- pairs with the post-failure Suggestion from aws_call. Requires `iam:SimulatePrincipalPolicy` on the caller. |
 
 ## Install
 

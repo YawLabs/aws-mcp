@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
+import { iamSimulateTools } from "./tools/iam-simulate.js";
 import { logsTools } from "./tools/logs.js";
 import { multiRegionTools } from "./tools/multi-region.js";
 import { paginateTools } from "./tools/paginate.js";
@@ -37,6 +38,7 @@ const allTools: readonly Tool[] = [
   ...logsTools,
   ...resourceTools,
   ...multiRegionTools,
+  ...iamSimulateTools,
   ...scriptTools,
 ];
 
