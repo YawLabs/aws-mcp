@@ -54,17 +54,26 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          # Registry propagation can lag a few seconds after publish succeeds.
-          for i in 1 2 3 4 5; do
-            if npm view "@yawlabs/aws-mcp@${VERSION}" version >/dev/null 2>&1; then
+          # Registry propagation can lag well past a minute after publish
+          # succeeds, and `npm view` and `npx` may hit different CDN paths --
+          # v0.8.0 false-failed because we gated on `npm view` (which cleared)
+          # but `npx -y` was still ETARGET'ing on a stale mirror. Retry the
+          # actual smoke (the npx invocation itself) with a budget generous
+          # enough to outlast realistic propagation. 30 * 10s = ~5min upper
+          # bound; typical case completes in < 30s.
+          ATTEMPTS=30
+          SLEEP_SECONDS=10
+          OUTPUT=""
+          STARTED_AT=$(date +%s)
+          for i in $(seq 1 $ATTEMPTS); do
+            if OUTPUT=$(npx -y "@yawlabs/aws-mcp@${VERSION}" --version 2>/dev/null); then
+              echo "npx output: $OUTPUT (after $(( $(date +%s) - STARTED_AT ))s)"
               break
             fi
-            echo "Waiting for @yawlabs/aws-mcp@${VERSION} to appear on the registry (attempt $i)..."
-            sleep 5
+            echo "Waiting for @yawlabs/aws-mcp@${VERSION} to be installable via npx (attempt $i/$ATTEMPTS, ${SLEEP_SECONDS}s)..."
+            sleep $SLEEP_SECONDS
           done
-          OUTPUT=$(npx -y "@yawlabs/aws-mcp@${VERSION}" --version)
-          echo "npx output: $OUTPUT"
           if [ "$OUTPUT" != "$VERSION" ]; then
-            echo "Expected $VERSION, got $OUTPUT" >&2
+            echo "Expected $VERSION, got '$OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - STARTED_AT ))s)" >&2
             exit 1
           fi
