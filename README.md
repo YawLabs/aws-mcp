@@ -17,6 +17,10 @@ Five things this server tries to handle well:
 4. **Live AWS docs.** `aws_docs_search` queries the same backend that powers the docs.aws.amazon.com search box; `aws_docs_read` fetches a doc page and returns it as paginated markdown. Lets the agent discover new services and look up exact parameter names without a second MCP server installed.
 5. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet inside a constrained `node:vm` sandbox with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, and `aws.logsTail` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same shape as AWS's `run_script` (Python, sandboxed server-side) -- yours is JS-native and runs locally.
 
+[![Add to mcp.hosting](https://mcp.hosting/install-button.svg)](https://mcp.hosting/install?name=AWS&command=npx&args=-y%2C%40yawlabs%2Faws-mcp&env=AWS_PROFILE%2CAWS_REGION&description=Call%20any%20AWS%20API%20from%20one%20server%20-%20CCAPI%20CRUD%2C%20multi-region%2C%20SSO%20re-login&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Faws-mcp)
+
+One click adds this to your [mcp.hosting](https://mcp.hosting) account so it syncs to every MCP client you use. Or install manually below.
+
 ## Optional companion: AWS Labs per-service servers
 
 For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval, DynamoDB with type-marshalling -- add the relevant [`awslabs/mcp`](https://github.com/awslabs/mcp) server alongside this one. Those are per-service helpers with no tool-name overlap, so they pair cleanly:
