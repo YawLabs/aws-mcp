@@ -37,6 +37,15 @@ const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
 const FETCH_TIMEOUT_MS = 30_000;
 
+// aws_docs_read is paginated: an agent reading a long page calls it N times
+// with different startIndex windows. Without a cache that's N full fetches +
+// N full HTML->markdown conversions of the same document. Cache the
+// *converted markdown* (conversion is the expensive half) keyed by URL,
+// bounded by size + TTL. TTL is short because docs do change -- but not
+// within the seconds-to-minutes window a single paginated read spans.
+const DOC_CACHE_MAX_ENTRIES = 16;
+const DOC_CACHE_TTL_MS = 5 * 60_000;
+
 export interface DocsSearchResult {
   title: string;
   url: string;
@@ -138,24 +147,34 @@ function getTurndown(): TurndownService {
       headingStyle: "atx",
       codeBlockStyle: "fenced",
     });
+    // Drop anchors with no visible text -- AWS doc chrome (PDF-download
+    // buttons, icon-only nav links) renders as `<a href="...">` with empty
+    // text and would otherwise convert to a useless `[](url)`. Doing this as
+    // a turndown rule (DOM level) instead of a regex on the output is robust
+    // to URLs that themselves contain `)`. An anchor wrapping an <img> is
+    // kept -- it carries a real image, not chrome.
+    turndown.addRule("dropEmptyAnchors", {
+      filter: (node) => {
+        if (node.nodeName !== "A") return false;
+        if (node.textContent.trim() !== "") return false;
+        const inner = (node as unknown as { innerHTML?: string }).innerHTML ?? "";
+        return !/<img/i.test(inner);
+      },
+      replacement: () => "",
+    });
   }
   return turndown;
 }
 
 /**
- * Convert an AWS doc page's HTML to markdown. After conversion, drop
- * empty-text links (`[](url)`) -- AWS doc chrome (PDF-download buttons,
- * icon-only links) converts to these, and a link with no visible text
- * carries no information for a reader. Also collapse 3+ consecutive blank
- * lines that the chrome removal can leave behind.
+ * Convert an AWS doc page's HTML to markdown. Empty-text links are dropped at
+ * the turndown rule level (see getTurndown). Here we just collapse 3+
+ * consecutive blank lines that chrome removal can leave behind.
  */
 export function htmlToMarkdown(html: string): string {
   const main = extractMainContent(html);
   const md = getTurndown().turndown(main);
-  return md
-    .replace(/\[\]\([^)]*\)/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return md.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export interface PaginatedContent {
@@ -206,7 +225,61 @@ async function fetchWithTimeout(
   }
 }
 
+/**
+ * True when an error is the AbortController firing our timeout. Node's fetch
+ * rejects with a DOMException (name "AbortError") which isn't always an
+ * `instanceof Error`, so we read `.name` defensively rather than relying on
+ * the prototype chain.
+ */
+function isAbortError(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { name?: unknown }).name === "AbortError";
+}
+
+interface DocCacheEntry {
+  markdown: string;
+  storedAt: number;
+}
+
+export interface DocCache {
+  get(url: string): string | undefined;
+  set(url: string, markdown: string): void;
+}
+
+/**
+ * Bounded, TTL'd LRU cache of converted markdown keyed by doc URL. Created
+ * per `buildDocsTools` call so each instance (and each test) gets an isolated
+ * cache -- a module-level cache would leak one test's fetch result into
+ * another test reading the same URL with a different injected fetch.
+ */
+export function makeDocCache(): DocCache {
+  const map = new Map<string, DocCacheEntry>();
+  return {
+    get(url) {
+      const entry = map.get(url);
+      if (!entry) return undefined;
+      if (Date.now() - entry.storedAt > DOC_CACHE_TTL_MS) {
+        map.delete(url);
+        return undefined;
+      }
+      // Refresh recency: re-insert so this URL is now the newest entry.
+      map.delete(url);
+      map.set(url, entry);
+      return entry.markdown;
+    },
+    set(url, markdown) {
+      map.delete(url);
+      map.set(url, { markdown, storedAt: Date.now() });
+      while (map.size > DOC_CACHE_MAX_ENTRIES) {
+        const oldest = map.keys().next().value;
+        if (oldest === undefined) break;
+        map.delete(oldest);
+      }
+    },
+  };
+}
+
 export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
+  const docCache = makeDocCache();
   return [
     {
       name: "aws_docs_search",
@@ -258,6 +331,12 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             FETCH_TIMEOUT_MS,
           );
         } catch (err) {
+          if (isAbortError(err)) {
+            return {
+              ok: false,
+              error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (proxy.search.docs.aws.com) may be slow or unreachable.`,
+            };
+          }
           const msg = err instanceof Error ? err.message : String(err);
           return {
             ok: false,
@@ -332,29 +411,59 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
         const startIndex = i.startIndex ?? 0;
         const maxLength = i.maxLength ?? DEFAULT_MAX_LENGTH;
 
-        let response: Response;
-        try {
-          response = await fetchWithTimeout(
-            fetchImpl,
-            i.url,
-            { method: "GET", headers: { "User-Agent": USER_AGENT, Accept: "text/html" } },
-            FETCH_TIMEOUT_MS,
-          );
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.` };
+        // Paginated reads of the same page hit the cache -- one fetch +
+        // convert per URL, then every subsequent window is a slice.
+        let markdown = docCache.get(i.url);
+        let cached = true;
+        if (markdown === undefined) {
+          cached = false;
+          let response: Response;
+          try {
+            response = await fetchWithTimeout(
+              fetchImpl,
+              i.url,
+              { method: "GET", headers: { "User-Agent": USER_AGENT, Accept: "text/html" } },
+              FETCH_TIMEOUT_MS,
+            );
+          } catch (err) {
+            if (isAbortError(err)) {
+              return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.` };
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.` };
+          }
+          if (!response.ok) {
+            return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
+          }
+          // A 200 doesn't guarantee HTML -- a docs URL can redirect to a
+          // login wall, an error page, or an asset. Feeding non-HTML to the
+          // parser produces junk markdown; reject it with a clear message
+          // instead.
+          const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+          if (!contentType.includes("text/html")) {
+            return {
+              ok: false,
+              error: `${i.url} returned content-type '${contentType || "unknown"}', not text/html -- the URL may have redirected to a non-documentation page (login wall, error page, or asset). aws_docs_read only handles AWS documentation HTML pages.`,
+            };
+          }
+          let html: string;
+          try {
+            html = await response.text();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { ok: false, error: `Failed to read the response body from ${i.url}: ${msg}.` };
+          }
+          markdown = htmlToMarkdown(html);
+          docCache.set(i.url, markdown);
         }
-        if (!response.ok) {
-          return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
-        }
-        const html = await response.text();
-        const markdown = htmlToMarkdown(html);
+
         const page = paginateContent(markdown, startIndex, maxLength);
 
         return {
           ok: true,
           data: {
             url: i.url,
+            cached,
             ...page,
           },
         };

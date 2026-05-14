@@ -21,18 +21,42 @@ function fakeResponse(opts: {
   statusText?: string;
   json?: unknown;
   text?: string;
+  contentType?: string;
+  textThrows?: boolean;
 }): Response {
+  const contentType = opts.contentType ?? "text/html; charset=utf-8";
   return {
     ok: opts.ok ?? true,
     status: opts.status ?? 200,
     statusText: opts.statusText ?? "OK",
+    headers: {
+      get: (name: string) => (name.toLowerCase() === "content-type" ? contentType : null),
+    },
     json: async () => {
       if (opts.json === undefined) throw new Error("no json body");
       return opts.json;
     },
-    text: async () => opts.text ?? "",
+    text: async () => {
+      if (opts.textThrows) throw new Error("stream error");
+      return opts.text ?? "";
+    },
   } as unknown as Response;
 }
+
+/** A fetch impl that aborts -- mimics AbortController firing the timeout. */
+const abortingFetch = (async (_url: string, init: RequestInit) => {
+  if (init.signal?.aborted) {
+    const e = new Error("This operation was aborted");
+    e.name = "AbortError";
+    throw e;
+  }
+  // Simulate the timeout firing: the AbortController in fetchWithTimeout
+  // calls abort() after FETCH_TIMEOUT_MS; reproduce that synchronously by
+  // throwing an AbortError-named error.
+  const e = new Error("This operation was aborted");
+  e.name = "AbortError";
+  throw e;
+}) as unknown as typeof fetch;
 
 describe("parseSearchResults", () => {
   it("flattens textExcerptSuggestion entries", () => {
@@ -154,6 +178,22 @@ describe("htmlToMarkdown", () => {
     const md = htmlToMarkdown(html);
     assert.match(md, /\[link text\]\(https:\/\/x\.com\)/);
   });
+
+  it("drops empty-text anchors, even when the URL contains parens", () => {
+    // AWS doc chrome (PDF-download buttons) renders as <a> with no text. The
+    // turndown rule must drop these without choking on a `)` in the href.
+    const html = `<html><body><main><p>keep this</p><a href="/pdfs/lambda-dg.pdf#x(y)" title="Open PDF"></a></main></body></html>`;
+    const md = htmlToMarkdown(html);
+    assert.match(md, /keep this/);
+    assert.doesNotMatch(md, /\]\(/);
+    assert.doesNotMatch(md, /lambda-dg\.pdf/);
+  });
+
+  it("keeps an anchor that wraps an image", () => {
+    const html = `<html><body><main><a href="/diagram.html"><img src="/arch.png" alt="architecture"></a></main></body></html>`;
+    const md = htmlToMarkdown(html);
+    assert.match(md, /diagram\.html/);
+  });
 });
 
 describe("paginateContent", () => {
@@ -236,6 +276,13 @@ describe("aws_docs_search handler", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /ECONNREFUSED/);
   });
+
+  it("reports a timeout distinctly from a generic failure", async () => {
+    const [search] = buildDocsTools(abortingFetch);
+    const r = await search.handler({ query: "x" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /timed out/);
+  });
 });
 
 describe("aws_docs_read handler", () => {
@@ -274,6 +321,72 @@ describe("aws_docs_read handler", () => {
     const r = await read.handler({ url: "https://docs.aws.amazon.com/missing.html" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /404/);
+  });
+
+  it("rejects a 200 response that isn't text/html", async () => {
+    // A docs URL can redirect to a login wall or error page that 200s with
+    // JSON or plain text -- feeding that to the HTML parser is junk.
+    const fetchImpl = (async () =>
+      fakeResponse({ contentType: "application/json", text: '{"error":"auth required"}' })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/protected.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /content-type/);
+    assert.match(r.error ?? "", /application\/json/);
+  });
+
+  it("surfaces a body-stream read failure", async () => {
+    const fetchImpl = (async () => fakeResponse({ textThrows: true })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/x.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /response body/);
+  });
+
+  it("reports a fetch timeout distinctly", async () => {
+    const [, read] = buildDocsTools(abortingFetch);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/x.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /timed out/);
+  });
+
+  it("caches the converted page: a second read of the same URL does not re-fetch", async () => {
+    let fetchCount = 0;
+    const html = `<html><body><main><h1>Lambda</h1><p>${"y".repeat(300)}</p></main></body></html>`;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ text: html });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const url = "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html";
+
+    const first = await read.handler({ url, startIndex: 0, maxLength: 50 });
+    assert.equal(first.ok, true);
+    assert.equal((first.data as { cached: boolean }).cached, false);
+
+    const second = await read.handler({ url, startIndex: 50, maxLength: 50 });
+    assert.equal(second.ok, true);
+    assert.equal((second.data as { cached: boolean }).cached, true);
+
+    // One fetch served both windows.
+    assert.equal(fetchCount, 1);
+    // The second window is a real slice, not a repeat of the first.
+    assert.notEqual((first.data as { content: string }).content, (second.data as { content: string }).content);
+  });
+
+  it("scopes the cache per buildDocsTools instance", async () => {
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ text: "<html><body><main><p>doc</p></main></body></html>" });
+    }) as unknown as typeof fetch;
+    const url = "https://docs.aws.amazon.com/x.html";
+    const [, readA] = buildDocsTools(fetchImpl);
+    const [, readB] = buildDocsTools(fetchImpl);
+    await readA.handler({ url });
+    await readB.handler({ url });
+    // Separate instances => separate caches => two fetches.
+    assert.equal(fetchCount, 2);
   });
 });
 
