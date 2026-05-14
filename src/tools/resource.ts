@@ -982,7 +982,15 @@ export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, aft
       continue;
     }
     const beforeAt = resolvePointer(before, op.path);
-    const afterAt = resolvePointer(after, op.path);
+    let afterAt = resolvePointer(after, op.path);
+    // RFC 6901 reserves "-" as the position past the last array element. It
+    // names a target slot, not a value, so resolvePointer naturally returns
+    // undefined -- leaving the changes entry useless for `add /Tags/-`-style
+    // appends. Fall back to the op's own value: that IS the value that just
+    // landed at the end of the array.
+    if (op.op === "add" && afterAt === undefined && op.path.endsWith("/-")) {
+      afterAt = op.value;
+    }
     out.push({ op: op.op, path: op.path, before: beforeAt, after: afterAt });
   }
   return out;

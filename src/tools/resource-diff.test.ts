@@ -166,6 +166,25 @@ describe("summarizePatch", () => {
     const changes = summarizePatch([{ op: "remove", path: "/A" }], before, after);
     assert.deepEqual(changes, [{ op: "remove", path: "/A", before: 1, after: undefined }]);
   });
+
+  it("surfaces the added value for `add /path/-` append paths", () => {
+    // RFC 6901 makes '-' a write-only target, so resolvePointer returns
+    // undefined on it. summarizePatch should fall back to the op's own
+    // value so the changes entry still tells the agent what landed.
+    const before = { Tags: [{ Key: "k1", Value: "v1" }] };
+    const after = {
+      Tags: [
+        { Key: "k1", Value: "v1" },
+        { Key: "k2", Value: "v2" },
+      ],
+    };
+    const changes = summarizePatch([{ op: "add", path: "/Tags/-", value: { Key: "k2", Value: "v2" } }], before, after);
+    assert.equal(changes.length, 1);
+    assert.equal(changes[0].op, "add");
+    assert.equal(changes[0].path, "/Tags/-");
+    assert.equal(changes[0].before, undefined);
+    assert.deepEqual(changes[0].after, { Key: "k2", Value: "v2" });
+  });
 });
 
 describe("aws_resource_diff schema", () => {
