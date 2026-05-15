@@ -866,7 +866,28 @@ function isObj(v: unknown): v is Record<string, unknown> {
  * or array-bounds violations -- callers catch and translate.
  */
 export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): unknown {
-  let doc = clone(original);
+  // Clone once at entry so callers' inputs stay immutable, then delegate to
+  // the in-place helper. The helper is also called directly by
+  // summarizePatch's per-op replay (it owns its own working copy, so the
+  // extra clone here would be wasted -- see _applyJsonPatchInPlace).
+  const doc = clone(original);
+  return _applyJsonPatchInPlace(doc, ops);
+}
+
+/**
+ * INTERNAL. Apply ops by mutating `doc` directly. Used by `applyJsonPatch`
+ * (which clones first) and by `summarizePatch` (which owns a single
+ * working copy across op replays, so cloning per call would be O(N*D)
+ * instead of O(N+D)). Public callers must use `applyJsonPatch`.
+ *
+ * Note: when `doc` is a primitive and a whole-document op fires, this
+ * function cannot mutate the binding visible to the caller -- the
+ * `applyJsonPatch` wrapper handles this by reassigning its local `doc`.
+ * The in-place helper returns the (possibly new) root so callers can
+ * still observe a whole-document replacement.
+ */
+function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unknown {
+  let root = doc;
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i];
     if (op.op === "move" || op.op === "copy" || op.op === "test") {
@@ -878,7 +899,7 @@ export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): 
       if (op.op === "remove") {
         throw new Error(`Cannot remove the document root at index ${i}.`);
       }
-      doc = clone(op.value);
+      root = clone(op.value);
       continue;
     }
     const parentTokens = tokens.slice(0, -1);
@@ -891,13 +912,23 @@ export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): 
     // empty containers. Array indices are NEVER auto-created (ambiguous --
     // splice or assign? what fills the gap?); `replace` and `remove` still
     // require an existing target so a typo can't silently create state.
-    let parent: unknown = doc;
+    let parent: unknown = root;
     for (let t = 0; t < parentTokens.length; t++) {
       const segment = parentTokens[t];
       if (Array.isArray(parent)) {
         const idx = Number.parseInt(segment, 10);
-        if (!Number.isInteger(idx) || idx < 0 || idx >= parent.length) {
-          throw new Error(`Path '${op.path}' segment '${segment}' is out of array bounds at index ${i}.`);
+        if (!Number.isInteger(idx) || idx < 0) {
+          throw new Error(`Path '${op.path}' segment '${segment}' is not a valid array index at op index ${i}.`);
+        }
+        if (idx >= parent.length) {
+          // Intermediate segment: caller is trying to traverse INTO a
+          // not-yet-existing array element. Name the segment, array
+          // length, and the not-yet-existing element so the message is
+          // actionable (and distinct from the final-token bounds errors
+          // below that say "Add/Remove/Replace index ...").
+          throw new Error(
+            `Path '${op.path}' cannot traverse into intermediate array element at segment '${segment}': array has length ${parent.length}, so index ${idx} does not exist yet (at op index ${i}).`,
+          );
         }
         parent = parent[idx];
       } else if (isObj(parent)) {
@@ -965,7 +996,7 @@ export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): 
       throw new Error(`Path '${op.path}' parent is not a container at index ${i}.`);
     }
   }
-  return doc;
+  return root;
 }
 
 export interface PatchChange {
@@ -997,6 +1028,14 @@ export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, aft
   // value at op[i]'s path AFTER op[i] applies but BEFORE op[i+1] applies.
   // Fall back to the final `after` doc if replay throws -- summarizePatch
   // is best-effort observability, not a second validation pass.
+  //
+  // Perf: clone `before` ONCE, then use the internal in-place helper to
+  // mutate the working copy across ops. The previous implementation called
+  // the public `applyJsonPatch` once per op, and each call deep-cloned the
+  // full document at entry -- O(N * D) for an N-op patch on a D-byte doc.
+  // The in-place replay is O(N + D). Correctness still holds because each
+  // op's `after` snapshot is taken right after its single op mutates the
+  // working copy, before the next op runs.
   let working: unknown;
   let replayOk = true;
   try {
@@ -1020,7 +1059,10 @@ export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, aft
     let afterAt: unknown;
     if (replayOk) {
       try {
-        working = applyJsonPatch(working, [op]);
+        // _applyJsonPatchInPlace returns the (possibly new) root -- it
+        // only differs from the input ref on whole-document ops, but we
+        // always reassign so primitive-root replacements survive.
+        working = _applyJsonPatchInPlace(working, [op]);
         afterAt = resolvePointer(working, op.path);
       } catch {
         // Replay diverged from the original applyJsonPatch run (shouldn't

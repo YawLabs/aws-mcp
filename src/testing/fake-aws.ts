@@ -350,6 +350,16 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "assume_role_slow": {
+      // Sleep longer than the test's timeoutMs to exercise the timeout path
+      // when aws_assume_role propagates a user-supplied timeoutMs through to
+      // runAwsCall.
+      await sleep(5000);
+      process.stdout.write("{}\n");
+      process.exit(0);
+      return;
+    }
+
     case "assume_role_access_denied": {
       // Real-world shape for an unauthorized AssumeRole call.
       process.stderr.write(

@@ -409,6 +409,124 @@ describe("runScript paginateAll", () => {
   });
 });
 
+describe("runScript cross-realm error bridging", () => {
+  it("a thrown host Error appears as `e instanceof Error` inside the script", async () => {
+    // Load-bearing assertion for the v0.9.2 realm-isolation fix: bridge
+    // handlers throw host-realm Error instances, but the sandbox sees a
+    // fresh `Error` extracted from the realm. Without the wrapForRealm
+    // shim, `e instanceof Error` is FALSE inside the script -- breaking
+    // the documented try/catch pattern.
+    const { handlers } = makeMockHandlers({
+      call: async () => {
+        throw new Error("AccessDenied");
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          try {
+            await aws.call({ service: "ec2", operation: "describe-instances" });
+            return { reached: true };
+          } catch (e) {
+            return {
+              isError: e instanceof Error,
+              message: e.message,
+              hasName: typeof e.name === "string",
+            };
+          }
+        `,
+      },
+      handlers,
+    );
+    const out = plain(r.data) as { isError: boolean; message: string; hasName: boolean };
+    assert.equal(out.isError, true, "e instanceof Error must be true inside the script");
+    assert.equal(out.message, "AccessDenied");
+    assert.equal(out.hasName, true);
+  });
+
+  it("propagates custom error props (rawBody, toolName) across the realm boundary", async () => {
+    const { handlers } = makeMockHandlers({
+      call: async () => {
+        const e = new Error("ToolFailed") as Error & { rawBody?: string; toolName?: string };
+        e.rawBody = "<xml>boom</xml>";
+        e.toolName = "aws_call";
+        throw e;
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          try {
+            await aws.call({ service: "ec2", operation: "describe-instances" });
+            return null;
+          } catch (e) {
+            return { message: e.message, rawBody: e.rawBody, toolName: e.toolName };
+          }
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), {
+      message: "ToolFailed",
+      rawBody: "<xml>boom</xml>",
+      toolName: "aws_call",
+    });
+  });
+
+  it("non-Error throws (strings, primitives) pass through unchanged", async () => {
+    const { handlers } = makeMockHandlers({
+      call: async () => {
+        throw "plain string boom";
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          try {
+            await aws.call({ service: "ec2", operation: "describe-instances" });
+            return null;
+          } catch (e) {
+            return { type: typeof e, value: e, isError: e instanceof Error };
+          }
+        `,
+      },
+      handlers,
+    );
+    const out = plain(r.data) as { type: string; value: unknown; isError: boolean };
+    assert.equal(out.type, "string");
+    assert.equal(out.value, "plain string boom");
+    assert.equal(out.isError, false);
+  });
+
+  it("captureLog survives an object with a throwing toString / @@toPrimitive", async () => {
+    const { handlers } = makeMockHandlers();
+    // Construct the trap INSIDE the sandbox so the failing path is the
+    // String(a) fallback on a sandbox-realm object. JSON.stringify on a
+    // circular ref throws first; String() on that same ref then trips the
+    // user-defined toString and throws too -- exactly the case we're
+    // hardening.
+    const r = await runScript(
+      {
+        code: `
+          const a = {};
+          a.self = a; // makes JSON.stringify throw
+          a.toString = () => { throw new Error("boom-toString"); };
+          a[Symbol.toPrimitive] = () => { throw new Error("boom-toPrimitive"); };
+          console.log(a);
+          return "ok";
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "ok");
+    assert.equal(r.logs.length, 1);
+    assert.ok(
+      r.logs[0].includes("[unrepresentable]"),
+      `expected '[unrepresentable]' sentinel in log line, got: ${r.logs[0]}`,
+    );
+  });
+});
+
 describe("runScript timeouts", () => {
   it("rejects an async wall-clock hang within timeoutMs", async () => {
     // The mock resolves at 200ms, the script timeout fires at 100ms. The

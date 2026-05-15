@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { applyJsonPatch, parseJsonPointer, resolvePointer, resourceTools, summarizePatch } from "./resource.js";
+import {
+  applyJsonPatch,
+  type JsonPatchOp,
+  type PatchChange,
+  parseJsonPointer,
+  resolvePointer,
+  resourceTools,
+  summarizePatch,
+} from "./resource.js";
 
 const diffTool = resourceTools.find((t) => t.name === "aws_resource_diff");
 if (!diffTool) throw new Error("resourceTools missing aws_resource_diff");
@@ -251,6 +259,134 @@ describe("applyJsonPatch -- add auto-creates missing object parents", () => {
     assert.throws(() => applyJsonPatch({}, [{ op: "remove", path: "/Environment/Variables/X" }]));
   });
 });
+
+describe("applyJsonPatch -- clearer intermediate array-bounds errors", () => {
+  it("traversing past array length names the segment, length, and 'intermediate'", () => {
+    // `add /Tags/2/foo` on Tags=["a","b"] tries to traverse INTO a not-yet-
+    // existing array element (index 2 doesn't exist; the array has 2
+    // elements at indices 0 and 1). The error should name the segment,
+    // the array length, and call out the intermediate-traversal case so
+    // it's distinguishable from final-token bounds errors.
+    assert.throws(
+      () => applyJsonPatch({ Tags: ["a", "b"] }, [{ op: "add", path: "/Tags/2/foo", value: 1 }]),
+      (err: Error) => {
+        const msg = err.message;
+        // Names the path so the caller can find it.
+        assert.match(msg, /\/Tags\/2\/foo/);
+        // Names the offending segment.
+        assert.match(msg, /segment '2'/);
+        // Reports the array length.
+        assert.match(msg, /length 2/);
+        // Reports the bad index explicitly.
+        assert.match(msg, /index 2/);
+        // Distinguishes from the final-token "Add index ... out of bounds"
+        // error by calling out the intermediate traversal explicitly.
+        assert.match(msg, /intermediate|traverse into/i);
+        return true;
+      },
+    );
+  });
+
+  it("non-integer intermediate array segment still rejects with a useful message", () => {
+    assert.throws(
+      () => applyJsonPatch({ Tags: ["a", "b"] }, [{ op: "add", path: "/Tags/notanint/foo", value: 1 }]),
+      /Tags\/notanint\/foo/,
+    );
+  });
+});
+
+describe("summarizePatch -- per-op replay perf refactor", () => {
+  it("produces identical output to the previous per-op clone path on a 50-op patch", () => {
+    // Build a 50-op patch that exercises add/replace/remove on object keys
+    // and array indices, then assert the refactored summarizePatch returns
+    // the same shape and values it would have produced before. The previous
+    // implementation called the public applyJsonPatch (which clones at
+    // entry) once per op -- this version uses a single clone + in-place
+    // replay. The diff list must be deep-equal.
+    const before: Record<string, unknown> = {
+      Counters: { a: 0, b: 0, c: 0, d: 0 },
+      Tags: ["t0", "t1", "t2", "t3", "t4"],
+      Meta: { keep: "yes", drop: "soon" },
+    };
+
+    const ops: JsonPatchOp[] = [];
+    // 40 alternating replace/add ops on Counters.*
+    for (let i = 0; i < 40; i++) {
+      const key = ["a", "b", "c", "d", `new${i}`][i % 5];
+      if (i % 5 === 4) {
+        ops.push({ op: "add", path: `/Counters/${key}`, value: i });
+      } else {
+        ops.push({ op: "replace", path: `/Counters/${key}`, value: i });
+      }
+    }
+    // 5 array appends
+    for (let i = 0; i < 5; i++) {
+      ops.push({ op: "add", path: "/Tags/-", value: `tnew${i}` });
+    }
+    // 1 nested add through a missing parent
+    ops.push({ op: "add", path: "/Nested/Inner/Leaf", value: "deep" });
+    // 1 remove on Meta.drop
+    ops.push({ op: "remove", path: "/Meta/drop" });
+    // 3 replaces on the same path -- verifies per-op `after` snapshots
+    // still reflect each op individually, not the final value.
+    ops.push({ op: "replace", path: "/Meta/keep", value: "v1" });
+    ops.push({ op: "replace", path: "/Meta/keep", value: "v2" });
+    ops.push({ op: "replace", path: "/Meta/keep", value: "v3" });
+
+    assert.equal(ops.length, 50);
+
+    // Reference: run the patch end-to-end via the public applyJsonPatch
+    // (which now goes through the in-place helper internally) and compute
+    // the diff.
+    const after = applyJsonPatch(before, ops);
+    const fastChanges = summarizePatch(ops, before, after);
+
+    // Manually compute the expected per-op `after` using a slow path that
+    // clones the full doc per op -- exactly what the previous
+    // summarizePatch did. The two must agree.
+    let slowWorking: unknown = clone(before);
+    const slowChanges: PatchChange[] = [];
+    for (const op of ops) {
+      const beforeAt = resolvePointer(before, op.path);
+      // Slow: re-clone working copy through the public API each op.
+      slowWorking = applyJsonPatch(slowWorking, [op]);
+      let afterAt = resolvePointer(slowWorking, op.path);
+      if (op.op === "add" && afterAt === undefined && op.path.endsWith("/-")) {
+        afterAt = op.value;
+      }
+      slowChanges.push({ op: op.op as "add" | "remove" | "replace", path: op.path, before: beforeAt, after: afterAt });
+    }
+
+    assert.deepEqual(fastChanges, slowChanges);
+    // Sanity: the three replace ops on /Meta/keep show their individual
+    // `after` values, not all "v3".
+    const keepChanges = fastChanges.filter((c) => c.path === "/Meta/keep");
+    assert.equal(keepChanges.length, 3);
+    assert.equal(keepChanges[0].after, "v1");
+    assert.equal(keepChanges[1].after, "v2");
+    assert.equal(keepChanges[2].after, "v3");
+  });
+
+  it("does not mutate the caller's `before` document during replay", () => {
+    // Regression guard: the in-place refactor must still clone once at
+    // entry to summarizePatch, so the caller's original object is never
+    // touched.
+    const before = { Counters: { a: 0 } };
+    const ops: JsonPatchOp[] = [
+      { op: "replace", path: "/Counters/a", value: 1 },
+      { op: "replace", path: "/Counters/a", value: 2 },
+    ];
+    const after = applyJsonPatch(before, ops);
+    summarizePatch(ops, before, after);
+    assert.equal(before.Counters.a, 0);
+  });
+});
+
+// Local clone helper for the perf test above (avoids importing the
+// internal one). Mirrors the implementation: JSON round-trip.
+function clone<T>(v: T): T {
+  return v === undefined ? v : JSON.parse(JSON.stringify(v));
+}
 
 describe("aws_resource_diff schema", () => {
   it("accepts a minimal valid input", () => {

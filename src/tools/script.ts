@@ -189,7 +189,15 @@ export async function runScript(
           try {
             return JSON.stringify(a);
           } catch {
-            return String(a);
+            // Second fallback can also throw -- e.g. an object whose
+            // `toString` / `@@toPrimitive` throws will make `String(a)` throw.
+            // Swallow that and emit a sentinel rather than crashing the log
+            // capture (which would crash the whole script).
+            try {
+              return String(a);
+            } catch {
+              return "[unrepresentable]";
+            }
           }
         })
         .join(" ");
@@ -197,14 +205,6 @@ export async function runScript(
         text.length > MAX_LOG_LINE_BYTES ? `${text.slice(0, MAX_LOG_LINE_BYTES)}... [line truncated]` : text;
       logs.push(`[${level}] ${capped}`);
     };
-
-  const aws = {
-    call: handlers.call,
-    paginate: handlers.paginate,
-    paginateAll: handlers.paginateAll,
-    logsTail: handlers.logsTail,
-    resource: { ...handlers.resource },
-  };
 
   // Realm-isolated context: passing an empty object to createContext gives
   // the script its OWN set of intrinsics (Object, Array, Promise, Error, ...).
@@ -235,6 +235,52 @@ export async function runScript(
     Number: typeof Number;
     Boolean: typeof Boolean;
     Error: typeof Error;
+  };
+
+  // Bridge handlers throw host-realm Error instances (created in `unwrap`
+  // above, or anywhere else inside the bridge that uses `new Error(...)`).
+  // Those instances have the HOST Error.prototype on their chain, so a
+  // script-side `e instanceof Error` -- which compares against the
+  // REALM-FRESH Error -- returns false. That breaks the documented
+  // try/catch + instanceof pattern script authors expect.
+  //
+  // Wrap every bridge entry so any thrown host Error is re-thrown as a
+  // fresh.Error with the same message and enumerable custom props
+  // (rawBody, toolName, ...). Non-Error throws (strings, primitives,
+  // null/undefined, plain objects) pass through unchanged -- the script
+  // sees them as-is, just like host JS would.
+  const wrapForRealm =
+    <Args extends unknown[], R>(fn: (...args: Args) => Promise<R>): ((...args: Args) => Promise<R>) =>
+    async (...args: Args) => {
+      try {
+        return await fn(...args);
+      } catch (err) {
+        if (err instanceof Error) {
+          const out = new fresh.Error(err.message);
+          // Copy enumerable own props (rawBody, toolName, anything else
+          // the bridge attached) onto the realm-fresh error.
+          for (const key of Object.keys(err)) {
+            (out as unknown as Record<string, unknown>)[key] = (err as unknown as Record<string, unknown>)[key];
+          }
+          throw out;
+        }
+        throw err;
+      }
+    };
+
+  const aws = {
+    call: wrapForRealm(handlers.call),
+    paginate: wrapForRealm(handlers.paginate),
+    paginateAll: wrapForRealm(handlers.paginateAll as (input: unknown) => Promise<unknown>),
+    logsTail: wrapForRealm(handlers.logsTail),
+    resource: {
+      get: wrapForRealm(handlers.resource.get),
+      list: wrapForRealm(handlers.resource.list),
+      create: wrapForRealm(handlers.resource.create),
+      update: wrapForRealm(handlers.resource.update),
+      delete: wrapForRealm(handlers.resource.delete),
+      status: wrapForRealm(handlers.resource.status),
+    },
   };
 
   // Bind realm-local intrinsics + the AWS bridge + console + explicit

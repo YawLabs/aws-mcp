@@ -42,7 +42,7 @@ export const assumeTools: readonly Tool[] = [
   {
     name: "aws_assume_role",
     description:
-      "Call STS AssumeRole and stash the returned temporary credentials as a named profile in ~/.aws/credentials. Subsequent calls to aws_call / aws_whoami / aws_paginate can use profile='mcp-<sessionName>' (or your overridden targetProfile name). The raw secret key / session token are NOT returned to the caller — only the profile name, expiration, and assumed identity. Use for cross-account access: a source profile (your SSO identity) assumes a role in another account.",
+      "Call STS AssumeRole and stash the returned temporary credentials as a named profile in ~/.aws/credentials. Subsequent calls to aws_call / aws_whoami / aws_paginate can use profile='mcp-<sessionName>' (or your overridden targetProfile name). The raw secret key / session token are NOT returned to the caller — only the profile name, expiration, and assumed identity. Use for cross-account access: a source profile (your SSO identity) assumes a role in another account. Default timeout is 120s (raise via timeoutMs for slow SAML / credential_process setups on cold start).",
     annotations: {
       title: "Assume an IAM role and stash creds as a profile",
       readOnlyHint: false,
@@ -77,6 +77,14 @@ export const assumeTools: readonly Tool[] = [
           "Profile name to write the temp creds under. Default 'mcp-<sessionName>'. Auto-prefixed with 'mcp-' if missing.",
         ),
       region: z.string().optional().describe("Region for the STS call. Defaults to session region / $AWS_REGION."),
+      timeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Timeout in milliseconds for the underlying STS AssumeRole CLI call. Default 120000 (120s) -- gives cold-start SAML / credential_process setups headroom over runAwsCall's 60s default. Raise further for unusually slow IdPs.",
+        ),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const i = input as {
@@ -87,6 +95,7 @@ export const assumeTools: readonly Tool[] = [
         sourceProfile?: string;
         targetProfile?: string;
         region?: string;
+        timeoutMs?: number;
       };
       const sourceProfile = i.sourceProfile || getProfile();
       const useRegion = i.region || getRegion();
@@ -116,6 +125,10 @@ export const assumeTools: readonly Tool[] = [
         profile: sourceProfile,
         region: useRegion,
         outputFormat: "json",
+        // SAML / credential_process flows can exceed runAwsCall's 60s default
+        // on cold start (federated IdP round-trip, MFA prompt forwarding).
+        // 120s is the assume-role-specific floor; callers can override.
+        timeoutMs: i.timeoutMs ?? 120_000,
       });
 
       if (!result.ok) {

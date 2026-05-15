@@ -120,6 +120,24 @@ describe("aws_assume_role schema", () => {
     assert.equal(tool.inputSchema.safeParse({ roleArn: "x" }).success, false);
     assert.equal(tool.inputSchema.safeParse({ sessionName: "x" }).success, false);
   });
+
+  it("accepts an explicit timeoutMs", () => {
+    const r = tool.inputSchema.safeParse({
+      roleArn: "arn:aws:iam::123:role/A",
+      sessionName: "sess",
+      timeoutMs: 180_000,
+    });
+    assert.equal(r.success, true);
+  });
+
+  it("rejects a non-positive timeoutMs", () => {
+    const r = tool.inputSchema.safeParse({
+      roleArn: "arn:aws:iam::123:role/A",
+      sessionName: "sess",
+      timeoutMs: 0,
+    });
+    assert.equal(r.success, false);
+  });
 });
 
 describe("aws_assume_role handler (fake-aws integration)", () => {
@@ -199,5 +217,25 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     } as never);
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /incomplete credentials/i);
+  });
+
+  it("propagates timeoutMs to the underlying CLI call (fires timeout path)", async () => {
+    // assume_role_slow sleeps ~5s before responding. A 200ms timeoutMs has to
+    // reach runAwsCall for the timeout error to surface inside that window;
+    // if the handler ignored timeoutMs we'd hit the 120s default instead and
+    // this test would either hang or eventually succeed.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_slow";
+    const start = Date.now();
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123:role/A",
+      sessionName: "sess",
+      timeoutMs: 200,
+    } as never);
+    const elapsed = Date.now() - start;
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /timed out/i);
+    // Sanity check that the small timeout actually took effect rather than
+    // waiting for the 5s sleep or the 120s default.
+    assert.ok(elapsed < 4000, `expected fast timeout, got ${elapsed}ms`);
   });
 });
