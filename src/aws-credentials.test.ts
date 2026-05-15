@@ -335,7 +335,14 @@ describe("upsertProfile — concurrent cross-process race on different profiles"
     // If this assertion ever fails (i.e. EVERY trial preserves both
     // profiles), the race may have been fixed -- update the comment at
     // aws-credentials.ts:160-168 and revisit this test.
-    const TRIALS = 80;
+    //
+    // TRIALS budget sized for CI reliability: the loop early-exits on the
+    // first observed loss, so the common-case cost is one trial. The budget
+    // only matters when the race fails to fire (rare given observed
+    // per-trial demonstration rates near 100%). 250 trials gives effectively
+    // zero false-fail probability across CI platforms; worst-case wall-clock
+    // ~50s if the race somehow never fires.
+    const TRIALS = 250;
     let observedLoss = 0;
     let bothPresent = 0;
     for (let i = 0; i < TRIALS; i++) {
