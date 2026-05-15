@@ -48,7 +48,28 @@ const SSO_EXPIRED_PATTERNS: RegExp[] = [
   // failed". The trailing fragment alone is specific enough.
   /Token has expired and refresh failed/,
 ];
-const NO_CREDS_RE = /CredentialsProviderError|could not load credentials|no identity|unable to locate credentials/i;
+// Same treatment as SSO_EXPIRED_PATTERNS -- anchor on the exact strings
+// botocore emits so we don't false-positive on stderr that happens to mention
+// "no identity" or "credentials" in unrelated contexts.
+//
+// Canonical sources (botocore/exceptions.py):
+//   - NoCredentialsError.fmt = "Unable to locate credentials"
+//   - NoAuthTokenError.fmt = "Unable to locate authorization token"
+//   - PartialCredentialsError.fmt =
+//       "Partial credentials found in {provider}, missing: {cred_var}"
+//   - CredentialRetrievalError.fmt =
+//       "Error when retrieving credentials from {provider}: {error_msg}"
+//   - ProfileNotFound.fmt = "The config profile ({profile}) could not be found"
+//
+// The JS SDK throws Error subclasses named CredentialsProviderError for the
+// same family; we match that by name above the regex check.
+const NO_CREDS_PATTERNS: RegExp[] = [
+  /Unable to locate credentials/,
+  /Unable to locate authorization token/,
+  /Partial credentials found in/,
+  /Error when retrieving credentials from/,
+  /The config profile \([^)]+\) could not be found/,
+];
 
 export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message: string } {
   const message = err instanceof Error ? err.message : String(err);
@@ -62,7 +83,7 @@ export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message:
   ) {
     return { kind: "sso_expired", message };
   }
-  if (NO_CREDS_RE.test(blob)) {
+  if (name === "CredentialsProviderError" || NO_CREDS_PATTERNS.some((re) => re.test(blob))) {
     return { kind: "no_creds", message };
   }
   return { kind: "other", message };

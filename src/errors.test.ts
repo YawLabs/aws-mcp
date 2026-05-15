@@ -78,6 +78,32 @@ describe("classifyAuthError — canonical AWS SSO messages", () => {
   });
 });
 
+describe("classifyAuthError — canonical AWS no-creds messages", () => {
+  // Sources for the messages below (botocore/exceptions.py):
+  //   NoCredentialsError.fmt, NoAuthTokenError.fmt, PartialCredentialsError.fmt,
+  //   CredentialRetrievalError.fmt, ProfileNotFound.fmt
+
+  it("detects PartialCredentialsError canonical message", () => {
+    const err = new Error("Partial credentials found in env, missing: aws_secret_access_key");
+    assert.equal(classifyAuthError(err).kind, "no_creds");
+  });
+
+  it("detects CredentialRetrievalError canonical message", () => {
+    const err = new Error("Error when retrieving credentials from container-role: HTTPSConnectionPool error");
+    assert.equal(classifyAuthError(err).kind, "no_creds");
+  });
+
+  it("detects ProfileNotFound canonical message", () => {
+    const err = new Error("The config profile (saml-prod) could not be found");
+    assert.equal(classifyAuthError(err).kind, "no_creds");
+  });
+
+  it("detects NoAuthTokenError canonical message", () => {
+    const err = new Error("Unable to locate authorization token");
+    assert.equal(classifyAuthError(err).kind, "no_creds");
+  });
+});
+
 describe("classifyAuthError — false-positive guards", () => {
   it("does NOT classify a benign sentence that happens to contain SSO/session/expired words", () => {
     // Regression guard: the old SSO_EXPIRED_RE used /SSO[^\n]{0,80}session
@@ -100,6 +126,27 @@ describe("classifyAuthError — false-positive guards", () => {
 
   it("does NOT classify random text mentioning 'token' and 'expired' far apart", () => {
     const err = new Error("the API token for the upstream service has been rotated; the cache entry expired");
+    assert.equal(classifyAuthError(err).kind, "other");
+  });
+
+  it("does NOT classify a benign sentence containing 'no identity'", () => {
+    // Regression guard: the old NO_CREDS_RE had a `/no identity/i` alternation
+    // (case-insensitive, unanchored) that matched any string mentioning "no
+    // identity" -- e.g. discussion text or unrelated AWS errors that quoted
+    // the phrase in a different context.
+    const err = new Error("the user has no identity crisis here -- this is a different issue");
+    assert.equal(classifyAuthError(err).kind, "other");
+  });
+
+  it("does NOT classify a generic 'could not load credentials' message without err.name set", () => {
+    // The old NO_CREDS_RE matched /could not load credentials/i on raw
+    // message text. The replacement relies on err.name ===
+    // "CredentialsProviderError" for the SDK class (always set by the
+    // @aws-sdk/property-provider class constructor) and anchored canonical
+    // botocore strings for the CLI side. A bare message without a name set
+    // is no longer auto-classified -- if a real-world case is found, add a
+    // specific anchored pattern.
+    const err = new Error("could not load credentials from some custom non-AWS provider");
     assert.equal(classifyAuthError(err).kind, "other");
   });
 });
