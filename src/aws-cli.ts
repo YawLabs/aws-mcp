@@ -100,7 +100,17 @@ export type AwsCallResult = AwsCallSuccess | AwsCallFailure;
 // that intentionally exercise this path can stub the var afresh each time.
 const warnedMalformedPrefixArgs = new Set<string>();
 
-function parseTestPrefixArgs(raw: string | undefined): string[] | undefined {
+/** Test-only: clear the malformed-value dedupe set so each test sees a fresh
+ * "first warn fires" state. Underscore prefix = exported for tests only, not
+ * for production callers. */
+export function _resetParseTestPrefixArgsDedupe(): void {
+  warnedMalformedPrefixArgs.clear();
+}
+
+// Exported for tests -- the dedupe + warn behavior is load-bearing (it shapes
+// every aws_call when a dev sets AWS_MCP_TEST_AWS_PREFIX_ARGS wrong), so it
+// gets direct unit coverage instead of being driven only through runAwsCall.
+export function parseTestPrefixArgs(raw: string | undefined): string[] | undefined {
   if (!raw) return undefined;
   let parsed: unknown;
   try {

@@ -221,4 +221,66 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     assert.equal(data.results[0].decision, "implicitDeny");
     assert.equal(data.results[0].matchedStatementIds, undefined);
   });
+
+  it("translates contextEntries camelCase -> PascalCase in the CLI argv (regression guard)", async () => {
+    // The schema accepts contextEntries: [{ contextKeyName, contextKeyType,
+    // contextKeyValues }] from the model; the AWS CLI requires PascalCase
+    // ContextKeyName / ContextKeyType / ContextKeyValues inside
+    // --cli-input-json. iam-simulate.ts:215-220 does the case translation.
+    // A refactor dropping the map would leave camelCase in the CLI payload;
+    // the CLI would silently produce missingContextValues for every
+    // tag-based policy sim -- a quiet false negative. We capture the argv
+    // via the iam_sim_echo_argv fake-aws scenario (side-channel via
+    // AWS_MCP_FAKE_ARGV_OUT, since the handler discards data.argv) and
+    // assert the --cli-input-json JSON is PascalCase.
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-argv-out-"));
+    const argvOutPath = join(sideChannelDir, "argv.json");
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_sim_echo_argv";
+    try {
+      const r = await tool.handler({
+        principalArn: "arn:aws:iam::123456789012:user/jeff",
+        actions: ["s3:GetObject"],
+        resources: ["arn:aws:s3:::my-bucket/*"],
+        contextEntries: [
+          {
+            contextKeyName: "aws:RequestTag/Project",
+            contextKeyType: "string",
+            contextKeyValues: ["alpha", "beta"],
+          },
+        ],
+      } as never);
+      assert.equal(r.ok, true);
+
+      const argv = JSON.parse(readFileSync(argvOutPath, "utf-8")) as string[];
+      const cliInputIdx = argv.indexOf("--cli-input-json");
+      assert.ok(cliInputIdx >= 0, "argv should contain --cli-input-json");
+      const payloadRaw = argv[cliInputIdx + 1];
+      assert.ok(typeof payloadRaw === "string", "--cli-input-json should be followed by a string");
+      const payload = JSON.parse(payloadRaw) as {
+        PolicySourceArn?: string;
+        ActionNames?: string[];
+        ResourceArns?: string[];
+        ContextEntries?: { ContextKeyName?: string; ContextKeyType?: string; ContextKeyValues?: string[] }[];
+      };
+      assert.equal(payload.PolicySourceArn, "arn:aws:iam::123456789012:user/jeff");
+      assert.deepEqual(payload.ActionNames, ["s3:GetObject"]);
+      assert.deepEqual(payload.ResourceArns, ["arn:aws:s3:::my-bucket/*"]);
+      assert.ok(Array.isArray(payload.ContextEntries), "ContextEntries should be PascalCase");
+      assert.equal(payload.ContextEntries?.[0].ContextKeyName, "aws:RequestTag/Project");
+      assert.equal(payload.ContextEntries?.[0].ContextKeyType, "string");
+      assert.deepEqual(payload.ContextEntries?.[0].ContextKeyValues, ["alpha", "beta"]);
+      // The regression we guard against: leaving camelCase in the payload.
+      const entry = payload.ContextEntries?.[0] ?? {};
+      assert.equal(Object.hasOwn(entry, "contextKeyName"), false, "camelCase contextKeyName must not leak");
+      assert.equal(Object.hasOwn(entry, "contextKeyType"), false, "camelCase contextKeyType must not leak");
+      assert.equal(Object.hasOwn(entry, "contextKeyValues"), false, "camelCase contextKeyValues must not leak");
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+      rmSync(sideChannelDir, { recursive: true, force: true });
+    }
+  });
 });

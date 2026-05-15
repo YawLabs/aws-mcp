@@ -129,10 +129,52 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "mr_partial_failure": {
+      // Multi-region test: vary output by --region argv so a single scenario
+      // produces ok for one region and an sso_expired failure for another.
+      // Lets the multi-region handler exercise the partial-failure result
+      // shape end-to-end -- one region returns {ok: true, data, command},
+      // another returns {ok: false, errorKind: "sso_expired", error, command}.
+      const argv = process.argv.slice(2);
+      const regionIdx = argv.indexOf("--region");
+      const region = regionIdx >= 0 ? argv[regionIdx + 1] : "";
+      if (region === "us-west-2") {
+        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.exit(255);
+        return;
+      }
+      // Default: success with a small JSON payload tagged by region.
+      process.stdout.write(`${JSON.stringify({ Buckets: [{ Name: `bucket-${region}` }] })}\n`);
+      process.exit(0);
+      return;
+    }
+
     case "call_echo_args": {
       // Emit the full argv (minus node executable and script path) as JSON on
       // stdout so tests can verify what flags runAwsCall actually assembled.
       process.stdout.write(`${JSON.stringify({ argv: process.argv.slice(2) })}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "awscli_utf8_split": {
+      // Exercises the per-stream StringDecoder in runAwsCall: emit a multi-byte
+      // UTF-8 character split across two stdout.write() calls so the decoder
+      // must buffer the partial sequence across data events. Using "𠮷"
+      // (U+20BB7, 4 bytes: F0 A0 AE B7) -- a supplementary-plane char that
+      // also needs surrogate-pair handling in the resulting JS string. If the
+      // production code is replaced by a naive chunk.toString(), the parent
+      // sees U+FFFD U+FFFD instead of the intact codepoint.
+      const fourByteChar = Buffer.from("\u{20BB7}", "utf8"); // F0 A0 AE B7
+      // Write enough JSON shell to satisfy --output json parsing AND split the
+      // multi-byte char across two distinct 'data' events. The sleep gives
+      // the parent's stdout.on('data') a chance to fire on the first chunk
+      // before the second arrives -- without it the kernel may coalesce the
+      // two writes into a single chunk and the split-boundary path doesn't
+      // exercise.
+      process.stdout.write(Buffer.concat([Buffer.from('{"name":"'), fourByteChar.slice(0, 2)]));
+      await sleep(50);
+      process.stdout.write(Buffer.concat([fourByteChar.slice(2), Buffer.from('"}\n')]));
       process.exit(0);
       return;
     }
@@ -369,6 +411,100 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "resource_update_sso_expired_mid_poll": {
+      // Mirrors `ccapi_create_then_status_sso_expired` for the update path:
+      //   1) cloudcontrol update-resource         -> IN_PROGRESS (success)
+      //   2) cloudcontrol get-resource-request-status -> SSO expired
+      // Drives the buildMutationResponse recovery-hint path for
+      // aws_resource_update through the real handler.
+      const argv = process.argv.slice(2);
+      if (argv.includes("update-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::Lambda::Function",
+              Identifier: "my-fn",
+              RequestToken: "req-tok-upd",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "UPDATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: resource_update_sso_expired_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "resource_delete_sso_expired_mid_poll": {
+      // Same pattern for the delete path.
+      const argv = process.argv.slice(2);
+      if (argv.includes("delete-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::S3::Bucket",
+              Identifier: "my-bucket",
+              RequestToken: "req-tok-del",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "DELETE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: resource_delete_sso_expired_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "resource_delete_no_creds_mid_poll": {
+      // Mid-poll auth lapse where credentials disappear (vs. SSO expiry).
+      // The buildMutationResponse recovery hint differs for kind=no_creds
+      // (it points at fixing credentials rather than re-running aws_login_start).
+      // Delete is the right verb to test: it's destructive, so a buried
+      // mid-poll failure has the highest blast radius.
+      const argv = process.argv.slice(2);
+      if (argv.includes("delete-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::S3::Bucket",
+              Identifier: "my-bucket",
+              RequestToken: "req-tok-del-nc",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "DELETE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write(
+          "Unable to locate credentials. You can configure credentials by running 'aws configure'.\n",
+        );
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: resource_delete_no_creds_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
     case "iam_simulate_implicit_deny": {
       // No matching statement at all -- the result is implicitDeny.
       process.stdout.write(
@@ -378,6 +514,36 @@ async function main(): Promise<void> {
               EvalActionName: "ec2:TerminateInstances",
               EvalResourceName: "*",
               EvalDecision: "implicitDeny",
+              MatchedStatements: [],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam_sim_echo_argv": {
+      // Capture-and-echo variant for iam_simulate: writes the full argv as
+      // JSON to the path in AWS_MCP_FAKE_ARGV_OUT (side channel that survives
+      // the handler discarding everything except EvaluationResults), then
+      // emits a normal-shaped EvaluationResults on stdout so the handler
+      // returns ok:true. Lets tests verify that the handler's
+      // camelCase -> PascalCase mapping (iam-simulate.ts:215-220) produces
+      // the right CLI flags (ContextKeyName/ContextKeyType/ContextKeyValues
+      // inside --cli-input-json). Modeled on call_echo_args.
+      const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
+      if (outPath) {
+        const fs = await import("node:fs");
+        fs.writeFileSync(outPath, JSON.stringify(process.argv.slice(2)));
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              EvalResourceName: "*",
+              EvalDecision: "allowed",
               MatchedStatements: [],
             },
           ],

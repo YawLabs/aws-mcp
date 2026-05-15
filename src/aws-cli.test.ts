@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
-import { redactDisplayArgs, runAwsCall, SAFE_NAME_RE, truncateForErrorMsg } from "./aws-cli.js";
+import { afterEach, describe, it, mock } from "node:test";
+import {
+  _resetParseTestPrefixArgsDedupe,
+  parseTestPrefixArgs,
+  redactDisplayArgs,
+  runAwsCall,
+  SAFE_NAME_RE,
+  truncateForErrorMsg,
+} from "./aws-cli.js";
 
 describe("SAFE_NAME_RE", () => {
   it("accepts typical kebab-case service/operation names", () => {
@@ -110,5 +117,68 @@ describe("truncateForErrorMsg", () => {
     const result = truncateForErrorMsg(huge);
     assert.ok(result.length < huge.length);
     assert.match(result, /\[truncated; \d+ bytes omitted\]/);
+  });
+});
+
+describe("parseTestPrefixArgs", () => {
+  // The dedupe set is module-level state; clear it between tests so each
+  // case starts from a clean "no values warned yet" baseline.
+  afterEach(() => {
+    _resetParseTestPrefixArgsDedupe();
+    mock.restoreAll();
+  });
+
+  it("returns undefined for undefined input without warning", () => {
+    const warn = mock.method(console, "warn", () => {});
+    assert.equal(parseTestPrefixArgs(undefined), undefined);
+    assert.equal(warn.mock.callCount(), 0);
+  });
+
+  it("returns undefined for malformed JSON and warns once", () => {
+    const warn = mock.method(console, "warn", () => {});
+    assert.equal(parseTestPrefixArgs("{not json"), undefined);
+    assert.equal(warn.mock.callCount(), 1);
+    assert.match(warn.mock.calls[0].arguments[0] as string, /isn't valid JSON/);
+  });
+
+  it("returns undefined for valid JSON that is not a string array", () => {
+    const warn = mock.method(console, "warn", () => {});
+    // Object payload -- valid JSON, wrong shape.
+    assert.equal(parseTestPrefixArgs('{"foo":"bar"}'), undefined);
+    assert.equal(warn.mock.callCount(), 1);
+    assert.match(warn.mock.calls[0].arguments[0] as string, /must parse to a string array/);
+  });
+
+  it("returns undefined for a JSON array containing a non-string element", () => {
+    const warn = mock.method(console, "warn", () => {});
+    assert.equal(parseTestPrefixArgs('["ok", 42]'), undefined);
+    assert.equal(warn.mock.callCount(), 1);
+    assert.match(warn.mock.calls[0].arguments[0] as string, /must parse to a string array/);
+  });
+
+  it("dedupes per malformed value: same input called twice warns ONCE total", () => {
+    const warn = mock.method(console, "warn", () => {});
+    parseTestPrefixArgs("{not json");
+    parseTestPrefixArgs("{not json");
+    parseTestPrefixArgs("{not json");
+    assert.equal(warn.mock.callCount(), 1, "expected exactly one warn for repeated identical malformed input");
+  });
+
+  it("warns again for a NEW malformed value even when a different value was malformed earlier", () => {
+    // Closes the "warn-once is per-value, not per-process" property: an
+    // earlier malformed value should not silence the warn for a fresh one.
+    const warn = mock.method(console, "warn", () => {});
+    parseTestPrefixArgs("{not json");
+    assert.equal(warn.mock.callCount(), 1);
+    parseTestPrefixArgs('{"foo":"bar"}'); // different malformed value
+    assert.equal(warn.mock.callCount(), 2, "expected a fresh warn for a new malformed value");
+    parseTestPrefixArgs('{"foo":"bar"}'); // and that new value is now itself deduped
+    assert.equal(warn.mock.callCount(), 2);
+  });
+
+  it("returns the parsed array for a valid string-array JSON without warning", () => {
+    const warn = mock.method(console, "warn", () => {});
+    assert.deepEqual(parseTestPrefixArgs('["a","b"]'), ["a", "b"]);
+    assert.equal(warn.mock.callCount(), 0);
   });
 });

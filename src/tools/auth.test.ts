@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { authTools, findCachedSsoToken } from "./auth.js";
+import { resolveProfileStartUrl } from "./profiles.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
@@ -191,6 +192,76 @@ describe("aws_whoami handler — error path consistency with aws_call (fake-aws)
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /No credentials found/);
     assert.match(r.error ?? "", /tester/);
+  });
+});
+
+describe("startUrlForProfile unknown-profile fallback", () => {
+  // startUrlForProfile (auth.ts:78-84) is internal: it reads ~/.aws/config and
+  // delegates to resolveProfileStartUrl, mapping null -> undefined. When the
+  // config is readable but doesn't contain the requested profile, callers see
+  // `undefined`, and findCachedSsoToken({ startUrl: undefined }) degrades to
+  // the legacy "any valid token" behavior. A regression returning a stale
+  // string or throwing here would silently misfilter the SSO token cache.
+
+  let configDir: string;
+  let cacheDir: string;
+  let homeBackup: string | undefined;
+  let userprofileBackup: string | undefined;
+
+  beforeEach(() => {
+    configDir = mkdtempSync(join(tmpdir(), "aws-mcp-auth-cfg-"));
+    cacheDir = mkdtempSync(join(tmpdir(), "aws-mcp-auth-cache-"));
+    homeBackup = process.env.HOME;
+    userprofileBackup = process.env.USERPROFILE;
+    process.env.HOME = configDir;
+    process.env.USERPROFILE = configDir;
+  });
+
+  afterEach(() => {
+    if (homeBackup === undefined) delete process.env.HOME;
+    else process.env.HOME = homeBackup;
+    if (userprofileBackup === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = userprofileBackup;
+    rmSync(configDir, { recursive: true, force: true });
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  it("resolveProfileStartUrl returns null for an unknown profile (input to the '?? undefined' map)", () => {
+    // The startUrlForProfile wrap is `resolveProfileStartUrl(text, profile) ?? undefined`.
+    // Pin the null contract here -- the wrap relies on it to surface undefined,
+    // which findCachedSsoToken treats as "no filter".
+    const text = `
+[profile alpha]
+sso_start_url = https://alpha.awsapps.com/start
+
+[profile beta]
+region = us-east-1
+`;
+    assert.equal(resolveProfileStartUrl(text, "no-such-profile"), null);
+  });
+
+  it("findCachedSsoToken with startUrl=undefined falls back to legacy 'any valid token' behavior without throwing", () => {
+    // This is the downstream half of the unknown-profile path: when
+    // startUrlForProfile returns undefined, findCachedSsoToken is invoked with
+    // { startUrl: undefined } and must not throw -- it should ignore the
+    // filter and return any valid non-expired token in the cache.
+    const future = new Date(Date.now() + 3600_000).toISOString();
+    writeFileSync(
+      join(cacheDir, "tok.json"),
+      JSON.stringify({
+        accessToken: "t",
+        expiresAt: future,
+        startUrl: "https://some-org.awsapps.com/start",
+      }),
+    );
+
+    // Explicit undefined: this is what the auth.ts:160 / :278 / :318 call
+    // sites pass when startUrlForProfile returns undefined. The call must
+    // neither throw nor return null -- it should ignore the absent filter
+    // and surface the cached token.
+    const result = findCachedSsoToken(cacheDir, { startUrl: undefined });
+    assert.ok(result, "findCachedSsoToken should not return null when a valid token is present");
+    assert.equal(result.expiresAt, future);
   });
 });
 

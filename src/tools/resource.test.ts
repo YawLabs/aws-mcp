@@ -550,6 +550,171 @@ describe("aws_resource_create handler — awaitCompletion mid-poll auth lapse (f
   });
 });
 
+describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion mid-poll auth lapse (fake-aws)", () => {
+  // Parallel to the create-side fake-aws test above. The
+  // buildMutationResponse recovery hint is shared, but each verb has its own
+  // initial CLI call (update-resource / delete-resource); these tests pin
+  // both verbs' paths through the same hint shape.
+  const beforeEachEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  };
+  const afterEachEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("aws_resource_update surfaces the SSO recovery hint with the requestToken", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "resource_update_sso_expired_mid_poll";
+      const r = (await updateResource.handler({
+        typeName: "AWS::Lambda::Function",
+        identifier: "my-fn",
+        patchDocument: [{ op: "replace", path: "/MemorySize", value: 512 }],
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 2000,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /SSO session expired/);
+      assert.match(r.error ?? "", /aws_login_start/);
+      assert.match(r.error ?? "", /tester/);
+      assert.match(r.error ?? "", /aws_resource_status/);
+      // The token from the update-resource fake-aws response, not the
+      // create-side one -- pins that the hint pulls from THIS handler's
+      // ProgressEvent rather than a hardcoded constant.
+      assert.match(r.error ?? "", /req-tok-upd/);
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("aws_resource_delete surfaces the SSO recovery hint with the requestToken", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "resource_delete_sso_expired_mid_poll";
+      const r = (await deleteResource.handler({
+        typeName: "AWS::S3::Bucket",
+        identifier: "my-bucket",
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 2000,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /SSO session expired/);
+      assert.match(r.error ?? "", /aws_login_start/);
+      assert.match(r.error ?? "", /tester/);
+      assert.match(r.error ?? "", /aws_resource_status/);
+      assert.match(r.error ?? "", /req-tok-del/);
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("aws_resource_delete surfaces the no_creds recovery hint (different wording from sso_expired)", async () => {
+    // kind=no_creds takes a separate branch in buildMutationResponse and
+    // produces a different hint ("After fixing credentials..." rather than
+    // "Call aws_login_start..."). Delete is the destructive verb, so it's
+    // the most important to cover.
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "resource_delete_no_creds_mid_poll";
+      const r = (await deleteResource.handler({
+        typeName: "AWS::S3::Bucket",
+        identifier: "my-bucket",
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 2000,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /No credentials available/);
+      assert.match(r.error ?? "", /fixing credentials/);
+      assert.match(r.error ?? "", /tester/);
+      assert.match(r.error ?? "", /aws_resource_status/);
+      assert.match(r.error ?? "", /req-tok-del-nc/);
+      // The SSO-specific text must NOT appear in the no_creds branch --
+      // mixing them would mislead the caller about how to recover.
+      assert.doesNotMatch(r.error ?? "", /SSO session expired/);
+      assert.doesNotMatch(r.error ?? "", /aws_login_start/);
+    } finally {
+      afterEachEnv();
+    }
+  });
+});
+
+describe("pollUntilTerminal — malformed/past RetryAfter falls back to pollIntervalMs", () => {
+  // Companion to the "honors RetryAfter" test above. The RetryAfter parsing
+  // path has two guards: Number.isNaN(Date.parse(raw)) and a past-time
+  // check (ra <= 0). Both must fall back to the configured pollIntervalMs
+  // rather than treating the bad value as a wait. Unit-style here so the
+  // sleep duration is observable; fake-aws can't surface that.
+  function progressResponse(event: Record<string, unknown> | null): AwsCallResult {
+    return {
+      ok: true,
+      data: { ProgressEvent: event },
+      command: "aws cloudcontrol get-resource-request-status --request-token tok-1",
+      rawStdout: JSON.stringify({ ProgressEvent: event }),
+    };
+  }
+
+  it("falls back to pollIntervalMs when RetryAfter is unparseable (Number.isNaN(Date.parse(...)))", async () => {
+    const responses: Record<string, unknown>[] = [
+      { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1", RetryAfter: "not-a-date" },
+      { OperationStatus: "SUCCESS", RequestToken: "tok-1" },
+    ];
+    let i = 0;
+    const awsCall = async (): Promise<AwsCallResult> => progressResponse(responses[i++]);
+    const sleeps: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      sleeps.push(ms);
+    };
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 250, maxWaitMs: 60_000 },
+      awsCall,
+      sleep,
+    );
+    assert.equal(r.ok, true);
+    assert.equal(sleeps.length, 1);
+    // Must be the pollIntervalMs verbatim, not the bad string interpreted
+    // as a millisecond count (would be NaN) or coerced to 0.
+    assert.equal(sleeps[0], 250);
+  });
+
+  it("falls back to pollIntervalMs when RetryAfter is in the past (target - now <= 0)", async () => {
+    // Date.parse succeeds, but the resulting target is before Date.now(),
+    // so the `ra > 0` guard rejects the override and pollIntervalMs wins.
+    const inThePast = new Date(Date.now() - 60_000).toISOString();
+    const responses: Record<string, unknown>[] = [
+      { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1", RetryAfter: inThePast },
+      { OperationStatus: "SUCCESS", RequestToken: "tok-1" },
+    ];
+    let i = 0;
+    const awsCall = async (): Promise<AwsCallResult> => progressResponse(responses[i++]);
+    const sleeps: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      sleeps.push(ms);
+    };
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 300, maxWaitMs: 60_000 },
+      awsCall,
+      sleep,
+    );
+    assert.equal(r.ok, true);
+    assert.equal(sleeps.length, 1);
+    // pollIntervalMs verbatim -- past-date must NOT cause a 0-wait
+    // tight-loop (which would still pass elapsedMs-style asserts but
+    // pin the wrong branch).
+    assert.equal(sleeps[0], 300);
+  });
+});
+
 describe("schemas — awaitCompletion / pollIntervalMs / maxWaitMs", () => {
   it("aws_resource_create accepts awaitCompletion with bounded poll/maxWait", () => {
     assert.equal(

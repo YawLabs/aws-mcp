@@ -327,4 +327,54 @@ describe("runAwsCall — failure paths", () => {
     if (r.ok) return;
     assert.equal(r.kind, "spawn_failure");
   });
+
+  it("settles via the async proc.on('error') handler when spawn returns but the binary is missing", async () => {
+    // Reliable trigger: Node's child_process.spawn for a nonexistent binary
+    // returns a ChildProcess on both POSIX and Windows, then emits the
+    // 'error' event asynchronously (ENOENT). The sync-throw codepath fires
+    // only for argument-shape errors (e.g. invalid options), not for ENOENT.
+    // The message variants differ: sync-throw produces "Failed to spawn ...";
+    // the async handler at aws-cli.ts:263-271 produces "Failed to run ...".
+    // Asserting the async-variant text pins the async handler.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      command: "this-binary-does-not-exist-async-trigger-xyz",
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "spawn_failure");
+    assert.match(
+      r.error,
+      /Failed to run/,
+      "async proc.on('error') handler should produce 'Failed to run', not 'Failed to spawn'",
+    );
+    assert.match(r.error, /AWS CLI installed and on PATH/);
+    // displayCommand must still be populated -- the handler reads it from the
+    // outer closure to give the user context about which invocation failed.
+    assert.ok(r.command, "command should be populated by the async error handler");
+    assert.ok(r.command.includes("s3api"));
+  });
+
+  it("decodes a multi-byte UTF-8 codepoint split across two stdout 'data' chunks (StringDecoder coverage)", async () => {
+    // The fake writes the 4-byte sequence for U+20BB7 split across two
+    // process.stdout.write() calls with a 50ms sleep in between, so the
+    // parent's stdout.on('data') handler fires twice and the StringDecoder
+    // at aws-cli.ts:221 must buffer the partial sequence across calls. If
+    // the decoder is replaced by a naive chunk.toString(), the second
+    // decoded chunk starts with U+FFFD (replacement) and JSON.parse fails
+    // or the resulting string contains replacement characters.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("awscli_utf8_split"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const data = r.data as { name: string };
+    assert.equal(data.name, "\u{20BB7}", "expected the supplementary-plane codepoint intact, not U+FFFD");
+    // Belt-and-suspenders: explicitly assert no replacement characters in the
+    // raw stdout. A naive .toString() per chunk would leave U+FFFD here.
+    assert.ok(!r.rawStdout.includes("�"), "rawStdout must not contain U+FFFD replacement chars");
+  });
 });

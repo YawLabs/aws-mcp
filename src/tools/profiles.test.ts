@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { parseAwsConfig, profilesTools, resolveProfileStartUrl } from "./profiles.js";
+import { type AwsProfile, parseAwsConfig, profilesTools, resolveProfileStartUrl } from "./profiles.js";
 
 const listTool = profilesTools.find((t) => t.name === "aws_list_profiles");
 if (!listTool) throw new Error("profilesTools missing aws_list_profiles");
@@ -187,5 +187,71 @@ describe("aws_list_profiles handler", () => {
     const r = (await listTool.handler({})) as { ok: boolean; error?: string };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /not found/);
+  });
+
+  it("reads + parses ~/.aws/config and returns names + regions + SSO metadata", async () => {
+    // Success-path round-trip the ENOENT test doesn't cover. Write a
+    // representative config (default profile, inline-sso profile, and an
+    // sso-session-backed profile) into HOME/.aws/config, invoke the handler,
+    // and verify parsed names/regions/SSO fields match the file contents.
+    mkdirSync(join(configDir, ".aws"));
+    const configContents = `[default]
+region = us-east-1
+
+[profile staging]
+sso_start_url = https://d-stg.awsapps.com/start
+sso_region = eu-west-1
+sso_account_id = 222222222222
+sso_role_name = ReadOnly
+region = eu-west-1
+
+[sso-session my-org]
+sso_start_url = https://d-org.awsapps.com/start
+sso_region = us-west-2
+
+[profile prod]
+sso_session = my-org
+sso_account_id = 111111111111
+sso_role_name = Admin
+region = us-west-2
+`;
+    writeFileSync(join(configDir, ".aws", "config"), configContents);
+
+    const r = (await listTool.handler({})) as {
+      ok: boolean;
+      data?: { configPath?: string; profiles?: AwsProfile[] };
+      error?: string;
+    };
+    assert.equal(r.ok, true, `expected ok=true, got error: ${r.error}`);
+    assert.ok(r.data);
+    assert.match(r.data.configPath ?? "", /[/\\]\.aws[/\\]config$/);
+
+    const profiles = r.data.profiles ?? [];
+    assert.deepEqual(
+      profiles.map((p) => p.name),
+      ["default", "staging", "prod"],
+    );
+
+    const def = profiles.find((p) => p.name === "default");
+    assert.ok(def);
+    assert.equal(def.region, "us-east-1");
+    assert.equal(def.isSso, false);
+    assert.equal(def.ssoStartUrl, undefined);
+
+    const staging = profiles.find((p) => p.name === "staging");
+    assert.ok(staging);
+    assert.equal(staging.region, "eu-west-1");
+    assert.equal(staging.isSso, true);
+    assert.equal(staging.ssoStartUrl, "https://d-stg.awsapps.com/start");
+    assert.equal(staging.ssoRegion, "eu-west-1");
+
+    const prod = profiles.find((p) => p.name === "prod");
+    assert.ok(prod);
+    assert.equal(prod.region, "us-west-2");
+    assert.equal(prod.isSso, true);
+    assert.equal(prod.ssoSession, "my-org");
+    // Inherited from [sso-session my-org]
+    assert.equal(prod.ssoStartUrl, "https://d-org.awsapps.com/start");
+    assert.equal(prod.ssoRegion, "us-west-2");
   });
 });

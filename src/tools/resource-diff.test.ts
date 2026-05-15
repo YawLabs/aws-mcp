@@ -388,6 +388,77 @@ function clone<T>(v: T): T {
   return v === undefined ? v : JSON.parse(JSON.stringify(v));
 }
 
+describe("applyJsonPatch -- whole-document ops (path: '')", () => {
+  // The `path: ""` branch is the RFC 6902 whole-document target. The helper
+  // (a) clones and re-binds `root` for add/replace, (b) throws for remove
+  // (you can't unset the root). Each case below pins one of those branches.
+  it("replace at root swaps the entire document", () => {
+    // before is an object; after is also an object but with completely
+    // different shape -- the patch result must be the value verbatim, not
+    // a merge.
+    const r = applyJsonPatch({ A: 1, B: 2 }, [{ op: "replace", path: "", value: { C: 3 } }]);
+    assert.deepEqual(r, { C: 3 });
+  });
+
+  it("replace at root can swap object for primitive", () => {
+    // The wrapper reassigns its local `doc` so a primitive root is
+    // observable to callers (the comment at _applyJsonPatchInPlace's
+    // top calls this out explicitly).
+    const r = applyJsonPatch({ A: 1 }, [{ op: "replace", path: "", value: "hello" }]);
+    assert.equal(r, "hello");
+  });
+
+  it("add at root behaves the same as replace (sets the document)", () => {
+    // RFC 6902 says add at root replaces the target -- there's no
+    // semantic difference at the root because there's nowhere to insert.
+    const r = applyJsonPatch({ A: 1 }, [{ op: "add", path: "", value: { B: 2 } }]);
+    assert.deepEqual(r, { B: 2 });
+  });
+
+  it("remove at root throws 'Cannot remove the document root'", () => {
+    // The error must name "root" so the caller understands they hit the
+    // whole-document remove branch rather than a missing-key error.
+    assert.throws(() => applyJsonPatch({ A: 1 }, [{ op: "remove", path: "" }]), /Cannot remove the document root/);
+  });
+
+  it("does not mutate the caller's original on whole-document replace", () => {
+    const original = { A: 1 };
+    applyJsonPatch(original, [{ op: "replace", path: "", value: { B: 2 } }]);
+    assert.deepEqual(original, { A: 1 });
+  });
+});
+
+describe("applyJsonPatch -- specific error paths", () => {
+  it("remove on '-' (end-of-array marker) throws 'Cannot remove'", () => {
+    // RFC 6901's '-' is a WRITE-ONLY pointer (append). Remove on it has
+    // no defined target, so the helper must reject it explicitly rather
+    // than silently no-op or pop the last element. The error message
+    // must name '-' so the caller can spot the bad pointer.
+    assert.throws(() => applyJsonPatch({ list: [] }, [{ op: "remove", path: "/list/-" }]), /Cannot remove '-'/);
+  });
+
+  it("intermediate traversal through a non-container (string) throws", () => {
+    // 3+ tokens so the parent-walk loop runs and hits a string in the
+    // middle. /A is a string, so descending into /A/B during the walk
+    // (looking for /A/B/C's parent) hits the else-branch that says
+    // "traverses a non-container value at index i" -- distinct from
+    // the final-token "parent is not a container" message below.
+    assert.throws(
+      () => applyJsonPatch({ A: "string-not-object" }, [{ op: "add", path: "/A/B/C", value: 1 }]),
+      /traverses a non-container value/,
+    );
+  });
+
+  it("intermediate traversal through a non-container (number) throws", () => {
+    // Same branch, different primitive -- guards against the check
+    // being string-specific.
+    assert.throws(
+      () => applyJsonPatch({ A: 42 }, [{ op: "replace", path: "/A/B/C", value: 1 }]),
+      /traverses a non-container value/,
+    );
+  });
+});
+
 describe("aws_resource_diff schema", () => {
   it("accepts a minimal valid input", () => {
     const r = diffTool.inputSchema.safeParse({

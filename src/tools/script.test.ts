@@ -527,6 +527,119 @@ describe("runScript cross-realm error bridging", () => {
   });
 });
 
+describe("runScript log capture limits", () => {
+  it("caps logs.length at MAX_LOG_LINES (500) and flips truncatedLogs when exceeded", async () => {
+    const { handlers } = makeMockHandlers();
+    // 501 console.log lines: the 501st must NOT land in logs, and
+    // truncatedLogs must flip to true. Loop runs inside the sandbox so we
+    // exercise the captureLog path on every call.
+    const r = await runScript(
+      {
+        code: `
+          for (let i = 0; i < 501; i++) console.log("line-" + i);
+          return "done";
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "done");
+    assert.equal(r.logs.length, 500, "logs.length must be capped at MAX_LOG_LINES (500)");
+    assert.equal(r.truncatedLogs, true, "truncatedLogs must flip true once the cap is hit");
+    // The first line is kept; the 501st (index "line-500") is dropped.
+    assert.ok(r.logs[0].includes("line-0"));
+    assert.ok(r.logs[499].includes("line-499"));
+    assert.ok(!r.logs.some((l) => l.includes("line-500")), "line-500 should have been dropped after the cap was hit");
+  });
+
+  it("truncates a single log line over MAX_LOG_LINE_BYTES (4096) with a `... [line truncated]` suffix", async () => {
+    const { handlers } = makeMockHandlers();
+    // 5000-char line: kept content is the first 4096 chars, then the marker.
+    // The total emitted line is `[log] <4096 chars>... [line truncated]`.
+    const r = await runScript(
+      {
+        code: `
+          console.log("x".repeat(5000));
+          return "done";
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "done");
+    assert.equal(r.logs.length, 1);
+    const line = r.logs[0];
+    assert.ok(line.startsWith("[log] "), `expected level prefix, got: ${line.slice(0, 20)}...`);
+    assert.ok(line.endsWith("... [line truncated]"), "expected the truncation suffix on an over-cap line");
+    // 5 char prefix "[log] " (6 with space) + 4096 char payload + suffix.
+    // Anchor on the payload length explicitly so a future refactor of the
+    // prefix doesn't silently flip this assertion.
+    const suffix = "... [line truncated]";
+    const payload = line.slice("[log] ".length, line.length - suffix.length);
+    assert.equal(payload.length, 4096, `expected payload of exactly MAX_LOG_LINE_BYTES (4096), got ${payload.length}`);
+    assert.ok(
+      payload.split("").every((c) => c === "x"),
+      "payload should be the first 4096 chars of the input, unchanged",
+    );
+  });
+
+  it("does NOT truncate a line exactly at the byte limit (boundary case)", async () => {
+    const { handlers } = makeMockHandlers();
+    // The cap path is `text.length > MAX_LOG_LINE_BYTES`, so length == 4096
+    // must pass through untouched. Anchor the boundary so a future `>=`
+    // typo is caught.
+    const r = await runScript(
+      {
+        code: `
+          console.log("x".repeat(4096));
+          return "done";
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.logs.length, 1);
+    assert.ok(
+      !r.logs[0].endsWith("... [line truncated]"),
+      "a line of exactly 4096 chars must not be tagged as truncated",
+    );
+  });
+});
+
+describe("runScript timer cleanup on normal completion", () => {
+  it("does not leak the wall-clock setTimeout handle when a script completes well before timeoutMs", async () => {
+    // Load-bearing: the finally-block `clearTimeout(timer)` must release the
+    // pending timer so a long-running process running many scripts back-to-
+    // back doesn't accumulate one pending handle per call. We assert the
+    // active-handle count is stable across N sequential runs with a very
+    // large timeoutMs -- without clearTimeout the timers would all stay
+    // pending and the handle count would climb by ~N.
+    //
+    // Some Node builds keep a small set of background handles unrelated to
+    // our script (test reporter, GC, etc.); we tolerate a slack of 2.
+    const { handlers } = makeMockHandlers();
+    // Prime: one warm-up run so any first-call lazy-init handles settle
+    // (require resolution caches, vm context init, etc.) before we measure.
+    await runScript({ code: "return 1;", timeoutMs: 300_000 }, handlers);
+
+    const getHandles = (process as unknown as { _getActiveHandles: () => unknown[] })._getActiveHandles;
+    assert.equal(typeof getHandles, "function", "expected process._getActiveHandles in Node");
+
+    const before = getHandles.call(process).length;
+    const RUNS = 20;
+    for (let i = 0; i < RUNS; i++) {
+      // timeoutMs much larger than the script's actual runtime. If the
+      // finally-block clearTimeout were removed, each iteration would leak
+      // one pending setTimeout handle.
+      const r = await runScript({ code: "return 1 + 1;", timeoutMs: 300_000 }, handlers);
+      assert.equal(r.data, 2);
+    }
+    const after = getHandles.call(process).length;
+    const delta = after - before;
+    assert.ok(
+      delta < RUNS / 2,
+      `expected no growth in active handles across ${RUNS} script runs (clearTimeout in finally), got delta=${delta}`,
+    );
+  });
+});
+
 describe("runScript timeouts", () => {
   it("rejects an async wall-clock hang within timeoutMs", async () => {
     // The mock resolves at 200ms, the script timeout fires at 100ms. The

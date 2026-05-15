@@ -91,6 +91,31 @@ describe("startSsoLogin — failure paths", () => {
     assert.match(result.error, /Failed to (spawn|run)|ENOENT/);
   });
 
+  it("settles via the async proc.on('error') handler before URL+code arrive", async () => {
+    // Reliable trigger: Node's child_process.spawn for a nonexistent binary
+    // returns a ChildProcess on both POSIX and Windows, then emits the
+    // 'error' event asynchronously (ENOENT). The sync-throw codepath at
+    // sso.ts:199-205 produces "Failed to spawn ..."; the async handler at
+    // sso.ts:345-371 produces "Failed to run ...". Asserting the async
+    // message variant pins the async handler. Lives in sso.integration
+    // because it requires a real subprocess spawn -- the alternative would
+    // be to factor the handler body into an exported helper like
+    // _ttlKillswitchTick, but the existing real-subprocess "command doesn't
+    // exist" test next door makes this the closer fit.
+    const start = await startSsoLogin("async-err-profile", {
+      command: "this-binary-does-not-exist-async-trigger-yyy",
+      urlWaitMs: 2000,
+    });
+    assert.equal(start.ok, false);
+    if (start.ok) return;
+    assert.match(
+      start.error,
+      /Failed to run/,
+      "async error handler should produce 'Failed to run', not 'Failed to spawn'",
+    );
+    assert.match(start.error, /AWS CLI installed and on PATH/);
+  });
+
   it("returns the URL+code on start, but waitForLogin reports nonzero exit", async () => {
     const start = await startSsoLogin("test-profile", fakeOpts("early_exit_failure", 2000));
     assert.equal(start.ok, true);

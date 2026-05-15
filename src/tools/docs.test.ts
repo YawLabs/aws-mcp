@@ -6,6 +6,7 @@ import {
   extractMainContent,
   htmlToMarkdown,
   isValidDocsUrl,
+  makeDocCache,
   paginateContent,
   parseSearchResults,
 } from "./docs.js";
@@ -411,5 +412,75 @@ describe("aws_docs_* schema", () => {
       readTool.inputSchema.safeParse({ url: "https://docs.aws.amazon.com/x.html", startIndex: -1 }).success,
       false,
     );
+  });
+});
+
+/**
+ * Cache contract pinned at docs.ts:254-279. Two behaviors matter:
+ *   1. LRU eviction at the 16-entry cap (set() drops the oldest insertion).
+ *   2. Move-to-end on read so the cache is true-LRU rather than insertion-
+ *      ordered -- get() re-inserts the entry to make it the freshest.
+ */
+describe("makeDocCache — LRU eviction and recency", () => {
+  it("evicts the oldest entry when the cap is exceeded", () => {
+    const cache = makeDocCache();
+    // Insert 17 entries; cap is 16, so the first insert must be evicted.
+    for (let i = 0; i < 17; i++) {
+      cache.set(`https://docs.aws.amazon.com/url-${i}.html`, `markdown-${i}`);
+    }
+    // The first-inserted URL is now gone.
+    assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), undefined);
+    // All subsequent entries (1..16) are still resident.
+    for (let i = 1; i < 17; i++) {
+      assert.equal(
+        cache.get(`https://docs.aws.amazon.com/url-${i}.html`),
+        `markdown-${i}`,
+        `entry ${i} should still be cached`,
+      );
+    }
+  });
+
+  it("reading an entry refreshes its recency (move-to-end)", () => {
+    const cache = makeDocCache();
+    // Fill exactly to the cap.
+    for (let i = 0; i < 16; i++) {
+      cache.set(`https://docs.aws.amazon.com/url-${i}.html`, `markdown-${i}`);
+    }
+    // Touch url-0 -- this should re-insert it as the newest entry.
+    // Touching multiple times on entries 0, 1, 2, 3 separates them from
+    // the rest so the next eviction targets url-4 (next-oldest after the
+    // refreshed ones), not url-0.
+    assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), "markdown-0");
+    // Now add one more entry. The cap (16) is exceeded by one. The oldest
+    // remaining entry is url-1, which should be evicted -- NOT url-0,
+    // because url-0 was just touched.
+    cache.set("https://docs.aws.amazon.com/url-NEW.html", "markdown-NEW");
+    assert.equal(
+      cache.get("https://docs.aws.amazon.com/url-0.html"),
+      "markdown-0",
+      "url-0 should survive because it was just read",
+    );
+    assert.equal(
+      cache.get("https://docs.aws.amazon.com/url-1.html"),
+      undefined,
+      "url-1 should be evicted as the now-oldest entry",
+    );
+    assert.equal(cache.get("https://docs.aws.amazon.com/url-NEW.html"), "markdown-NEW");
+  });
+
+  it("re-setting an existing URL re-inserts it as the newest (no growth past cap)", () => {
+    const cache = makeDocCache();
+    // Fill to cap with insertion order url-0 .. url-15.
+    for (let i = 0; i < 16; i++) {
+      cache.set(`https://docs.aws.amazon.com/url-${i}.html`, `markdown-${i}`);
+    }
+    // Re-set url-0; per the implementation (delete-then-set), url-0 is
+    // now the newest, not the oldest.
+    cache.set("https://docs.aws.amazon.com/url-0.html", "markdown-0-v2");
+    // Adding one more entry should evict url-1 (now the oldest), not
+    // url-0.
+    cache.set("https://docs.aws.amazon.com/url-NEW.html", "markdown-NEW");
+    assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), "markdown-0-v2");
+    assert.equal(cache.get("https://docs.aws.amazon.com/url-1.html"), undefined);
   });
 });

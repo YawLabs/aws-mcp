@@ -116,6 +116,66 @@ describe("aws_multi_region handler", () => {
     assert.equal(evil.errorKind, "bad_input");
   });
 
+  it("propagates per-region runAwsCall failures through the result envelope (partial failure)", async () => {
+    // End-to-end: the handler invokes runAwsCall per region. The
+    // mr_partial_failure scenario routes us-west-2 to sso_expired and any
+    // other region to a successful JSON payload. The result envelope must
+    // surface okCount=1, errorCount=1, and each entry's {region, ok,
+    // errorKind?, error?, command} shape -- the "partial failure is
+    // expected and surfaced" contract the tool's docstring leans on.
+    const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+    process.env.AWS_MCP_FAKE_SCENARIO = "mr_partial_failure";
+    try {
+      const result = await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        regions: ["us-east-1", "us-west-2"],
+      } as never);
+      assert.equal(result.ok, true);
+      const data = result.data as {
+        regionCount: number;
+        okCount: number;
+        errorCount: number;
+        results: {
+          region: string;
+          ok: boolean;
+          data?: unknown;
+          command?: string;
+          error?: string;
+          errorKind?: string;
+        }[];
+      };
+      assert.equal(data.regionCount, 2);
+      assert.equal(data.okCount, 1);
+      assert.equal(data.errorCount, 1);
+
+      const east = data.results.find((r) => r.region === "us-east-1");
+      const west = data.results.find((r) => r.region === "us-west-2");
+      assert.ok(east, "us-east-1 entry missing");
+      assert.ok(west, "us-west-2 entry missing");
+
+      // Success entry: ok=true, data carries the parsed JSON, command is set,
+      // error/errorKind absent.
+      assert.equal(east.ok, true);
+      assert.ok(east.command && east.command.length > 0, "success entry must carry command");
+      const eastData = east.data as { Buckets: { Name: string }[] };
+      assert.equal(eastData.Buckets[0].Name, "bucket-us-east-1");
+      assert.equal(east.error, undefined);
+      assert.equal(east.errorKind, undefined);
+
+      // Failure entry: ok=false, errorKind=sso_expired, error message present,
+      // command surfaced so the caller can see what was attempted.
+      assert.equal(west.ok, false);
+      assert.equal(west.errorKind, "sso_expired");
+      assert.ok(west.error && west.error.length > 0, "failure entry must carry an error message");
+      assert.ok(west.command && west.command.length > 0, "failure entry must surface the command attempted");
+      assert.equal(west.data, undefined);
+    } finally {
+      if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+      else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+    }
+  });
+
   it("dedupes repeated regions before dispatching", async () => {
     const result = await tool.handler({
       service: "s3api",
