@@ -884,8 +884,13 @@ export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): 
     const parentTokens = tokens.slice(0, -1);
     const lastToken = tokens[tokens.length - 1];
 
-    // Walk to the parent, creating nothing along the way -- if an
-    // intermediate segment is missing, the patch is malformed.
+    // Walk to the parent. For `add` ops only, missing intermediate OBJECT
+    // segments are auto-materialized as `{}` -- CCAPI accepts patches like
+    // `/Environment/Variables/NEW_KEY` even when `/Environment` doesn't
+    // exist yet, and rejecting them would force every caller to pre-stage
+    // empty containers. Array indices are NEVER auto-created (ambiguous --
+    // splice or assign? what fills the gap?); `replace` and `remove` still
+    // require an existing target so a typo can't silently create state.
     let parent: unknown = doc;
     for (let t = 0; t < parentTokens.length; t++) {
       const segment = parentTokens[t];
@@ -897,6 +902,11 @@ export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): 
         parent = parent[idx];
       } else if (isObj(parent)) {
         if (!(segment in parent)) {
+          if (op.op === "add") {
+            parent[segment] = {};
+            parent = parent[segment];
+            continue;
+          }
           throw new Error(`Path '${op.path}' segment '${segment}' does not exist at index ${i}.`);
         }
         parent = parent[segment];
@@ -970,8 +980,32 @@ export interface PatchChange {
  * agent gets a compact diff list without having to compare full Properties
  * trees by hand. For ops we don't implement, the entry surfaces the op name
  * verbatim with no before/after.
+ *
+ * `after` is captured per-op by replaying the patch one step at a time, so
+ * the snapshot reflects what THIS op produced rather than the final
+ * post-patch state. This matters when multiple ops touch the same path
+ * (sequential `replace` on /X, or `remove` then `add` at /X) -- the naive
+ * `resolvePointer(finalAfter, op.path)` would report the final value for
+ * every op and bury the intermediate steps.
+ *
+ * `before` is still resolved against the original pre-patch document --
+ * that's what the user asked to mutate, and reporting "before relative to
+ * the prior op" would conflate change-tracking with replay-tracking.
  */
 export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, after: unknown): PatchChange[] {
+  // Replay ops one at a time against a working copy so we can snapshot the
+  // value at op[i]'s path AFTER op[i] applies but BEFORE op[i+1] applies.
+  // Fall back to the final `after` doc if replay throws -- summarizePatch
+  // is best-effort observability, not a second validation pass.
+  let working: unknown;
+  let replayOk = true;
+  try {
+    working = clone(before);
+  } catch {
+    replayOk = false;
+    working = undefined;
+  }
+
   const out: PatchChange[] = [];
   for (const op of ops) {
     if (op.op === "move" || op.op === "copy" || op.op === "test") {
@@ -982,7 +1016,28 @@ export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, aft
       continue;
     }
     const beforeAt = resolvePointer(before, op.path);
-    let afterAt = resolvePointer(after, op.path);
+
+    let afterAt: unknown;
+    if (replayOk) {
+      try {
+        working = applyJsonPatch(working, [op]);
+        afterAt = resolvePointer(working, op.path);
+      } catch {
+        // Replay diverged from the original applyJsonPatch run (shouldn't
+        // normally happen -- caller already applied the full patch). Stop
+        // replaying and fall back to the final-state snapshot for
+        // remaining ops.
+        replayOk = false;
+        afterAt = resolvePointer(after, op.path);
+      }
+    } else {
+      afterAt = resolvePointer(after, op.path);
+    }
+
+    // `remove` succeeded means the value is gone from the working copy.
+    // resolvePointer returns undefined, which is exactly what we want to
+    // surface -- no special-casing.
+
     // RFC 6901 reserves "-" as the position past the last array element. It
     // names a target slot, not a value, so resolvePointer naturally returns
     // undefined -- leaving the changes entry useless for `add /Tags/-`-style

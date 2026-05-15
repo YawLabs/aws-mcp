@@ -206,18 +206,51 @@ export async function runScript(
     resource: { ...handlers.resource },
   };
 
-  const sandbox: Record<string, unknown> = {
+  // Realm-isolated context: passing an empty object to createContext gives
+  // the script its OWN set of intrinsics (Object, Array, Promise, Error, ...).
+  // A script that does `Object.prototype.polluted = 1` mutates the sandbox
+  // realm's Object, not the host's -- the parent process stays clean. We then
+  // pull JSON / Math / Date / Promise / Array / Object / String / Number /
+  // Boolean / Error / console out of the FRESH context (via runInContext)
+  // and rebind them on the same context so a script that names them as
+  // globals gets the realm-local versions, not the host's.
+  const ctx = createContext(
+    {},
+    {
+      name: "aws_script",
+      codeGeneration: { strings: false, wasm: false },
+    },
+  );
+
+  // Grab the fresh realm's intrinsics. `runInContext` evaluates inside ctx,
+  // so the values returned here are the sandbox's own constructors.
+  const fresh = runInContext("({ JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error })", ctx) as {
+    JSON: typeof JSON;
+    Math: typeof Math;
+    Date: typeof Date;
+    Promise: typeof Promise;
+    Array: typeof Array;
+    Object: typeof Object;
+    String: typeof String;
+    Number: typeof Number;
+    Boolean: typeof Boolean;
+    Error: typeof Error;
+  };
+
+  // Bind realm-local intrinsics + the AWS bridge + console + explicit
+  // shadows onto the context's global object.
+  Object.assign(ctx, {
     aws,
-    JSON,
-    Math,
-    Date,
-    Promise,
-    Array,
-    Object,
-    String,
-    Number,
-    Boolean,
-    Error,
+    JSON: fresh.JSON,
+    Math: fresh.Math,
+    Date: fresh.Date,
+    Promise: fresh.Promise,
+    Array: fresh.Array,
+    Object: fresh.Object,
+    String: fresh.String,
+    Number: fresh.Number,
+    Boolean: fresh.Boolean,
+    Error: fresh.Error,
     console: {
       log: captureLog("log"),
       info: captureLog("info"),
@@ -227,8 +260,8 @@ export async function runScript(
     },
     // Node injects a handful of host globals into every new vm context
     // (Buffer, the timer APIs, queueMicrotask, AbortController, ...). The
-    // ones that hand out filesystem / event-loop / process access are
-    // explicitly shadowed here so `typeof Buffer === "undefined"` inside
+    // ones that hand out filesystem / event-loop / process / network access
+    // are explicitly shadowed here so `typeof Buffer === "undefined"` inside
     // the script -- a model that asks for them gets a ReferenceError.
     Buffer: undefined,
     process: undefined,
@@ -242,11 +275,16 @@ export async function runScript(
     queueMicrotask: undefined,
     global: undefined,
     globalThis: undefined,
-  };
-
-  const ctx = createContext(sandbox, {
-    name: "aws_script",
-    codeGeneration: { strings: false, wasm: false },
+    // README claims no network access. node:vm doesn't inject fetch by
+    // default, but Node's behaviour here has changed before -- shadow the
+    // whole fetch surface explicitly so the contract is enforced by code,
+    // not by a runtime default.
+    fetch: undefined,
+    Request: undefined,
+    Response: undefined,
+    Headers: undefined,
+    AbortController: undefined,
+    AbortSignal: undefined,
   });
 
   const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);

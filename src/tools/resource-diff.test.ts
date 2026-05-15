@@ -185,6 +185,71 @@ describe("summarizePatch", () => {
     assert.equal(changes[0].before, undefined);
     assert.deepEqual(changes[0].after, { Key: "k2", Value: "v2" });
   });
+
+  it("reports per-op `after` for sequential replace on the same path", () => {
+    // Two replaces on /X: op 0 sets it to 1, op 1 sets it to 2. The naive
+    // implementation (resolve against final `after` doc) would report
+    // after=2 for both ops. Per-op replay must show op 0 -> 1, op 1 -> 2.
+    const before = { X: 0 };
+    const after = { X: 2 };
+    const changes = summarizePatch(
+      [
+        { op: "replace", path: "/X", value: 1 },
+        { op: "replace", path: "/X", value: 2 },
+      ],
+      before,
+      after,
+    );
+    assert.equal(changes.length, 2);
+    assert.deepEqual(changes[0], { op: "replace", path: "/X", before: 0, after: 1 });
+    assert.deepEqual(changes[1], { op: "replace", path: "/X", before: 0, after: 2 });
+  });
+
+  it("reports remove-then-add at same path with op 0 after = undefined", () => {
+    // After op 0 (remove /X), the path is absent -- op 0's `after` must
+    // reflect that, not the value op 1 puts back.
+    const before = { X: "old" };
+    const after = { X: "new" };
+    const changes = summarizePatch(
+      [
+        { op: "remove", path: "/X" },
+        { op: "add", path: "/X", value: "new" },
+      ],
+      before,
+      after,
+    );
+    assert.equal(changes.length, 2);
+    assert.deepEqual(changes[0], { op: "remove", path: "/X", before: "old", after: undefined });
+    assert.deepEqual(changes[1], { op: "add", path: "/X", before: "old", after: "new" });
+  });
+});
+
+describe("applyJsonPatch -- add auto-creates missing object parents", () => {
+  it("creates intermediate objects when adding through a missing parent", () => {
+    // CCAPI accepts /Environment/Variables/NEW even when /Environment is
+    // absent. RFC 6902 is strict; we relax for `add` only.
+    const r = applyJsonPatch({}, [{ op: "add", path: "/Environment/Variables/NEW_KEY", value: "v" }]);
+    assert.deepEqual(r, { Environment: { Variables: { NEW_KEY: "v" } } });
+  });
+
+  it("creates intermediate objects when partial parent chain exists", () => {
+    const r = applyJsonPatch({ Environment: {} }, [{ op: "add", path: "/Environment/Variables/NEW_KEY", value: "v" }]);
+    assert.deepEqual(r, { Environment: { Variables: { NEW_KEY: "v" } } });
+  });
+
+  it("does NOT auto-create when traversing an empty array (index 0 missing)", () => {
+    // `/list/0/foo` with /list present but empty: index 0 is out of
+    // bounds, and array indices must never be auto-created. Must throw.
+    assert.throws(() => applyJsonPatch({ list: [] }, [{ op: "add", path: "/list/0/foo", value: 1 }]));
+  });
+
+  it("replace still rejects a missing intermediate path", () => {
+    assert.throws(() => applyJsonPatch({}, [{ op: "replace", path: "/Environment/Variables/X", value: 1 }]));
+  });
+
+  it("remove still rejects a missing intermediate path", () => {
+    assert.throws(() => applyJsonPatch({}, [{ op: "remove", path: "/Environment/Variables/X" }]));
+  });
 });
 
 describe("aws_resource_diff schema", () => {

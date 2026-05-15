@@ -257,6 +257,86 @@ describe("runScript sandbox isolation", () => {
     );
     assert.deepEqual(plain(r.data), { evalBlocked: true, funcBlocked: true });
   });
+
+  it("script-side prototype pollution does NOT leak to host Object.prototype", async () => {
+    const { handlers } = makeMockHandlers();
+    // Make sure host is clean going in. If a previous run leaked, fail loudly.
+    assert.equal(
+      (Object.prototype as Record<string, unknown>).polluted_by_aws_script,
+      undefined,
+      "host Object.prototype is dirty before the test runs -- earlier leak?",
+    );
+    const r = await runScript(
+      {
+        code: `
+          Object.prototype.polluted_by_aws_script = "yes";
+          // From inside the sandbox, the script's own Object IS polluted.
+          const innerSees = ({}).polluted_by_aws_script;
+          return innerSees;
+        `,
+      },
+      handlers,
+    );
+    // The sandbox's own realm sees the pollution -- that's expected.
+    assert.equal(r.data, "yes");
+    // The host's Object.prototype must NOT see it.
+    assert.equal(
+      (Object.prototype as Record<string, unknown>).polluted_by_aws_script,
+      undefined,
+      "sandbox prototype pollution leaked into host Object.prototype",
+    );
+  });
+
+  it("does not expose fetch / Request / Response / Headers / AbortController / AbortSignal", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          return {
+            fetch: typeof fetch,
+            Request: typeof Request,
+            Response: typeof Response,
+            Headers: typeof Headers,
+            AbortController: typeof AbortController,
+            AbortSignal: typeof AbortSignal,
+          };
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), {
+      fetch: "undefined",
+      Request: "undefined",
+      Response: "undefined",
+      Headers: "undefined",
+      AbortController: "undefined",
+      AbortSignal: "undefined",
+    });
+  });
+
+  it("realm-local Math / JSON / Date / Promise / console still work", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          const mathOk = Math.max(1, 2, 3) === 3 && typeof Math.PI === "number";
+          const jsonOk = JSON.parse(JSON.stringify({ a: 1 })).a === 1;
+          const dateOk = typeof (new Date()).getTime() === "number" && typeof Date.now() === "number";
+          const promiseOk = (await Promise.resolve(7)) === 7;
+          console.log("hello from realm");
+          return { mathOk, jsonOk, dateOk, promiseOk };
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), {
+      mathOk: true,
+      jsonOk: true,
+      dateOk: true,
+      promiseOk: true,
+    });
+    assert.ok(r.logs.some((l) => l.includes("hello from realm")));
+  });
 });
 
 describe("runScript paginateAll", () => {

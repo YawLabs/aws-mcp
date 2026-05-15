@@ -20,8 +20,13 @@ describe("classifyAuthError — SDK patterns", () => {
     assert.equal(classifyAuthError(err).kind, "sso_expired");
   });
 
-  it("detects 'token is expired' phrasing", () => {
-    const err = new Error("Provided token is expired");
+  it("detects 'Token has expired and refresh failed' (TokenRetrievalError content)", () => {
+    // botocore/tokens.py DeferredRefreshableToken._protected_refresh raises
+    // TokenRetrievalError with error_msg="Token has expired and refresh failed"
+    // when a mandatory refresh on an expired SSO token fails. The CLI surfaces
+    // it as "Error when retrieving token from sso: Token has expired and
+    // refresh failed".
+    const err = new Error("Error when retrieving token from sso: Token has expired and refresh failed");
     assert.equal(classifyAuthError(err).kind, "sso_expired");
   });
 
@@ -46,6 +51,56 @@ describe("classifyAuthError — CLI stderr patterns", () => {
   it("detects 'Unable to locate credentials' CLI output", () => {
     const err = new Error("Unable to locate credentials. You can configure credentials by running 'aws configure'.");
     assert.equal(classifyAuthError(err).kind, "no_creds");
+  });
+});
+
+describe("classifyAuthError — canonical AWS SSO messages", () => {
+  // Sources for the messages below:
+  //   botocore/exceptions.py: SSOTokenLoadError.fmt,
+  //     UnauthorizedSSOTokenError.fmt, TokenRetrievalError.fmt
+  //   botocore/tokens.py: DeferredRefreshableToken._protected_refresh
+
+  it("detects SSOTokenLoadError prefix (Error loading SSO Token:)", () => {
+    const err = new Error("Error loading SSO Token: Token for my-profile has expired.");
+    assert.equal(classifyAuthError(err).kind, "sso_expired");
+  });
+
+  it("detects UnauthorizedSSOTokenError full sentence", () => {
+    const err = new Error(
+      "The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.",
+    );
+    assert.equal(classifyAuthError(err).kind, "sso_expired");
+  });
+
+  it("detects TokenRetrievalError 'Token has expired and refresh failed'", () => {
+    const err = new Error("Error when retrieving token from sso: Token has expired and refresh failed");
+    assert.equal(classifyAuthError(err).kind, "sso_expired");
+  });
+});
+
+describe("classifyAuthError — false-positive guards", () => {
+  it("does NOT classify a benign sentence that happens to contain SSO/session/expired words", () => {
+    // Regression guard: the old SSO_EXPIRED_RE used /SSO[^\n]{0,80}session
+    // [^\n]{0,80}(?:expired|invalid)/ which matched this string and sent
+    // users on a wild goose chase to re-run `aws sso login`.
+    const err = new Error("SSO admin's session expired the parameter named foo");
+    assert.equal(classifyAuthError(err).kind, "other");
+  });
+
+  it("does NOT classify a bare ExpiredToken STS error (no name set)", () => {
+    // The STS-side ExpiredToken error code is surfaced via the standard
+    // `An error occurred (ExpiredToken) when calling ...` shape and handled
+    // by parseAwsError -- not classifyAuthError. As a bare message with no
+    // `err.name = "ExpiredTokenException"`, it must fall through to "other".
+    const err = new Error(
+      "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired",
+    );
+    assert.equal(classifyAuthError(err).kind, "other");
+  });
+
+  it("does NOT classify random text mentioning 'token' and 'expired' far apart", () => {
+    const err = new Error("the API token for the upstream service has been rotated; the cache entry expired");
+    assert.equal(classifyAuthError(err).kind, "other");
   });
 });
 

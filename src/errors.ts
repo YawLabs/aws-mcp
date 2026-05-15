@@ -14,13 +14,40 @@
 
 export type AuthErrorKind = "sso_expired" | "no_creds" | "other";
 
-// All gaps are bounded with `[^\n]{0,N}` so the regex can't span unrelated
-// log lines or run away on long stderr blobs that happen to mention both
-// "sso/session/token" and "expired/invalid" far apart. The 80/40-char
-// budgets are comfortably wider than every real CLI string seen in
-// errors.test.ts; tighten further if a benign false-positive shows up.
-const SSO_EXPIRED_RE =
-  /SSOTokenProviderFailure|SSO[^\n]{0,80}session[^\n]{0,80}(?:expired|invalid)|token[^\n]{0,40}is\s+expired|no cached sso token|error loading sso token/i;
+// Anchor on the exact strings botocore/aws-cli emit so we don't false-positive
+// on stderr that mentions "SSO", "session", and "expired" in unrelated
+// contexts (e.g. "SSO admin's session expired the parameter named foo").
+//
+// Canonical sources (botocore/exceptions.py):
+//   - SSOTokenLoadError.fmt
+//       "Error loading SSO Token: {error_msg}"
+//     where {error_msg} is e.g. "Token for my-profile is expired."
+//   - UnauthorizedSSOTokenError.fmt
+//       "The SSO session associated with this profile has expired or is
+//        otherwise invalid. To refresh this SSO session run aws sso login
+//        with the corresponding profile."
+//   - TokenRetrievalError.fmt
+//       "Error when retrieving token from {provider}: {error_msg}"
+//     where {provider}="sso" and {error_msg}="Token has expired and refresh
+//     failed" comes from DeferredRefreshableToken._protected_refresh in
+//     botocore/tokens.py when a mandatory refresh fails on an expired token.
+//
+// The SDK throws an Error subclass named SSOTokenProviderFailure for the
+// same family; we match that by name above the regex check.
+const SSO_EXPIRED_PATTERNS: RegExp[] = [
+  // "Error loading SSO Token: ..." -- the prefix is the load() failure;
+  // the rest is variable (profile name, expiry phrasing) but the prefix is
+  // a deterministic anchor.
+  /Error loading SSO Token:/,
+  // UnauthorizedSSOTokenError -- the "associated with this profile" wording
+  // is distinctive enough that it can't reasonably collide with unrelated
+  // stderr. We don't require the full sentence in case a wrapper truncates.
+  /The SSO session associated with this profile/,
+  // TokenRetrievalError content for the sso provider. The full CLI shape is
+  // "Error when retrieving token from sso: Token has expired and refresh
+  // failed". The trailing fragment alone is specific enough.
+  /Token has expired and refresh failed/,
+];
 const NO_CREDS_RE = /CredentialsProviderError|could not load credentials|no identity|unable to locate credentials/i;
 
 export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message: string } {
@@ -28,7 +55,11 @@ export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message:
   const name = err instanceof Error ? err.name : "";
   const blob = `${name}: ${message}`;
 
-  if (SSO_EXPIRED_RE.test(blob) || name === "ExpiredTokenException") {
+  if (
+    name === "SSOTokenProviderFailure" ||
+    name === "ExpiredTokenException" ||
+    SSO_EXPIRED_PATTERNS.some((re) => re.test(blob))
+  ) {
     return { kind: "sso_expired", message };
   }
   if (NO_CREDS_RE.test(blob)) {

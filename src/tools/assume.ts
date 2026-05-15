@@ -1,10 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
-import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { z } from "zod";
+import { runAwsCall } from "../aws-cli.js";
 import { upsertProfile } from "../aws-credentials.js";
-import { classifyAuthError } from "../errors.js";
 import { getProfile, getRegion } from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
 
@@ -18,6 +16,26 @@ function resolveTargetProfile(input: { targetProfile?: string; sessionName: stri
     return input.targetProfile.startsWith("mcp-") ? input.targetProfile : `mcp-${input.targetProfile}`;
   }
   return `mcp-${input.sessionName}`;
+}
+
+/**
+ * Shape returned by `aws sts assume-role --output json`. We only consume
+ * Credentials + AssumedRoleUser; the CLI also includes PackedPolicySize
+ * and ResponseMetadata that we ignore.
+ */
+interface AssumeRoleCliResponse {
+  Credentials?: {
+    AccessKeyId?: string;
+    SecretAccessKey?: string;
+    SessionToken?: string;
+    // ISO 8601 string when --output json is used. The SDK returned a Date,
+    // but the CLI emits the string directly so we don't need to convert.
+    Expiration?: string;
+  };
+  AssumedRoleUser?: {
+    Arn?: string;
+    AssumedRoleId?: string;
+  };
 }
 
 export const assumeTools: readonly Tool[] = [
@@ -74,53 +92,72 @@ export const assumeTools: readonly Tool[] = [
       const useRegion = i.region || getRegion();
       const targetProfile = resolveTargetProfile({ targetProfile: i.targetProfile, sessionName: i.sessionName });
 
-      try {
-        const client = new STSClient({
-          region: useRegion,
-          credentials: fromNodeProviderChain({ profile: sourceProfile }),
-        });
-        const result = await client.send(
-          new AssumeRoleCommand({
-            RoleArn: i.roleArn,
-            RoleSessionName: i.sessionName,
-            DurationSeconds: i.durationSeconds ?? 3600,
-            ExternalId: i.externalId,
-          }),
-        );
-        const creds = result.Credentials;
-        if (!creds?.AccessKeyId || !creds.SecretAccessKey || !creds.SessionToken) {
-          return { ok: false, error: "STS AssumeRole succeeded but returned incomplete credentials." };
-        }
+      // Shell out to `aws sts assume-role` rather than using the in-process
+      // SDK. The SDK's fromNodeProviderChain occasionally diverges from the
+      // CLI for profiles that use `credential_process` (the standard SAML
+      // escape hatch) or non-Identity-Center SSO -- mirroring how every
+      // other tool in this server reaches AWS keeps the "SAML works because
+      // we shell out" story consistent. Inputs are sent via --cli-input-json
+      // (no argv positionals), so RoleArn / RoleSessionName / ExternalId
+      // can't pose as flags.
+      const params: Record<string, unknown> = {
+        RoleArn: i.roleArn,
+        RoleSessionName: i.sessionName,
+        DurationSeconds: i.durationSeconds ?? 3600,
+      };
+      if (i.externalId !== undefined) {
+        params.ExternalId = i.externalId;
+      }
 
-        const credentialsPath = join(homedir(), ".aws", "credentials");
-        upsertProfile(credentialsPath, targetProfile, {
-          aws_access_key_id: creds.AccessKeyId,
-          aws_secret_access_key: creds.SecretAccessKey,
-          aws_session_token: creds.SessionToken,
-        });
+      const result = await runAwsCall({
+        service: "sts",
+        operation: "assume-role",
+        params,
+        profile: sourceProfile,
+        region: useRegion,
+        outputFormat: "json",
+      });
 
-        return {
-          ok: true,
-          data: {
-            profile: targetProfile,
-            credentialsPath,
-            expiration: creds.Expiration?.toISOString(),
-            assumedRoleArn: result.AssumedRoleUser?.Arn,
-            assumedRoleId: result.AssumedRoleUser?.AssumedRoleId,
-            sourceProfile,
-            hint: `Pass profile='${targetProfile}' to subsequent aws_call / aws_whoami / aws_paginate calls to use these credentials. They expire at ${creds.Expiration?.toISOString() ?? "unknown"}.`,
-          },
-        };
-      } catch (err) {
-        const classified = classifyAuthError(err);
-        if (classified.kind === "sso_expired") {
+      if (!result.ok) {
+        // runAwsCall already classified auth-class failures; rewrite the
+        // sso_expired hint to name the source profile (the CLI's stderr
+        // mentions whichever profile it failed to load, but the caller
+        // cares about the assuming identity specifically).
+        if (result.kind === "sso_expired") {
           return {
             ok: false,
             error: `SSO session expired for source profile '${sourceProfile}'. Call aws_login_start with profile='${sourceProfile}' before assuming.`,
           };
         }
-        return { ok: false, error: classified.message };
+        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
       }
+
+      const data = (result.data ?? {}) as AssumeRoleCliResponse;
+      const creds = data.Credentials;
+      if (!creds?.AccessKeyId || !creds.SecretAccessKey || !creds.SessionToken) {
+        return { ok: false, error: "STS AssumeRole succeeded but returned incomplete credentials." };
+      }
+
+      const credentialsPath = join(homedir(), ".aws", "credentials");
+      upsertProfile(credentialsPath, targetProfile, {
+        aws_access_key_id: creds.AccessKeyId,
+        aws_secret_access_key: creds.SecretAccessKey,
+        aws_session_token: creds.SessionToken,
+      });
+
+      const expiration = creds.Expiration;
+      return {
+        ok: true,
+        data: {
+          profile: targetProfile,
+          credentialsPath,
+          expiration,
+          assumedRoleArn: data.AssumedRoleUser?.Arn,
+          assumedRoleId: data.AssumedRoleUser?.AssumedRoleId,
+          sourceProfile,
+          hint: `Pass profile='${targetProfile}' to subsequent aws_call / aws_whoami / aws_paginate calls to use these credentials. They expire at ${expiration ?? "unknown"}.`,
+        },
+      };
     },
   },
 ];

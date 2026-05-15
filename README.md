@@ -73,7 +73,7 @@ The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-regio
 | Tool | What it does |
 |------|--------------|
 | `aws_whoami` | Current identity (account, ARN) + SSO token expiry countdown. Call this first. |
-| `aws_login_start` | Start `aws sso login --no-browser`, returns a verification URL + 8-character code and a `sessionId`. |
+| `aws_login_start` | Start `aws sso login --no-browser`, returns a verification URL + short code and a `sessionId`. |
 | `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity. |
 | `aws_refresh_if_expiring_soon` | Check the cached SSO token and auto-start a refresh when < `thresholdMinutes` remain (default 10). One round-trip for "am I about to expire? if so, re-login." |
 | `aws_session_set` | Set the default profile and/or region for the rest of this MCP session. "Switch to prod," "use us-west-2." |
@@ -90,7 +90,7 @@ The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-regio
 | `aws_resource_update` | Update an AWS resource via CCAPI using RFC 6902 JSON Patch. Same async + `awaitCompletion` shape as create. |
 | `aws_resource_delete` | Delete an AWS resource via CCAPI. Same async + `awaitCompletion` shape as create. Destructive — verify `identifier` first. |
 | `aws_resource_status` | Poll an async CCAPI request by `requestToken`. Returns the current state with `operationStatus`, `identifier`, `errorCode`, `statusMessage` flat-promoted (PENDING / IN_PROGRESS / SUCCESS / FAILED / CANCEL_*). |
-| `aws_resource_diff` | Dry-run a CCAPI update: fetches current state, simulates the JSON Patch in memory, returns `{before, after, changes[]}`. No mutation sent to AWS. Supports the add/remove/replace subset of RFC 6902 -- enough for the vast majority of CCAPI updates. Call before `aws_resource_update` when you want to verify the patch does what you expect. |
+| `aws_resource_diff` | Dry-run a CCAPI update: fetches current state, simulates the JSON Patch in memory, returns `{before, after, changes[]}`. No mutation sent to AWS. Supports the add/remove/replace subset of RFC 6902; `add` auto-creates missing object parents to match CCAPI's actual update semantics (so patches like `/Environment/Variables/NEW_KEY` work even when `/Environment/Variables` doesn't exist yet). `changes[i].after` reflects what op `i` produced (not the final post-patch state), so sequential ops on the same path read correctly. Call before `aws_resource_update` when you want to verify the patch does what you expect. |
 | `aws_multi_region` | Run the same AWS operation across N regions in parallel. Same shape as `aws_call` but takes `regions: string[]`. Returns `{region, ok, data?, error?}[]` with `okCount`/`errorCount`. Partial failure is expected (services aren't everywhere, perms may be region-scoped). |
 | `aws_script` | Run a short JS snippet that orchestrates the other tools and returns a combined result. Sandbox exposes `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.{get,list,create,update,delete,status}`, `aws.logsTail`, plus standard JS builtins (`JSON`, `Math`, `Date`, `Promise`, etc.) and `console`. No `require`/`import`/`process`/`fs`/`fetch`/timers. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise be N round-trips. Use `return <value>` to surface a result. Not a security sandbox -- treat the same as any other tool the model can call. |
 | `aws_iam_simulate` | Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide). Use BEFORE a risky operation to avoid a 403 -- pairs with the post-failure Suggestion from aws_call. Requires `iam:SimulatePrincipalPolicy` on the caller. |
@@ -218,6 +218,10 @@ For multi-region reads:
 |----------|---------|---------|
 | `AWS_PROFILE` | `default` | Profile used when a tool call omits `profile`. |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | Region used when a tool call omits `region`. `AWS_REGION` wins if both are set. |
+
+If you authenticate via SAML (Okta / Azure AD / ADFS) or a custom `credential_process`, set `AWS_PROFILE` to that profile. The server passes `--profile` through to the AWS CLI, so the CLI's standard credential chain -- `credential_process`, SSO sessions, role chaining, static keys, IMDS -- resolves as usual.
+
+If neither `AWS_PROFILE` is set nor `aws_session_set` has been called and there's no `[default]` section in `~/.aws/config`, tools will fail with `ProfileNotFound`. Set `AWS_PROFILE` in your MCP config to your usual working profile.
 
 ## How the SSO login flow works
 

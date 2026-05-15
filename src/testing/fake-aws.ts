@@ -315,6 +315,50 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "assume_role_success": {
+      // Mimics `aws sts assume-role --output json` on a successful assume.
+      // Mirrors the real CLI shape: Credentials, AssumedRoleUser, PackedPolicySize.
+      process.stdout.write(
+        `${JSON.stringify({
+          Credentials: {
+            AccessKeyId: "ASIA1234EXAMPLE",
+            SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            SessionToken: "FQoGZXIvYXdzEXAMPLETOKENBLAHBLAH",
+            Expiration: "2099-12-31T23:59:59+00:00",
+          },
+          AssumedRoleUser: {
+            AssumedRoleId: "AROA1234EXAMPLE:my-session",
+            Arn: "arn:aws:sts::123456789012:assumed-role/Admin/my-session",
+          },
+          PackedPolicySize: 6,
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "assume_role_incomplete": {
+      // CLI returns 0 but the Credentials block is missing required fields --
+      // tests the post-success defensive guard in the handler.
+      process.stdout.write(
+        `${JSON.stringify({
+          Credentials: { AccessKeyId: "ASIA1234EXAMPLE" },
+          AssumedRoleUser: { Arn: "arn:aws:sts::123:assumed-role/Admin/sess" },
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "assume_role_access_denied": {
+      // Real-world shape for an unauthorized AssumeRole call.
+      process.stderr.write(
+        "An error occurred (AccessDenied) when calling the AssumeRole operation: User: arn:aws:iam::123456789012:user/jeff is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::999999999999:role/NoSuchRole\n",
+      );
+      process.exit(255);
+      return;
+    }
+
     case "iam_simulate_implicit_deny": {
       // No matching statement at all -- the result is implicitDeny.
       process.stdout.write(
