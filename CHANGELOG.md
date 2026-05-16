@@ -11,6 +11,19 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-05-16
+
+### Fixed
+- README Stability section was missing or mis-documenting 5 tools'
+  success-envelope shapes. The omissions (`aws_login_complete`,
+  `aws_session_set`, `aws_session_clear`, `aws_list_profiles`) and the
+  mis-document (`aws_refresh_if_expiring_soon` lumped with
+  `aws_login_start` despite returning one of two distinct shapes
+  discriminated by `status`) would have left callers writing against
+  undocumented shapes the 1.x contract didn't actually promise. Also
+  added `aws_script`, `aws_docs_search`, `aws_docs_read` shapes
+  (previously missing). All shapes verified against the actual handlers.
+
 ## [1.0.0] - 2026-05-16
 
 **API stability commitment.** From this version onward the public tool shapes
@@ -251,7 +264,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/YawLabs/aws-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/YawLabs/aws-mcp/compare/v0.9.10...v1.0.0
 [0.9.10]: https://github.com/YawLabs/aws-mcp/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/YawLabs/aws-mcp/compare/v0.9.8...v0.9.9
