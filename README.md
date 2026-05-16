@@ -84,6 +84,7 @@ The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-regio
 | `aws_call` | Run any AWS API operation. `service: 's3api', operation: 'list-buckets'`, optional `params` (PascalCase JSON), optional `query` (JMESPath). Returns parsed JSON. |
 | `aws_paginate` | Fetch one page of a paginated list/describe operation. Supports `query` too. Returns `nextToken`/`hasMore`; call again with the token to continue. |
 | `aws_logs_tail` | Fetch recent CloudWatch Logs events for a log group. Wraps `aws logs tail --format json` with `since`, `filterPattern`, and stream-name filters; returns events as a parsed array. |
+| `aws_metrics_query` | Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API). Pass `queries: [{id, namespace, metricName, dimensions?, statistic?, period?}]` or expression-based queries; `startTime`/`endTime` accept ISO 8601 or relative shorthand (`'15m'`, `'1h'`, `'1d'`). Period auto-picks from the time range. Returns `{series, periodSeconds, messages?}`. |
 | `aws_resource_get` | Read an AWS resource via Cloud Control API by `typeName` + `identifier` (e.g. `AWS::Lambda::Function` + function name). Returns parsed Properties. |
 | `aws_resource_list` | List resources of a type via CCAPI, paginated. Returns `{identifier, properties}` per entry plus a `nextToken`/`hasMore`. |
 | `aws_resource_create` | Create an AWS resource via CCAPI. Async — returns top-level `requestToken` + `operationStatus`. Pass `awaitCompletion: true` to have the server poll to terminal state in one call. |
@@ -247,7 +248,7 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 
 **Stable in 1.x (anything below is a breaking change requiring a major bump):**
 
-- **Tool names** -- the 24 tool names listed in the Tools table above will not be renamed or removed.
+- **Tool names** -- the 25 tool names listed in the Tools table above will not be renamed or removed.
 - **Tool annotations** -- `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. These signal to MCP hosts how to gate calls; flipping them silently would break host UIs.
 - **Required input fields** -- the required fields per tool will not change shape or be removed. New *optional* fields may be added.
 - **Success envelope shape per tool** -- the `data` object on `{ok: true, data}` responses, specifically:
@@ -266,6 +267,7 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
   - `aws_resource_create` / `_update` / `_delete` / `_status` -> flat-promoted `{command, requestToken, operationStatus, identifier, errorCode, statusMessage, retryAfter, progressEvent}` plus an `awaited: {attempts, elapsedMs}` block when `awaitCompletion: true` was passed
   - `aws_resource_diff` -> `{command, typeName, identifier, before, after, changes, changeCount}`
   - `aws_logs_tail` -> `{command, logGroupName, since, eventCount, events}`
+  - `aws_metrics_query` -> `{command, startTime, endTime, periodSeconds, series: [{id, label?, timestamps, values, statusCode?}], messages?: [{code?, value?}]}` (`messages` is omitted when empty; per-series `label` / `statusCode` are present when CloudWatch returns them)
   - `aws_iam_simulate` -> `{command, principalArn, summary: {allowed, denied, total}, results, evaluationResults}`
   - `aws_script` -> `{result, logs, truncatedLogs, durationMs}` where `result` is whatever the script `return`ed (any JSON-serializable value, including `undefined`)
   - `aws_docs_search` -> `{query, count, results: [{title, url, summary?, excerpt?}]}` (`summary` / `excerpt` are present only when the upstream search backend returns them)

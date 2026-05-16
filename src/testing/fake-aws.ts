@@ -523,6 +523,104 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "metrics_success": {
+      // Realistic GetMetricData response with two series: one CPUUtilization
+      // (regular metric-stat) and one expression-derived (uses same Timestamps
+      // axis). Mirrors what CloudWatch emits for a typical "show CPU + load
+      // over 1h" query.
+      process.stdout.write(
+        `${JSON.stringify({
+          MetricDataResults: [
+            {
+              Id: "cpu",
+              Label: "CPUUtilization",
+              Timestamps: ["2026-05-16T11:00:00Z", "2026-05-16T10:55:00Z", "2026-05-16T10:50:00Z"],
+              Values: [42.5, 38.1, 35.7],
+              StatusCode: "Complete",
+            },
+            {
+              Id: "expr",
+              Label: "cpu_x2",
+              Timestamps: ["2026-05-16T11:00:00Z", "2026-05-16T10:55:00Z", "2026-05-16T10:50:00Z"],
+              Values: [85.0, 76.2, 71.4],
+              StatusCode: "Complete",
+            },
+          ],
+          Messages: [],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "metrics_empty": {
+      // CloudWatch returns the MetricDataResults envelope with empty
+      // Timestamps/Values when no datapoints exist in the window. The series
+      // entry still appears so callers can tell "the query ran but returned
+      // nothing" vs "the query never executed."
+      process.stdout.write(
+        `${JSON.stringify({
+          MetricDataResults: [
+            {
+              Id: "cpu",
+              Label: "CPUUtilization",
+              Timestamps: [],
+              Values: [],
+              StatusCode: "Complete",
+            },
+          ],
+          Messages: [],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "metrics_partial_data": {
+      // StatusCode='PartialData' when CloudWatch truncated -- the agent
+      // should surface this so a caller knows their datapoints aren't the
+      // full picture.
+      process.stdout.write(
+        `${JSON.stringify({
+          MetricDataResults: [
+            {
+              Id: "cpu",
+              Label: "CPUUtilization",
+              Timestamps: ["2026-05-16T11:00:00Z"],
+              Values: [42.5],
+              StatusCode: "PartialData",
+            },
+          ],
+          Messages: [{ Code: "MaxMetricsExceeded", Value: "Maximum allowed metrics exceeded" }],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "metrics_bad_metric": {
+      // Real-world shape for an invalid namespace or malformed query.
+      process.stderr.write(
+        "An error occurred (ValidationError) when calling the GetMetricData operation: The parameter MetricDataQueries.member.1.MetricStat.Metric.Namespace is required.\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "metrics_echo_argv": {
+      // Capture-and-echo variant: dump argv to AWS_MCP_FAKE_ARGV_OUT so tests
+      // can verify the --cli-input-json payload includes the right
+      // MetricDataQueries shape. Returns an empty-but-valid response.
+      const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
+      if (outPath) {
+        const fs = await import("node:fs");
+        fs.writeFileSync(outPath, JSON.stringify(process.argv.slice(2)));
+      }
+      process.stdout.write(`${JSON.stringify({ MetricDataResults: [], Messages: [] })}\n`);
+      process.exit(0);
+      return;
+    }
+
     case "iam_sim_echo_argv": {
       // Capture-and-echo variant for iam_simulate: writes the full argv as
       // JSON to the path in AWS_MCP_FAKE_ARGV_OUT (side channel that survives

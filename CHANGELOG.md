@@ -11,6 +11,23 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-16
+
+### Added
+- `aws_metrics_query` -- query CloudWatch metrics via GetMetricData (the
+  modern multi-metric / expression-capable API; not the legacy
+  get-metric-statistics). Accepts a flat array of `{id, namespace,
+  metricName, dimensions?, statistic?, period?}` or expression-based
+  `{id, expression}` queries and shapes them into CloudWatch's nested
+  PascalCase MetricDataQueries payload. `startTime`/`endTime` accept
+  ISO 8601 or the same relative shorthand as `aws_logs_tail`'s `since`
+  flag (`'15m'`, `'1h'`, `'1d'`, `'1w'`); `endTime` defaults to `'now'`.
+  Period auto-picks from the time range (60s/300s/900s/3600s) to stay
+  under CloudWatch's ~100,800-datapoint response cap. Returns
+  `{command, startTime, endTime, periodSeconds, series, messages?}`.
+  Pairs with `aws_logs_tail` for the metric side of the same
+  observability question the agent gets asked all the time.
+
 ## [1.0.2] - 2026-05-16
 
 ### Fixed
@@ -275,7 +292,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/YawLabs/aws-mcp/compare/v1.0.2...v1.1.0
 [1.0.2]: https://github.com/YawLabs/aws-mcp/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/YawLabs/aws-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/YawLabs/aws-mcp/compare/v0.9.10...v1.0.0

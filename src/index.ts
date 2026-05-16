@@ -8,6 +8,7 @@ import { callTools } from "./tools/call.js";
 import { docsTools } from "./tools/docs.js";
 import { iamSimulateTools } from "./tools/iam-simulate.js";
 import { logsTools } from "./tools/logs.js";
+import { metricsTools } from "./tools/metrics.js";
 import { multiRegionTools } from "./tools/multi-region.js";
 import { paginateTools } from "./tools/paginate.js";
 import { profilesTools } from "./tools/profiles.js";
@@ -37,6 +38,7 @@ const allTools: readonly Tool[] = [
   ...paginateTools,
   ...assumeTools,
   ...logsTools,
+  ...metricsTools,
   ...resourceTools,
   ...multiRegionTools,
   ...iamSimulateTools,
