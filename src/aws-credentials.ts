@@ -196,22 +196,39 @@ async function acquireLock(lockPath: string): Promise<void> {
         `upsertProfile: failed to acquire lock at ${lockPath} after ${LOCK_MAX_WAIT_MS}ms. If a previous writer crashed, remove the lock file manually.`,
       );
     }
+    // Phase 1: try to atomically claim the lock file. The catch only fires
+    // on openSync failure; write/close errors are handled separately in
+    // Phase 2. Splitting the two paths keeps the cleanup intent explicit --
+    // openSync-fail has nothing to unlink, write/close-fail does.
+    let fd: number | null = null;
     try {
-      const fd = openSync(lockPath, "wx");
-      try {
-        writeSync(fd, `pid=${process.pid} time=${Date.now()}\n`);
-      } finally {
-        closeSync(fd);
-      }
-      return;
+      fd = openSync(lockPath, "wx");
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") {
-        // openSync succeeded but writeSync/closeSync threw -- the lock file
-        // exists with no useful content. Best-effort cleanup so we don't
-        // orphan a lock that would block new writers for LOCK_STALE_AFTER_MS.
-        // If openSync itself failed for a non-EEXIST reason (EPERM, ENOSPC),
-        // there's nothing to unlink and the try/catch swallows the ENOENT.
+        // openSync itself failed for a non-EEXIST reason (EPERM on a
+        // read-only ~/.aws, ENOENT on a missing parent dir, ENOSPC on a
+        // full disk, ...). No lock file was created; nothing to clean up.
+        // Propagate so the caller sees the real error instead of timing
+        // out later with a misleading "failed to acquire lock" message.
+        throw err;
+      }
+      // EEXIST: another writer holds the lock. Fall through to the
+      // stale-check + backoff below.
+    }
+
+    if (fd !== null) {
+      // Phase 2: lock is ours. Stamp it + close. If either throws, the
+      // lock file exists but may be empty/garbled -- orphan-clean so new
+      // writers don't block on it for LOCK_STALE_AFTER_MS.
+      try {
+        try {
+          writeSync(fd, `pid=${process.pid} time=${Date.now()}\n`);
+        } finally {
+          closeSync(fd);
+        }
+        return;
+      } catch (err) {
         try {
           unlinkSync(lockPath);
         } catch {

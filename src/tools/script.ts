@@ -346,13 +346,23 @@ export async function runScript(
   // the loop to fall behind the timeout's setTimeout entry on the event
   // loop -- documented limitation, not a security issue.
   const started = Date.now();
-  let timer: NodeJS.Timeout | undefined;
+  // Hoist the reject so setTimeout can be created OUTSIDE the Promise
+  // executor. The previous shape (let timer; new Promise(() => { timer =
+  // setTimeout(...) }); timer.unref()) only worked because Promise executors
+  // run synchronously, so `timer` was always defined by the time the unref
+  // line ran. Removing that ordering dependency means a future reorder
+  // (moving the unref into an async block, or restructuring the Promise)
+  // can't silently leak a ref'd handle that pins the event loop.
+  let timeoutReject!: (err: Error) => void;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`Script timed out after ${Math.round(timeoutMs / 1000)}s. Raise timeoutMs or trim the script.`));
-    }, timeoutMs);
+    timeoutReject = reject;
   });
-  if (timer && typeof timer.unref === "function") timer.unref();
+  const timer = setTimeout(() => {
+    timeoutReject(
+      new Error(`Script timed out after ${Math.round(timeoutMs / 1000)}s. Raise timeoutMs or trim the script.`),
+    );
+  }, timeoutMs);
+  timer.unref();
 
   try {
     const evalResult = runInContext(wrappedSource, ctx, {
@@ -362,7 +372,7 @@ export async function runScript(
     const data = await Promise.race([evalResult, timeoutPromise]);
     return { data, logs, truncatedLogs, durationMs: Date.now() - started };
   } finally {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   }
 }
 
