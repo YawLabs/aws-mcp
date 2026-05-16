@@ -152,7 +152,7 @@ export const assumeTools: readonly Tool[] = [
       }
 
       const credentialsPath = join(homedir(), ".aws", "credentials");
-      upsertProfile(credentialsPath, targetProfile, {
+      await upsertProfile(credentialsPath, targetProfile, {
         aws_access_key_id: creds.AccessKeyId,
         aws_secret_access_key: creds.SecretAccessKey,
         aws_session_token: creds.SessionToken,

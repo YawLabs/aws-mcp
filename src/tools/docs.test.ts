@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import {
+  _resetParseSearchSchemaWarn,
   buildDocsTools,
+  DOC_CACHE_MAX_ENTRIES,
   docsTools,
   extractMainContent,
   htmlToMarkdown,
@@ -104,9 +106,23 @@ describe("parseSearchResults", () => {
   });
 
   it("returns [] for malformed input", () => {
+    // The `{ suggestions: "nope" }` case below intentionally trips the
+    // schema-drift codepath, which writes to console.warn AND flips the
+    // module-level `schemaWarned` flag. Stub stderr for the duration of
+    // the call and reset the flag after so other tests in this module see
+    // a clean baseline. Without this, every test run printed the
+    // schema-drift warning, and `schemaWarned=true` would block the
+    // dedicated schema-drift tests below from observing their own warn.
     assert.deepEqual(parseSearchResults(null, 10), []);
     assert.deepEqual(parseSearchResults({}, 10), []);
-    assert.deepEqual(parseSearchResults({ suggestions: "nope" }, 10), []);
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      assert.deepEqual(parseSearchResults({ suggestions: "nope" }, 10), []);
+    } finally {
+      console.warn = originalWarn;
+      _resetParseSearchSchemaWarn();
+    }
   });
 
   it("falls back to url as title when title is missing", () => {
@@ -422,16 +438,19 @@ describe("aws_docs_* schema", () => {
  *      ordered -- get() re-inserts the entry to make it the freshest.
  */
 describe("makeDocCache — LRU eviction and recency", () => {
+  // Drive eviction off the production cap rather than a hardcoded number so
+  // bumping DOC_CACHE_MAX_ENTRIES doesn't silently invalidate these tests.
+  const CAP = DOC_CACHE_MAX_ENTRIES;
+
   it("evicts the oldest entry when the cap is exceeded", () => {
     const cache = makeDocCache();
-    // Insert 17 entries; cap is 16, so the first insert must be evicted.
-    for (let i = 0; i < 17; i++) {
+    // Insert CAP+1 entries; the first insert must be evicted.
+    for (let i = 0; i < CAP + 1; i++) {
       cache.set(`https://docs.aws.amazon.com/url-${i}.html`, `markdown-${i}`);
     }
-    // The first-inserted URL is now gone.
     assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), undefined);
-    // All subsequent entries (1..16) are still resident.
-    for (let i = 1; i < 17; i++) {
+    // All subsequent entries (1..CAP) are still resident.
+    for (let i = 1; i < CAP + 1; i++) {
       assert.equal(
         cache.get(`https://docs.aws.amazon.com/url-${i}.html`),
         `markdown-${i}`,
@@ -442,18 +461,11 @@ describe("makeDocCache — LRU eviction and recency", () => {
 
   it("reading an entry refreshes its recency (move-to-end)", () => {
     const cache = makeDocCache();
-    // Fill exactly to the cap.
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < CAP; i++) {
       cache.set(`https://docs.aws.amazon.com/url-${i}.html`, `markdown-${i}`);
     }
-    // Touch url-0 -- this should re-insert it as the newest entry.
-    // Touching multiple times on entries 0, 1, 2, 3 separates them from
-    // the rest so the next eviction targets url-4 (next-oldest after the
-    // refreshed ones), not url-0.
+    // Touch url-0 -- this re-inserts it as the newest entry.
     assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), "markdown-0");
-    // Now add one more entry. The cap (16) is exceeded by one. The oldest
-    // remaining entry is url-1, which should be evicted -- NOT url-0,
-    // because url-0 was just touched.
     cache.set("https://docs.aws.amazon.com/url-NEW.html", "markdown-NEW");
     assert.equal(
       cache.get("https://docs.aws.amazon.com/url-0.html"),
@@ -470,17 +482,68 @@ describe("makeDocCache — LRU eviction and recency", () => {
 
   it("re-setting an existing URL re-inserts it as the newest (no growth past cap)", () => {
     const cache = makeDocCache();
-    // Fill to cap with insertion order url-0 .. url-15.
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < CAP; i++) {
       cache.set(`https://docs.aws.amazon.com/url-${i}.html`, `markdown-${i}`);
     }
     // Re-set url-0; per the implementation (delete-then-set), url-0 is
     // now the newest, not the oldest.
     cache.set("https://docs.aws.amazon.com/url-0.html", "markdown-0-v2");
-    // Adding one more entry should evict url-1 (now the oldest), not
-    // url-0.
     cache.set("https://docs.aws.amazon.com/url-NEW.html", "markdown-NEW");
     assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), "markdown-0-v2");
     assert.equal(cache.get("https://docs.aws.amazon.com/url-1.html"), undefined);
+  });
+});
+
+describe("parseSearchResults — schema-drift warning", () => {
+  // Module-level `schemaWarned` is one-shot per process. Reset before each
+  // case so the warn-firing assertions land deterministically.
+  beforeEach(() => {
+    _resetParseSearchSchemaWarn();
+  });
+
+  it("warns once when a non-empty response is missing the suggestions array", () => {
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    try {
+      // Response has other keys but no `suggestions` -- the schema-drift case.
+      parseSearchResults({ queryId: "abc", note: "shape changed" }, 10);
+      parseSearchResults({ queryId: "def" }, 10);
+      parseSearchResults({ queryId: "ghi" }, 10);
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(warned.length, 1, "expected exactly one warn across three schema-drift responses");
+    assert.match(warned[0], /backend shape may have changed/);
+  });
+
+  it("does NOT warn on a legitimately empty {} response", () => {
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    try {
+      parseSearchResults({}, 10);
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(warned.length, 0, "empty object is not a schema break (could be a no-op error response)");
+  });
+
+  it("does NOT warn on a legitimate empty-results response (suggestions: [])", () => {
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    try {
+      parseSearchResults({ suggestions: [] }, 10);
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(warned.length, 0, "an empty suggestions array is the no-match case, not a schema break");
   });
 });

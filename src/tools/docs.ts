@@ -20,10 +20,11 @@ import type { Tool, ToolResult } from "./tool.js";
  */
 
 // Powers the docs.aws.amazon.com search box. Undocumented/internal -- treat
-// as a moving target. A session id is generated once per process, mirroring
-// how the AWS Labs documentation server scopes a search session.
+// as a moving target. A session id is generated per `buildDocsTools` call
+// (one per process in production, distinct per test instance) rather than
+// at module load, so tests get isolation without paying the cost of a
+// shared module-global handle.
 const SEARCH_API_URL = "https://proxy.search.docs.aws.com/search";
-const SESSION_UUID = randomUUID();
 const USER_AGENT = "@yawlabs/aws-mcp (https://github.com/YawLabs/aws-mcp)";
 
 // read_documentation only accepts AWS doc pages, and only .html ones --
@@ -43,7 +44,12 @@ const FETCH_TIMEOUT_MS = 30_000;
 // *converted markdown* (conversion is the expensive half) keyed by URL,
 // bounded by size + TTL. TTL is short because docs do change -- but not
 // within the seconds-to-minutes window a single paginated read spans.
-const DOC_CACHE_MAX_ENTRIES = 16;
+//
+// Cap sized for typical multi-doc agent workflows (read N service overviews
+// in one session) without unbounded memory growth. Each entry is bounded
+// by MAX_MAX_LENGTH (1MB) of converted markdown, so worst-case footprint
+// is ~64MB; typical doc pages are 10-100 KB after chrome stripping.
+export const DOC_CACHE_MAX_ENTRIES = 64;
 const DOC_CACHE_TTL_MS = 5 * 60_000;
 
 export interface DocsSearchResult {
@@ -54,14 +60,39 @@ export interface DocsSearchResult {
 }
 
 /**
+ * Once-per-process flag so the schema-drift warn doesn't spam stderr on
+ * every search after the first hit. Exported reset for tests.
+ */
+let schemaWarned = false;
+/** Test-only: reset the once-per-process schema-drift warn flag. */
+export function _resetParseSearchSchemaWarn(): void {
+  schemaWarned = false;
+}
+
+/**
  * Pull the fields callers want off the search backend's `suggestions[]`.
  * Each suggestion nests the useful bits under `textExcerptSuggestion`;
  * entries without a `link` are dropped (can't act on a result with no URL).
+ *
+ * If the response is a non-empty object that lacks a `suggestions` array,
+ * warn once -- the undocumented backend at proxy.search.docs.aws.com may
+ * have changed its shape, and the silent-empty-results that would otherwise
+ * result is the kind of thing operators only notice after debugging an
+ * agent's "I couldn't find any docs" complaint. A legitimately empty
+ * `suggestions: []` is not warned (real no-match case).
  */
 export function parseSearchResults(json: unknown, limit: number): DocsSearchResult[] {
   if (!json || typeof json !== "object") return [];
   const suggestions = (json as { suggestions?: unknown }).suggestions;
-  if (!Array.isArray(suggestions)) return [];
+  if (!Array.isArray(suggestions)) {
+    if (!schemaWarned && Object.keys(json as object).length > 0) {
+      schemaWarned = true;
+      console.warn(
+        "[aws-mcp] aws_docs_search: response from proxy.search.docs.aws.com is missing the expected 'suggestions' array. The undocumented backend shape may have changed; aws_docs_search will return empty results until parseSearchResults is updated.",
+      );
+    }
+    return [];
+  }
   const out: DocsSearchResult[] = [];
   for (const s of suggestions) {
     if (out.length >= limit) break;
@@ -280,6 +311,10 @@ export function makeDocCache(): DocCache {
 
 export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
   const docCache = makeDocCache();
+  // One session per buildDocsTools() instance. Production calls
+  // buildDocsTools once at module load, so the prod-server lifetime UUID
+  // is unchanged. Tests get isolated UUIDs without sharing module state.
+  const sessionUuid = randomUUID();
   return [
     {
       name: "aws_docs_search",
@@ -313,13 +348,13 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
         try {
           response = await fetchWithTimeout(
             fetchImpl,
-            `${SEARCH_API_URL}?session=${SESSION_UUID}`,
+            `${SEARCH_API_URL}?session=${sessionUuid}`,
             {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "User-Agent": USER_AGENT,
-                "X-MCP-Session-Id": SESSION_UUID,
+                "X-MCP-Session-Id": sessionUuid,
               },
               body: JSON.stringify({
                 textQuery: { input: i.query },

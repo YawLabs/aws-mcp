@@ -14,7 +14,10 @@ import type { Tool, ToolResult } from "./tool.js";
  * runAwsCall blocks it for API params.
  */
 
-const SINCE_RE = /^\d+[smhdw]$/i;
+// Lowercase units only -- `aws logs tail` rejects uppercase (15M, 2H, ...),
+// so accepting them at the schema level would Zod-OK an input the CLI then
+// errors on. Mirror the CLI's strict-lowercase contract here.
+const SINCE_RE = /^\d+[smhdw]$/;
 // AWS log group names: [.\-_/#A-Za-z0-9]+ (length 1-512). We additionally
 // disallow a leading hyphen so an input like "--force" can't masquerade as
 // a flag when we append it to argv.
@@ -92,7 +95,7 @@ export const logsTools: readonly Tool[] = [
         .describe("Log group name, e.g. '/aws/lambda/my-fn' or '/aws/ecs/my-service'. No leading 'logs/'."),
       since: z
         .string()
-        .regex(SINCE_RE, "since must match /^\\d+[smhdw]$/i, e.g. '5m', '2h', '1d'")
+        .regex(SINCE_RE, "since must match /^\\d+[smhdw]$/ (lowercase units only), e.g. '5m', '2h', '1d'")
         .optional()
         .describe("Window to tail: '<number><s|m|h|d|w>'. Default '10m'. Example: '30m', '1h', '3d'."),
       filterPattern: z

@@ -42,7 +42,7 @@ describe("aws_iam_simulate schema", () => {
 
   it("rejects empty actions", () => {
     const r = tool.inputSchema.safeParse({
-      principalArn: "arn:aws:iam::123:user/jeff",
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
       actions: [],
     });
     assert.equal(r.success, false);
@@ -50,13 +50,13 @@ describe("aws_iam_simulate schema", () => {
 
   it("rejects more than 50 actions", () => {
     const actions = Array.from({ length: 51 }, (_, i) => `s3:Action${i}`);
-    const r = tool.inputSchema.safeParse({ principalArn: "arn:aws:iam::123:user/x", actions });
+    const r = tool.inputSchema.safeParse({ principalArn: "arn:aws:iam::123456789012:user/x", actions });
     assert.equal(r.success, false);
   });
 
   it("rejects an unsupported contextKeyType", () => {
     const r = tool.inputSchema.safeParse({
-      principalArn: "arn:aws:iam::123:user/x",
+      principalArn: "arn:aws:iam::123456789012:user/x",
       actions: ["s3:GetObject"],
       contextEntries: [{ contextKeyName: "k", contextKeyType: "garbage", contextKeyValues: ["v"] }],
     });
@@ -71,9 +71,53 @@ describe("aws_iam_simulate handler validation", () => {
     assert.match(r.error ?? "", /principalArn/);
   });
 
+  it("rejects an ARN with a wrong-length account ID (AWS account IDs are 12 digits)", async () => {
+    // The pre-tightening regex matched [0-9]{0,32}, so 3-digit "accounts"
+    // passed schema-shape validation only to fail server-side with a less
+    // actionable error. Tightening to exactly-12-or-empty produces a clear
+    // upfront rejection.
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123:user/jeff",
+      actions: ["s3:GetObject"],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /principalArn/);
+  });
+
+  it("accepts an ARN with an empty account segment (AWS-managed global resources)", async () => {
+    // Some global-service ARNs legitimately have an empty account segment.
+    // The new regex permits empty OR exactly 12 digits; this pins the
+    // empty-case allowlist so a future tightening that requires non-empty
+    // gets caught here. We expect this to PASS the principalArn check; it
+    // may still fail downstream on a CLI call, but the validation step
+    // returning a principalArn error would be wrong.
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam:::role/some-global-role",
+      actions: ["s3:GetObject"],
+    } as never);
+    // We only care that the principalArn check itself does NOT fire. The
+    // call may still error on action / CLI, so just assert the error (if
+    // any) doesn't mention principalArn.
+    if (!r.ok) {
+      assert.doesNotMatch(r.error ?? "", /Invalid principalArn/);
+    }
+  });
+
+  it("rejects an ARN missing the service segment", async () => {
+    // pre-tightening regex accepted [a-z0-9-]{0,32} for service, so an ARN
+    // with an empty service ('arn:aws::us-east-1:123:resource') slipped
+    // through. Service is required by the AWS spec.
+    const r = await tool.handler({
+      principalArn: "arn:aws::us-east-1:123456789012:user/jeff",
+      actions: ["s3:GetObject"],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /principalArn/);
+  });
+
   it("rejects malformed action shapes", async () => {
     const r = await tool.handler({
-      principalArn: "arn:aws:iam::123:user/x",
+      principalArn: "arn:aws:iam::123456789012:user/x",
       actions: ["no-colon-here"],
     } as never);
     assert.equal(r.ok, false);
@@ -82,7 +126,7 @@ describe("aws_iam_simulate handler validation", () => {
 
   it("rejects resources with leading hyphen (argv-injection defense)", async () => {
     const r = await tool.handler({
-      principalArn: "arn:aws:iam::123:user/x",
+      principalArn: "arn:aws:iam::123456789012:user/x",
       actions: ["s3:GetObject"],
       resources: ["--evil"],
     } as never);
@@ -190,7 +234,7 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
   it("counts mixed allow/deny correctly and surfaces missing context", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_mixed";
     const r = await tool.handler({
-      principalArn: "arn:aws:iam::123:user/x",
+      principalArn: "arn:aws:iam::123456789012:user/x",
       actions: ["s3:GetObject", "s3:DeleteObject"],
       resources: ["arn:aws:s3:::my-bucket/*"],
     } as never);
@@ -209,7 +253,7 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
   it("reports implicitDeny with no matched statements", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_implicit_deny";
     const r = await tool.handler({
-      principalArn: "arn:aws:iam::123:user/x",
+      principalArn: "arn:aws:iam::123456789012:user/x",
       actions: ["ec2:TerminateInstances"],
     } as never);
     assert.equal(r.ok, true);

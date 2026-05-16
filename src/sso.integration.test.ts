@@ -281,4 +281,27 @@ describe("startSsoLogin — concurrent dedup", () => {
     assert.notEqual(first.sessionId, second.sessionId);
     await waitForLogin(second.sessionId);
   });
+
+  it("same profile, DIFFERENT opts -> distinct subprocesses (dedupe key includes opts)", async () => {
+    // Pre-widening, the dedupe key was `profile` alone, so a second caller
+    // with different opts (different fake scenario, different urlWaitMs)
+    // would silently share the first caller's promise -- the second's opts
+    // were ignored. After widening to hash(profile + canonical opts),
+    // distinct opts must produce distinct subprocesses even when the
+    // profile is identical. Pins the fix.
+    const [a, b] = await Promise.all([
+      startSsoLogin("opts-divergence-profile", fakeOpts("happy", 5000)),
+      // Same profile string but different urlWaitMs -> different opts hash.
+      startSsoLogin("opts-divergence-profile", fakeOpts("happy", 4000)),
+    ]);
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true);
+    if (!a.ok || !b.ok) return;
+    assert.notEqual(
+      a.sessionId,
+      b.sessionId,
+      "different opts must produce distinct subprocesses (and distinct sessionIds)",
+    );
+    await Promise.all([waitForLogin(a.sessionId), waitForLogin(b.sessionId)]);
+  });
 });

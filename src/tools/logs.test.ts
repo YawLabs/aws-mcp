@@ -137,11 +137,24 @@ describe("aws_logs_tail schema", () => {
   });
 
   it("accepts typical since values", () => {
-    for (const since of ["5m", "30s", "2h", "1d", "1w", "15M"]) {
+    for (const since of ["5m", "30s", "2h", "1d", "1w"]) {
       assert.equal(
         tool.inputSchema.safeParse({ logGroupName: "/aws/lambda/my-fn", since }).success,
         true,
         `expected ${since} to parse`,
+      );
+    }
+  });
+
+  it("rejects uppercase unit suffixes (aws logs tail accepts lowercase only)", () => {
+    // The CLI rejects "15M"/"2H"/etc.; the schema must too, else we Zod-OK
+    // an input the CLI then errors on. Anchored case so a future `/i` flip
+    // gets caught here rather than at runtime.
+    for (const since of ["15M", "2H", "1D", "1W", "30S"]) {
+      assert.equal(
+        tool.inputSchema.safeParse({ logGroupName: "/aws/lambda/my-fn", since }).success,
+        false,
+        `expected ${since} to be rejected (uppercase unit)`,
       );
     }
   });

@@ -9,6 +9,13 @@
  * We write to a .tmp file first and rename on top of the original so a
  * crash mid-write can't leave the user with a truncated credentials file.
  * On Unix we chmod 0o600 to match the AWS CLI's own behavior.
+ *
+ * Concurrent writers are serialized via a sidecar lock file (`<path>.lock`).
+ * Without the lock, two upsertProfile calls landing at the same instant for
+ * DIFFERENT profiles could each read the file, each compute their own
+ * single-profile output, and the second rename would clobber the first
+ * caller's profile changes. The lock turns the read-modify-rename window
+ * into a critical section.
  */
 
 import { randomUUID } from "node:crypto";
@@ -21,9 +28,11 @@ import {
   renameSync,
   type Stats,
   statSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { platform } from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 
 export interface AssumedCredentials {
   aws_access_key_id: string;
@@ -145,42 +154,138 @@ export function upsertProfileIntoText(text: string, profile: string, creds: Assu
     .replace(/\n*$/, "\n");
 }
 
+/** Max wall-clock spent trying to acquire the lock before giving up. */
+const LOCK_MAX_WAIT_MS = 10_000;
+/**
+ * Lock files older than this are considered stale (prior holder crashed
+ * before unlinking). 30s is a generous upper bound on a healthy
+ * read-modify-rename cycle; anything older was almost certainly orphaned.
+ */
+const LOCK_STALE_AFTER_MS = 30_000;
+/** Base retry delay; jittered + scaled per attempt up to a cap. */
+const LOCK_BASE_RETRY_MS = 25;
+const LOCK_MAX_RETRY_MS = 250;
+
+/**
+ * Acquire a sidecar lock file via O_EXCL. Honored cross-process: both POSIX
+ * `openSync(p, 'wx')` and Windows `_open` reject a `CREATE | EXCL` request
+ * when the file already exists, so a second process loses the race and
+ * retries.
+ *
+ * Stale-lock recovery: if the existing lock is older than
+ * `LOCK_STALE_AFTER_MS`, the prior holder is presumed dead and we force-
+ * unlink. The stat-then-unlink window is racy in the worst case (two
+ * processes both spot the same stale lock, both unlink, both try to claim),
+ * but the next retry loop iteration recovers cleanly.
+ *
+ * Limitation: a process killed (SIGKILL, power loss) leaves a lock that
+ * blocks new writers for up to `LOCK_STALE_AFTER_MS` before recovery kicks
+ * in. Acceptable for the assume-role write path; users who hit a permanent
+ * "failed to acquire lock" error can manually remove `<credentials>.lock`.
+ */
+async function acquireLock(lockPath: string): Promise<void> {
+  const start = Date.now();
+  let attempt = 0;
+  while (true) {
+    // Timeout check at the top of the loop so EVERY iteration -- including
+    // the stale-recovery and stat-failed `continue` paths below -- is bounded
+    // by LOCK_MAX_WAIT_MS. Without this, two processes that keep recreating
+    // the lock between our openSync and statSync could starve us forever.
+    if (Date.now() - start > LOCK_MAX_WAIT_MS) {
+      throw new Error(
+        `upsertProfile: failed to acquire lock at ${lockPath} after ${LOCK_MAX_WAIT_MS}ms. If a previous writer crashed, remove the lock file manually.`,
+      );
+    }
+    try {
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeSync(fd, `pid=${process.pid} time=${Date.now()}\n`);
+      } finally {
+        closeSync(fd);
+      }
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        // openSync succeeded but writeSync/closeSync threw -- the lock file
+        // exists with no useful content. Best-effort cleanup so we don't
+        // orphan a lock that would block new writers for LOCK_STALE_AFTER_MS.
+        // If openSync itself failed for a non-EEXIST reason (EPERM, ENOSPC),
+        // there's nothing to unlink and the try/catch swallows the ENOENT.
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // best-effort
+        }
+        throw err;
+      }
+    }
+    let shouldRetryImmediately = false;
+    try {
+      const st = statSync(lockPath);
+      if (Date.now() - st.mtimeMs > LOCK_STALE_AFTER_MS) {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // Someone else unlinked it; fine, loop and try to claim.
+        }
+        shouldRetryImmediately = true;
+      }
+    } catch {
+      // Lock removed under us between EEXIST and statSync; loop and claim.
+      shouldRetryImmediately = true;
+    }
+    if (shouldRetryImmediately) continue;
+    const cappedAttempt = Math.min(attempt, 8);
+    const baseDelay = Math.min(LOCK_BASE_RETRY_MS * (1 + cappedAttempt), LOCK_MAX_RETRY_MS);
+    await delay(baseDelay + Math.random() * baseDelay);
+    attempt++;
+  }
+}
+
+function releaseLock(lockPath: string): void {
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // Best-effort: the lock may have already been swept by a stale-recovery
+    // pass from another process. Either way we're done with it.
+  }
+}
+
 /**
  * Read, modify, and atomically rewrite a credentials file. Creates the file
  * if it doesn't exist. Applies 0o600 permissions on Unix.
+ *
+ * Concurrent callers (multi-process or async) are serialized via a sidecar
+ * lock file -- see `acquireLock` for the protocol.
  */
-export function upsertProfile(path: string, profile: string, creds: AssumedCredentials): void {
-  const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
-  const nextText = upsertProfileIntoText(existing, profile, creds);
-  // Pid alone collides if two upsertProfile calls overlap in the same
-  // process (e.g. concurrent aws_assume_role). The randomUUID suffix makes
-  // tmpfiles unique per call so the second call's openSync(w) can't
-  // truncate the first's in-flight write.
-  //
-  // Residual race: two concurrent calls each finish their write and then
-  // both call renameSync(tmpPath, path). The second rename atomically
-  // replaces the first. For two callers updating the SAME profile the
-  // last-writer-wins outcome is the natural semantics. For two callers
-  // updating DIFFERENT profiles in the file at the same time, the second
-  // caller's read happened before the first caller's rename, so the first
-  // caller's profile changes are lost when the second rename lands. Fixing
-  // this needs a file lock or a single-writer queue; tracked as future
-  // work, not closed by the UUID suffix alone.
-  const tmpPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  const fd = openSync(tmpPath, "w", 0o600);
+export async function upsertProfile(path: string, profile: string, creds: AssumedCredentials): Promise<void> {
+  const lockPath = `${path}.lock`;
+  await acquireLock(lockPath);
   try {
-    writeSync(fd, nextText);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmpPath, path);
-  if (platform() !== "win32") {
-    let existingMode = 0o600;
-    if (existsSync(path)) {
-      const st: Stats = statSync(path);
-      existingMode = st.mode & 0o777;
+    const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
+    const nextText = upsertProfileIntoText(existing, profile, creds);
+    // randomUUID suffix prevents two same-process callers from clobbering
+    // each other's in-flight tmp writes; the lock above prevents cross-
+    // process clobber via the read-modify-rename race.
+    const tmpPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
+    const fd = openSync(tmpPath, "w", 0o600);
+    try {
+      writeSync(fd, nextText);
+    } finally {
+      closeSync(fd);
     }
-    // If the file was more permissive, tighten it.
-    if ((existingMode & 0o077) !== 0) chmodSync(path, 0o600);
+    renameSync(tmpPath, path);
+    if (platform() !== "win32") {
+      let existingMode = 0o600;
+      if (existsSync(path)) {
+        const st: Stats = statSync(path);
+        existingMode = st.mode & 0o777;
+      }
+      // If the file was more permissive, tighten it.
+      if ((existingMode & 0o077) !== 0) chmodSync(path, 0o600);
+    }
+  } finally {
+    releaseLock(lockPath);
   }
 }

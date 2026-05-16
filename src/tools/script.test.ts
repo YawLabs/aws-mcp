@@ -619,8 +619,13 @@ describe("runScript timer cleanup on normal completion", () => {
     // (require resolution caches, vm context init, etc.) before we measure.
     await runScript({ code: "return 1;", timeoutMs: 300_000 }, handlers);
 
-    const getHandles = (process as unknown as { _getActiveHandles: () => unknown[] })._getActiveHandles;
-    assert.equal(typeof getHandles, "function", "expected process._getActiveHandles in Node");
+    // process._getActiveHandles is a Node internal. If a future Node version
+    // removes it, skip rather than fail -- the cleanup behavior itself is
+    // still pinned indirectly by overall suite handle hygiene (Node's
+    // built-in runner reports unsettled timers on exit). When the API is
+    // present (current Node 22+ ships it), use it for the direct signal.
+    const getHandles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles;
+    if (typeof getHandles !== "function") return;
 
     const before = getHandles.call(process).length;
     const RUNS = 20;

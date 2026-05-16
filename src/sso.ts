@@ -13,7 +13,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { killProc, procHasExited } from "./kill-proc.js";
 
@@ -71,22 +71,41 @@ interface LoginSession {
 const sessions = new Map<string, LoginSession>();
 
 /**
- * Profile -> in-flight startSsoLogin promise. Guards against the race where
- * two callers (e.g. aws_login_start + aws_refresh_if_expiring_soon firing on
- * the same tick) both pass findActiveSessionByProfile -- which only sees
- * sessions AFTER URL+code arrive, ~seconds later -- and each spawn their own
- * `aws sso login` subprocess. With the dedupe map both await the same promise
- * and only one subprocess ever runs.
+ * Dedupe-key -> in-flight startSsoLogin promise. Guards against the race
+ * where two callers (e.g. aws_login_start + aws_refresh_if_expiring_soon
+ * firing on the same tick) both pass findActiveSessionByProfile -- which
+ * only sees sessions AFTER URL+code arrive, ~seconds later -- and each
+ * spawn their own `aws sso login` subprocess. With the dedupe map both
+ * await the same promise and only one subprocess ever runs.
  *
- * Caveat: dedup key is `profile` only. Two concurrent calls for the same
- * profile with DIFFERENT `opts` will share the first call's promise, so the
- * second call's `command/prefixArgs/env/urlWaitMs/sessionTtlMs` overrides
- * are silently ignored. Production never passes opts (only tests do), so
- * this is unreachable in production. If a test ever needs distinct opts
- * per concurrent call for the same profile, dedupe on the full opts shape
- * or use distinct profile names per case.
+ * The key is `sha256(profile + canonicalized opts)` so that:
+ *   - Two callers with identical profile AND opts share the same subprocess.
+ *   - Two callers with the same profile but DIFFERENT opts get distinct
+ *     subprocesses (previously a silent-override hazard -- the second
+ *     caller's opts were ignored).
+ * Production callers always use opts = {} (the default), so they collapse
+ * to a single per-profile key. Tests that pass distinct opts get distinct
+ * keys, which is the intended behavior.
  */
 const pendingStarts = new Map<string, Promise<LoginStartResult | LoginStartError>>();
+
+/**
+ * Canonicalize (profile, opts) into a stable hash. JSON.stringify alone is
+ * not deterministic on object key order in the general case, but the inputs
+ * here have a fixed shape and we sort env entries explicitly. The hash keeps
+ * the map key compact even when `opts.env` carries process.env.
+ */
+function dedupeKey(profile: string, opts: SsoLoginOptions): string {
+  const payload = JSON.stringify({
+    profile,
+    command: opts.command ?? null,
+    prefixArgs: opts.prefixArgs ?? null,
+    urlWaitMs: opts.urlWaitMs ?? null,
+    sessionTtlMs: opts.sessionTtlMs ?? null,
+    env: opts.env ? Object.entries(opts.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)) : null,
+  });
+  return createHash("sha256").update(payload).digest("hex");
+}
 
 // Exported for tests — these regexes are load-bearing when the aws CLI output
 // format shifts between versions, so they need direct coverage.
@@ -165,13 +184,14 @@ export function startSsoLogin(
   profile: string,
   opts: SsoLoginOptions = {},
 ): Promise<LoginStartResult | LoginStartError> {
-  const pending = pendingStarts.get(profile);
+  const key = dedupeKey(profile, opts);
+  const pending = pendingStarts.get(key);
   if (pending) return pending;
   const promise = doStartSsoLogin(profile, opts);
-  pendingStarts.set(profile, promise);
+  pendingStarts.set(key, promise);
   void promise.finally(() => {
-    if (pendingStarts.get(profile) === promise) {
-      pendingStarts.delete(profile);
+    if (pendingStarts.get(key) === promise) {
+      pendingStarts.delete(key);
     }
   });
   return promise;

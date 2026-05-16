@@ -22,11 +22,16 @@ import type { Tool, ToolResult } from "./tool.js";
  * case if the caller lacks that permission.
  */
 
-// ARN format: arn:<partition>:<service>:<region>:<account>:<resource>. We
-// only check the structural shape + leading-hyphen defense; AWS validates
-// the rest server-side. Bounded length keeps a malformed input from making
-// the regex run away.
-const ARN_RE = /^arn:[a-z0-9-]{1,32}:[a-z0-9-]{0,32}:[a-z0-9-]{0,32}:[0-9]{0,32}:[^:\s][^\s]{0,1024}$/;
+// ARN format: arn:<partition>:<service>:<region>:<account>:<resource>.
+//   - partition: required, 1-32 chars (aws, aws-cn, aws-us-gov)
+//   - service: required, 1-32 chars (an ARN without a service is malformed)
+//   - region: optional (global services like IAM omit it)
+//   - account: empty OR exactly 12 digits (AWS account IDs are always 12).
+//     The previous {0,32} accepted any digit-count, so 3-digit "accounts"
+//     and arbitrary-length runs passed -- AWS rejects them but the error
+//     wasn't actionable.
+//   - resource: required, no leading colon/whitespace, bounded length.
+const ARN_RE = /^arn:[a-z0-9-]{1,32}:[a-z0-9-]{1,32}:[a-z0-9-]{0,32}:(?:[0-9]{12})?:[^:\s][^\s]{0,1024}$/;
 
 // IAM action format: `<service>:<Action>` -- service is lowercase
 // kebab/alphanumeric; action is PascalCase or wildcard. Defensive but

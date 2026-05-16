@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -152,14 +152,14 @@ describe("upsertProfile — filesystem round-trip", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("creates the file when missing", () => {
-    upsertProfile(path, "mcp-dev", CREDS);
+  it("creates the file when missing", async () => {
+    await upsertProfile(path, "mcp-dev", CREDS);
     const text = readFileSync(path, "utf-8");
     assert.match(text, /\[mcp-dev\]/);
     assert.match(text, /AKIA-NEW-1/);
   });
 
-  it("modifies in place without destroying other profiles", () => {
+  it("modifies in place without destroying other profiles", async () => {
     writeFileSync(
       path,
       `[default]
@@ -167,7 +167,7 @@ aws_access_key_id = DEFAULT
 aws_secret_access_key = default-secret
 `,
     );
-    upsertProfile(path, "mcp-dev", CREDS);
+    await upsertProfile(path, "mcp-dev", CREDS);
     const text = readFileSync(path, "utf-8");
     assert.match(text, /\[default\]/);
     assert.match(text, /DEFAULT/);
@@ -175,16 +175,16 @@ aws_secret_access_key = default-secret
     assert.match(text, /AKIA-NEW-1/);
   });
 
-  it("applies 0600 perms on Unix (skipped on Windows)", () => {
+  it("applies 0600 perms on Unix (skipped on Windows)", async () => {
     if (platform() === "win32") return;
-    upsertProfile(path, "mcp-dev", CREDS);
+    await upsertProfile(path, "mcp-dev", CREDS);
     const mode = statSync(path).mode & 0o777;
     assert.equal(mode, 0o600, `expected 0600, got ${mode.toString(8)}`);
   });
 
-  it("second upsert updates the same profile (not appends)", () => {
-    upsertProfile(path, "mcp-dev", CREDS);
-    upsertProfile(path, "mcp-dev", {
+  it("second upsert updates the same profile (not appends)", async () => {
+    await upsertProfile(path, "mcp-dev", CREDS);
+    await upsertProfile(path, "mcp-dev", {
       aws_access_key_id: "AKIA-V2",
       aws_secret_access_key: "secret-v2",
       aws_session_token: "token-v2",
@@ -195,26 +195,27 @@ aws_secret_access_key = default-secret
     assert.ok(!text.includes("AKIA-NEW-1"));
     assert.match(text, /AKIA-V2/);
   });
+
+  it("releases the lock after a successful upsert (no lingering <path>.lock)", async () => {
+    await upsertProfile(path, "mcp-dev", CREDS);
+    assert.ok(!existsSync(`${path}.lock`), "lock file should be unlinked after a clean upsert");
+  });
 });
 
 /**
- * The race documented at aws-credentials.ts:160-168 ("two callers updating
- * DIFFERENT profiles in the file at the same time, the second caller's read
- * happened before the first caller's rename, so the first caller's profile
- * changes are lost"). With no file lock or single-writer queue, two
- * cross-process callers each read the empty file, each compute their own
- * single-profile output, and the second rename clobbers the first. The
- * synchronous filesystem ops inside `upsertProfile` cannot interleave WITHIN
- * a single Node process -- but separate forked child processes scheduled by
- * the OS absolutely can interleave, and that's exactly the scenario the
- * comment describes.
+ * Cross-process concurrency guard. Before the sidecar lock was introduced,
+ * two callers updating DIFFERENT profiles in the file at the same time
+ * could lose one writer's changes (each reads the file first, then they
+ * race to rename; the second rename clobbers the first). The lock added
+ * in `upsertProfile` serializes the read-modify-rename window across
+ * processes, so every trial below must preserve BOTH profiles.
  *
- * This test pins the documented contract: today the loss is observable
- * across a stress budget. If a future patch adds a file lock or
- * single-writer queue, this test should start failing -- at which point
- * the comment AND the test should be revised together.
+ * If this assertion starts failing -- the race can drop a profile again --
+ * either the lock regressed (acquire/release missing, lock path wrong,
+ * stale-recovery is too aggressive) or the OS-level open(O_EXCL) semantics
+ * we rely on aren't being honored on the test platform.
  */
-describe("upsertProfile — concurrent cross-process race on different profiles", () => {
+describe("upsertProfile — concurrent cross-process writers are serialized", () => {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
   // Resolve compiled module path; tests run from dist/. Convert to a file:// URL
@@ -255,10 +256,10 @@ describe("upsertProfile — concurrent cross-process race on different profiles"
       // Pre-warm: synchronous import done above. Signal ready, then wait
       // for the go message before doing the read-modify-write.
       process.send({ type: "ready" });
-      process.on("message", (msg) => {
+      process.on("message", async (msg) => {
         if (msg && msg.type === "go") {
           try {
-            upsertProfile(filePath, profile, {
+            await upsertProfile(filePath, profile, {
               aws_access_key_id: akid,
               aws_secret_access_key: "secret-" + profile,
               aws_session_token: "token-" + profile,
@@ -313,58 +314,49 @@ describe("upsertProfile — concurrent cross-process race on different profiles"
       a.child.send({ type: "go" });
       b.child.send({ type: "go" });
       const [ra, rb] = await Promise.all([exitA, exitB]);
-      // Surface unexpected failures (anything that ISN'T the documented
-      // EPERM-on-rename race) so a bug doesn't hide as "race observed".
+      // With the lock in place, BOTH children should always succeed. A
+      // non-zero exit here means the lock failed to serialize (regression)
+      // or a real bug in the children -- either way surface the stderr so
+      // the failure is debuggable instead of silently dropping a profile.
       for (const r of [ra, rb]) {
-        if (r.code !== 0 && !/EPERM|rename/.test(r.stderr)) {
-          throw new Error(`unexpected child failure (code=${r.code}): ${r.stderr}`);
+        if (r.code !== 0) {
+          throw new Error(`child failed (code=${r.code}): ${r.stderr}`);
         }
       }
     })();
   }
 
-  it("documented loss: across N concurrent runs at least one trial drops a profile", async () => {
-    // Stress the race documented at aws-credentials.ts:160-168. Each trial:
-    // two children with pre-imported `upsertProfile`, both waiting on a go
-    // signal; the parent fires both signals back-to-back so the window of
-    // overlap is just the synchronous read-modify-rename inside the
-    // function. Across many trials, the OS scheduler will at some point
-    // interleave the two reads before either rename, demonstrating the
-    // documented loss.
+  it("across N concurrent trials, every trial preserves BOTH profiles (lock fix)", async () => {
+    // Pre-fix, this same harness lost a profile in nearly 100% of trials.
+    // Post-fix, the lock serializes the read-modify-rename so every trial
+    // must preserve both. TRIALS is sized for confidence without dragging
+    // CI wall-clock too long -- each trial forks two children, waits for
+    // both to acquire/release the lock, and verifies the file.
     //
-    // If this assertion ever fails (i.e. EVERY trial preserves both
-    // profiles), the race may have been fixed -- update the comment at
-    // aws-credentials.ts:160-168 and revisit this test.
-    //
-    // TRIALS budget sized for CI reliability: the loop early-exits on the
-    // first observed loss, so the common-case cost is one trial. The budget
-    // only matters when the race fails to fire (rare given observed
-    // per-trial demonstration rates near 100%). 250 trials gives effectively
-    // zero false-fail probability across CI platforms; worst-case wall-clock
-    // ~50s if the race somehow never fires.
-    const TRIALS = 250;
+    // If this fails: the lock regressed (e.g. acquire/release path removed
+    // or the lock filename changed) OR the OS-level O_EXCL semantics aren't
+    // being honored on the test platform.
+    const TRIALS = 40;
     let observedLoss = 0;
     let bothPresent = 0;
     for (let i = 0; i < TRIALS; i++) {
       try {
         rmSync(path, { force: true });
       } catch {}
+      try {
+        rmSync(`${path}.lock`, { force: true });
+      } catch {}
       await runConcurrentPair("alpha", "beta", i);
-      // After both children exit (possibly one with EPERM on rename), the
-      // file may contain only one profile -- that's the documented loss.
-      // The file always exists because at least one child won the rename.
       const text = readFileSync(path, "utf-8");
       const hasAlpha = /\[alpha\]/.test(text);
       const hasBeta = /\[beta\]/.test(text);
       if (hasAlpha && hasBeta) bothPresent++;
       else observedLoss++;
-      if (observedLoss > 0) break; // one is enough to demonstrate the race
     }
-    assert.ok(
-      observedLoss > 0,
-      `expected concurrent upsertProfile to drop a profile in at least one of ${TRIALS} trials ` +
-        `(both-present=${bothPresent}, loss=${observedLoss}). If this fails, the race may have been ` +
-        `fixed -- update the comment at aws-credentials.ts:160-168 and revisit this test.`,
+    assert.equal(
+      observedLoss,
+      0,
+      `expected ZERO profile losses across ${TRIALS} concurrent trials (both-present=${bothPresent}, loss=${observedLoss}). The lock should serialize cross-process writers.`,
     );
   });
 });
