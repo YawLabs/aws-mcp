@@ -100,12 +100,23 @@ export const assumeTools: readonly Tool[] = [
       const sourceProfile = i.sourceProfile || getProfile();
       const useRegion = i.region || getRegion();
       const targetProfile = resolveTargetProfile({ targetProfile: i.targetProfile, sessionName: i.sessionName });
+      // Validate sourceProfile up front so the error names sourceProfile
+      // explicitly. Without this, an invalid sourceProfile would still get
+      // caught inside runAwsCall, but the resulting message would say
+      // "Check the 'profile' arg or AWS_PROFILE env var" -- confusing for
+      // an aws_assume_role caller who passed `sourceProfile`.
+      if (!isValidProfileName(sourceProfile)) {
+        return {
+          ok: false,
+          error: `Invalid sourceProfile name '${sourceProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='. Check the 'sourceProfile' arg or AWS_PROFILE env var.`,
+        };
+      }
       // The resolved name lands as a `[name]` section header in
       // ~/.aws/credentials. Reject INI-breakers (brackets, newlines, `=`) up
       // front so a hostile or fat-fingered targetProfile can't corrupt the
-      // credentials file. sourceProfile and useRegion are validated inside
-      // runAwsCall via isValidProfileName/isValidRegionName; this guards the
-      // remaining write path that doesn't pass through runAwsCall.
+      // credentials file. useRegion is validated inside runAwsCall via
+      // isValidRegionName; this guards the remaining write path that
+      // doesn't pass through runAwsCall.
       if (!isValidProfileName(targetProfile)) {
         return {
           ok: false,

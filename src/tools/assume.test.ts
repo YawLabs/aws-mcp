@@ -219,6 +219,21 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.match(r.error ?? "", /incomplete credentials/i);
   });
 
+  it("rejects an invalid sourceProfile with a sourceProfile-named error (not the generic 'profile' message)", async () => {
+    // Without the assume.ts-level check, this would still get caught inside
+    // runAwsCall but the error would say "Check the 'profile' arg or
+    // AWS_PROFILE env var" -- misleading for an aws_assume_role caller who
+    // passed sourceProfile. The handler-level check names the right field.
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123:role/A",
+      sessionName: "sess",
+      sourceProfile: "--query=evil",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid sourceProfile name/);
+    assert.match(r.error ?? "", /sourceProfile/);
+  });
+
   it("rejects an INI-breaking targetProfile before touching ~/.aws/credentials", async () => {
     // The resolved targetProfile lands as a `[name]` section header in the
     // INI file. A `]` in the name would silently split the section. Catch
