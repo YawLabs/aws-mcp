@@ -11,6 +11,13 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-05-16
+
+**API stability commitment.** From this version onward the public tool shapes
+documented in the README's [Stability](./README.md#stability) section follow
+strict SemVer -- breaking them requires a major bump. No user-facing breaking
+changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
+
 ### Added
 - `aws_assume_role` now validates `sourceProfile` at the handler boundary with
   an error message that names `sourceProfile` explicitly (instead of bubbling
@@ -244,7 +251,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v0.9.10...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/YawLabs/aws-mcp/compare/v0.9.10...v1.0.0
 [0.9.10]: https://github.com/YawLabs/aws-mcp/compare/v0.9.9...v0.9.10
 [0.9.9]: https://github.com/YawLabs/aws-mcp/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/YawLabs/aws-mcp/compare/v0.9.7...v0.9.8
