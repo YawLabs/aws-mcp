@@ -11,6 +11,17 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-05-16
+
+### Fixed
+- README Stability section now marks optional fields as optional in two
+  places: `ssoToken.startUrl?` on `aws_whoami` / `aws_login_complete`
+  (omitted when the cached token didn't record one) and `summary?` /
+  `excerpt?` on `aws_docs_search` results (present only when the upstream
+  backend returns them). Callers assuming these were always present would
+  hit `undefined` -- the handler shapes were always correct, only the
+  docs overstated guarantees.
+
 ## [1.0.1] - 2026-05-16
 
 ### Fixed
@@ -264,7 +275,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/YawLabs/aws-mcp/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/YawLabs/aws-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/YawLabs/aws-mcp/compare/v0.9.10...v1.0.0
 [0.9.10]: https://github.com/YawLabs/aws-mcp/compare/v0.9.9...v0.9.10

@@ -254,9 +254,9 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
   - `aws_call` -> `{command, result}`
   - `aws_paginate` -> `{command, result, nextToken, hasMore}`
   - `aws_multi_region` -> `{service, operation, regionCount, okCount, errorCount, results: [{region, ok, data?, command?, error?, errorKind?}]}`
-  - `aws_whoami` -> `{account, userId, arn, profile, region, ssoToken: {expiresAt, minutesLeft, startUrl} | null}`
+  - `aws_whoami` -> `{account, userId, arn, profile, region, ssoToken: {expiresAt, minutesLeft, startUrl?} | null}` (`startUrl` is omitted when the cached token didn't record one)
   - `aws_login_start` -> `{sessionId, profile, verificationUrl, userCode, instructions, reused?}` (`reused: true` when re-surfacing an in-flight login for the same profile)
-  - `aws_login_complete` -> `{loggedIn, account, userId, arn, profile, region, ssoToken}` (same `ssoToken` shape as `aws_whoami`)
+  - `aws_login_complete` -> `{loggedIn, account, userId, arn, profile, region, ssoToken}` (same `ssoToken` shape as `aws_whoami`, including the optional `startUrl`)
   - `aws_refresh_if_expiring_soon` -> **one of two shapes by branch:** `{status: "ok", minutesLeft, expiresAt, profile}` when the cached token has more than `thresholdMinutes` left, or `{status: "refreshing", reason, sessionId, profile, verificationUrl, userCode, reused?, instructions}` when a refresh is in flight. Discriminate on `status`.
   - `aws_assume_role` -> `{profile, credentialsPath, expiration, assumedRoleArn, assumedRoleId, sourceProfile, hint}`
   - `aws_list_profiles` -> `{configPath, profiles: [{name, region?, ssoStartUrl?, ssoRegion?, ssoSession?, isSso}]}`
@@ -268,7 +268,7 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
   - `aws_logs_tail` -> `{command, logGroupName, since, eventCount, events}`
   - `aws_iam_simulate` -> `{command, principalArn, summary: {allowed, denied, total}, results, evaluationResults}`
   - `aws_script` -> `{result, logs, truncatedLogs, durationMs}` where `result` is whatever the script `return`ed (any JSON-serializable value, including `undefined`)
-  - `aws_docs_search` -> `{query, count, results: [{title, url, summary, excerpt}]}`
+  - `aws_docs_search` -> `{query, count, results: [{title, url, summary?, excerpt?}]}` (`summary` / `excerpt` are present only when the upstream search backend returns them)
   - `aws_docs_read` -> `{url, cached, content, startIndex, endIndex, totalLength, hasMore, nextStartIndex}`
 - **Error envelope** -- `{ok: false, error: string, rawBody?: string}`. The `error` string is human-readable; its *wording* is best-effort (see below).
 - **`errorKind` enum on `aws_multi_region`** -- `"sso_expired" | "no_creds" | "bad_input" | "spawn_failure" | "timeout" | "output_too_large" | "nonzero_exit"`. New variants may be added (additive); existing ones won't be renamed or repurposed.
