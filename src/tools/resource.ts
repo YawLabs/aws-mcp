@@ -743,7 +743,7 @@ export const resourceTools: readonly Tool[] = [
   {
     name: "aws_resource_diff",
     description:
-      "Dry-run a CCAPI update: fetch the current resource state, simulate applying a JSON Patch in memory, and return before/after plus a flat list of changed paths. No mutation is sent to AWS. Use this before aws_resource_update to verify the patch does what you expect. Supports the add/remove/replace subset of RFC 6902 (covers the vast majority of CCAPI updates); 'move'/'copy'/'test' are not implemented and fail with a clear error.",
+      "Dry-run a CCAPI update: fetch the current resource state, simulate applying a JSON Patch in memory, and return before/after plus a flat list of changed paths. No mutation is sent to AWS. Use this before aws_resource_update to verify the patch does what you expect. Supports the add/remove/replace subset of RFC 6902 (covers the vast majority of CCAPI updates); 'move'/'copy'/'test' are rejected at schema validation -- use aws_resource_update directly if you need those (CCAPI accepts them, this preview tool just doesn't simulate them locally).",
     annotations: {
       title: "Preview a CCAPI update without applying it",
       readOnlyHint: true,
@@ -757,14 +757,23 @@ export const resourceTools: readonly Tool[] = [
       patchDocument: z
         .array(
           z.object({
-            op: z.enum(["add", "remove", "replace", "move", "copy", "test"]),
+            // Diff simulates patches locally via applyJsonPatch; only the
+            // add/remove/replace subset is implemented. Reject the other
+            // three RFC 6902 ops here so the model gets schema-validation
+            // feedback instead of a runtime "not implemented" error
+            // surfaced as a generic "Patch application failed". The
+            // sibling aws_resource_update tool accepts the full op set
+            // because CCAPI does -- only this preview tool is restricted.
+            op: z.enum(["add", "remove", "replace"]),
             path: z.string(),
             value: z.unknown().optional(),
             from: z.string().optional(),
           }),
         )
         .min(1)
-        .describe("RFC 6902 JSON Patch (the same shape aws_resource_update accepts)."),
+        .describe(
+          "RFC 6902 JSON Patch (add/remove/replace subset). For move/copy/test, use aws_resource_update directly.",
+        ),
       ...baseFields,
     }),
     handler: async (input: unknown): Promise<ToolResult> => {

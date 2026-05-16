@@ -99,15 +99,21 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} — skipping"
 else
   npm version "$VERSION" --no-git-tag-version
-  info "Version bumped"
+  info "package.json bumped"
+  # Keep server.json in sync with package.json. CI also rewrites server.json
+  # via jq at publish time (.github/workflows/release.yml) as a safety net,
+  # but doing it here too means the committed value matches reality between
+  # releases instead of drifting until the next CI publish.
+  node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$VERSION"
+  info "server.json bumped"
 fi
 
 step 4 "Commit, tag, and push"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode — skipping commit/tag/push (already tagged)"
 else
-  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-    git add package.json package-lock.json
+  if [ -n "$(git status --porcelain package.json package-lock.json server.json 2>/dev/null)" ]; then
+    git add package.json package-lock.json server.json
     git commit -m "v${VERSION}"
     info "Committed version bump"
   else

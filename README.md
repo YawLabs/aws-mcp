@@ -241,6 +241,41 @@ The token is cached in `~/.aws/sso/cache/<hash>.json` the same way a normal `aws
 
 SSO tokens live in `~/.aws/sso/cache/` on *your* device. A remote MCP server can't read them. So this is a stdio server, not a hosted one. That's a constraint of AWS SSO, not a limitation of mcp.hosting.
 
+## Stability
+
+From 1.0 onward this package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The 0.x line is the pre-stability tightening phase -- breaking changes are documented in [`CHANGELOG.md`](./CHANGELOG.md) but are not necessarily gated on a major bump.
+
+**Stable in 1.x (anything below is a breaking change requiring a major bump):**
+
+- **Tool names** -- the 24 tool names listed in the Tools table above will not be renamed or removed.
+- **Tool annotations** -- `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. These signal to MCP hosts how to gate calls; flipping them silently would break host UIs.
+- **Required input fields** -- the required fields per tool will not change shape or be removed. New *optional* fields may be added.
+- **Success envelope shape per tool** -- the `data` object on `{ok: true, data}` responses, specifically:
+  - `aws_call` -> `{command, result}`
+  - `aws_paginate` -> `{command, result, nextToken, hasMore}`
+  - `aws_multi_region` -> `{service, operation, regionCount, okCount, errorCount, results: [{region, ok, data?, command?, error?, errorKind?}]}`
+  - `aws_whoami` -> `{account, userId, arn, profile, region, ssoToken: {expiresAt, minutesLeft, startUrl} | null}`
+  - `aws_assume_role` -> `{profile, credentialsPath, expiration, assumedRoleArn, assumedRoleId, sourceProfile, hint}`
+  - `aws_login_start` / `aws_refresh_if_expiring_soon` -> `{sessionId, profile, verificationUrl, userCode, instructions, reused?}`
+  - `aws_resource_get` -> `{command, typeName, identifier, properties, propertiesRaw?}`
+  - `aws_resource_list` -> `{command, typeName, resources: [{identifier, properties}], nextToken, hasMore}`
+  - `aws_resource_create` / `_update` / `_delete` / `_status` -> flat-promoted `{command, requestToken, operationStatus, identifier, errorCode, statusMessage, retryAfter, progressEvent}` plus an `awaited: {attempts, elapsedMs}` block when `awaitCompletion: true` was passed
+  - `aws_resource_diff` -> `{command, typeName, identifier, before, after, changes, changeCount}`
+  - `aws_logs_tail` -> `{command, logGroupName, since, eventCount, events}`
+  - `aws_iam_simulate` -> `{command, principalArn, summary: {allowed, denied, total}, results, evaluationResults}`
+  - `aws_session_get` -> `{profile, region, profileSource, regionSource}` where `*Source` is `"session" | "env" | "default"`
+- **Error envelope** -- `{ok: false, error: string, rawBody?: string}`. The `error` string is human-readable; its *wording* is best-effort (see below).
+- **`errorKind` enum on `aws_multi_region`** -- `"sso_expired" | "no_creds" | "bad_input" | "spawn_failure" | "timeout" | "output_too_large" | "nonzero_exit"`. New variants may be added (additive); existing ones won't be renamed or repurposed.
+
+**Best-effort (may change in a minor or patch):**
+
+- **Error message wording.** Strings like "SSO session expired for profile 'X'. Call aws_login_start..." may be retuned for clarity. Anchor on `errorKind` (for `aws_multi_region`) or the structured envelope, not on regex-matching `error` text.
+- **`rawBody`** content -- raw stderr/stdout from the underlying `aws` CLI for diagnostic purposes. Format follows whatever the CLI emits in your installed version.
+- **`command`** strings -- the human-readable command shown alongside results. Argv ordering and the exact redaction-stub format (`<redacted len=N>`) may shift.
+- **Tool *descriptions*** -- the prose surfaced to the model. Tightening these is non-breaking.
+
+**Deprecation policy:** breaking a stable shape requires a major bump. A deprecation lands first in a minor (the old shape continues to work and the new shape becomes available alongside it), with a removal scheduled for the next major. Both the deprecation and the removal show up in `CHANGELOG.md`.
+
 ## License
 
 MIT

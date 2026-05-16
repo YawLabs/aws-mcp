@@ -486,4 +486,19 @@ describe("aws_resource_diff schema", () => {
     });
     assert.equal(r.success, true); // schema-level passes (it's a string); validation happens in handler
   });
+
+  it("rejects move/copy/test ops at schema (diff only simulates add/remove/replace locally)", () => {
+    // Sibling aws_resource_update accepts the full RFC 6902 op set because
+    // CCAPI does. aws_resource_diff is the strict one -- only the subset
+    // applyJsonPatch can simulate. Catch at schema so the model gets a
+    // clean "invalid enum" error instead of "Patch application failed".
+    for (const op of ["move", "copy", "test"] as const) {
+      const r = diffTool.inputSchema.safeParse({
+        typeName: "AWS::Lambda::Function",
+        identifier: "my-fn",
+        patchDocument: [{ op, path: "/A", from: "/B" }],
+      });
+      assert.equal(r.success, false, `expected schema to reject op '${op}'`);
+    }
+  });
 });
