@@ -7,6 +7,8 @@ import {
   getProfile,
   getRegion,
   getSessionState,
+  isValidProfileName,
+  isValidRegionName,
   setProfile,
   setRegion,
 } from "./session.js";
@@ -93,6 +95,74 @@ describe("setProfile / setRegion", () => {
     setProfile("first");
     setProfile("second");
     assert.equal(getProfile(), "second");
+  });
+
+  it("setProfile rejects leading-hyphen (argv-injection defense)", () => {
+    assert.throws(() => setProfile("--query=foo"), /Invalid profile name/);
+    assert.throws(() => setProfile("-evil"), /Invalid profile name/);
+  });
+
+  it("setProfile rejects INI-breaking characters", () => {
+    assert.throws(() => setProfile("evil]hack"), /Invalid profile name/);
+    assert.throws(() => setProfile("[bracket"), /Invalid profile name/);
+    assert.throws(() => setProfile("line\nbreak"), /Invalid profile name/);
+  });
+
+  it("setRegion rejects leading-hyphen and shell metacharacters", () => {
+    assert.throws(() => setRegion("--query=foo"), /Invalid region/);
+    assert.throws(() => setRegion("us-east-1;rm"), /Invalid region/);
+    assert.throws(() => setRegion("US-EAST-1"), /Invalid region/);
+  });
+});
+
+describe("isValidProfileName", () => {
+  it("accepts typical AWS profile names", () => {
+    for (const name of ["default", "prod", "mcp-my-session", "dev_user", "org:account:role", "user@company.com"]) {
+      assert.equal(isValidProfileName(name), true, `expected '${name}' to be valid`);
+    }
+  });
+
+  it("rejects leading hyphen (argv-injection defense)", () => {
+    assert.equal(isValidProfileName("--query=foo"), false);
+    assert.equal(isValidProfileName("-prod"), false);
+    assert.equal(isValidProfileName("-"), false);
+  });
+
+  it("rejects whitespace and control characters", () => {
+    assert.equal(isValidProfileName("with space"), false);
+    assert.equal(isValidProfileName("with\ttab"), false);
+    assert.equal(isValidProfileName("with\nnewline"), false);
+    assert.equal(isValidProfileName("with\x00null"), false);
+  });
+
+  it("rejects INI-breaking characters", () => {
+    assert.equal(isValidProfileName("evil]hack"), false);
+    assert.equal(isValidProfileName("[bracket"), false);
+  });
+
+  it("rejects empty and over-length names", () => {
+    assert.equal(isValidProfileName(""), false);
+    assert.equal(isValidProfileName("a".repeat(129)), false);
+    assert.equal(isValidProfileName("a".repeat(128)), true);
+  });
+});
+
+describe("isValidRegionName", () => {
+  it("accepts standard AWS region IDs", () => {
+    for (const r of ["us-east-1", "us-west-2", "eu-west-3", "ap-northeast-1", "us-gov-east-1", "cn-north-1"]) {
+      assert.equal(isValidRegionName(r), true, `expected '${r}' to be valid`);
+    }
+  });
+
+  it("rejects leading hyphen and shell metacharacters", () => {
+    assert.equal(isValidRegionName("--query=foo"), false);
+    assert.equal(isValidRegionName("-us-east-1"), false);
+    assert.equal(isValidRegionName("us-east-1;rm"), false);
+  });
+
+  it("rejects uppercase and whitespace", () => {
+    assert.equal(isValidRegionName("US-EAST-1"), false);
+    assert.equal(isValidRegionName("us east 1"), false);
   });
 });
 

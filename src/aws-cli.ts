@@ -14,7 +14,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { killProc, procHasExited } from "./kill-proc.js";
-import { getProfile, getRegion } from "./session.js";
+import { getProfile, getRegion, isValidProfileName, isValidRegionName } from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
@@ -161,6 +161,23 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
 
   const profile = opts.profile ?? getProfile();
   const region = opts.region ?? getRegion();
+  // Argv-safety: the resolved values land in `aws --profile X --region Y`.
+  // Validate AFTER resolution so this catches both explicit opts overrides
+  // AND env-var fallback (AWS_PROFILE / AWS_REGION bypass setProfile/setRegion).
+  if (!isValidProfileName(profile)) {
+    return Promise.resolve({
+      ok: false,
+      kind: "bad_input",
+      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='. Check the 'profile' arg or AWS_PROFILE env var.`,
+    });
+  }
+  if (!isValidRegionName(region)) {
+    return Promise.resolve({
+      ok: false,
+      kind: "bad_input",
+      error: `Invalid region '${region}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1'). Check the 'region' arg or AWS_REGION / AWS_DEFAULT_REGION env var.`,
+    });
+  }
   const outputFormat = opts.outputFormat ?? "json";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { describe, it } from "node:test";
-import { _ttlKillswitchTick, CODE_RE, parseLoginOutput, URL_RE } from "./sso.js";
+import { _ttlKillswitchTick, CODE_RE, parseLoginOutput, startSsoLogin, URL_RE } from "./sso.js";
 
 describe("URL_RE", () => {
   it("matches standard AWS SSO device URLs across regions", () => {
@@ -174,5 +174,24 @@ describe("_ttlKillswitchTick", () => {
       observedTtlExpired = s.ttlExpired;
     });
     assert.equal(observedTtlExpired, true, "ttlExpired must already be true when killFn fires");
+  });
+});
+
+describe("startSsoLogin -- profile validation", () => {
+  // No fake-aws fixture is needed: the validator bails before spawn. If
+  // validation were absent these calls would invoke `aws sso login` for
+  // real (or whatever the test env's `aws` binary does with the bad arg).
+  it("rejects a profile that looks like a flag without spawning", async () => {
+    const result = await startSsoLogin("--query=evil");
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.match(result.error, /Invalid profile name/);
+  });
+
+  it("rejects a profile with INI-breaking characters", async () => {
+    const result = await startSsoLogin("evil]hack");
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.match(result.error, /Invalid profile name/);
   });
 });

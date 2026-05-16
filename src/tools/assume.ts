@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
 import { upsertProfile } from "../aws-credentials.js";
-import { getProfile, getRegion } from "../session.js";
+import { getProfile, getRegion, isValidProfileName } from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -100,6 +100,18 @@ export const assumeTools: readonly Tool[] = [
       const sourceProfile = i.sourceProfile || getProfile();
       const useRegion = i.region || getRegion();
       const targetProfile = resolveTargetProfile({ targetProfile: i.targetProfile, sessionName: i.sessionName });
+      // The resolved name lands as a `[name]` section header in
+      // ~/.aws/credentials. Reject INI-breakers (brackets, newlines, `=`) up
+      // front so a hostile or fat-fingered targetProfile can't corrupt the
+      // credentials file. sourceProfile and useRegion are validated inside
+      // runAwsCall via isValidProfileName/isValidRegionName; this guards the
+      // remaining write path that doesn't pass through runAwsCall.
+      if (!isValidProfileName(targetProfile)) {
+        return {
+          ok: false,
+          error: `Invalid targetProfile name '${targetProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='. Pick a different targetProfile or sessionName.`,
+        };
+      }
 
       // Shell out to `aws sts assume-role` rather than using the in-process
       // SDK. The SDK's fromNodeProviderChain occasionally diverges from the

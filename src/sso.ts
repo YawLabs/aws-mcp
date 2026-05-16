@@ -16,6 +16,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { killProc, procHasExited } from "./kill-proc.js";
+import { isValidProfileName } from "./session.js";
 
 // Matches aws-cli.ts — a runaway CLI shouldn't be able to balloon memory via
 // stderr. 5 MB is ample for any legit sso login session.
@@ -184,6 +185,16 @@ export function startSsoLogin(
   profile: string,
   opts: SsoLoginOptions = {},
 ): Promise<LoginStartResult | LoginStartError> {
+  // Argv-safety: the resolved value lands in `aws sso login --profile X`.
+  // Reject up front so a malicious `profile` can't pose as a flag, AND so
+  // an invalid profile never enters the pendingStarts dedupe map (where a
+  // cached rejection would block legitimate retries for the same key).
+  if (!isValidProfileName(profile)) {
+    return Promise.resolve({
+      ok: false,
+      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='.`,
+    });
+  }
   const key = dedupeKey(profile, opts);
   const pending = pendingStarts.get(key);
   if (pending) return pending;

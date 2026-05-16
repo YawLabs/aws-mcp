@@ -219,6 +219,20 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.match(r.error ?? "", /incomplete credentials/i);
   });
 
+  it("rejects an INI-breaking targetProfile before touching ~/.aws/credentials", async () => {
+    // The resolved targetProfile lands as a `[name]` section header in the
+    // INI file. A `]` in the name would silently split the section. Catch
+    // it at the handler boundary so the credentials file is never opened.
+    // No fake-aws scenario needed: validation runs before runAwsCall.
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123:role/A",
+      sessionName: "sess",
+      targetProfile: "mcp-evil]hack",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid targetProfile name/);
+  });
+
   it("propagates timeoutMs to the underlying CLI call (fires timeout path)", async () => {
     // assume_role_slow sleeps ~5s before responding. A 200ms timeoutMs has to
     // reach runAwsCall for the timeout error to surface inside that window;

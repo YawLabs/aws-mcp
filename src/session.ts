@@ -20,6 +20,37 @@
 let sessionProfile: string | undefined;
 let sessionRegion: string | undefined;
 
+// Argv-safety validators for the two values that flow into `aws --profile X
+// --region Y`. Without these, an AWS_PROFILE env var of `--query=...` (or a
+// caller passing the same as opts.profile) would slot in as a flag to the
+// aws CLI. Mirrors the leading-hyphen + control-char defense applied to
+// typeName / identifier / opaque tokens in tools/resource.ts and to region
+// IDs in tools/multi-region.ts. Centralized here so every consumer
+// (runAwsCall, startSsoLogin, aws_assume_role) shares one definition.
+//
+// The profile char set matches what aws_assume_role's sessionName schema
+// accepts ([\w+=,.@-]) plus `:` for SSO profile names like
+// 'org-name:account:role'. First char rules out leading `-` so the value
+// can't pose as a CLI flag, and rules out the few INI-special chars
+// (`[`, `]`, `=`, whitespace, newlines) so a malformed name can't break
+// `~/.aws/credentials` parsing when assume.ts writes a section header.
+// Length capped at 128 to match AWS's profile name limit.
+export const PROFILE_NAME_RE = /^[A-Za-z0-9_+,.@:][A-Za-z0-9_+=,.@:-]{0,127}$/;
+
+// AWS region IDs: lowercase letters, digits, hyphens, must start with a
+// letter, must contain at least one hyphen-separated segment. Matches
+// us-east-1, eu-west-3, ap-northeast-1, us-gov-east-1, cn-north-1,
+// me-central-1. Mirrors REGION_RE in tools/multi-region.ts.
+export const REGION_NAME_RE = /^[a-z][a-z0-9-]{2,30}$/;
+
+export function isValidProfileName(name: string): boolean {
+  return PROFILE_NAME_RE.test(name);
+}
+
+export function isValidRegionName(name: string): boolean {
+  return REGION_NAME_RE.test(name);
+}
+
 export function getProfile(): string {
   return sessionProfile ?? process.env.AWS_PROFILE ?? "default";
 }
@@ -32,14 +63,26 @@ export function setProfile(name: string): void {
   if (!name?.trim()) {
     throw new Error("Profile name cannot be empty");
   }
-  sessionProfile = name.trim();
+  const trimmed = name.trim();
+  if (!isValidProfileName(trimmed)) {
+    throw new Error(
+      `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '=', no whitespace or shell metacharacters.`,
+    );
+  }
+  sessionProfile = trimmed;
 }
 
 export function setRegion(name: string): void {
   if (!name?.trim()) {
     throw new Error("Region cannot be empty");
   }
-  sessionRegion = name.trim();
+  const trimmed = name.trim();
+  if (!isValidRegionName(trimmed)) {
+    throw new Error(
+      `Invalid region '${trimmed}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1', 'eu-west-3').`,
+    );
+  }
+  sessionRegion = trimmed;
 }
 
 export function clearProfile(): void {

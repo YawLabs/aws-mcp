@@ -81,6 +81,48 @@ describe("runAwsCall — input validation (no spawn)", () => {
     if (r.ok) return;
     assert.equal(r.kind, "bad_input");
   });
+
+  it("rejects profile that looks like a flag (argv-injection defense)", async () => {
+    const r = await runAwsCall({ service: "s3", operation: "list-buckets", profile: "--query=foo" });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /Invalid profile name/);
+  });
+
+  it("rejects region that looks like a flag", async () => {
+    const r = await runAwsCall({ service: "s3", operation: "list-buckets", region: "--profile=evil" });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /Invalid region/);
+  });
+
+  it("rejects profile with whitespace / newlines", async () => {
+    const r = await runAwsCall({ service: "s3", operation: "list-buckets", profile: "evil\nname" });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /Invalid profile name/);
+  });
+
+  it("catches malicious AWS_PROFILE env var (resolved-value validation)", async () => {
+    // setProfile validates at write time, but env vars bypass it -- getProfile
+    // returns whatever AWS_PROFILE says. The validator inside runAwsCall is
+    // the backstop that catches a hostile env-var fallback.
+    const saved = process.env.AWS_PROFILE;
+    process.env.AWS_PROFILE = "--query=evil";
+    try {
+      const r = await runAwsCall({ service: "s3", operation: "list-buckets" });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "bad_input");
+      assert.match(r.error, /AWS_PROFILE/);
+    } finally {
+      if (saved === undefined) delete process.env.AWS_PROFILE;
+      else process.env.AWS_PROFILE = saved;
+    }
+  });
 });
 
 describe("redactDisplayArgs", () => {
