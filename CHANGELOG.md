@@ -11,6 +11,53 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-05-19
+
+### Added
+- `aws_metrics_query` pagination: handler now accepts a `nextToken` input
+  and surfaces `nextToken`/`hasMore` in the response when CloudWatch
+  truncates a large result (previously the resume cursor was silently
+  dropped; in practice rare because the auto-period picker keeps most
+  queries under CloudWatch's ~100,800-datapoint cap, but a 100-query
+  batch over 24h at 300s resolution can produce ~2.88M datapoints).
+- `aws_metrics_query` response now echoes the effective `profile` and
+  `region` it ran against (mirrors `runAwsCall`'s resolution chain:
+  opts override -> session -> env -> default), so an agent fanning out
+  across regions doesn't have to track them separately.
+- `aws_metrics_query` `statistic` validator accepts the simple stats
+  case-insensitively (`'average'` / `'AVERAGE'` / `'Average'`). Previously
+  the extended-stat regex was `/i` but the simple-stat list was
+  case-sensitive, so `'p99'` worked while `'average'` was rejected.
+
+### Fixed
+- `aws_metrics_query` duplicate-id error names BOTH colliding indices
+  (`queries[3] duplicates queries[1]`) instead of just the id string,
+  so an operator with a 50-query batch can find the offenders.
+- `aws_script` tool description and file-level comment now accurately
+  list what's available inside the sandbox. The previous wording claimed
+  `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`, `crypto`,
+  `structuredClone`, `EventTarget`, `MessageChannel`, `performance`
+  were "left available," but `vm.createContext({})` on Node 22 doesn't
+  inject any of them -- a script trusting that wording would have hit
+  `ReferenceError`. Empirically verified list: only `Intl`, `WebAssembly`
+  (with `compile`/`instantiate` blocked), `Atomics`, `SharedArrayBuffer`
+  are injected.
+
+### Changed
+- `aws_script` sandbox now shadows `BroadcastChannel` (defense-in-depth;
+  no current parent-process subscriber, but the cost of shadowing is
+  zero and a future parent plugin might subscribe).
+- `aws-credentials.ts:upsertProfile` removes a dead `existsSync` guard
+  after `renameSync` (the file always exists at that point).
+- Comment-only fixes: `resource.ts` explains why JSON Patch root-add
+  matches RFC 6902 replace semantics; `paginate.ts` clarifies
+  `extractNextToken` only holds when `--max-items` is passed;
+  `docs.ts` explains why the schema-drift warn flag is module-level
+  while the session UUID is per-instance.
+- `fake-aws.ts` + `metrics.test.ts` document the
+  `AWS_MCP_FAKE_SCENARIO` isolation model (sequential subtests within
+  a file; separate worker process per file).
+
 ## [1.1.0] - 2026-05-16
 
 ### Added
@@ -292,7 +339,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/YawLabs/aws-mcp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/YawLabs/aws-mcp/compare/v1.0.2...v1.1.0
 [1.0.2]: https://github.com/YawLabs/aws-mcp/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/YawLabs/aws-mcp/compare/v1.0.0...v1.0.1
