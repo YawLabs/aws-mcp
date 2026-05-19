@@ -62,6 +62,14 @@ export interface DocsSearchResult {
 /**
  * Once-per-process flag so the schema-drift warn doesn't spam stderr on
  * every search after the first hit. Exported reset for tests.
+ *
+ * Intentionally MODULE-LEVEL, not per-`buildDocsTools` instance like the
+ * sibling session UUID at lines below. The session UUID is per-instance
+ * because it identifies a logical client to the upstream backend; the warn
+ * flag tracks something different -- the upstream proxy.search.docs.aws.com
+ * response SHAPE -- which is a process-wide singleton (one upstream, one
+ * schema). Per-instance would warn N times per process when the same break
+ * surfaces in N instances, defeating the once-per-process intent.
  */
 let schemaWarned = false;
 /** Test-only: reset the once-per-process schema-drift warn flag. */

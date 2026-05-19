@@ -13,6 +13,18 @@ if (!tool) throw new Error("metricsTools missing aws_metrics_query");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
+// Tests in this file mutate `process.env.AWS_MCP_FAKE_SCENARIO` and
+// `AWS_MCP_FAKE_ARGV_OUT` per-case to steer fake-aws.ts. Two isolation
+// layers keep these safe:
+//   - WITHIN this file: node:test runs subtests sequentially by default,
+//     so before/it/afterEach mutations don't bleed between cases. The
+//     afterEach below clears both vars.
+//   - ACROSS files: `node --test dist/**/*.test.js` spawns one worker
+//     process per test file, so a sibling file mutating the same env vars
+//     can't reach into this process. Cross-file isolation is structural,
+//     not a fragile coordination contract.
+// The matching note in testing/fake-aws.ts documents the constraint on the
+// producer side.
 let prevCommand: string | undefined;
 let prevPrefixArgs: string | undefined;
 before(() => {
@@ -255,6 +267,126 @@ describe("aws_metrics_query handler validation", () => {
       } as never);
       assert.equal(r.ok, true, `expected stat '${stat}' to be accepted`);
     }
+  });
+
+  it("accepts simple statistics regardless of casing (average, AVERAGE, Average)", async () => {
+    // The extended-stat regex is /i, so case-folding the simple list keeps the
+    // two paths consistent -- 'average' was previously rejected while 'p99'
+    // was accepted.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    for (const stat of ["average", "AVERAGE", "Average", "sum", "MAXIMUM"]) {
+      const r = await tool.handler({
+        queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
+      } as never);
+      assert.equal(r.ok, true, `expected stat '${stat}' to be accepted`);
+    }
+  });
+
+  it("echoes the effective profile + region in the response", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      profile: "prod",
+      region: "us-west-2",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { profile: string; region: string };
+    assert.equal(data.profile, "prod");
+    assert.equal(data.region, "us-west-2");
+  });
+
+  it("falls back to the session profile/region when no override is passed", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    // No profile/region in the call -- handler resolves via getProfile() /
+    // getRegion(). With no session override and no env vars set, these fall
+    // back to "default" / "us-east-1" per session.ts.
+    const prevProfile = process.env.AWS_PROFILE;
+    const prevRegion = process.env.AWS_REGION;
+    const prevDefaultRegion = process.env.AWS_DEFAULT_REGION;
+    delete process.env.AWS_PROFILE;
+    delete process.env.AWS_REGION;
+    delete process.env.AWS_DEFAULT_REGION;
+    try {
+      const r = await tool.handler({
+        queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      } as never);
+      assert.equal(r.ok, true);
+      const data = r.data as { profile: string; region: string };
+      assert.equal(data.profile, "default");
+      assert.equal(data.region, "us-east-1");
+    } finally {
+      if (prevProfile !== undefined) process.env.AWS_PROFILE = prevProfile;
+      if (prevRegion !== undefined) process.env.AWS_REGION = prevRegion;
+      if (prevDefaultRegion !== undefined) process.env.AWS_DEFAULT_REGION = prevDefaultRegion;
+    }
+  });
+
+  it("surfaces nextToken + hasMore=true when CloudWatch truncates", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_paginated";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { nextToken: string | null; hasMore: boolean; series: Array<{ values: number[] }> };
+    assert.equal(data.hasMore, true);
+    assert.equal(typeof data.nextToken, "string");
+    assert.ok((data.nextToken as string).length > 0);
+    assert.equal(data.series[0].values.length, 2);
+  });
+
+  it("returns hasMore=false and nextToken=null on the resume call (last page)", async () => {
+    // Same scenario, different shape: the fake inspects --cli-input-json for
+    // a NextToken and switches behavior. Driving both pages through the same
+    // scenario keeps the test self-contained.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_paginated";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      nextToken: "eyJtZXRyaWNzIjoiYWJjIn0=",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { nextToken: string | null; hasMore: boolean; series: Array<{ values: number[] }> };
+    assert.equal(data.hasMore, false);
+    assert.equal(data.nextToken, null);
+    assert.equal(data.series[0].values.length, 1);
+  });
+
+  it("forwards nextToken as CloudWatch's NextToken in --cli-input-json", async () => {
+    const argvOut = join(tmpdir(), `metrics-resume-argv-${process.pid}-${Date.now()}.json`);
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_echo_argv";
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOut;
+    try {
+      const r = await tool.handler({
+        queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+        nextToken: "resume-cursor-xyz",
+      } as never);
+      assert.equal(r.ok, true);
+      const argv = JSON.parse(readFileSync(argvOut, "utf-8")) as string[];
+      const jsonIdx = argv.indexOf("--cli-input-json");
+      assert.notEqual(jsonIdx, -1);
+      const payload = JSON.parse(argv[jsonIdx + 1]) as { NextToken?: string };
+      assert.equal(payload.NextToken, "resume-cursor-xyz");
+    } finally {
+      try {
+        unlinkSync(argvOut);
+      } catch {
+        // best-effort
+      }
+    }
+  });
+
+  it("includes both colliding indices in the duplicate-id error", async () => {
+    const r = await tool.handler({
+      queries: [
+        { id: "a", namespace: "AWS/EC2", metricName: "CPUUtilization" },
+        { id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" },
+        { id: "b", namespace: "AWS/EC2", metricName: "DiskReadOps" },
+        { id: "cpu", namespace: "AWS/EC2", metricName: "DiskWriteOps" },
+      ],
+    } as never);
+    assert.equal(r.ok, false);
+    // Names BOTH offending indices (the new occurrence and the first one).
+    assert.match(r.error ?? "", /queries\[3\]/);
+    assert.match(r.error ?? "", /queries\[1\]/);
   });
 
   it("rejects invalid startTime", async () => {

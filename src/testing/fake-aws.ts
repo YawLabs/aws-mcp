@@ -6,6 +6,16 @@
  * Reads the `AWS_MCP_FAKE_SCENARIO` env var to decide what to emit.
  * Exercises the full subprocess path in sso.ts (spawn, pipe stdout, exit
  * handling) without requiring a real AWS CLI or SSO setup in CI.
+ *
+ * Concurrency note: AWS_MCP_FAKE_SCENARIO is read out of the parent's env
+ * via the spawn inherit, but the PARENT sets it via `process.env.AWS_MCP_
+ * FAKE_SCENARIO = ...` per-test. node:test runs subtests SEQUENTIALLY
+ * within a single test file (the default concurrency model for our
+ * suites), so a `before`/`it`/`afterEach` block that sets + clears the var
+ * is race-free for tests in the same file. If a future test runner change
+ * enables intra-file parallelism, or a second file mutates the same var
+ * concurrently, callers will need a serial guard. See metrics.test.ts for
+ * the matching note on the test side.
  */
 
 const scenario = process.env.AWS_MCP_FAKE_SCENARIO ?? "happy";
@@ -604,6 +614,65 @@ async function main(): Promise<void> {
         "An error occurred (ValidationError) when calling the GetMetricData operation: The parameter MetricDataQueries.member.1.MetricStat.Metric.Namespace is required.\n",
       );
       process.exit(255);
+      return;
+    }
+
+    case "metrics_paginated": {
+      // Stateful by argv inspection: if the --cli-input-json payload carries
+      // a top-level NextToken (= caller is resuming), emit the final page;
+      // otherwise emit the first page with a NextToken pointing at the
+      // resume cursor. Lets one scenario name cover both call shapes in a
+      // paginate test. Parse the payload as JSON and check the actual key
+      // rather than substring-matching '"NextToken"' -- a metric label,
+      // dimension value, or expression containing that literal would
+      // otherwise silently switch branches.
+      const argv = process.argv.slice(2);
+      const jsonIdx = argv.indexOf("--cli-input-json");
+      const payload = jsonIdx >= 0 ? argv[jsonIdx + 1] : "";
+      let isResume = false;
+      try {
+        const parsed = JSON.parse(payload) as { NextToken?: unknown };
+        isResume = parsed.NextToken !== undefined;
+      } catch {
+        // Malformed JSON shouldn't reach us in a real call (runAwsCall
+        // serializes the payload). If it does, default to the first-page
+        // branch so the test fails loud rather than silently resuming.
+        isResume = false;
+      }
+      if (isResume) {
+        process.stdout.write(
+          `${JSON.stringify({
+            MetricDataResults: [
+              {
+                Id: "cpu",
+                Label: "CPUUtilization",
+                Timestamps: ["2026-05-16T09:00:00Z"],
+                Values: [33.3],
+                StatusCode: "Complete",
+              },
+            ],
+            Messages: [],
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          MetricDataResults: [
+            {
+              Id: "cpu",
+              Label: "CPUUtilization",
+              Timestamps: ["2026-05-16T11:00:00Z", "2026-05-16T10:00:00Z"],
+              Values: [42.5, 38.1],
+              StatusCode: "Complete",
+            },
+          ],
+          Messages: [],
+          NextToken: "eyJtZXRyaWNzIjoiYWJjIn0=",
+        })}\n`,
+      );
+      process.exit(0);
       return;
     }
 

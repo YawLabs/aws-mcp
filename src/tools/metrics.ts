@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
+import { getProfile, getRegion } from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -15,6 +16,18 @@ import type { Tool, ToolResult } from "./tool.js";
  *
  * Pairs with aws_logs_tail (the Logs counterpart) -- the metric side of
  * the same observability question the agent gets asked all the time.
+ *
+ * Response shape: this tool flat-promotes useful fields (series, periodSeconds,
+ * startTime, endTime, profile, region, nextToken, hasMore) at the top level
+ * INSTEAD of nesting under a {result: ...} envelope. That follows the
+ * semantic-tool convention used by aws_resource_get / aws_resource_list /
+ * aws_resource_status, not the thin CLI-proxy convention used by aws_call /
+ * aws_paginate (which DO nest under `result`). Both shapes are intentional:
+ * the proxy tools forward an opaque AWS response so wrapping in `result`
+ * keeps the proxy boundary obvious, while the semantic tools shape a typed
+ * response and flat-promote so callers can destructure without a step.
+ * Don't "fix" this to add a `result` envelope -- it would be a SemVer-major
+ * break and the semantic-tool sibling convention is the right one here.
  */
 
 // Statistic vocabulary CloudWatch accepts on a MetricStat.Stat field. The
@@ -27,7 +40,11 @@ const SIMPLE_STATS = ["Average", "Sum", "Maximum", "Minimum", "SampleCount"] as 
 const EXTENDED_STAT_RE = /^(p|tm|tc|wm|pr|ts|iqm)(\d{1,3}(\.\d{1,3})?)?$/i;
 
 function isValidStatistic(s: string): boolean {
-  if ((SIMPLE_STATS as readonly string[]).includes(s)) return true;
+  // Case-fold the simple list so 'average', 'AVERAGE', 'Average' all pass --
+  // the extended-stat regex below is already case-insensitive (/i), so a
+  // case-sensitive simple list would reject 'average' while accepting 'p99'.
+  const lower = s.toLowerCase();
+  if (SIMPLE_STATS.some((stat) => stat.toLowerCase() === lower)) return true;
   return EXTENDED_STAT_RE.test(s);
 }
 
@@ -186,7 +203,7 @@ export const metricsTools: readonly Tool[] = [
   {
     name: "aws_metrics_query",
     description:
-      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept ISO 8601 or relative shorthand ('15m', '1h', '1d', '1w'); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, statusCode?}], messages?, periodSeconds}. Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
+      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept ISO 8601 or relative shorthand ('15m', '1h', '1d', '1w'); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. When CloudWatch truncates a large response, `hasMore` is true and `nextToken` carries the resume cursor -- call again with `nextToken` set to fetch the next page (rare for typical agent queries that stay within the per-request cap). Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
     annotations: {
       title: "Query CloudWatch metrics (GetMetricData)",
       readOnlyHint: true,
@@ -267,7 +284,13 @@ export const metricsTools: readonly Tool[] = [
         .positive()
         .optional()
         .describe(
-          "Soft cap on returned datapoints across all queries. CloudWatch's hard cap is ~100,800; lower this to keep response sizes manageable.",
+          "Soft cap on returned datapoints across all queries. CloudWatch's hard cap is ~100,800; lower this to keep response sizes manageable. Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
+        ),
+      nextToken: z
+        .string()
+        .optional()
+        .describe(
+          "Resume cursor from a previous call's `nextToken`. Omit for the first page. Forwarded as CloudWatch's NextToken; only meaningful when a prior call returned `hasMore: true`.",
         ),
       profile: z.string().optional().describe("Override session profile for this call."),
       region: z.string().optional().describe("Override session region for this call."),
@@ -280,6 +303,7 @@ export const metricsTools: readonly Tool[] = [
         endTime?: string;
         scanBy?: "TimestampAscending" | "TimestampDescending";
         maxDataPoints?: number;
+        nextToken?: string;
         profile?: string;
         region?: string;
         timeoutMs?: number;
@@ -288,15 +312,17 @@ export const metricsTools: readonly Tool[] = [
       // Cross-field validation that zod can't express cleanly: per-query
       // "exactly one of (namespace+metricName) or expression" + statistic
       // shape check + id-uniqueness across the batch.
-      const seenIds = new Set<string>();
-      for (const q of i.queries) {
-        if (seenIds.has(q.id)) {
+      const seenIds = new Map<string, number>();
+      for (let qi = 0; qi < i.queries.length; qi++) {
+        const q = i.queries[qi];
+        const firstIdx = seenIds.get(q.id);
+        if (firstIdx !== undefined) {
           return {
             ok: false,
-            error: `Duplicate query id '${q.id}'. Each MetricDataQuery.Id must be unique in a batch.`,
+            error: `Duplicate query id '${q.id}' at queries[${qi}]; first seen at queries[${firstIdx}]. Each MetricDataQuery.Id must be unique in a batch.`,
           };
         }
-        seenIds.add(q.id);
+        seenIds.set(q.id, qi);
 
         const hasMetricStat = q.namespace !== undefined || q.metricName !== undefined || q.dimensions !== undefined;
         const hasExpression = q.expression !== undefined;
@@ -360,6 +386,14 @@ export const metricsTools: readonly Tool[] = [
         ScanBy: i.scanBy ?? "TimestampDescending",
       };
       if (i.maxDataPoints !== undefined) params.MaxDatapoints = i.maxDataPoints;
+      if (i.nextToken !== undefined) params.NextToken = i.nextToken;
+
+      // Mirror runAwsCall's resolution so the response echoes back the
+      // EFFECTIVE profile/region the CLI was invoked with -- not the user's
+      // raw input (which may be undefined). Same fallback chain as
+      // runAwsCall in aws-cli.ts (opts override -> session -> env -> default).
+      const effectiveProfile = i.profile ?? getProfile();
+      const effectiveRegion = i.region ?? getRegion();
 
       const result = await runAwsCall({
         service: "cloudwatch",
@@ -387,15 +421,20 @@ export const metricsTools: readonly Tool[] = [
         code: m.Code,
         value: m.Value,
       }));
+      const nextToken = typeof raw.NextToken === "string" && raw.NextToken.length > 0 ? raw.NextToken : null;
 
       return {
         ok: true,
         data: {
           command: result.command,
+          profile: effectiveProfile,
+          region: effectiveRegion,
           startTime: startDate.toISOString(),
           endTime: endDate.toISOString(),
           periodSeconds,
           series,
+          nextToken,
+          hasMore: nextToken !== null,
           ...(messages && messages.length > 0 ? { messages } : {}),
         },
       };

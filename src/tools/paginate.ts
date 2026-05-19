@@ -6,7 +6,11 @@ import type { Tool, ToolResult } from "./tool.js";
  * When --max-items is passed and the underlying API truncates, the AWS CLI
  * always surfaces the resume token under the top-level `NextToken` key (even
  * when the raw API uses Marker / NextContinuationToken / nextToken). So a
- * single field check covers every paginated operation.
+ * single field check covers every paginated operation when invoked via
+ * aws_paginate (which always passes --max-items). Without --max-items the
+ * raw API field names pass through verbatim (e.g. list-objects-v2 returns
+ * NextContinuationToken), so this helper is NOT a general "find the next
+ * token anywhere" -- it's specifically the aws_paginate envelope reader.
  */
 export function extractNextToken(data: unknown): string | null {
   if (data && typeof data === "object" && "NextToken" in data) {

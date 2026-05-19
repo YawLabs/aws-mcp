@@ -214,6 +214,16 @@ describe("parseAwsError -- standard CLI shape", () => {
     );
     assert.match(r.suggestion ?? "", /aws_resource_update/);
   });
+
+  it("suggests aws_resource_get for ConflictException (pins tool name reference)", () => {
+    // Pins the cross-module tool-name reference in errors.ts so a rename of
+    // aws_resource_get fails this test loudly rather than leaving a stale
+    // suggestion string in the field.
+    const r = parseAwsError(
+      "An error occurred (ConflictException) when calling the UpdateResource operation: state conflict",
+    );
+    assert.match(r.suggestion ?? "", /aws_resource_get/);
+  });
 });
 
 describe("parseAwsError -- non-standard shapes", () => {

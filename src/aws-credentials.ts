@@ -294,12 +294,11 @@ export async function upsertProfile(path: string, profile: string, creds: Assume
     }
     renameSync(tmpPath, path);
     if (platform() !== "win32") {
-      let existingMode = 0o600;
-      if (existsSync(path)) {
-        const st: Stats = statSync(path);
-        existingMode = st.mode & 0o777;
-      }
-      // If the file was more permissive, tighten it.
+      // Post-rename the file always exists -- statSync directly, no existsSync
+      // guard needed. The chmod only fires when the file was more permissive
+      // than 0o600, so a freshly-opened-with-0o600 tmp file is a no-op.
+      const st: Stats = statSync(path);
+      const existingMode = st.mode & 0o777;
       if ((existingMode & 0o077) !== 0) chmodSync(path, 0o600);
     }
   } finally {

@@ -21,7 +21,7 @@ import type { Tool, ToolResult } from "./tool.js";
  * the model can already call -- the threat surface is "model writes JS that
  * calls our tools," not "untrusted code from the internet."
  *
- * Sandbox surface:
+ * Sandbox surface (explicitly bound):
  *   aws.call({service, operation, params?, query?, profile?, region?,
  *             outputFormat?, timeoutMs?}) -> {command, result}
  *   aws.paginate({...}) -> {command, result, nextToken, hasMore}
@@ -30,11 +30,32 @@ import type { Tool, ToolResult } from "./tool.js";
  *   aws.logsTail({...})
  *   console.log/info/warn/error/debug -> captured into a buffer, returned
  *                                        with the result
- *   JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error
+ *   Realm-fresh intrinsics: JSON, Math, Date, Promise, Array, Object,
+ *     String, Number, Boolean, Error
  *
- * No require, no import, no process, no fs, no fetch, no setTimeout/Interval,
- * no globalThis. The script body is wrapped in `(async () => { ... })()`
- * so callers use `return <value>` to surface a result.
+ * Explicitly shadowed (made `undefined`):
+ *   - I/O & process: require, import, process, fs, fetch, Request, Response,
+ *     Headers, AbortController, AbortSignal, BroadcastChannel
+ *   - Event loop: setTimeout/Interval/Immediate, clearTimeout/Interval/
+ *     Immediate, queueMicrotask
+ *   - Realm/process handles: Buffer, global, globalThis
+ *
+ * Other Node-injected vm-context globals left available: `Intl`,
+ * `WebAssembly` (with `compile`/`instantiate` blocked by
+ * `codeGeneration.wasm: false`), `Atomics`, `SharedArrayBuffer`. All
+ * pure-compute APIs with no filesystem/network/event-loop reach.
+ *
+ * Globals NOT injected by `vm.createContext({})` on Node 22 (so neither
+ * bound here nor in the shadow list): `URL`, `URLSearchParams`,
+ * `TextEncoder`, `TextDecoder`, `crypto`, `structuredClone`, `EventTarget`,
+ * `MessageChannel`, `performance`. A script that uses any of these gets a
+ * ReferenceError today. If a future Node release starts injecting them, or
+ * any other global with reach beyond compute (a `webcrypto.subtle`-style
+ * key store, a thread spawner, ...), revisit the shadow list -- the list
+ * is the contract, not the absence-from-list.
+ *
+ * The script body is wrapped in `(async () => { ... })()` so callers use
+ * `return <value>` to surface a result.
  */
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -70,6 +91,15 @@ async function unwrap(tool: Tool, input: unknown): Promise<unknown> {
   return r.data;
 }
 
+/**
+ * Mirror of aws_paginate's input schema, minus fields the auto-loop manages
+ * itself (`startingToken`) and minus fields aws_paginate doesn't expose
+ * today (`outputFormat` -- aws_paginate hard-codes JSON because the wrapper
+ * needs to parse the response shape for next-token extraction). If
+ * aws_paginate ever surfaces outputFormat, add it here too -- this interface
+ * intentionally tracks the aws_paginate surface 1:1 to avoid silently
+ * dropping a field a script author passed.
+ */
 export interface PaginateAllInput {
   service: string;
   operation: string;
@@ -331,6 +361,12 @@ export async function runScript(
     Headers: undefined,
     AbortController: undefined,
     AbortSignal: undefined,
+    // BroadcastChannel can post messages to listeners in OTHER vm contexts
+    // or the parent process when a channel with the same name is open
+    // there. The aws-mcp parent doesn't subscribe to any channel, so the
+    // realistic reach is nil -- but a future plugin in the parent could,
+    // and the cost of shadowing is zero. Defense-in-depth.
+    BroadcastChannel: undefined,
   });
 
   const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
@@ -395,7 +431,7 @@ export const scriptTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, console. No require/import/process/fs/fetch/setTimeout/globalThis. Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
+          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Shadowed (undefined): require, import, process, fs, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
         ),
       timeoutMs: z
         .number()

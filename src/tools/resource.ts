@@ -904,7 +904,11 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
     }
     const tokens = parseJsonPointer(op.path);
     if (tokens.length === 0) {
-      // Whole-document replace/add/remove.
+      // Whole-document replace/add/remove. RFC 6902 says `add` at the root
+      // REPLACES the document when one exists (not an error) -- same effective
+      // semantics as `replace`. We collapse both ops to the same reassignment
+      // so a future reviewer doesn't "fix" the add branch to throw on a
+      // pre-existing root.
       if (op.op === "remove") {
         throw new Error(`Cannot remove the document root at index ${i}.`);
       }
