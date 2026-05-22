@@ -11,6 +11,30 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-05-22
+
+### Fixed
+- `aws_metrics_query` now canonicalizes simple `statistic` inputs
+  (`average`, `AVERAGE`, `Average`) to CloudWatch's PascalCase
+  (`Average`) before sending. Previously the case-insensitive validator
+  accepted lowercase input but the handler passed the raw string through
+  to CloudWatch, which rejects non-PascalCase simple stats with a
+  ValidationError. Extended stats (`p99`, `tm95`, ...) still pass through
+  verbatim.
+
+### Changed
+- `aws_script` description now explicitly names the intentionally-NOT-bound
+  tools (`aws_metrics_query`, `aws_iam_simulate`, `aws_multi_region`,
+  `aws_assume_role`, `aws_docs_search`, `aws_docs_read`, plus the
+  auth/session/profile tools and `aws_script` itself). Tells the model to
+  call those as sibling MCP tools instead of trying them inside a script
+  and hitting a ReferenceError.
+
+### Internal
+- `tools/multi-region.ts` now imports `isValidRegionName` /
+  `REGION_NAME_RE` from `session.ts` instead of carrying a duplicate
+  regex. No behavior change -- both patterns were identical.
+
 ## [1.2.1] - 2026-05-21
 
 ### Changed
