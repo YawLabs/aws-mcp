@@ -440,7 +440,7 @@ export const scriptTools: readonly Tool[] = [
         .max(MAX_TIMEOUT_MS)
         .optional()
         .describe(
-          `Wall-clock timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}; max ${MAX_TIMEOUT_MS}. Covers evaluation plus every awaited aws.* call.`,
+          `Wall-clock timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}; max ${MAX_TIMEOUT_MS}. Covers evaluation plus every awaited aws.* call. On timeout the script stops being awaited and the tool returns an error, but any aws.* call already in flight is NOT cancelled -- it continues until its own per-call timeout (default 60s). Plan retries accordingly: a script that timed out mid 'resource.delete' may have completed the delete; re-issuing the same script can double-mutate.`,
         ),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
