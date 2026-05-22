@@ -67,9 +67,7 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
         ) as ScriptHandlers["paginateAll"])
       : defaults.paginateAll,
     logsTail: overrides.logsTail ? record("logsTail", overrides.logsTail) : defaults.logsTail,
-    metricsQuery: overrides.metricsQuery
-      ? record("metricsQuery", overrides.metricsQuery)
-      : defaults.metricsQuery,
+    metricsQuery: overrides.metricsQuery ? record("metricsQuery", overrides.metricsQuery) : defaults.metricsQuery,
     iamSimulate: overrides.iamSimulate ? record("iamSimulate", overrides.iamSimulate) : defaults.iamSimulate,
     multiRegion: overrides.multiRegion ? record("multiRegion", overrides.multiRegion) : defaults.multiRegion,
     assumeRole: overrides.assumeRole ? record("assumeRole", overrides.assumeRole) : defaults.assumeRole,
@@ -793,10 +791,7 @@ describe("runScript additional aws.* bindings", () => {
     assert.equal(r.data, true);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].method, "docs.read");
-    assert.equal(
-      (calls[0].input as { url: string }).url,
-      "https://docs.aws.amazon.com/AmazonS3/...",
-    );
+    assert.equal((calls[0].input as { url: string }).url, "https://docs.aws.amazon.com/AmazonS3/...");
   });
 });
 

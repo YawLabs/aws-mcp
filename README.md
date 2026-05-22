@@ -100,11 +100,7 @@ The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-regio
 
 ## Install
 
-```bash
-npm install -g @yawlabs/aws-mcp
-```
-
-Or add to your MCP client config (e.g. `.mcp.json`):
+Add to your MCP client config (e.g. `.mcp.json`):
 
 ```json
 {
@@ -116,6 +112,26 @@ Or add to your MCP client config (e.g. `.mcp.json`):
   }
 }
 ```
+
+The `-y` flag is what gives you **auto-update on each session load**: every time your MCP client spawns the server, `npx` checks the registry for the latest `@yawlabs/aws-mcp` and downloads it if newer. The first launch in a fresh cache adds ~100-500 ms; subsequent launches use npm's cache (typical metadata-freshness window: 5 min) and add ~50 ms or less. Once the server is up, tool calls have zero auto-update overhead -- the check fires only on (re-)spawn. No separate install step is needed; `-y` covers both first-time install and ongoing updates.
+
+If you'd rather pin a specific version (no auto-update, but zero startup overhead), install globally and point the config at the installed binary:
+
+```bash
+npm install -g @yawlabs/aws-mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "aws": {
+      "command": "aws-mcp"
+    }
+  }
+}
+```
+
+You'll need to `npm install -g @yawlabs/aws-mcp@latest` manually when you want a newer version.
 
 ## Example session
 

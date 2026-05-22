@@ -11,6 +11,26 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-05-22
+
+### Changed
+- README's Install section now leads with the `npx -y` MCP-client-config
+  pattern (the auto-update path) and demotes `npm install -g` to a "pin
+  a version" alternative. Added an explicit one-paragraph note on what
+  `-y` does: re-checks the registry on each MCP session spawn, fetches
+  newer releases when available, costs ~100-500 ms first-launch (or
+  ~50 ms warm cache), and adds zero overhead to tool calls once the
+  server is up. No code change; documentation reshapes the default
+  install path to match how most users were already running it.
+
+### Internal
+- Fixed two Biome-format violations in `src/tools/script.test.ts`
+  introduced by the v1.3.0 bump that slipped past local lint (ARM64
+  Windows `npm run lint` segfaults; CI Biome on ubuntu is the
+  authoritative format check). v1.3.0's release CI failed at the
+  lint gate before publishing, so v1.3.0 never landed on npm or the
+  MCP Registry; v1.3.1 supersedes it and carries the same feature set.
+
 ## [1.3.0] - 2026-05-22
 
 ### Added
