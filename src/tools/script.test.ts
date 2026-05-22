@@ -652,20 +652,26 @@ describe("runScript additional aws.* bindings", () => {
   });
 
   it("invokes aws.iamSimulate with the script's input", async () => {
+    // Mock mirrors the real aws_iam_simulate response shape: results[] has
+    // flat-promoted { action, decision, ... } (lowercase, transformed from
+    // the raw EvalActionName/EvalDecision the underlying CLI returns), plus
+    // a summary { allowed, denied, total } envelope. Field on the input is
+    // `principalArn`, not `principal` (real schema).
     const { handlers, calls } = makeMockHandlers({
       iamSimulate: async () => ({
-        results: [{ EvalActionName: "s3:GetObject", EvalDecision: "allowed" }],
+        summary: { allowed: 1, denied: 0, total: 1 },
+        results: [{ action: "s3:GetObject", resource: "arn:aws:s3:::bucket/key", decision: "allowed" }],
       }),
     });
     const r = await runScript(
       {
         code: `
           const r = await aws.iamSimulate({
-            principal: "arn:aws:iam::123456789012:role/r",
+            principalArn: "arn:aws:iam::123456789012:role/r",
             actions: ["s3:GetObject"],
             resources: ["arn:aws:s3:::bucket/key"],
           });
-          return r.results[0].EvalDecision;
+          return r.results[0].decision;
         `,
       },
       handlers,
@@ -677,9 +683,19 @@ describe("runScript additional aws.* bindings", () => {
   });
 
   it("invokes aws.multiRegion with the script's input", async () => {
+    // Mock mirrors the real aws_multi_region response shape: a flat envelope
+    // with service/operation/regionCount/okCount/errorCount plus
+    // results: RegionResult[] (each entry { region, ok, data?, error?,
+    // errorKind?, command? }). Earlier draft used { regions: {<region>: ...} }
+    // which doesn't match the real handler.
     const { handlers, calls } = makeMockHandlers({
       multiRegion: async () => ({
-        regions: { "us-east-1": { ok: true, result: { Buckets: [] } } },
+        service: "s3api",
+        operation: "list-buckets",
+        regionCount: 1,
+        okCount: 1,
+        errorCount: 0,
+        results: [{ region: "us-east-1", ok: true, data: { Buckets: [] } }],
       }),
     });
     const r = await runScript(
@@ -690,7 +706,7 @@ describe("runScript additional aws.* bindings", () => {
             operation: "list-buckets",
             regions: ["us-east-1"],
           });
-          return Object.keys(r.regions);
+          return r.results.map((x) => x.region);
         `,
       },
       handlers,
@@ -702,9 +718,18 @@ describe("runScript additional aws.* bindings", () => {
   });
 
   it("invokes aws.assumeRole with the script's input", async () => {
+    // Mock mirrors the real aws_assume_role response shape. CRUCIAL: the
+    // real handler deliberately does NOT return raw credentials -- it
+    // stashes them in ~/.aws/credentials and returns { profile,
+    // credentialsPath, expiration, assumedRoleArn, ... }. The whole point
+    // of the tool is keeping secrets off the wire. sessionName must also
+    // pass the real schema's min(2) / regex; the earlier "s" failed both.
     const { handlers, calls } = makeMockHandlers({
       assumeRole: async () => ({
-        credentials: { AccessKeyId: "AKIA...", Expiration: "2026-01-01T00:00:00Z" },
+        profile: "mcp-smoke",
+        credentialsPath: "/home/u/.aws/credentials",
+        expiration: "2026-01-01T00:00:00Z",
+        assumedRoleArn: "arn:aws:sts::123456789012:assumed-role/r/smoke",
       }),
     });
     const r = await runScript(
@@ -712,14 +737,14 @@ describe("runScript additional aws.* bindings", () => {
         code: `
           const r = await aws.assumeRole({
             roleArn: "arn:aws:iam::123456789012:role/r",
-            sessionName: "s",
+            sessionName: "smoke",
           });
-          return r.credentials.AccessKeyId;
+          return r.profile;
         `,
       },
       handlers,
     );
-    assert.equal(r.data, "AKIA...");
+    assert.equal(r.data, "mcp-smoke");
     assert.equal(calls.length, 1);
     assert.equal(calls[0].method, "assumeRole");
     assert.equal((calls[0].input as { roleArn: string }).roleArn, "arn:aws:iam::123456789012:role/r");
