@@ -11,6 +11,36 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-05-22
+
+### Added
+- `aws_script` now exposes five additional AWS tools through its JS
+  sandbox: `aws.metricsQuery`, `aws.iamSimulate`, `aws.multiRegion`,
+  `aws.assumeRole`, and `aws.docs.{search,read}`. Previously these were
+  intentional feature gaps -- the prior release's "either add them or
+  document the cut-off" note resolves as add. Auth/session/profile tools
+  and `aws_script` itself remain intentionally not bound (process-wide
+  state / self-recursion).
+
+### Fixed
+- `aws_metrics_query` extended statistics (`p99`, `tm95`, `tc90`, ...)
+  are now lowercased before being sent to CloudWatch. The validator's
+  case-insensitive regex was accepting `P99` / `Tm95` but the
+  CloudWatch wire format only accepts lowercase; uppercase inputs were
+  bouncing server-side with a ValidationError. `canonicalizeStatistic`
+  now handles both branches (PascalCase simple stats, lowercase extended
+  stats) and the trailing fall-through still passes unrecognized inputs
+  through verbatim as defense-in-depth.
+
+### Internal
+- Test fixtures for the new `aws_script` bindings now mirror the real
+  handlers' response shapes -- `iamSimulate` results are
+  `{ action, decision, ... }` not raw CLI `{ EvalActionName, ... }`;
+  `multiRegion` returns `results: RegionResult[]` not a region-keyed
+  object; `assumeRole` returns `{ profile, credentialsPath, expiration,
+  assumedRoleArn }` (deliberately NOT raw credentials -- secrets stay
+  off the wire). No behavior change in production code.
+
 ## [1.2.2] - 2026-05-22
 
 ### Fixed
