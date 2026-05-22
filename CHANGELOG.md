@@ -11,6 +11,20 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-05-21
+
+### Changed
+- `aws_script` `timeoutMs` description now spells out that timeout stops
+  the script from being awaited but does NOT cancel any `aws.*` call
+  already in flight -- those keep running until their own per-call
+  timeout (default 60s). Matters because a script that timed out mid
+  `resource.delete` may have completed the delete; re-issuing the same
+  script on retry can double-mutate.
+- `aws_multi_region` description now notes that duplicate regions in the
+  input are collapsed (first occurrence wins) so `results.length` may be
+  less than `regions.length`; the returned `regionCount` is authoritative
+  for the actual count run.
+
 ## [1.2.0] - 2026-05-19
 
 ### Added
