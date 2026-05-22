@@ -48,6 +48,23 @@ function isValidStatistic(s: string): boolean {
   return EXTENDED_STAT_RE.test(s);
 }
 
+/**
+ * Canonicalize a simple stat to CloudWatch's PascalCase. CloudWatch's
+ * MetricStat.Stat field is case-sensitive: 'Average' is accepted, 'average'
+ * gets a ValidationError. isValidStatistic accepts the case-folded form so
+ * the schema doesn't reject 'average' while accepting 'p99', but we MUST
+ * canonicalize before sending so the agent's lowercase input doesn't bounce
+ * server-side. Extended stats (p99, p99.9, tm95, ...) are accepted by
+ * CloudWatch case-insensitively, so we pass them through verbatim.
+ */
+function canonicalizeStatistic(s: string): string {
+  const lower = s.toLowerCase();
+  for (const stat of SIMPLE_STATS) {
+    if (stat.toLowerCase() === lower) return stat;
+  }
+  return s;
+}
+
 // CloudWatch requires query Ids match /^[a-z][A-Za-z0-9_]*$/ and be unique
 // within a request. Mirror the spec; the handler additionally checks for
 // duplicates across the input list.
@@ -177,7 +194,7 @@ export function buildMetricDataQueries(
         ...(dimensions ? { Dimensions: dimensions } : {}),
       },
       Period: q.period ?? autoPeriod,
-      Stat: q.statistic ?? "Average",
+      Stat: q.statistic !== undefined ? canonicalizeStatistic(q.statistic) : "Average",
     };
     if (q.unit !== undefined) stat.Unit = q.unit;
     base.MetricStat = stat;

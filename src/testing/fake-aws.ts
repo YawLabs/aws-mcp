@@ -723,6 +723,7 @@ async function main(): Promise<void> {
     default: {
       process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
       process.exit(2);
+      return;
     }
   }
 }

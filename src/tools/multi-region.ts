@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
+import { isValidRegionName, REGION_NAME_RE } from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -22,13 +23,10 @@ const DEFAULT_CONCURRENCY = 8;
 const MAX_CONCURRENCY = 32;
 const MAX_REGIONS = 32;
 
-// AWS region IDs are e.g. us-east-1, eu-west-3, ap-northeast-1, us-gov-east-1,
-// cn-north-1, me-central-1. The pattern is <area>-<direction>-<digit>(-<digit>).
-// We enforce a conservative regex: lowercase letters, digits, hyphens, must
-// contain at least one hyphen, must not start with a hyphen. Length-capped.
-// This is also argv-injection defense: a region of "--profile evil" must not
-// pose as a CLI flag when we append it to the aws CLI argv.
-const REGION_RE = /^[a-z][a-z0-9-]{2,30}$/;
+// Region validation comes from session.ts (REGION_NAME_RE / isValidRegionName)
+// so the argv-safety contract for region IDs is defined in one place. Previously
+// this file carried a duplicate regex with the identical pattern -- harmless
+// today, drift risk tomorrow.
 
 export interface RegionResult {
   region: string;
@@ -132,11 +130,11 @@ export const multiRegionTools: readonly Tool[] = [
       const concurrency = i.concurrency ?? DEFAULT_CONCURRENCY;
 
       const results = await runWithConcurrency(regions, concurrency, async (region): Promise<RegionResult> => {
-        if (!REGION_RE.test(region)) {
+        if (!isValidRegionName(region)) {
           return {
             region,
             ok: false,
-            error: `Invalid region '${region}'. Must match /^[a-z][a-z0-9-]{2,30}$/.`,
+            error: `Invalid region '${region}'. Must match ${REGION_NAME_RE} (e.g. 'us-east-1').`,
             errorKind: "bad_input",
           };
         }

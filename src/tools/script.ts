@@ -33,6 +33,19 @@ import type { Tool, ToolResult } from "./tool.js";
  *   Realm-fresh intrinsics: JSON, Math, Date, Promise, Array, Object,
  *     String, Number, Boolean, Error
  *
+ * Intentionally NOT bound (run as separate MCP tool calls):
+ *   - aws_metrics_query, aws_iam_simulate, aws_multi_region, aws_assume_role
+ *   - aws_docs_search, aws_docs_read
+ *   - aws_list_profiles, aws_whoami, aws_login_start, aws_login_complete,
+ *     aws_refresh_if_expiring_soon, aws_session_*
+ *   - aws_script itself (no self-recursion)
+ * Auth/session/profile tools are intentionally not bound -- they reshape
+ * process-wide state that doesn't compose with scripted orchestration.
+ * The rest (metrics_query, iam_simulate, multi_region, assume_role, docs_*)
+ * are feature gaps -- callers who need them today emit a sibling MCP tool
+ * call before or after the script. If a workflow consistently needs one of
+ * these inside aws_script, add it to ScriptHandlers + the aws bridge below.
+ *
  * Explicitly shadowed (made `undefined`):
  *   - I/O & process: require, import, process, fs, fetch, Request, Response,
  *     Headers, AbortController, AbortSignal, BroadcastChannel
@@ -431,7 +444,7 @@ export const scriptTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Shadowed (undefined): require, import, process, fs, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
+          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_metrics_query, aws_iam_simulate, aws_multi_region, aws_assume_role, aws_docs_search, aws_docs_read, aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, import, process, fs, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
         ),
       timeoutMs: z
         .number()
