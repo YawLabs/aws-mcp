@@ -163,6 +163,45 @@ describe("buildMetricDataQueries", () => {
     assert.deepEqual(out, [{ Id: "sum", Label: "total", Expression: "SUM([m1, m2])" }]);
   });
 
+  it("canonicalizes simple stats to PascalCase regardless of input casing", () => {
+    // CloudWatch's MetricStat.Stat is case-sensitive on simple stats:
+    // 'average' bounces server-side, 'Average' is accepted. The validator
+    // accepts case-folded forms; the wire shaper must canonicalize.
+    for (const input of ["average", "AVERAGE", "Average"]) {
+      const out = buildMetricDataQueries(
+        [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: input }],
+        60,
+      );
+      assert.equal(out[0].MetricStat?.Stat, "Average", `input '${input}' should canonicalize to 'Average'`);
+    }
+    const sumOut = buildMetricDataQueries(
+      [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: "sum" }],
+      60,
+    );
+    assert.equal(sumOut[0].MetricStat?.Stat, "Sum");
+  });
+
+  it("canonicalizes extended stats to lowercase regardless of input casing", () => {
+    // CloudWatch's MetricStat.Stat is also case-sensitive on extended stats,
+    // but in the OPPOSITE direction: 'p99' is accepted, 'P99' bounces. The
+    // validator's /i regex accepts both shapes; the wire shaper must lower.
+    const cases: Array<[string, string]> = [
+      ["P99", "p99"],
+      ["P99.9", "p99.9"],
+      ["Tm95", "tm95"],
+      ["TC90", "tc90"],
+      ["WM99", "wm99"],
+      ["IQM", "iqm"],
+    ];
+    for (const [input, expected] of cases) {
+      const out = buildMetricDataQueries(
+        [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: input }],
+        60,
+      );
+      assert.equal(out[0].MetricStat?.Stat, expected, `input '${input}' should canonicalize to '${expected}'`);
+    }
+  });
+
   it("omits Dimensions when none are given", () => {
     const out = buildMetricDataQueries([{ id: "x", namespace: "AWS/SQS", metricName: "NumberOfMessagesReceived" }], 60);
     assert.equal((out[0].MetricStat?.Metric as { Dimensions?: unknown }).Dimensions, undefined);

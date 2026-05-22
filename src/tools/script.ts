@@ -1,7 +1,12 @@
 import { createContext, runInContext } from "node:vm";
 import { z } from "zod";
+import { assumeTools } from "./assume.js";
 import { callTools } from "./call.js";
+import { docsTools } from "./docs.js";
+import { iamSimulateTools } from "./iam-simulate.js";
 import { logsTools } from "./logs.js";
+import { metricsTools } from "./metrics.js";
+import { multiRegionTools } from "./multi-region.js";
 import { paginateTools } from "./paginate.js";
 import { resourceTools } from "./resource.js";
 import type { Tool, ToolResult } from "./tool.js";
@@ -28,23 +33,24 @@ import type { Tool, ToolResult } from "./tool.js";
  *   aws.paginateAll({...}) -> {items[], pages, count}  (auto-loops)
  *   aws.resource.{get,list,create,update,delete,status}({...})
  *   aws.logsTail({...})
+ *   aws.metricsQuery({...})
+ *   aws.iamSimulate({...})
+ *   aws.multiRegion({...})
+ *   aws.assumeRole({...})
+ *   aws.docs.{search,read}({...})
  *   console.log/info/warn/error/debug -> captured into a buffer, returned
  *                                        with the result
  *   Realm-fresh intrinsics: JSON, Math, Date, Promise, Array, Object,
  *     String, Number, Boolean, Error
  *
  * Intentionally NOT bound (run as separate MCP tool calls):
- *   - aws_metrics_query, aws_iam_simulate, aws_multi_region, aws_assume_role
- *   - aws_docs_search, aws_docs_read
  *   - aws_list_profiles, aws_whoami, aws_login_start, aws_login_complete,
  *     aws_refresh_if_expiring_soon, aws_session_*
  *   - aws_script itself (no self-recursion)
  * Auth/session/profile tools are intentionally not bound -- they reshape
  * process-wide state that doesn't compose with scripted orchestration.
- * The rest (metrics_query, iam_simulate, multi_region, assume_role, docs_*)
- * are feature gaps -- callers who need them today emit a sibling MCP tool
- * call before or after the script. If a workflow consistently needs one of
- * these inside aws_script, add it to ScriptHandlers + the aws bridge below.
+ * aws_script self-recursion is also off the table for the same reason a
+ * shell script doesn't embed a second copy of itself.
  *
  * Explicitly shadowed (made `undefined`):
  *   - I/O & process: require, import, process, fs, fetch, Request, Response,
@@ -164,6 +170,10 @@ export interface ScriptHandlers {
   paginate: (input: unknown) => Promise<unknown>;
   paginateAll: (input: PaginateAllInput) => Promise<unknown>;
   logsTail: (input: unknown) => Promise<unknown>;
+  metricsQuery: (input: unknown) => Promise<unknown>;
+  iamSimulate: (input: unknown) => Promise<unknown>;
+  multiRegion: (input: unknown) => Promise<unknown>;
+  assumeRole: (input: unknown) => Promise<unknown>;
   resource: {
     get: (input: unknown) => Promise<unknown>;
     list: (input: unknown) => Promise<unknown>;
@@ -172,6 +182,10 @@ export interface ScriptHandlers {
     delete: (input: unknown) => Promise<unknown>;
     status: (input: unknown) => Promise<unknown>;
   };
+  docs: {
+    search: (input: unknown) => Promise<unknown>;
+    read: (input: unknown) => Promise<unknown>;
+  };
 }
 
 /** Build the production handler set from the real tool registries. Exposed so tests can substitute mocks via `runScript(opts, customHandlers)`. */
@@ -179,6 +193,12 @@ export function defaultScriptHandlers(): ScriptHandlers {
   const callTool = findTool("aws_call", callTools);
   const paginateTool = findTool("aws_paginate", paginateTools);
   const logsTailTool = findTool("aws_logs_tail", logsTools);
+  const metricsQueryTool = findTool("aws_metrics_query", metricsTools);
+  const iamSimulateTool = findTool("aws_iam_simulate", iamSimulateTools);
+  const multiRegionTool = findTool("aws_multi_region", multiRegionTools);
+  const assumeRoleTool = findTool("aws_assume_role", assumeTools);
+  const docsSearchTool = findTool("aws_docs_search", docsTools);
+  const docsReadTool = findTool("aws_docs_read", docsTools);
   const resourceGet = findTool("aws_resource_get", resourceTools);
   const resourceList = findTool("aws_resource_list", resourceTools);
   const resourceCreate = findTool("aws_resource_create", resourceTools);
@@ -190,6 +210,10 @@ export function defaultScriptHandlers(): ScriptHandlers {
     paginate: (input) => unwrap(paginateTool, input),
     paginateAll: buildPaginateAll(paginateTool),
     logsTail: (input) => unwrap(logsTailTool, input),
+    metricsQuery: (input) => unwrap(metricsQueryTool, input),
+    iamSimulate: (input) => unwrap(iamSimulateTool, input),
+    multiRegion: (input) => unwrap(multiRegionTool, input),
+    assumeRole: (input) => unwrap(assumeRoleTool, input),
     resource: {
       get: (input) => unwrap(resourceGet, input),
       list: (input) => unwrap(resourceList, input),
@@ -197,6 +221,10 @@ export function defaultScriptHandlers(): ScriptHandlers {
       update: (input) => unwrap(resourceUpdate, input),
       delete: (input) => unwrap(resourceDelete, input),
       status: (input) => unwrap(resourceStatus, input),
+    },
+    docs: {
+      search: (input) => unwrap(docsSearchTool, input),
+      read: (input) => unwrap(docsReadTool, input),
     },
   };
 }
@@ -316,6 +344,10 @@ export async function runScript(
     paginate: wrapForRealm(handlers.paginate),
     paginateAll: wrapForRealm(handlers.paginateAll as (input: unknown) => Promise<unknown>),
     logsTail: wrapForRealm(handlers.logsTail),
+    metricsQuery: wrapForRealm(handlers.metricsQuery),
+    iamSimulate: wrapForRealm(handlers.iamSimulate),
+    multiRegion: wrapForRealm(handlers.multiRegion),
+    assumeRole: wrapForRealm(handlers.assumeRole),
     resource: {
       get: wrapForRealm(handlers.resource.get),
       list: wrapForRealm(handlers.resource.list),
@@ -323,6 +355,10 @@ export async function runScript(
       update: wrapForRealm(handlers.resource.update),
       delete: wrapForRealm(handlers.resource.delete),
       status: wrapForRealm(handlers.resource.status),
+    },
+    docs: {
+      search: wrapForRealm(handlers.docs.search),
+      read: wrapForRealm(handlers.docs.read),
     },
   };
 
@@ -429,7 +465,7 @@ export const scriptTools: readonly Tool[] = [
   {
     name: "aws_script",
     description:
-      "Run a short JavaScript snippet that orchestrates other aws-mcp tools (aws.call, aws.paginate, aws.paginateAll, aws.resource.*, aws.logsTail) and returns a combined result. Best for batched read+filter+aggregate workflows that would otherwise need N tool round-trips: 'list all Lambdas, fetch each one's config, return those with memory > 1024'. Use `return <value>` at the end to surface a result; console.log lines are captured and returned alongside. Helpers throw Errors on failure -- use try/catch. NOT a security sandbox -- treat the same as any other tool the model can call.",
+      "Run a short JavaScript snippet that orchestrates other aws-mcp tools (aws.call, aws.paginate, aws.paginateAll, aws.resource.*, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}) and returns a combined result. Best for batched read+filter+aggregate workflows that would otherwise need N tool round-trips: 'list all Lambdas, fetch each one's config, return those with memory > 1024'. Use `return <value>` at the end to surface a result; console.log lines are captured and returned alongside. Helpers throw Errors on failure -- use try/catch. NOT a security sandbox -- treat the same as any other tool the model can call.",
     annotations: {
       title: "Run a JS snippet that orchestrates AWS tool calls",
       // The script may invoke destructive tools (resource.create/update/delete)
@@ -444,7 +480,7 @@ export const scriptTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_metrics_query, aws_iam_simulate, aws_multi_region, aws_assume_role, aws_docs_search, aws_docs_read, aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, import, process, fs, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
+          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, import, process, fs, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
         ),
       timeoutMs: z
         .number()

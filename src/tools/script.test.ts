@@ -40,6 +40,10 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
     paginate: notImpl("paginate"),
     paginateAll: notImpl("paginateAll"),
     logsTail: notImpl("logsTail"),
+    metricsQuery: notImpl("metricsQuery"),
+    iamSimulate: notImpl("iamSimulate"),
+    multiRegion: notImpl("multiRegion"),
+    assumeRole: notImpl("assumeRole"),
     resource: {
       get: notImpl("resource.get"),
       list: notImpl("resource.list"),
@@ -47,6 +51,10 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
       update: notImpl("resource.update"),
       delete: notImpl("resource.delete"),
       status: notImpl("resource.status"),
+    },
+    docs: {
+      search: notImpl("docs.search"),
+      read: notImpl("docs.read"),
     },
   };
   const merged: ScriptHandlers = {
@@ -59,6 +67,12 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
         ) as ScriptHandlers["paginateAll"])
       : defaults.paginateAll,
     logsTail: overrides.logsTail ? record("logsTail", overrides.logsTail) : defaults.logsTail,
+    metricsQuery: overrides.metricsQuery
+      ? record("metricsQuery", overrides.metricsQuery)
+      : defaults.metricsQuery,
+    iamSimulate: overrides.iamSimulate ? record("iamSimulate", overrides.iamSimulate) : defaults.iamSimulate,
+    multiRegion: overrides.multiRegion ? record("multiRegion", overrides.multiRegion) : defaults.multiRegion,
+    assumeRole: overrides.assumeRole ? record("assumeRole", overrides.assumeRole) : defaults.assumeRole,
     resource: {
       get: overrides.resource?.get ? record("resource.get", overrides.resource.get) : defaults.resource.get,
       list: overrides.resource?.list ? record("resource.list", overrides.resource.list) : defaults.resource.list,
@@ -74,6 +88,10 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
       status: overrides.resource?.status
         ? record("resource.status", overrides.resource.status)
         : defaults.resource.status,
+    },
+    docs: {
+      search: overrides.docs?.search ? record("docs.search", overrides.docs.search) : defaults.docs.search,
+      read: overrides.docs?.read ? record("docs.read", overrides.docs.read) : defaults.docs.read,
     },
   };
   return { handlers: merged, calls };
@@ -599,6 +617,160 @@ describe("runScript log capture limits", () => {
     assert.ok(
       !r.logs[0].endsWith("... [line truncated]"),
       "a line of exactly 4096 chars must not be tagged as truncated",
+    );
+  });
+});
+
+describe("runScript additional aws.* bindings", () => {
+  it("invokes aws.metricsQuery with the script's input", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      metricsQuery: async () => ({
+        series: [{ id: "m1", label: "CPU", timestamps: ["2026-01-01T00:00:00Z"], values: [42] }],
+        periodSeconds: 60,
+        profile: "default",
+        region: "us-east-1",
+      }),
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.metricsQuery({
+            queries: [{ id: "m1", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+            startTime: "1h",
+          });
+          return r.series[0].values[0];
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, 42);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "metricsQuery");
+    assert.deepEqual(plain((calls[0].input as { queries: unknown[] }).queries), [
+      { id: "m1", namespace: "AWS/EC2", metricName: "CPUUtilization" },
+    ]);
+  });
+
+  it("invokes aws.iamSimulate with the script's input", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      iamSimulate: async () => ({
+        results: [{ EvalActionName: "s3:GetObject", EvalDecision: "allowed" }],
+      }),
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.iamSimulate({
+            principal: "arn:aws:iam::123456789012:role/r",
+            actions: ["s3:GetObject"],
+            resources: ["arn:aws:s3:::bucket/key"],
+          });
+          return r.results[0].EvalDecision;
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "allowed");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "iamSimulate");
+    assert.deepEqual(plain((calls[0].input as { actions: string[] }).actions), ["s3:GetObject"]);
+  });
+
+  it("invokes aws.multiRegion with the script's input", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      multiRegion: async () => ({
+        regions: { "us-east-1": { ok: true, result: { Buckets: [] } } },
+      }),
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.multiRegion({
+            service: "s3api",
+            operation: "list-buckets",
+            regions: ["us-east-1"],
+          });
+          return Object.keys(r.regions);
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), ["us-east-1"]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "multiRegion");
+    assert.deepEqual(plain((calls[0].input as { regions: string[] }).regions), ["us-east-1"]);
+  });
+
+  it("invokes aws.assumeRole with the script's input", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      assumeRole: async () => ({
+        credentials: { AccessKeyId: "AKIA...", Expiration: "2026-01-01T00:00:00Z" },
+      }),
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.assumeRole({
+            roleArn: "arn:aws:iam::123456789012:role/r",
+            sessionName: "s",
+          });
+          return r.credentials.AccessKeyId;
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "AKIA...");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "assumeRole");
+    assert.equal((calls[0].input as { roleArn: string }).roleArn, "arn:aws:iam::123456789012:role/r");
+  });
+
+  it("invokes aws.docs.search with the script's input", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      docs: {
+        search: async () => ({
+          results: [{ title: "S3 GetObject", url: "https://docs.aws.amazon.com/..." }],
+        }),
+        read: async () => ({ content: "" }),
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.docs.search({ query: "s3 get object" });
+          return r.results[0].title;
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, "S3 GetObject");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "docs.search");
+    assert.equal((calls[0].input as { query: string }).query, "s3 get object");
+  });
+
+  it("invokes aws.docs.read with the script's input", async () => {
+    const { handlers, calls } = makeMockHandlers({
+      docs: {
+        search: async () => ({ results: [] }),
+        read: async () => ({ content: "# S3 GetObject\nReturns an object..." }),
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          const r = await aws.docs.read({ url: "https://docs.aws.amazon.com/AmazonS3/..." });
+          return r.content.startsWith("# S3 GetObject");
+        `,
+      },
+      handlers,
+    );
+    assert.equal(r.data, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "docs.read");
+    assert.equal(
+      (calls[0].input as { url: string }).url,
+      "https://docs.aws.amazon.com/AmazonS3/...",
     );
   });
 });

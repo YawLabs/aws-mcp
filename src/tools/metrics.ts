@@ -49,19 +49,25 @@ function isValidStatistic(s: string): boolean {
 }
 
 /**
- * Canonicalize a simple stat to CloudWatch's PascalCase. CloudWatch's
- * MetricStat.Stat field is case-sensitive: 'Average' is accepted, 'average'
- * gets a ValidationError. isValidStatistic accepts the case-folded form so
- * the schema doesn't reject 'average' while accepting 'p99', but we MUST
- * canonicalize before sending so the agent's lowercase input doesn't bounce
- * server-side. Extended stats (p99, p99.9, tm95, ...) are accepted by
- * CloudWatch case-insensitively, so we pass them through verbatim.
+ * Canonicalize a stat to the exact form CloudWatch's MetricStat.Stat field
+ * expects. The wire format is case-sensitive on BOTH branches:
+ *   - Simple stats want PascalCase: 'Average' is accepted, 'average' gets a
+ *     ValidationError.
+ *   - Extended stats want lowercase: 'p99' / 'tm95' are accepted, 'P99' /
+ *     'Tm95' get a ValidationError.
+ * isValidStatistic accepts case-folded forms on both branches (the simple
+ * list is folded explicitly, the extended-stat regex carries /i), so the
+ * schema doesn't reject 'average' or 'P99' -- but we MUST canonicalize
+ * before sending so the agent's mixed-case input doesn't bounce server-side.
+ * The trailing `return s` is defense-in-depth for inputs that somehow reach
+ * this function without passing isValidStatistic first.
  */
 function canonicalizeStatistic(s: string): string {
   const lower = s.toLowerCase();
   for (const stat of SIMPLE_STATS) {
     if (stat.toLowerCase() === lower) return stat;
   }
+  if (EXTENDED_STAT_RE.test(s)) return lower;
   return s;
 }
 
