@@ -30,7 +30,7 @@ For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval
   "mcpServers": {
     "aws": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/aws-mcp"]
+      "args": ["-y", "@yawlabs/aws-mcp@latest"]
     },
     "aws-lambda": {
       "command": "uvx",
@@ -107,7 +107,7 @@ Add to your MCP client config (e.g. `.mcp.json`):
   "mcpServers": {
     "aws": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/aws-mcp"]
+      "args": ["-y", "@yawlabs/aws-mcp@latest"]
     }
   }
 }
