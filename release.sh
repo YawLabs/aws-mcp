@@ -23,7 +23,7 @@ info() { echo -e "${GREEN}  ✓ $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 
-TOTAL_STEPS=7
+TOTAL_STEPS=9
 
 VERSION="${1:-}"
 IS_CI="${CI:-false}"
@@ -75,7 +75,9 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo "  4. Commit, tag, and push"
   echo "  5. Publish to npm"
   echo "  6. Create GitHub release"
-  echo "  7. Verify"
+  echo "  7. Publish to MCP Registry"
+  echo "  8. Smoke test published package"
+  echo "  9. Verify"
   echo ""
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -100,20 +102,24 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
 else
   npm version "$VERSION" --no-git-tag-version
   info "package.json bumped"
-  # Keep server.json in sync with package.json. CI also rewrites server.json
-  # via jq at publish time (.github/workflows/release.yml) as a safety net,
-  # but doing it here too means the committed value matches reality between
-  # releases instead of drifting until the next CI publish.
-  node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('server.json','utf-8')); j.version=process.argv[1]; if(j.packages&&j.packages[0]) j.packages[0].version=process.argv[1]; fs.writeFileSync('server.json', JSON.stringify(j, null, 2) + '\n');" "$VERSION"
-  info "server.json bumped"
+  # server.json is published to the MCP Registry in step 7; bump its version
+  # alongside package.json so the bump commit fully reflects the release and
+  # server.json is never left dirty in the working tree after a publish.
+  if [ -f server.json ]; then
+    jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+    mv server.tmp server.json
+    info "server.json bumped"
+  fi
 fi
 
 step 4 "Commit, tag, and push"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode — skipping commit/tag/push (already tagged)"
 else
-  if [ -n "$(git status --porcelain package.json package-lock.json server.json 2>/dev/null)" ]; then
-    git add package.json package-lock.json server.json
+  BUMP_FILES="package.json package-lock.json"
+  [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+  if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
+    git add $BUMP_FILES
     git commit -m "v${VERSION}"
     info "Committed version bump"
   else
@@ -259,7 +265,90 @@ else
   info "GitHub release created"
 fi
 
-step 7 "Verify"
+step 7 "Publish to MCP Registry"
+# Downstream catalogs (Glama, PulseMCP, mcpservers.org) auto-source from the
+# Official MCP Registry; publishing here is what makes the new version visible
+# to them. server.json was already bumped in step 3 so the version matches the
+# tag.
+if [ ! -f server.json ]; then
+  info "No server.json -- not an MCP server, skipping registry publish"
+else
+  # mcp-publisher binary cached at ~/.local/bin. Pinned to "latest" upstream;
+  # if the registry's CLI introduces a breaking change, the next release will
+  # surface it. The OS/arch detection handles Linux, macOS, and Git Bash on
+  # Windows (MINGW/MSYS uname -s starts with "mingw" / "msys").
+  MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher}"
+  if ! [ -x "$MP" ]; then
+    info "mcp-publisher not found at $MP -- downloading"
+    mkdir -p "$(dirname "$MP")"
+    OS_RAW=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$OS_RAW" in mingw*|msys*|cygwin*) OS=windows ;; *) OS="$OS_RAW" ;; esac
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    TMP=$(mktemp -d)
+    curl -sL -o "$TMP/mp.tar.gz" \
+      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" \
+      || fail "Failed to download mcp-publisher (${OS}/${ARCH})"
+    tar xzf "$TMP/mp.tar.gz" -C "$TMP" || fail "Failed to extract mcp-publisher tarball"
+    if [ -f "$TMP/mcp-publisher.exe" ]; then
+      mv "$TMP/mcp-publisher.exe" "$MP"
+    else
+      mv "$TMP/mcp-publisher" "$MP"
+    fi
+    rm -rf "$TMP"
+    chmod +x "$MP" 2>/dev/null || true
+  fi
+
+  # OIDC auth (used by the old release.yml) only works inside Actions; locally
+  # we use a GitHub PAT via `login github -token <PAT>`. The PAT needs read:org
+  # for YawLabs so the registry can verify org membership for the
+  # io.github.YawLabs/* namespace.
+  if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+    fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+  fi
+  "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
+    || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
+  "$MP" publish \
+    || fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
+  info "Published to MCP Registry"
+fi
+
+step 8 "Smoke test published package"
+# Confirm a fresh install via npx can execute the binary and respond to
+# --version. Catches packaging regressions (missing bin shebang, bad "files"
+# entry, broken esbuild output) before they hit real users. Run from a temp
+# dir -- if run from the checkout root, npx sees our own package.json `bin`
+# entry and tries to resolve the local (unbuilt) path instead of installing
+# the published tarball.
+SMOKE_DIR=$(mktemp -d)
+(
+  cd "$SMOKE_DIR"
+  # Registry propagation can lag well past a minute after publish succeeds,
+  # and `npm view` and `npx` may hit different CDN paths -- v0.8.0
+  # false-failed because we gated on `npm view` (which cleared) but `npx -y`
+  # was still ETARGET'ing on a stale mirror. Retry the actual smoke (the npx
+  # invocation itself) with a budget generous enough to outlast realistic
+  # propagation. 30 * 10s = ~5min upper bound; typical case completes in <30s.
+  ATTEMPTS=30
+  SLEEP_SECONDS=10
+  OUTPUT=""
+  STARTED_AT=$(date +%s)
+  for i in $(seq 1 $ATTEMPTS); do
+    if OUTPUT=$(npx -y "@yawlabs/aws-mcp@${VERSION}" --version 2>/dev/null); then
+      echo "  npx output: $OUTPUT (after $(( $(date +%s) - STARTED_AT ))s)"
+      break
+    fi
+    echo "  Waiting for @yawlabs/aws-mcp@${VERSION} to be installable via npx (attempt $i/$ATTEMPTS, ${SLEEP_SECONDS}s)..."
+    sleep $SLEEP_SECONDS
+  done
+  if [ "$OUTPUT" != "$VERSION" ]; then
+    echo "  Expected $VERSION, got '$OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - STARTED_AT ))s)" >&2
+    exit 1
+  fi
+) || fail "Smoke test failed -- @yawlabs/aws-mcp@${VERSION} did not respond to --version with the expected value"
+rm -rf "$SMOKE_DIR"
+info "Smoke test passed"
+
+step 9 "Verify"
 sleep 3
 
 NPM_VERSION=$(npm view "@yawlabs/aws-mcp@${VERSION}" version 2>/dev/null || echo "")
