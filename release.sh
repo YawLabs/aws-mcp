@@ -79,11 +79,15 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo "  8. Smoke test published package"
   echo "  9. Verify"
   echo ""
-  read -p "Continue? (y/N) " -n 1 -r
-  echo
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 0
+  if [ -t 0 ]; then
+    read -p "Continue? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      echo "Aborted."
+      exit 0
+    fi
+  else
+    info "Non-interactive shell -- proceeding without confirmation"
   fi
 fi
 
