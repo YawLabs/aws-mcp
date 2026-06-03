@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/aws-mcp",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "mcpName": "io.github.YawLabs/aws-mcp",
   "description": "AWS MCP server — call any AWS API from AI assistants, with first-class SSO re-login (no more 'browser won't open' dead ends)",
   "license": "MIT",
