@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
+import { _clearSessions, findActiveSessionByProfile, startSsoLogin } from "../sso.js";
 import { authTools, findCachedSsoToken } from "./auth.js";
 import { resolveProfileStartUrl } from "./profiles.js";
 
@@ -284,5 +285,136 @@ describe("aws_refresh_if_expiring_soon schema", () => {
 
   it("rejects non-integer thresholdMinutes", () => {
     assert.equal(tool.inputSchema.safeParse({ thresholdMinutes: 5.5 }).success, false);
+  });
+});
+
+describe("aws_login_start handler — reuse vs fresh-spawn (auth.ts:195-236)", () => {
+  const startTool = authTools.find((t) => t.name === "aws_login_start");
+  if (!startTool) throw new Error("aws_login_start not registered");
+
+  // The reuse branch only depends on findActiveSessionByProfile returning a
+  // live session for the requested profile. We seed that by calling
+  // startSsoLogin directly with the fake-aws shim (the handler itself calls
+  // bare startSsoLogin(useProfile) with no opts, so the FRESH path can't be
+  // routed at the fake — see the gated block below). The 'happy' fake emits
+  // URL+code immediately and stays alive ~200ms before exiting, leaving a
+  // window where the session is registered and not yet completed.
+  function fakeOpts(scenario: string, urlWaitMs = 5000) {
+    return {
+      command: process.execPath,
+      prefixArgs: [FAKE_AWS],
+      urlWaitMs,
+      // Stretch the session TTL well past the test so the killswitch never
+      // races us; we tear sessions down explicitly in afterEach.
+      sessionTtlMs: 60_000,
+      env: { ...process.env, AWS_MCP_FAKE_SCENARIO: scenario },
+    };
+  }
+
+  beforeEach(() => {
+    _resetSession();
+    _clearSessions();
+  });
+
+  afterEach(() => {
+    _clearSessions();
+    _resetSession();
+  });
+
+  it("reuses an in-flight login instead of spawning a second subprocess", async () => {
+    // Seed a live session for 'reuse-prof'. startSsoLogin returns once URL+code
+    // are parsed; the subprocess is still alive at that instant.
+    const seed = await startSsoLogin("reuse-prof", fakeOpts("happy"));
+    assert.equal(seed.ok, true);
+    if (!seed.ok) return;
+
+    // Sanity: the session is discoverable while the subprocess is alive.
+    assert.ok(findActiveSessionByProfile("reuse-prof"), "expected a live session to seed the reuse branch");
+
+    const r = (await startTool.handler({ profile: "reuse-prof" })) as {
+      ok: boolean;
+      data?: {
+        sessionId?: string;
+        profile?: string;
+        verificationUrl?: string;
+        userCode?: string;
+        reused?: boolean;
+        instructions?: string;
+      };
+    };
+    assert.equal(r.ok, true);
+    // The defining marker of the reuse branch.
+    assert.equal(r.data?.reused, true);
+    // It hands back the EXISTING session's identifiers, not a fresh spawn's.
+    assert.equal(r.data?.sessionId, seed.sessionId);
+    assert.equal(r.data?.profile, "reuse-prof");
+    assert.equal(r.data?.verificationUrl, seed.verificationUrl);
+    assert.equal(r.data?.userCode, seed.userCode);
+    assert.match(r.data?.instructions ?? "", /already in progress/);
+    assert.match(r.data?.instructions ?? "", new RegExp(seed.sessionId));
+  });
+
+  it("does not cross profiles: a session for one profile is not reused for another", async () => {
+    const seed = await startSsoLogin("prof-a", fakeOpts("happy"));
+    assert.equal(seed.ok, true);
+    if (!seed.ok) return;
+    // prof-b has no in-flight session -> findActiveSessionByProfile returns
+    // null -> the reuse branch must NOT fire for prof-b. (We assert the
+    // negative observable here without spawning prof-b's real login: the
+    // helper that gates the branch reports no active session for prof-b.)
+    assert.equal(findActiveSessionByProfile("prof-b"), null);
+  });
+
+  it("reuse path is not taken once the seeded session has completed", async () => {
+    // The 'happy' fake exits ~200ms after URL+code, which flips the session to
+    // completed. findActiveSessionByProfile excludes completed sessions, so the
+    // handler's reuse guard (active === null) would fall through to a fresh
+    // spawn. Assert the guard input directly to avoid spawning the real binary.
+    const seed = await startSsoLogin("expire-prof", fakeOpts("happy"));
+    assert.equal(seed.ok, true);
+    if (!seed.ok) return;
+    assert.ok(findActiveSessionByProfile("expire-prof"), "live immediately after start");
+    // Wait past the fake's ~200ms exit so the session is marked completed.
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    assert.equal(
+      findActiveSessionByProfile("expire-prof"),
+      null,
+      "a completed session must not be reused — handler would spawn fresh",
+    );
+  });
+
+  // --- Fresh-spawn branch (no active session -> handler calls startSsoLogin) ---
+  //
+  // GATED. The handler invokes `startSsoLogin(useProfile)` with NO opts, so
+  // there is no in-process seam to point it at the fake aws shim (unlike
+  // runAwsCall, startSsoLogin reads no AWS_MCP_TEST_* env vars). Running this
+  // path for real would spawn `aws sso login --no-browser` against live AWS
+  // SSO endpoints — network + a real SSO-configured profile, neither available
+  // in CI. PATH-shadowing the `aws` binary with a .cmd/.bat does NOT work:
+  // Node's spawn() without shell:true won't execute those, and a real aws.exe
+  // on PATH wins resolution. So we skip unless AWS_MCP_LIVE_SSO=1 is set by an
+  // operator who has a real SSO profile configured. When skipped, this is NOT
+  // claimed as passing.
+  it("fresh spawn: with no active session the handler returns a NEW session without the reused flag", {
+    skip: process.env.AWS_MCP_LIVE_SSO === "1" ? false : "requires live AWS SSO (set AWS_MCP_LIVE_SSO=1)",
+  }, async () => {
+    const profile = process.env.AWS_MCP_LIVE_SSO_PROFILE ?? "default";
+    assert.equal(findActiveSessionByProfile(profile), null, "precondition: no in-flight session for the profile");
+    const r = (await startTool.handler({ profile })) as {
+      ok: boolean;
+      error?: string;
+      data?: { sessionId?: string; reused?: boolean; verificationUrl?: string; userCode?: string };
+    };
+    // A genuine fresh start succeeds with a sessionId and NO reused marker.
+    // (If the operator's profile isn't SSO-backed the call fails fast with
+    // ok:false; we only assert the branch shape under a working SSO profile.)
+    if (r.ok) {
+      assert.equal(r.data?.reused, undefined, "fresh spawn must not carry the reuse marker");
+      assert.ok(r.data?.sessionId, "fresh spawn returns a sessionId");
+      assert.ok(r.data?.verificationUrl, "fresh spawn returns a verification URL");
+    } else {
+      // Surface the error rather than silently passing on an unconfigured box.
+      assert.match(r.error ?? "", /SSO|profile|aws/i);
+    }
   });
 });

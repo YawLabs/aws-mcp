@@ -120,6 +120,16 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "call_fail_stdout_only": {
+      // Nonzero exit with output on stdout and a deliberately EMPTY stderr.
+      // Forces the `?? rawStdout` half of the aws_call handler's
+      // `rawBody: result.rawStderr ?? result.rawStdout`. The classifier sees
+      // no stderr, so this lands as a generic nonzero_exit (kind: other).
+      process.stdout.write("partial-output-on-stdout\n");
+      process.exit(1);
+      return;
+    }
+
     case "call_slow": {
       // Sleep longer than the test's timeoutMs to exercise the timeout path.
       await sleep(5000);
