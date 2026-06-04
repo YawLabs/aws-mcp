@@ -116,6 +116,30 @@ describe("startSsoLogin — failure paths", () => {
     assert.match(start.error, /AWS CLI installed and on PATH/);
   });
 
+  // The proc.on('error') branch at sso.ts:383-409 has TWO reachable states:
+  //
+  //   (1) error BEFORE URL+code arrive (settled=false, no session registered):
+  //       covered by "settles via the async proc.on('error') handler before
+  //       URL+code arrive" above -- a nonexistent binary emits ENOENT on the
+  //       proc itself, the handler resolves the START promise with "Failed to
+  //       run ...".
+  //
+  //   (2) error AFTER URL+code arrive (settled=true, session registered): the
+  //       handler instead resolves `completion` so a waitForLogin caller that
+  //       already holds the sessionId doesn't hang. This state is NOT
+  //       deterministically triggerable from real subprocess input. Node fires
+  //       'error' on the ChildProcess for spawn failure (ENOENT/EACCES) or a
+  //       failed kill -- none of which can occur AFTER the child has already
+  //       spawned and written URL+code to stdout. Tearing the child's stdio
+  //       surfaces errors on proc.stdout/proc.stderr (separate EventEmitters),
+  //       not on `proc` itself, so it never reaches this handler. Forcing the
+  //       state would require a synthetic EventEmitter masquerading as a
+  //       ChildProcess and re-implementing the spawn wiring -- a brittle mock
+  //       of Node internals, not a behavioral test. Per the test brief we do
+  //       NOT force it. The completion-resolve path is instead exercised
+  //       indirectly: the 'exit' handler (sso.ts:323-381) is the common case
+  //       that resolves `completion` after a registered session, and it is
+  //       covered by the early_exit_failure / TTL tests below.
   it("returns the URL+code on start, but waitForLogin reports nonzero exit", async () => {
     const start = await startSsoLogin("test-profile", fakeOpts("early_exit_failure", 2000));
     assert.equal(start.ok, true);
@@ -153,7 +177,13 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
   });
 
   it("returns the live session's URL/code for the matching profile", async () => {
-    const start = await startSsoLogin("dedupe-profile", fakeOpts("happy", 5000));
+    // Uses `happy_hold` (NOT `happy`): the fake stays alive until killed, so
+    // the session's `completed` flag stays false deterministically. With
+    // `happy` the 200ms exit could fire before the synchronous
+    // findActiveSessionByProfile assertion below, mark the session completed,
+    // and exclude it -- a load-dependent flake. `happy_hold` emits the
+    // identical URL+code stdout, so the parsed verificationUrl/userCode match.
+    const start = await startSsoLogin("dedupe-profile", fakeOpts("happy_hold", 5000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const active = findActiveSessionByProfile("dedupe-profile");
@@ -163,7 +193,9 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
     assert.equal(active.userCode, start.userCode);
     // A different profile should NOT see this session.
     assert.equal(findActiveSessionByProfile("some-other-profile"), null);
-    await waitForLogin(start.sessionId);
+    // No waitForLogin here -- the fake won't exit on its own. afterEach's
+    // _clearSessions() kills the held subprocess and clears the session map,
+    // so teardown is prompt (a SIGTERM/SIGKILL, not the 10-min sleep).
   });
 
   it("stops returning a session after waitForLogin resolves it", async () => {
@@ -303,5 +335,60 @@ describe("startSsoLogin — concurrent dedup", () => {
       "different opts must produce distinct subprocesses (and distinct sessionIds)",
     );
     await Promise.all([waitForLogin(a.sessionId), waitForLogin(b.sessionId)]);
+  });
+
+  it("same profile, SAME env entries in DIFFERENT insertion order -> ONE subprocess (env hash is order-independent)", async () => {
+    // Counterpart to the opts-divergence test above. dedupeKey canonicalizes
+    // opts.env via Object.entries(...).sort() (sso.ts:106), so two callers
+    // whose env carries the SAME key/value pairs but in different INSERTION
+    // order must hash to the same key and share one subprocess. Without the
+    // sort, JSON.stringify of the entries array would be insertion-ordered and
+    // the two callers would spuriously spawn distinct subprocesses. We build
+    // the same fakeOpts (identical urlWaitMs etc.) but hand each a freshly
+    // ordered env object: one with AWS_MCP_FAKE_SCENARIO appended last, one
+    // with a leading reorder marker -- both containing an identical set of
+    // entries, just inserted in a different sequence.
+    const baseScenario = "happy";
+    // Pull a couple of stable keys out of process.env to reorder around the
+    // scenario key. Using literal keys keeps the entry SET identical across
+    // both objects regardless of what process.env contains.
+    const shared = { AWS_MCP_FAKE_SCENARIO: baseScenario, AWS_MCP_REORDER_A: "1", AWS_MCP_REORDER_B: "2" };
+    const optsForward = {
+      command: process.execPath,
+      prefixArgs: [FAKE_AWS],
+      urlWaitMs: 5000,
+      // Insertion order: SCENARIO, then A, then B.
+      env: {
+        AWS_MCP_FAKE_SCENARIO: shared.AWS_MCP_FAKE_SCENARIO,
+        AWS_MCP_REORDER_A: shared.AWS_MCP_REORDER_A,
+        AWS_MCP_REORDER_B: shared.AWS_MCP_REORDER_B,
+      },
+    };
+    const optsReversed = {
+      command: process.execPath,
+      prefixArgs: [FAKE_AWS],
+      urlWaitMs: 5000,
+      // Same three entries, reversed insertion order: B, then A, then SCENARIO.
+      env: {
+        AWS_MCP_REORDER_B: shared.AWS_MCP_REORDER_B,
+        AWS_MCP_REORDER_A: shared.AWS_MCP_REORDER_A,
+        AWS_MCP_FAKE_SCENARIO: shared.AWS_MCP_FAKE_SCENARIO,
+      },
+    };
+    const [a, b] = await Promise.all([
+      startSsoLogin("env-reorder-profile", optsForward),
+      startSsoLogin("env-reorder-profile", optsReversed),
+    ]);
+    assert.equal(a.ok, true);
+    assert.equal(b.ok, true);
+    if (!a.ok || !b.ok) return;
+    assert.equal(
+      a.sessionId,
+      b.sessionId,
+      "reordered-but-identical env entries must hash to the same dedupe key (one shared subprocess)",
+    );
+    assert.equal(a.verificationUrl, b.verificationUrl);
+    assert.equal(a.userCode, b.userCode);
+    await waitForLogin(a.sessionId);
   });
 });

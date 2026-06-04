@@ -121,7 +121,7 @@ export const paginateTools: readonly Tool[] = [
       let nextToken: string | null;
       if (queryWrapped) {
         const wrapped = (result.data ?? {}) as { NextToken?: unknown; items?: unknown };
-        nextToken = typeof wrapped.NextToken === "string" && wrapped.NextToken.length > 0 ? wrapped.NextToken : null;
+        nextToken = extractNextToken(wrapped);
         resultBody = wrapped.items ?? null;
       } else {
         nextToken = extractNextToken(result.data);

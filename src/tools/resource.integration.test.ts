@@ -26,12 +26,18 @@
  */
 
 import assert from "node:assert/strict";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { _resetSession } from "../session.js";
 import { resourceTools } from "./resource.js";
 
 const LIVE = process.env.AWS_MCP_LIVE_TESTS === "1";
 const LIVE_PROFILE = process.env.AWS_MCP_LIVE_PROFILE;
 const LIVE_REGION = process.env.AWS_MCP_LIVE_REGION;
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
 const getTool = (name: string) => {
   const t = resourceTools.find((x) => x.name === name);
@@ -40,6 +46,7 @@ const getTool = (name: string) => {
 };
 
 const getRes = getTool("aws_resource_get");
+const listRes = getTool("aws_resource_list");
 const createRes = getTool("aws_resource_create");
 const updateRes = getTool("aws_resource_update");
 const deleteRes = getTool("aws_resource_delete");
@@ -209,6 +216,171 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
           // ignore
         }
       }
+    }
+  });
+});
+
+/**
+ * Fake-aws-driven handler integration -- runs in a normal `npm test` (no
+ * AWS_MCP_LIVE_TESTS, no real account). These exercise the handlers end-to-end
+ * through runAwsCall by routing its spawn at the fake-aws shim via the
+ * documented AWS_MCP_TEST_AWS_* env hook, the same mechanism resource.test.ts
+ * uses for the awaitCompletion mid-poll auth-lapse tests. Distinct from the
+ * unit-level argv/parse tests in resource.test.ts: these drive the FULL handler
+ * including the Phase-1 stateful scenarios (pagination resume, create -> status
+ * poll) rather than asserting flag placement.
+ */
+describe("aws_resource_list -- pagination via fake-aws", () => {
+  const setEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_list_resources_paginated";
+    _resetSession();
+  };
+  const clearEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  interface ListResult {
+    ok: boolean;
+    data?: {
+      resources: { identifier?: string; properties?: unknown }[];
+      nextToken: string | null;
+      hasMore: boolean;
+    };
+    error?: string;
+  }
+
+  it("first page (no nextToken) returns 2 parsed resources + a resume cursor + hasMore", async () => {
+    setEnv();
+    try {
+      const r = (await listRes.handler({ typeName: "AWS::SSM::Parameter" })) as ListResult;
+      assert.equal(r.ok, true, `list page 1 failed: ${r.error}`);
+      const d = r.data;
+      assert.ok(d, "page 1 data missing");
+      // The fake scenario branches on --next-token in argv: absent -> page 1.
+      assert.equal(d.resources.length, 2);
+      assert.equal(d.resources[0].identifier, "/my/param-1");
+      assert.equal(d.resources[1].identifier, "/my/param-2");
+      // Properties arrive from CCAPI as a JSON-ENCODED STRING; the handler
+      // (parseResourceProperties) must turn that back into an object.
+      assert.deepEqual(d.resources[0].properties, { Name: "/my/param-1", Type: "String", Value: "v1" });
+      assert.deepEqual(d.resources[1].properties, { Name: "/my/param-2", Type: "String", Value: "v2" });
+      // Truncated page: a resume cursor under nextToken and hasMore=true.
+      assert.equal(d.nextToken, "ccapi-list-cursor-page2");
+      assert.equal(d.hasMore, true);
+    } finally {
+      clearEnv();
+    }
+  });
+
+  it("second page (WITH nextToken) returns the final 2 resources, nextToken null, hasMore false", async () => {
+    setEnv();
+    try {
+      // Passing nextToken puts --next-token in the argv, which flips the fake
+      // scenario to the FINAL page (no top-level NextToken in its response).
+      const r = (await listRes.handler({
+        typeName: "AWS::SSM::Parameter",
+        nextToken: "ccapi-list-cursor-page2",
+      })) as ListResult;
+      assert.equal(r.ok, true, `list page 2 failed: ${r.error}`);
+      const d = r.data;
+      assert.ok(d, "page 2 data missing");
+      assert.equal(d.resources.length, 2);
+      assert.equal(d.resources[0].identifier, "/my/param-3");
+      assert.equal(d.resources[1].identifier, "/my/param-4");
+      assert.deepEqual(d.resources[0].properties, { Name: "/my/param-3", Type: "String", Value: "v3" });
+      assert.deepEqual(d.resources[1].properties, { Name: "/my/param-4", Type: "String", Value: "v4" });
+      // Exhausted: no resume cursor, hasMore false.
+      assert.equal(d.nextToken, null);
+      assert.equal(d.hasMore, false);
+    } finally {
+      clearEnv();
+    }
+  });
+});
+
+describe("aws_resource_create -- awaitCompletion happy path via fake-aws", () => {
+  const setEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_then_status_success";
+    _resetSession();
+  };
+  const clearEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("create -> status poll reaches terminal SUCCESS in one handler call", async () => {
+    setEnv();
+    try {
+      // create-resource returns IN_PROGRESS (RequestToken req-tok-ok); the
+      // status poll returns SUCCESS on the FIRST attempt, so buildMutationResponse
+      // walks the poll loop exactly once. NOT the req-tok-abc / sso-expired flow.
+      const r = (await createRes.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 5_000,
+      })) as MutationResult;
+      assert.equal(r.ok, true, `awaited create failed: ${r.error}`);
+      assert.equal(r.data?.operationStatus, "SUCCESS");
+      // The final ProgressEvent's RequestToken survives onto the flat field.
+      assert.equal(r.data?.requestToken, "req-tok-ok");
+      // awaitCompletion was honored: the awaited block is present and the
+      // terminal status was reached on the first poll (attempts === 1).
+      assert.ok(r.data?.awaited, "awaited block must be present when awaitCompletion is true");
+      assert.equal(r.data?.awaited?.attempts, 1);
+    } finally {
+      clearEnv();
+    }
+  });
+});
+
+describe("aws_resource_create -- awaitCompletion short-circuits an already-terminal create via fake-aws", () => {
+  const setEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_already_terminal";
+    _resetSession();
+  };
+  const clearEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("returns SUCCESS without polling when the initial create is already terminal", async () => {
+    setEnv();
+    try {
+      // create-resource returns OperationStatus=SUCCESS on the FIRST response.
+      // buildMutationResponse's `!alreadyTerminal` guard must skip the poll
+      // loop entirely. The fake scenario's get-resource-request-status branch
+      // ERRORS, so reaching it would flip ok to false -- a clean SUCCESS here
+      // proves the short-circuit held.
+      const r = (await createRes.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 5_000,
+      })) as MutationResult;
+      assert.equal(r.ok, true, `already-terminal create failed (poll should have been skipped): ${r.error}`);
+      assert.equal(r.data?.operationStatus, "SUCCESS");
+      assert.equal(r.data?.requestToken, "req-tok-term");
+      // No `awaited` block: the short-circuit returns the flat fields directly
+      // and never enters the poll branch that would attach one.
+      assert.equal(r.data?.awaited, undefined, "awaited block must be ABSENT when the initial status is terminal");
+    } finally {
+      clearEnv();
     }
   });
 });

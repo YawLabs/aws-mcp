@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
 import { getProfile, getRegion } from "../session.js";
+import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -81,11 +82,21 @@ const QUERY_ID_RE = /^[a-z][A-Za-z0-9_]*$/;
 // before the API would reject it; 100 covers every realistic agent case.
 const MAX_QUERIES = 100;
 
-// CloudWatch's billing tiers: 1s/10s/30s/60s available for the last 3 hours,
-// 60s for the last 15 days, 300s for the last 63 days, 3600s beyond. Pick
-// the smallest period that won't exceed CloudWatch's ~100,800 datapoints/
-// request cap; if a user is asking for 7 days at 1s resolution they didn't
-// mean it.
+// CloudWatch caps a single GetMetricData response at ~100,800 datapoints per
+// request (1,440 points/day over 70 days). When a caller supplies an explicit
+// `period`, we validate datapoint-count upfront so an over-the-cap period+range
+// bounces with an actionable message instead of CloudWatch's less-specific
+// downstream ValidationError. The auto-pick path (pickAutoPeriodSeconds) is
+// already capped well under this by construction, so we only check explicit
+// periods. CloudWatch also requires `period` to be a positive multiple of 60.
+const CLOUDWATCH_MAX_DATAPOINTS = 100_800;
+
+// Pick a sane period granularity scaled to the requested range so a wide
+// window doesn't default to a needlessly fine resolution: minutes for a few
+// hours, coarser steps as the range grows to days/weeks. The tiers stay well
+// short of CloudWatch's per-request datapoint ceiling -- they exist to give a
+// useful default shape (someone asking for 7 days almost never wants 1s
+// points), not to defend against that cap.
 const PERIOD_3H_MS = 3 * 60 * 60 * 1000;
 const PERIOD_24H_MS = 24 * 60 * 60 * 1000;
 const PERIOD_15D_MS = 15 * 24 * 60 * 60 * 1000;
@@ -307,7 +318,7 @@ export const metricsTools: readonly Tool[] = [
         .positive()
         .optional()
         .describe(
-          "Soft cap on returned datapoints across all queries. CloudWatch's hard cap is ~100,800; lower this to keep response sizes manageable. Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
+          "Target datapoint count. CloudWatch does not truncate to the first N points -- it widens (coarsens) the period server-side so the series aggregates down to fit this many points. CloudWatch's own ceiling is ~100,800; lower this to make CloudWatch return a coarser, smaller series. Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
         ),
       nextToken: z
         .string()
@@ -399,6 +410,29 @@ export const metricsTools: readonly Tool[] = [
         };
       }
 
+      // Validate any EXPLICITLY-supplied per-query period upfront so a bad
+      // period bounces with an actionable message instead of CloudWatch's
+      // less-specific downstream ValidationError. Only the explicit-period
+      // path is checked here; the auto-pick path (pickAutoPeriodSeconds) is
+      // capped safe by construction.
+      const rangeSeconds = (endDate.getTime() - startDate.getTime()) / 1000;
+      for (const q of i.queries) {
+        if (q.period === undefined) continue;
+        if (q.period <= 0 || q.period % 60 !== 0) {
+          return {
+            ok: false,
+            error: `Query '${q.id}' has invalid period ${q.period}. CloudWatch requires period to be a positive multiple of 60 (seconds).`,
+          };
+        }
+        const datapoints = Math.ceil(rangeSeconds / q.period);
+        if (datapoints > CLOUDWATCH_MAX_DATAPOINTS) {
+          return {
+            ok: false,
+            error: `Query '${q.id}' with period ${q.period}s over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period or narrow the time range.`,
+          };
+        }
+      }
+
       const periodSeconds = pickAutoPeriodSeconds(startDate.getTime(), endDate.getTime());
       const metricDataQueries = buildMetricDataQueries(i.queries, periodSeconds);
 
@@ -444,7 +478,7 @@ export const metricsTools: readonly Tool[] = [
         code: m.Code,
         value: m.Value,
       }));
-      const nextToken = typeof raw.NextToken === "string" && raw.NextToken.length > 0 ? raw.NextToken : null;
+      const nextToken = extractNextToken(raw);
 
       return {
         ok: true,

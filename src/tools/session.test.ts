@@ -75,6 +75,20 @@ describe("aws_session_set", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /cannot be empty/);
   });
+
+  it("is atomic: valid profile + invalid region rejects without partially mutating profile", async () => {
+    const r = (await setTool.handler({ profile: "prod", region: "US_WEST_2!" })) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid region/);
+    // The valid profile must NOT have been applied -- otherwise the ok:false
+    // response would lie about leaving session state unchanged.
+    const state = (await getTool.handler({})) as { data: SessionData };
+    assert.equal(state.data.profile, "default");
+    assert.equal(state.data.profileSource, "default");
+  });
 });
 
 describe("aws_session_clear", () => {

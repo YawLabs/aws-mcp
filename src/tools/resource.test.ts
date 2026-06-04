@@ -508,6 +508,33 @@ describe("pollUntilTerminal", () => {
     // jitter in the date math by checking the floor only.
     assert.ok(sleeps[0] > 200, `expected sleep > pollIntervalMs (RetryAfter wins), got ${sleeps[0]}`);
   });
+
+  it("clamps a RetryAfter that exceeds the remaining maxWaitMs budget", async () => {
+    // RetryAfter points ~10s into the future, but maxWaitMs is only 1500ms.
+    // The loop must NOT sleep the full RetryAfter (that would overshoot the
+    // caller's budget and the next iteration's timeout check would only fire
+    // 10s late). The `Math.min(waitMs, maxWaitMs - elapsed)` clamp caps the
+    // wait at the remaining budget. On the first iteration elapsed is ~0, so
+    // the clamp lands at maxWaitMs itself. This pins the clamp line: without
+    // it the sleep would be ~10000, not <= 1500.
+    const tenSecondsOut = new Date(Date.now() + 10_000).toISOString();
+    const responses: Record<string, unknown>[] = [
+      { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1", RetryAfter: tenSecondsOut },
+      { OperationStatus: "SUCCESS", RequestToken: "tok-1" },
+    ];
+    let i = 0;
+    const awsCall = async (): Promise<AwsCallResult> => progressResponse(responses[i++]);
+    const sleeps: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      sleeps.push(ms);
+    };
+    const r = await pollUntilTerminal({ requestToken: "tok-1", pollIntervalMs: 100, maxWaitMs: 1_500 }, awsCall, sleep);
+    assert.equal(r.ok, true);
+    assert.equal(sleeps.length, 1);
+    // Clamped to the remaining budget, not the raw ~10000ms RetryAfter.
+    assert.ok(sleeps[0] <= 1_500, `expected sleep clamped to <= maxWaitMs, got ${sleeps[0]}`);
+    assert.ok(sleeps[0] < 10_000, `expected sleep below the raw RetryAfter (~10000ms), got ${sleeps[0]}`);
+  });
 });
 
 describe("aws_resource_create handler — awaitCompletion mid-poll auth lapse (fake-aws)", () => {

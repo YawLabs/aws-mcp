@@ -13,6 +13,26 @@ import type { Tool, ToolResult } from "./tool.js";
 // event loop on readFileSync.
 const MAX_SSO_CACHE_FILE_BYTES = 64 * 1024;
 
+// Test seam for the aws_login_start fresh-spawn branch. The handler calls
+// `_startSsoLoginImpl(useProfile)` rather than `startSsoLogin` directly so a
+// test can inject an implementation that supplies the fake-aws shim opts
+// (startSsoLogin reads no AWS_MCP_TEST_* env vars, so there is no in-process
+// way to point its bare call at the fake otherwise). In production this is
+// the real startSsoLogin with no opts -- behavior is byte-identical to a
+// direct call. Follows the same `_`-prefixed exported-hook convention as
+// _resetSession / _clearSessions / _ttlKillswitchTick.
+let _startSsoLoginImpl: (profile: string) => ReturnType<typeof startSsoLogin> = (profile) => startSsoLogin(profile);
+
+/** For tests -- inject a startSsoLogin implementation (e.g. one that passes fakeOpts). */
+export function _setStartSsoLoginImpl(fn: (profile: string) => ReturnType<typeof startSsoLogin>): void {
+  _startSsoLoginImpl = fn;
+}
+
+/** For tests -- restore the production startSsoLogin call. Run in afterEach so the seam can't bleed across tests. */
+export function _resetStartSsoLoginImpl(): void {
+  _startSsoLoginImpl = (profile) => startSsoLogin(profile);
+}
+
 export interface FindTokenOptions {
   /**
    * If set, only return tokens whose `startUrl` matches. Prevents the
@@ -67,6 +87,24 @@ export function findCachedSsoToken(
     // no cache dir
   }
   return null;
+}
+
+/**
+ * Project a cached-token record down to exactly the three fields the MCP
+ * surface exposes: { expiresAt, minutesLeft, startUrl }. Both aws_whoami and
+ * aws_login_complete route their `ssoToken` response through this so a future
+ * field added to the findCachedSsoToken return type can't leak out of either
+ * path. Keeps the emitted shape stable and identical across both tools.
+ */
+function projectSsoToken(
+  cachedToken: { expiresAt: string; minutesLeft: number; startUrl?: string } | null,
+): { expiresAt: string; minutesLeft: number; startUrl?: string } | null {
+  if (!cachedToken) return null;
+  return {
+    expiresAt: cachedToken.expiresAt,
+    minutesLeft: cachedToken.minutesLeft,
+    startUrl: cachedToken.startUrl,
+  };
 }
 
 /**
@@ -147,6 +185,11 @@ export const authTools: readonly Tool[] = [
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const { profile, region } = input as { profile?: string; region?: string };
+      // `||` (not `??`) is intentional here and at the sibling sites below: an
+      // empty-string profile is not a real profile, so it must fall through to
+      // getProfile() (session/env/'default'), not slot in as "". Don't "tidy"
+      // this to `??` -- that would let `profile: ""` override the default with
+      // an unusable value.
       const useProfile = profile || getProfile();
       const useRegion = region || getRegion();
 
@@ -167,13 +210,7 @@ export const authTools: readonly Tool[] = [
           arn: identity.arn,
           profile: useProfile,
           region: useRegion,
-          ssoToken: cachedToken
-            ? {
-                expiresAt: cachedToken.expiresAt,
-                minutesLeft: cachedToken.minutesLeft,
-                startUrl: cachedToken.startUrl,
-              }
-            : null,
+          ssoToken: projectSsoToken(cachedToken),
         },
       };
     },
@@ -215,7 +252,7 @@ export const authTools: readonly Tool[] = [
         };
       }
 
-      const result = await startSsoLogin(useProfile);
+      const result = await _startSsoLoginImpl(useProfile);
       if (!result.ok) {
         return {
           ok: false,
@@ -285,7 +322,7 @@ export const authTools: readonly Tool[] = [
           arn: identity.arn,
           profile: useProfile,
           region: useRegion,
-          ssoToken: cachedToken,
+          ssoToken: projectSsoToken(cachedToken),
         },
       };
     },
@@ -349,7 +386,13 @@ export const authTools: readonly Tool[] = [
         };
       }
 
-      const loginResult = await startSsoLogin(useProfile);
+      // Route through the same test-injection seam as aws_login_start so
+      // a test can swap in a fake-aws shim and exercise this branch
+      // without a real SSO subprocess. Sibling to the _startSsoLoginImpl
+      // call above; if a future test wants the refresh flow to use a
+      // different scenario than the start flow, the same _setStartSsoLoginImpl
+      // call covers both paths uniformly.
+      const loginResult = await _startSsoLoginImpl(useProfile);
       if (!loginResult.ok) {
         return { ok: false, error: loginResult.error, rawBody: loginResult.rawOutput };
       }

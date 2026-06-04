@@ -1,9 +1,33 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { dirname, join } from "node:path";
+import { after, afterEach, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { isValidLogStreamName, LOG_GROUP_RE, LOG_STREAM_NAME_RE, logsTools, parseLogsJsonOutput } from "./logs.js";
 
 const tool = logsTools.find((t) => t.name === "aws_logs_tail");
 if (!tool) throw new Error("logsTools missing aws_logs_tail");
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
+
+let prevCommand: string | undefined;
+let prevPrefixArgs: string | undefined;
+before(() => {
+  prevCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+  prevPrefixArgs = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+  process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+  process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+});
+after(() => {
+  if (prevCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+  else process.env.AWS_MCP_TEST_AWS_COMMAND = prevCommand;
+  if (prevPrefixArgs === undefined) delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+  else process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = prevPrefixArgs;
+});
+
+afterEach(() => {
+  delete process.env.AWS_MCP_FAKE_SCENARIO;
+});
 
 describe("LOG_GROUP_RE", () => {
   it("accepts common log group shapes", () => {
@@ -93,6 +117,15 @@ describe("isValidLogStreamName", () => {
       "MixedCASE-123",
     ]) {
       assert.ok(isValidLogStreamName(name), `expected ${name} to be valid`);
+    }
+  });
+
+  it("accepts legitimate stream-name prefixes (used for logStreamNamePrefix)", () => {
+    // A prefix is a partial stream name; the handler validates
+    // logStreamNamePrefix with this same predicate. A slashed date prefix
+    // like '2026/04/21/' must pass.
+    for (const prefix of ["2026/04/21/", "app/service/", "main-"]) {
+      assert.ok(isValidLogStreamName(prefix), `expected prefix ${prefix} to be valid`);
     }
   });
 
@@ -221,5 +254,25 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     })) as { ok: boolean; error?: string };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid logStreamName/);
+  });
+
+  it("rejects a hostile logStreamNamePrefix (leading hyphen)", async () => {
+    for (const prefix of ["-rf", "--force"]) {
+      const r = (await tool.handler({
+        logGroupName: "/aws/lambda/my-fn",
+        logStreamNamePrefix: prefix,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false, `expected ${prefix} to be rejected`);
+      assert.match(r.error ?? "", /Invalid logStreamNamePrefix/);
+    }
+  });
+
+  it("rejects a logStreamNamePrefix with control characters", async () => {
+    const r = (await tool.handler({
+      logGroupName: "/aws/lambda/my-fn",
+      logStreamNamePrefix: "bad\x01prefix",
+    })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid logStreamNamePrefix/);
   });
 });

@@ -93,6 +93,31 @@ describe("runWithConcurrency", () => {
     const r = await runWithConcurrency([], 4, async () => "x");
     assert.deepEqual(r, []);
   });
+
+  it("places each result at its INPUT index even when completion order differs from dispatch order", async () => {
+    // Guards the indexed assignment `results[i] = ...` against a refactor to
+    // `results.push(...)`. With concurrency high enough to run everything in
+    // parallel and DECREASING per-task delays, the tasks complete in REVERSE
+    // dispatch order: input[0] sleeps longest and finishes LAST, input[4]
+    // sleeps shortest and finishes FIRST. A `.push()` implementation would
+    // produce results ordered by completion (reverse), so the assertion below
+    // would see the wrong values at each index. Indexed assignment keeps the
+    // result aligned to the input position regardless of timing.
+    const inputs = [0, 1, 2, 3, 4];
+    const completionOrder: number[] = [];
+    const r = await runWithConcurrency(inputs, inputs.length, async (n, index) => {
+      // Earlier inputs wait longer: index 0 -> 50ms, index 4 -> 10ms.
+      await new Promise((resolve) => setTimeout(resolve, (inputs.length - index) * 10));
+      completionOrder.push(n);
+      return `result-for-${n}`;
+    });
+    // Results align to INPUT order, not completion order.
+    assert.deepEqual(r, ["result-for-0", "result-for-1", "result-for-2", "result-for-3", "result-for-4"]);
+    // Sanity: completion order really did differ from dispatch order (reverse),
+    // so the assertion above genuinely exercises out-of-order completion rather
+    // than coincidentally-ordered timing.
+    assert.deepEqual(completionOrder, [4, 3, 2, 1, 0]);
+  });
 });
 
 describe("aws_multi_region handler", () => {

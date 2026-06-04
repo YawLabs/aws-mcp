@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { beforeEach, describe, it } from "node:test";
+import { beforeEach, describe, it, mock } from "node:test";
 import {
   _resetParseSearchSchemaWarn,
   buildDocsTools,
@@ -156,6 +156,23 @@ describe("isValidDocsUrl", () => {
 
   it("rejects http (non-TLS)", () => {
     assert.equal(isValidDocsUrl("http://docs.aws.amazon.com/x.html"), false);
+  });
+
+  it("rejects a URL with embedded whitespace before .html", () => {
+    // The `[^\s]*` clause in DOCS_URL_RE forbids whitespace anywhere in the
+    // path. A space (or tab) smuggled in ahead of the .html suffix must fail
+    // -- this is the guard that keeps a crafted "...foo .html" from slipping
+    // past the allowlist into a fetch.
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/foo bar.html"), false);
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/foo\tbar.html"), false);
+  });
+
+  it("rejects double-extension / trailing-junk after .html", () => {
+    // The regex anchors `.html` to end-of-string (or a `?`/`#` boundary), so
+    // `...x.html.evil` and `...x.htmlx` are NOT valid .html pages -- the
+    // anchored allowlist must reject anything trailing the .html suffix.
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/x.html.evil"), false);
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/x.htmlx"), false);
   });
 });
 
@@ -352,6 +369,27 @@ describe("aws_docs_read handler", () => {
     assert.match(r.error ?? "", /application\/json/);
   });
 
+  it("rejects a 200 response with an ABSENT content-type header (-> 'unknown')", async () => {
+    // When the response carries no content-type header at all, the handler's
+    // `?? ""` -> empty string -> the `|| "unknown"` fallback in the error
+    // message fires. Stub fetch to return a 200 whose headers.get always
+    // yields null (no content-type present).
+    const fetchImpl = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: { get: () => null },
+        json: async () => ({}),
+        text: async () => "<html></html>",
+      }) as unknown as Response) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/x.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /content-type/);
+    assert.match(r.error ?? "", /unknown/);
+  });
+
   it("surfaces a body-stream read failure", async () => {
     const fetchImpl = (async () => fakeResponse({ textThrows: true })) as unknown as typeof fetch;
     const [, read] = buildDocsTools(fetchImpl);
@@ -432,8 +470,8 @@ describe("aws_docs_* schema", () => {
 });
 
 /**
- * Cache contract pinned at docs.ts:254-279. Two behaviors matter:
- *   1. LRU eviction at the 16-entry cap (set() drops the oldest insertion).
+ * Cache contract pinned at docs.ts:293-318. Two behaviors matter:
+ *   1. LRU eviction at the 64-entry cap (set() drops the oldest insertion).
  *   2. Move-to-end on read so the cache is true-LRU rather than insertion-
  *      ordered -- get() re-inserts the entry to make it the freshest.
  */
@@ -491,6 +529,68 @@ describe("makeDocCache — LRU eviction and recency", () => {
     cache.set("https://docs.aws.amazon.com/url-NEW.html", "markdown-NEW");
     assert.equal(cache.get("https://docs.aws.amazon.com/url-0.html"), "markdown-0-v2");
     assert.equal(cache.get("https://docs.aws.amazon.com/url-1.html"), undefined);
+  });
+});
+
+/**
+ * TTL expiry pinned at docs.ts:299 (`Date.now() - entry.storedAt >
+ * DOC_CACHE_TTL_MS`). The cache reads the host `Date.now()` directly, so we
+ * drive virtual time with node:test's MockTimers Date support: enable Date,
+ * tick past the TTL, and assert the stale entry is evicted on get() (and that
+ * a paginated read therefore re-fetches). DOC_CACHE_TTL_MS is 5 minutes
+ * (docs.ts:53); it isn't exported, so the tick value is anchored to that
+ * literal with a comment rather than imported.
+ */
+describe("makeDocCache — TTL expiry", () => {
+  const TTL_MS = 5 * 60_000; // mirror DOC_CACHE_TTL_MS (docs.ts:53)
+
+  it("evicts an entry older than DOC_CACHE_TTL_MS on get()", () => {
+    mock.timers.enable({ apis: ["Date"] });
+    try {
+      const cache = makeDocCache();
+      const url = "https://docs.aws.amazon.com/x.html";
+      cache.set(url, "markdown");
+      // Within the TTL window the entry is still served.
+      mock.timers.tick(TTL_MS - 1);
+      assert.equal(cache.get(url), "markdown", "entry within TTL must still be cached");
+      // One tick past the TTL boundary evicts on the next get().
+      mock.timers.tick(2);
+      assert.equal(cache.get(url), undefined, "entry older than DOC_CACHE_TTL_MS must be evicted on get()");
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it("a read after TTL expiry re-fetches instead of serving the stale page", async () => {
+    mock.timers.enable({ apis: ["Date"] });
+    try {
+      let fetchCount = 0;
+      const html = "<html><body><main><p>doc body content</p></main></body></html>";
+      const fetchImpl = (async () => {
+        fetchCount++;
+        return fakeResponse({ text: html });
+      }) as unknown as typeof fetch;
+      const [, read] = buildDocsTools(fetchImpl);
+      const url = "https://docs.aws.amazon.com/x.html";
+
+      const first = await read.handler({ url });
+      assert.equal(first.ok, true);
+      assert.equal((first.data as { cached: boolean }).cached, false);
+
+      // A second read within the TTL is a cache hit -- no refetch.
+      mock.timers.tick(60_000);
+      const second = await read.handler({ url });
+      assert.equal((second.data as { cached: boolean }).cached, true);
+      assert.equal(fetchCount, 1, "within-TTL read must not re-fetch");
+
+      // Push past the TTL: the stale entry is evicted and the read re-fetches.
+      mock.timers.tick(TTL_MS + 1);
+      const third = await read.handler({ url });
+      assert.equal((third.data as { cached: boolean }).cached, false, "post-TTL read must report cached:false");
+      assert.equal(fetchCount, 2, "post-TTL read must trigger a second fetch");
+    } finally {
+      mock.timers.reset();
+    }
   });
 });
 

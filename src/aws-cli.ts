@@ -283,6 +283,11 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
 
     proc.stderr?.on("data", (chunk: Buffer) => {
       stderrBytes += chunk.length;
+      // Deliberate asymmetry vs stdout: oversized stderr is silently truncated
+      // -- we stop appending past MAX_OUTPUT_BYTES but do NOT set tooLarge and
+      // do NOT kill the proc. stderr is diagnostic text (CLI warnings/errors),
+      // not the data payload we parse, so an output_too_large failure here would
+      // be noise. stdout is the parsed result, so only it trips that guard above.
       if (stderrBytes > MAX_OUTPUT_BYTES) return;
       stderrBuf += stderrDecoder.write(chunk);
     });

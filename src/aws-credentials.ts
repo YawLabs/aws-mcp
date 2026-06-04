@@ -6,6 +6,12 @@
  * touching anything else. Comments, whitespace between sections, unrelated
  * profiles, and keys we don't manage all pass through unchanged.
  *
+ * One deliberate exception: when we MATCH the target profile (see
+ * upsertProfileIntoText), its header is normalized to the canonical
+ * `[name]` form (e.g. `[ mcp-dev ]` -> `[mcp-dev]`). Only the matched
+ * managed profile's header is rewritten this way; unrelated and non-managed
+ * sections keep their headers verbatim.
+ *
  * We write to a .tmp file first and rename on top of the original so a
  * crash mid-write can't leave the user with a truncated credentials file.
  * On Unix we chmod 0o600 to match the AWS CLI's own behavior.
@@ -299,6 +305,11 @@ export async function upsertProfile(path: string, profile: string, creds: Assume
       // than 0o600, so a freshly-opened-with-0o600 tmp file is a no-op.
       const st: Stats = statSync(path);
       const existingMode = st.mode & 0o777;
+      // unreachable in practice: the tmp file is opened 0600 before rename, and
+      // renameSync replaces the destination inode (discarding any looser perms
+      // that existed at `path`), so post-rename mode is always 0600 and the
+      // group/other bits are already clear. Kept as a defensive belt for
+      // hypothetical platforms whose open(mode) is advisory.
       if ((existingMode & 0o077) !== 0) chmodSync(path, 0o600);
     }
   } finally {

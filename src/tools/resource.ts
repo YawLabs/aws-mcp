@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
 import { getProfile } from "../session.js";
+import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -478,7 +479,7 @@ export const resourceTools: readonly Tool[] = [
         const p = parseResourceProperties(d);
         return { identifier: p.Identifier, properties: p.Properties };
       });
-      const nextToken = typeof raw?.NextToken === "string" && raw.NextToken.length > 0 ? raw.NextToken : null;
+      const nextToken = extractNextToken(raw);
       return {
         ok: true,
         data: {
@@ -1078,10 +1079,13 @@ export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, aft
         working = _applyJsonPatchInPlace(working, [op]);
         afterAt = resolvePointer(working, op.path);
       } catch {
-        // Replay diverged from the original applyJsonPatch run (shouldn't
-        // normally happen -- caller already applied the full patch). Stop
-        // replaying and fall back to the final-state snapshot for
-        // remaining ops.
+        // DEFENSIVE-ONLY / effectively unreachable in normal operation: the
+        // caller (aws_resource_diff) already ran the full patch via
+        // applyJsonPatch before calling summarizePatch, so replaying the same
+        // ops one-at-a-time here cannot throw where the full run succeeded.
+        // This branch only fires if a direct summarizePatch caller passes a
+        // patch that was never validated by applyJsonPatch. Stop replaying and
+        // fall back to the final-state snapshot for the remaining ops.
         replayOk = false;
         afterAt = resolvePointer(after, op.path);
       }

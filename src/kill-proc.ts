@@ -2,9 +2,15 @@
  * SIGTERM-then-SIGKILL escalation for a child process. Extracted here so
  * aws-cli.ts and sso.ts share one implementation instead of two copies.
  *
- * SIGTERM is ignored on Windows (and some Unix daemons), so we escalate to
- * SIGKILL after a short grace window. The escalation timer is .unref()'d so
- * a still-pending kill can't keep the Node event loop alive past shutdown.
+ * The SIGTERM->SIGKILL escalation matters on Unix, where a stubborn child
+ * (a daemon, a process in uninterruptible sleep) can ignore SIGTERM and needs
+ * the uncatchable SIGKILL to die. The escalation timer is .unref()'d so a
+ * still-pending kill can't keep the Node event loop alive past shutdown.
+ *
+ * On Windows the escalation branch is effectively dead: Node maps every
+ * kill() signal to TerminateProcess, which terminates the child immediately
+ * and unconditionally, so the SIGTERM call already killed it and the
+ * post-window SIGKILL never has a live proc to act on.
  */
 
 import type { ChildProcess } from "node:child_process";
@@ -33,6 +39,11 @@ export function killProc(proc: ChildProcess, escalationMs: number = KILL_ESCALAT
     // proc may already be dead
   }
   setTimeout(() => {
+    // Unix escalation path. On Windows this is effectively unreachable: the
+    // SIGTERM above maps to TerminateProcess and kills the child immediately,
+    // so by the time this fires proc.killed is true (or exitCode is set) and
+    // the guard short-circuits. SIGKILL only does real work for a Unix child
+    // that ignored SIGTERM and is still alive after the grace window.
     if (!proc.killed && proc.exitCode === null) {
       try {
         proc.kill("SIGKILL");

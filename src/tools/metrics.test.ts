@@ -446,6 +446,37 @@ describe("aws_metrics_query handler validation", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /endTime .* must be after startTime/);
   });
+
+  it("rejects an explicit period that is not a positive multiple of 60", async () => {
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 45 }],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /invalid period 45/);
+    assert.match(r.error ?? "", /positive multiple of 60/);
+  });
+
+  it("rejects an explicit period+range that would exceed CloudWatch's datapoint cap", async () => {
+    // 71 days at period=60s -> ceil(6,134,400 / 60) = 102,240 datapoints,
+    // over the ~100,800 per-request ceiling.
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-13T00:00:00Z",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /exceeding CloudWatch's per-request cap/);
+    assert.match(r.error ?? "", /Widen the period or narrow the time range/);
+  });
+
+  it("accepts a valid explicit period (multiple of 60, under the datapoint cap)", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 300 }],
+      startTime: "1h",
+    } as never);
+    assert.equal(r.ok, true);
+  });
 });
 
 describe("aws_metrics_query handler (fake-aws integration)", () => {

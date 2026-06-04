@@ -135,19 +135,15 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     assert.match(r.rawBody ?? "", /Unable to locate credentials/);
   });
 
-  it("rawBody is the EMPTY stderr (not stdout) on a stdout-only nonzero exit — `??` does not fall through on ''", async () => {
-    // Documents the REAL behavior of `rawBody: result.rawStderr ?? result.rawStdout`.
-    // On any nonzero exit runAwsCall sets BOTH rawStdout and rawStderr, and
-    // rawStderr is a STRING (possibly empty), never undefined. Because `??`
-    // only falls back on null/undefined — not on '' — an empty rawStderr
-    // short-circuits and rawBody becomes '' even though stdout had content.
-    //
-    // Practical consequence: the `?? result.rawStdout` operand is effectively
-    // dead for the nonzero_exit/timeout shapes (they always supply a string
-    // rawStderr). It would only fire on a failure shape that leaves rawStderr
-    // strictly undefined while populating rawStdout — and no current runAwsCall
-    // branch does that (spawn_failure sets neither; output_too_large sets
-    // rawStderr only). Flagged as a finding; the test pins the observed shape.
+  it("falls through to stdout when stderr is an empty string on a nonzero exit", async () => {
+    // The `call_fail_stdout_only` fake writes diagnostic content to stdout
+    // and leaves stderr empty. An empty rawStderr is treated as "no stderr"
+    // (handler uses a truthy check, not `??`) so the agent gets the stdout
+    // content in rawBody instead of an empty string. Practical case: a
+    // wrapper script that swallows stderr, an `aws` operation that routes
+    // through stdout when stderr is closed, or a CLI version that emits
+    // the error in a different stream than the version this server was
+    // tested against.
     process.env.AWS_MCP_FAKE_SCENARIO = "call_fail_stdout_only";
     const r = (await tool.handler({ service: "s3api", operation: "list-buckets" })) as {
       ok: boolean;
@@ -158,16 +154,17 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     // The generic nonzero-exit error text is the stderr trim (empty) -> the
     // "no stderr" fallback message from aws-cli.ts.
     assert.match(r.error ?? "", /aws CLI exited with code 1 and no stderr/);
-    // rawBody resolves to the empty rawStderr string, NOT the stdout content.
-    assert.equal(r.rawBody, "");
+    // rawBody falls through to stdout because rawStderr is an empty string.
+    assert.match(r.rawBody ?? "", /partial-output-on-stdout/);
   });
 
   // --- bad_input short-circuit (runAwsCall returns before spawning) ---
 
   it("returns ok:false with undefined rawBody when validation fails before any subprocess", async () => {
     // An invalid (flag-shaped) service makes runAwsCall bail with kind:bad_input
-    // and NO rawStdout/rawStderr, so the handler's `rawStderr ?? rawStdout`
-    // resolves to undefined. The fake is never spawned.
+    // and NO rawStdout/rawStderr, so the handler's
+    // `rawStderr ? rawStderr : rawStdout` resolves to undefined. The fake is
+    // never spawned.
     const r = (await tool.handler({ service: "--evil", operation: "list-buckets" })) as {
       ok: boolean;
       error?: string;

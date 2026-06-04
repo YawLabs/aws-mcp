@@ -97,6 +97,16 @@ describe("applyJsonPatch -- arrays", () => {
     assert.deepEqual(r, { Tags: ["a", "b", "c"] });
   });
 
+  it("add at idx === array length appends (boundary: distinguishes > from >=)", () => {
+    // RFC 6902 permits `add` at index === length (the slot just past the last
+    // element) -- it's an append, identical to `/Tags/-`. The bounds guard is
+    // `idx > parent.length` (strict): if it were `>=`, this exact case would
+    // wrongly throw "out of bounds". Tags has length 2, so /Tags/2 is the
+    // append boundary.
+    const r = applyJsonPatch({ Tags: ["a", "b"] }, [{ op: "add", path: "/Tags/2", value: "c" }]);
+    assert.deepEqual(r, { Tags: ["a", "b", "c"] });
+  });
+
   it("remove at index", () => {
     const r = applyJsonPatch({ Tags: ["a", "b", "c"] }, [{ op: "remove", path: "/Tags/1" }]);
     assert.deepEqual(r, { Tags: ["a", "c"] });
@@ -426,6 +436,23 @@ describe("applyJsonPatch -- whole-document ops (path: '')", () => {
     applyJsonPatch(original, [{ op: "replace", path: "", value: { B: 2 } }]);
     assert.deepEqual(original, { A: 1 });
   });
+
+  it("add at root materializes the document when the original is undefined", () => {
+    // applyJsonPatch clones `undefined` (clone() returns undefined for it), so
+    // the working root starts undefined. A whole-document `add` then sets the
+    // root to the cloned value -- the result is the value verbatim, NOT a
+    // merge against a (nonexistent) prior document.
+    const r = applyJsonPatch(undefined, [{ op: "add", path: "", value: { X: 1 } }]);
+    assert.deepEqual(r, { X: 1 });
+  });
+
+  it("replace at root materializes the document when the original is undefined", () => {
+    // RFC 6902 add/replace collapse to the same reassignment at the root, so
+    // `replace` on an undefined original behaves like `add` -- it sets the
+    // document rather than throwing on a missing target.
+    const r = applyJsonPatch(undefined, [{ op: "replace", path: "", value: { Y: 2 } }]);
+    assert.deepEqual(r, { Y: 2 });
+  });
 });
 
 describe("applyJsonPatch -- specific error paths", () => {
@@ -455,6 +482,30 @@ describe("applyJsonPatch -- specific error paths", () => {
     assert.throws(
       () => applyJsonPatch({ A: 42 }, [{ op: "replace", path: "/A/B/C", value: 1 }]),
       /traverses a non-container value/,
+    );
+  });
+
+  it("final-token op on a primitive parent throws 'parent is not a container'", () => {
+    // Distinct from the intermediate-traversal branch above: a SINGLE-token
+    // path means the parent-walk loop never runs, so `parent` stays as the
+    // root. When the root is itself a primitive (string/number), the final
+    // dispatch falls through to the else-branch that says "parent is not a
+    // container" -- the message at the very end of _applyJsonPatchInPlace,
+    // NOT the mid-walk "traverses a non-container value" one.
+    assert.throws(() => applyJsonPatch("hello", [{ op: "add", path: "/key", value: 1 }]), /parent is not a container/);
+  });
+
+  it("final-token op on a numeric primitive root also throws 'parent is not a container'", () => {
+    // Same final-token branch, numeric root -- guards against the check being
+    // string-specific and pins that the message is the parent-not-a-container
+    // one rather than the intermediate-traversal wording.
+    assert.throws(
+      (): unknown => applyJsonPatch(42, [{ op: "replace", path: "/key", value: 1 }]),
+      (err: Error) => {
+        assert.match(err.message, /parent is not a container/);
+        assert.doesNotMatch(err.message, /traverses a non-container value/);
+        return true;
+      },
     );
   });
 });

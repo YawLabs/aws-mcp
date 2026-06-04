@@ -248,6 +248,83 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.match(r.error ?? "", /Invalid targetProfile name/);
   });
 
+  it("sends DurationSeconds/ExternalId/RoleArn/RoleSessionName via --cli-input-json and the source profile via --profile", async () => {
+    // The handler routes assume-role params through --cli-input-json (no argv
+    // positionals, so RoleArn/ExternalId can't pose as flags) and passes the
+    // assuming identity as a separate --profile entry (assembled by
+    // runAwsCall). The assume_role_echo_args fake writes the full argv to
+    // AWS_MCP_FAKE_ARGV_OUT (side channel, since the handler discards
+    // everything except Credentials/AssumedRoleUser) then emits a normal
+    // success payload. Modeled on iam-simulate.test.ts's iam_sim_echo_argv
+    // consumption: parse --cli-input-json, assert the PascalCase params reached
+    // the CLI, and assert --profile carries the source profile.
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-assume-argv-out-"));
+    const argvOutPath = join(sideChannelDir, "argv.json");
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_echo_args";
+    try {
+      const r = await tool.handler({
+        roleArn: "arn:aws:iam::123456789012:role/CrossAccountAdmin",
+        sessionName: "echo-session",
+        durationSeconds: 7200,
+        externalId: "ext-12345",
+        sourceProfile: "my-source",
+      } as never);
+      assert.equal(r.ok, true);
+      const data = r.data as { sourceProfile: string };
+      assert.equal(data.sourceProfile, "my-source");
+
+      const argv = JSON.parse(readFileSync(argvOutPath, "utf-8")) as string[];
+
+      // --cli-input-json carries the assume-role params in PascalCase.
+      const cliInputIdx = argv.indexOf("--cli-input-json");
+      assert.ok(cliInputIdx >= 0, "argv should contain --cli-input-json");
+      const payloadRaw = argv[cliInputIdx + 1];
+      assert.ok(typeof payloadRaw === "string", "--cli-input-json should be followed by a string");
+      const payload = JSON.parse(payloadRaw) as {
+        RoleArn?: string;
+        RoleSessionName?: string;
+        DurationSeconds?: number;
+        ExternalId?: string;
+      };
+      assert.equal(payload.RoleArn, "arn:aws:iam::123456789012:role/CrossAccountAdmin");
+      assert.equal(payload.RoleSessionName, "echo-session");
+      assert.equal(payload.DurationSeconds, 7200);
+      assert.equal(payload.ExternalId, "ext-12345");
+
+      // --profile carries the source (assuming) profile.
+      const profileIdx = argv.indexOf("--profile");
+      assert.ok(profileIdx >= 0, "argv should contain --profile");
+      assert.equal(argv[profileIdx + 1], "my-source");
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+      rmSync(sideChannelDir, { recursive: true, force: true });
+    }
+  });
+
+  it("renders 'expire at unknown' and undefined expiration when the CLI omits Expiration", async () => {
+    // assume_role_success_no_expiration returns a complete Credentials block
+    // (AccessKeyId/SecretAccessKey/SessionToken) but NO Expiration. AWS always
+    // sends Expiration in practice, but the handler reads it defensively
+    // (creds.Expiration is optional). The envelope must carry
+    // expiration===undefined and the hint must fall back to "expire at
+    // unknown" rather than crashing or emitting a bogus value.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success_no_expiration";
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "no-exp-session",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { expiration?: string; hint: string; assumedRoleArn?: string };
+    assert.equal(data.expiration, undefined);
+    assert.match(data.hint, /expire at unknown/);
+    // AssumedRoleUser is present in the scenario, so identity still populates.
+    assert.equal(data.assumedRoleArn, "arn:aws:sts::123456789012:assumed-role/Admin/no-exp-session");
+  });
+
   it("propagates timeoutMs to the underlying CLI call (fires timeout path)", async () => {
     // assume_role_slow sleeps ~5s before responding. A 200ms timeoutMs has to
     // reach runAwsCall for the timeout error to surface inside that window;

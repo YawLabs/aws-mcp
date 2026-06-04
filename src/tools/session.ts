@@ -1,5 +1,13 @@
 import { z } from "zod";
-import { clearProfile, clearRegion, getSessionState, setProfile, setRegion } from "../session.js";
+import {
+  clearProfile,
+  clearRegion,
+  getSessionState,
+  isValidProfileName,
+  isValidRegionName,
+  setProfile,
+  setRegion,
+} from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 export const sessionTools: readonly Tool[] = [
@@ -30,12 +38,40 @@ export const sessionTools: readonly Tool[] = [
             "Nothing to set — pass at least one of 'profile' or 'region'. Use aws_session_get to read current values.",
         };
       }
-      try {
-        if (profile !== undefined) setProfile(profile);
-        if (region !== undefined) setRegion(region);
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      // Validate BOTH inputs before mutating EITHER. setProfile/setRegion
+      // write to module-global state, so a sequential apply with one valid +
+      // one invalid input would leave the first mutation in place while
+      // returning ok:false -- a response that lies about what changed. Reject
+      // up front instead. setProfile/setRegion trim before validating, so we
+      // trim here too and validate the trimmed value to match their semantics.
+      if (profile !== undefined) {
+        const trimmed = profile.trim();
+        if (!trimmed) {
+          return { ok: false, error: "Profile name cannot be empty" };
+        }
+        if (!isValidProfileName(trimmed)) {
+          return {
+            ok: false,
+            error: `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '=', no whitespace or shell metacharacters.`,
+          };
+        }
       }
+      if (region !== undefined) {
+        const trimmed = region.trim();
+        if (!trimmed) {
+          return { ok: false, error: "Region cannot be empty" };
+        }
+        if (!isValidRegionName(trimmed)) {
+          return {
+            ok: false,
+            error: `Invalid region '${trimmed}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1', 'eu-west-3').`,
+          };
+        }
+      }
+      // Both inputs valid -- now apply. setProfile/setRegion re-trim, so the
+      // stored value preserves the trim behavior callers already rely on.
+      if (profile !== undefined) setProfile(profile);
+      if (region !== undefined) setRegion(region);
       return { ok: true, data: getSessionState() };
     },
   },

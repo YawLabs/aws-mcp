@@ -53,7 +53,7 @@ import type { Tool, ToolResult } from "./tool.js";
  * shell script doesn't embed a second copy of itself.
  *
  * Explicitly shadowed (made `undefined`):
- *   - I/O & process: require, import, process, fs, fetch, Request, Response,
+ *   - I/O & process: require, process, fetch, Request, Response,
  *     Headers, AbortController, AbortSignal, BroadcastChannel
  *   - Event loop: setTimeout/Interval/Immediate, clearTimeout/Interval/
  *     Immediate, queueMicrotask
@@ -67,8 +67,12 @@ import type { Tool, ToolResult } from "./tool.js";
  * Globals NOT injected by `vm.createContext({})` on Node 22 (so neither
  * bound here nor in the shadow list): `URL`, `URLSearchParams`,
  * `TextEncoder`, `TextDecoder`, `crypto`, `structuredClone`, `EventTarget`,
- * `MessageChannel`, `performance`. A script that uses any of these gets a
- * ReferenceError today. If a future Node release starts injecting them, or
+ * `MessageChannel`, `performance`, `fs`. `import` is likewise unavailable --
+ * a bare `import` statement is a syntax error in the non-module script body,
+ * and dynamic `import()` is off because `codeGeneration` is disabled. None of
+ * these are in the shadow list because they're absent-by-default (a
+ * ReferenceError-by-absence), not actively set to `undefined`. A script that
+ * uses any of them gets a ReferenceError today. If a future Node release starts injecting them, or
  * any other global with reach beyond compute (a `webcrypto.subtle`-style
  * key store, a thread spawner, ...), revisit the shadow list -- the list
  * is the contract, not the absence-from-list.
@@ -480,7 +484,7 @@ export const scriptTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, import, process, fs, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
+          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, process, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance, fs, import. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
         ),
       timeoutMs: z
         .number()
@@ -489,7 +493,7 @@ export const scriptTools: readonly Tool[] = [
         .max(MAX_TIMEOUT_MS)
         .optional()
         .describe(
-          `Wall-clock timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}; max ${MAX_TIMEOUT_MS}. Covers evaluation plus every awaited aws.* call. On timeout the script stops being awaited and the tool returns an error, but any aws.* call already in flight is NOT cancelled -- it continues until its own per-call timeout (default 60s). Plan retries accordingly: a script that timed out mid 'resource.delete' may have completed the delete; re-issuing the same script can double-mutate.`,
+          `Wall-clock timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}; max ${MAX_TIMEOUT_MS}. Best-effort across evaluation plus awaited aws.* calls -- it fires on synchronous spin before the first await and on async wall-clock once the script has yielded, but a synchronous infinite loop BETWEEN awaits can outrun the timer and is not guaranteed to be interrupted. On timeout the script stops being awaited and the tool returns an error, but any aws.* call already in flight is NOT cancelled -- it continues until its own per-call timeout (default 60s). Plan retries accordingly: a script that timed out mid 'resource.delete' may have completed the delete; re-issuing the same script can double-mutate.`,
         ),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {

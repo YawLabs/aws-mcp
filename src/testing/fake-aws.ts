@@ -24,19 +24,44 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// The exact stdout the `happy` scenario emits up to and including the URL +
+// code lines. Shared so `happy_hold` is guaranteed byte-for-byte identical
+// through the point findActiveSessionByProfile parses (verificationUrl +
+// userCode), and can't silently drift from `happy`.
+const HAPPY_URL_CODE_BANNER =
+  "Attempting to automatically open the SSO authorization page in your default browser.\n" +
+  "If the browser does not open or you wish to use a different device to authorize this request, open the following URL:\n\n" +
+  "https://device.sso.us-east-1.amazonaws.com/\n\n" +
+  "Then enter the code:\n\n" +
+  "ABCD-EFGH\n";
+
 async function main(): Promise<void> {
   switch (scenario) {
     case "happy": {
       // Realistic aws-cli output: banner text, URL, code, then successful auth.
-      process.stdout.write(
-        "Attempting to automatically open the SSO authorization page in your default browser.\n" +
-          "If the browser does not open or you wish to use a different device to authorize this request, open the following URL:\n\n" +
-          "https://device.sso.us-east-1.amazonaws.com/\n\n" +
-          "Then enter the code:\n\n" +
-          "ABCD-EFGH\n",
-      );
+      // HARD CONSTRAINT: the 200ms exit timing is depended on by
+      // auth.test.ts and several sso.integration.test.ts cases (TTL
+      // killswitch, completed-session exclusion). Do not change it. If you
+      // need a session that stays active deterministically, use `happy_hold`.
+      process.stdout.write(HAPPY_URL_CODE_BANNER);
       await sleep(200); // Simulate user auth delay
       process.stdout.write("Successfully logged into Start URL: https://d-test.awsapps.com/start\n");
+      process.exit(0);
+      return;
+    }
+
+    case "happy_hold": {
+      // Same URL+code stdout as `happy` (so findActiveSessionByProfile parses
+      // the identical verificationUrl/userCode), but then stays alive until
+      // the parent kills it instead of exiting after 200ms. This keeps the
+      // session's `completed` flag false deterministically, so a test that
+      // synchronously asserts findActiveSessionByProfile right after start
+      // can't lose the race to the 200ms exit. The parent reaps it via
+      // killProc (_clearSessions in afterEach), so the long sleep never
+      // actually elapses -- it's just a "stay alive" floor well past any
+      // test's wall-clock.
+      process.stdout.write(HAPPY_URL_CODE_BANNER);
+      await sleep(10 * 60_000); // 10 min: effectively "until killed"
       process.exit(0);
       return;
     }
@@ -61,14 +86,6 @@ async function main(): Promise<void> {
     case "exits_before_url": {
       // Exit cleanly before emitting anything useful.
       await sleep(50);
-      process.exit(0);
-      return;
-    }
-
-    case "slow_url": {
-      // Wait longer than the test's urlWaitMs before emitting — exercises timeout.
-      await sleep(3000);
-      process.stdout.write("https://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n");
       process.exit(0);
       return;
     }
@@ -138,13 +155,34 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "call_partial_then_hang": {
+      // Write some stdout FIRST, then hang past a short timeoutMs. Unlike
+      // call_slow (which hangs before emitting anything), this exercises the
+      // timeout-PRESERVES-partial-output path: runAwsCall's timeout branch
+      // attaches rawStdout to the AwsCallFailure, so a test can assert the
+      // partial bytes survived the kill. We flush a fragment immediately, give
+      // the parent's stdout.on('data') a tick to drain it, then sleep well past
+      // any reasonable test timeoutMs so the parent's timeout fires and kills
+      // us. The fragment is intentionally NOT valid JSON on its own -- the
+      // timeout path never parses stdout, it just preserves the raw bytes.
+      process.stdout.write('{"partial":"this-arrived-before-the-timeout"');
+      await sleep(50); // let the parent drain the first chunk before we hang
+      await sleep(10_000); // hang well past the test's timeoutMs
+      process.stdout.write("}\n");
+      process.exit(0);
+      return;
+    }
+
     case "call_large": {
-      // Stream more than MAX_OUTPUT_BYTES (5 MB) so the parent kills us.
-      const oneMb = "x".repeat(1024 * 1024);
-      for (let i = 0; i < 8; i++) {
-        process.stdout.write(oneMb);
-        await sleep(10); // give parent a chance to read, hit the cap, and kill us
-      }
+      // Emit more than MAX_OUTPUT_BYTES (5 MB) so the parent trips its
+      // output_too_large cap and kills us. Write a single 6 MB burst with NO
+      // inter-chunk sleeps: the parent's cap is cumulative over stdout 'data'
+      // events, so once it drains 6 MB the guard fires regardless of reader
+      // speed or CI load. The earlier 1 MB-chunks-with-10ms-sleeps version was
+      // timing-coupled -- it only passed because the parent read fast enough to
+      // kill mid-stream before all 8 MB were written and before the test
+      // timeout. This burst makes the cap deterministic.
+      process.stdout.write("x".repeat(6 * 1024 * 1024));
       process.exit(0);
       return;
     }
@@ -238,6 +276,143 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "ccapi_list_resources_paginated": {
+      // Mimics `aws cloudcontrol list-resources` for the aws_resource_list
+      // pagination path. Stateful by argv: when `--next-token` is present the
+      // caller is resuming, so emit the FINAL page (ResourceDescriptions with
+      // NO top-level NextToken). On the first call (no --next-token) emit a
+      // truncated page: ResourceDescriptions PLUS a NextToken resume cursor.
+      //
+      // Each ResourceDescription carries an Identifier and a Properties field
+      // that is a JSON-ENCODED STRING (not a parsed object) -- this is exactly
+      // how CCAPI emits it, and parseResourceProperties in resource.ts is what
+      // turns that string back into an object. Tests asserting
+      // resources[i].properties get a parsed object; resources[i].identifier
+      // gets the Identifier string. hasMore is derived from NextToken by the
+      // handler (extractNextToken), so page 1 -> hasMore:true, page 2 ->
+      // hasMore:false, nextToken:null.
+      const argv = process.argv.slice(2);
+      const isResume = argv.includes("--next-token");
+      if (isResume) {
+        // Final page: two resources, NO NextToken.
+        process.stdout.write(
+          `${JSON.stringify({
+            ResourceDescriptions: [
+              {
+                Identifier: "/my/param-3",
+                Properties: JSON.stringify({ Name: "/my/param-3", Type: "String", Value: "v3" }),
+              },
+              {
+                Identifier: "/my/param-4",
+                Properties: JSON.stringify({ Name: "/my/param-4", Type: "String", Value: "v4" }),
+              },
+            ],
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      // First page: two resources PLUS a resume cursor under NextToken.
+      process.stdout.write(
+        `${JSON.stringify({
+          ResourceDescriptions: [
+            {
+              Identifier: "/my/param-1",
+              Properties: JSON.stringify({ Name: "/my/param-1", Type: "String", Value: "v1" }),
+            },
+            {
+              Identifier: "/my/param-2",
+              Properties: JSON.stringify({ Name: "/my/param-2", Type: "String", Value: "v2" }),
+            },
+          ],
+          NextToken: "ccapi-list-cursor-page2",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "ccapi_create_then_status_success": {
+      // Routes a single AWS_MCP_FAKE_SCENARIO across the two CLI calls the
+      // create-with-awaitCompletion HAPPY path makes:
+      //   1) cloudcontrol create-resource             -> IN_PROGRESS (success), RequestToken=req-tok-ok
+      //   2) cloudcontrol get-resource-request-status -> SUCCESS    (success)
+      // Drives buildMutationResponse + pollUntilTerminal end-to-end to a
+      // terminal SUCCESS in one handler call. The status-poll branch reaches a
+      // TERMINAL_STATUSES member ("SUCCESS") on the first poll, so attempts==1.
+      // Companion to ccapi_create_then_status_sso_expired (the failure path).
+      const argv = process.argv.slice(2);
+      if (argv.includes("create-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::SSM::Parameter",
+              Identifier: "/my/p",
+              RequestToken: "req-tok-ok",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "CREATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::SSM::Parameter",
+              Identifier: "/my/p",
+              RequestToken: "req-tok-ok",
+              OperationStatus: "SUCCESS",
+              Operation: "CREATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: ccapi_create_then_status_success hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "ccapi_create_already_terminal": {
+      // The create-resource call returns a ProgressEvent that is ALREADY in a
+      // terminal state (SUCCESS) on the very first response -- some CCAPI
+      // resource types complete synchronously. With awaitCompletion:true the
+      // handler's buildMutationResponse must SHORT-CIRCUIT: it sees the initial
+      // status is terminal and skips the poll loop entirely (no `awaited`
+      // block, attempts never run). To PROVE the poll was skipped, the
+      // get-resource-request-status branch errors out -- if the handler ever
+      // reaches it, the test sees ok:false instead of a clean SUCCESS.
+      const argv = process.argv.slice(2);
+      if (argv.includes("create-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::SSM::Parameter",
+              Identifier: "/my/p",
+              RequestToken: "req-tok-term",
+              OperationStatus: "SUCCESS",
+              Operation: "CREATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        // Should be unreachable: the initial SUCCESS short-circuits the poll.
+        process.stderr.write("fake-aws: ccapi_create_already_terminal poll was called but should have been skipped\n");
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: ccapi_create_already_terminal hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
     case "logs_tail_ndjson": {
       // 'aws logs tail --format json' emits one JSON object per line.
       process.stdout.write(
@@ -259,6 +434,25 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "logs_tail_ndjson_malformed": {
+      // Multi-line NDJSON where ONE line is not valid JSON. The aws CLI
+      // normally never emits this, but a partially-flushed event, an injected
+      // CLI warning line, or a truncated final record can produce it.
+      // parseLogsJsonOutput in logs.ts gives up on the first un-parseable line
+      // and returns the RAW string unchanged; the handler then renders
+      // eventCount=null (since events is a string, not an array) while still
+      // surfacing the blob in `events` for diagnosis. First line is valid JSON,
+      // second line is garbage, third line is valid JSON -- so the failure is
+      // mid-stream, not at the very start.
+      process.stdout.write(
+        `${JSON.stringify({ timestamp: "2026-04-21T00:00:00Z", logStreamName: "s1", message: "hello" })}\n` +
+          "this-line-is-not-json\n" +
+          `${JSON.stringify({ timestamp: "2026-04-21T00:00:02Z", logStreamName: "s2", message: "ok" })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     case "sts_caller_identity_success": {
       // Mimics `aws sts get-caller-identity --output json`.
       process.stdout.write(
@@ -269,33 +463,6 @@ async function main(): Promise<void> {
         })}\n`,
       );
       process.exit(0);
-      return;
-    }
-
-    case "ccapi_in_progress": {
-      // Mimics a cloudcontrol create/update/delete-resource initial response:
-      // operation accepted, IN_PROGRESS, with a RequestToken to poll.
-      process.stdout.write(
-        `${JSON.stringify({
-          ProgressEvent: {
-            TypeName: "AWS::SSM::Parameter",
-            Identifier: "/my/p",
-            RequestToken: "req-tok-abc",
-            OperationStatus: "IN_PROGRESS",
-            Operation: "CREATE",
-          },
-        })}\n`,
-      );
-      process.exit(0);
-      return;
-    }
-
-    case "ccapi_status_sso_expired": {
-      // Mimics `aws cloudcontrol get-resource-request-status` failing with
-      // the same SSO expiry stderr aws_call sees, so awaitCompletion
-      // surfaces the same hint.
-      process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
-      process.exit(255);
       return;
     }
 
@@ -406,6 +573,70 @@ async function main(): Promise<void> {
         `${JSON.stringify({
           Credentials: { AccessKeyId: "ASIA1234EXAMPLE" },
           AssumedRoleUser: { Arn: "arn:aws:sts::123:assumed-role/Admin/sess" },
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "assume_role_echo_args": {
+      // Capture-and-echo variant for aws_assume_role: write the full argv as
+      // JSON to AWS_MCP_FAKE_ARGV_OUT (side channel, since the handler discards
+      // everything except Credentials/AssumedRoleUser), then emit a normal
+      // successful assume-role payload so the handler returns ok:true and the
+      // post-success path runs. Lets a test assert that DurationSeconds /
+      // ExternalId reached the CLI inside --cli-input-json AND that the source
+      // profile reached --profile. Modeled on iam_sim_echo_argv.
+      //
+      // The handler sends assume-role params (RoleArn / RoleSessionName /
+      // DurationSeconds / ExternalId) via --cli-input-json; the source profile
+      // lands as a separate --profile argv entry. Both are recoverable from
+      // the echoed argv.
+      const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
+      if (outPath) {
+        const fs = await import("node:fs");
+        fs.writeFileSync(outPath, JSON.stringify(process.argv.slice(2)));
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          Credentials: {
+            AccessKeyId: "ASIA1234EXAMPLE",
+            SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            SessionToken: "FQoGZXIvYXdzEXAMPLETOKENBLAHBLAH",
+            Expiration: "2099-12-31T23:59:59+00:00",
+          },
+          AssumedRoleUser: {
+            AssumedRoleId: "AROA1234EXAMPLE:my-session",
+            Arn: "arn:aws:sts::123456789012:assumed-role/Admin/my-session",
+          },
+          PackedPolicySize: 6,
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "assume_role_success_no_expiration": {
+      // Successful assume whose Credentials block has all three required
+      // fields (AccessKeyId / SecretAccessKey / SessionToken) but NO
+      // Expiration. AWS always returns Expiration in practice, but the handler
+      // reads it defensively (`creds.Expiration` is optional) and must not
+      // crash or emit a bogus expiration. The returned envelope should have
+      // expiration === undefined and the hint should render the
+      // "expire at unknown" fallback. AssumedRoleUser is present so the
+      // assumedRoleArn / assumedRoleId fields still populate.
+      process.stdout.write(
+        `${JSON.stringify({
+          Credentials: {
+            AccessKeyId: "ASIA1234NOEXPIRE",
+            SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYNOEXPIRE",
+            SessionToken: "FQoGZXIvYXdzNOEXPIRETOKEN",
+          },
+          AssumedRoleUser: {
+            AssumedRoleId: "AROA1234EXAMPLE:no-exp-session",
+            Arn: "arn:aws:sts::123456789012:assumed-role/Admin/no-exp-session",
+          },
+          PackedPolicySize: 6,
         })}\n`,
       );
       process.exit(0);
@@ -535,6 +766,62 @@ async function main(): Promise<void> {
               EvalResourceName: "*",
               EvalDecision: "implicitDeny",
               MatchedStatements: [],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam_simulate_advisory_and_filter": {
+      // Exercises three branches of parseSimulationResults in one response:
+      //
+      //  [0] EvalDecision MISSING entirely -> parseSimulationResults falls back
+      //      to decision="unknown". Because the handler counts allowed by
+      //      `decision === "allowed"`, this entry lands in the DENIED bucket
+      //      (allowed:0). Also its sole MatchedStatements entry has a
+      //      NON-STRING SourcePolicyId (number 42), so the matched-statement
+      //      filter drops it and matchedStatementIds stays undefined.
+      //
+      //  [1] Carries OrganizationsDecisionDetail.AllowedByOrganizations=false
+      //      and PermissionsBoundaryDecisionDetail.AllowedByPermissionsBoundary
+      //      =true -> the advisory fields organizationsDecision="denied" and
+      //      permissionsBoundaryDecision="allowed" populate. Decision is a
+      //      real "allowed" so this is the one allowed entry.
+      //
+      //  [2] A MatchedStatements array that MIXES a valid string SourcePolicyId
+      //      ("KeepThis") with an entry whose SourcePolicyId is non-string
+      //      (null) and an entry missing SourcePolicyId entirely -> the filter
+      //      keeps ONLY "KeepThis". decision="explicitDeny" (denied bucket).
+      //
+      // Net summary: allowed=1, denied=2, total=3.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              EvalResourceName: "*",
+              // EvalDecision intentionally omitted -> "unknown"
+              MatchedStatements: [{ SourcePolicyId: 42, SourcePolicyType: "IAM Policy" }],
+            },
+            {
+              EvalActionName: "lambda:InvokeFunction",
+              EvalResourceName: "*",
+              EvalDecision: "allowed",
+              MatchedStatements: [{ SourcePolicyId: "OrgAllowed", SourcePolicyType: "IAM Policy" }],
+              OrganizationsDecisionDetail: { AllowedByOrganizations: false },
+              PermissionsBoundaryDecisionDetail: { AllowedByPermissionsBoundary: true },
+            },
+            {
+              EvalActionName: "ec2:TerminateInstances",
+              EvalResourceName: "*",
+              EvalDecision: "explicitDeny",
+              MatchedStatements: [
+                { SourcePolicyId: "KeepThis", SourcePolicyType: "IAM Policy" },
+                { SourcePolicyId: null, SourcePolicyType: "IAM Policy" },
+                { SourcePolicyType: "IAM Policy" },
+              ],
             },
           ],
         })}\n`,

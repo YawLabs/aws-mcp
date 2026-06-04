@@ -266,11 +266,91 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     assert.equal(data.results[0].matchedStatementIds, undefined);
   });
 
+  it("advisory fields + SourcePolicyId filtering through the handler (Phase-1 scenario)", async () => {
+    // iam_simulate_advisory_and_filter emits three EvaluationResults:
+    //  [0] s3:GetObject  -- EvalDecision omitted -> decision "unknown" (denied
+    //      bucket); sole MatchedStatements SourcePolicyId is the number 42, so
+    //      the string-only filter drops it and matchedStatementIds is undefined.
+    //  [1] lambda:InvokeFunction -- EvalDecision "allowed" (the one allowed
+    //      entry); AllowedByOrganizations:false -> organizationsDecision
+    //      "denied"; AllowedByPermissionsBoundary:true ->
+    //      permissionsBoundaryDecision "allowed".
+    //  [2] ec2:TerminateInstances -- EvalDecision "explicitDeny" (denied);
+    //      MatchedStatements mixes string "KeepThis" + null + a missing
+    //      SourcePolicyId -> only ["KeepThis"] survives the filter.
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject", "lambda:InvokeFunction", "ec2:TerminateInstances"],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      summary: { allowed: number; denied: number; total: number };
+      results: {
+        action: string;
+        decision: string;
+        matchedStatementIds?: string[];
+        organizationsDecision?: string;
+        permissionsBoundaryDecision?: string;
+      }[];
+    };
+
+    // unknown (entry [0]) AND explicitDeny (entry [2]) both land in denied.
+    assert.deepEqual(data.summary, { allowed: 1, denied: 2, total: 3 });
+
+    const get = data.results.find((res) => res.action === "s3:GetObject");
+    assert.ok(get);
+    assert.equal(get.decision, "unknown");
+    // number SourcePolicyId (42) dropped by the string-only filter.
+    assert.equal(get.matchedStatementIds, undefined);
+    assert.equal(get.organizationsDecision, undefined);
+    assert.equal(get.permissionsBoundaryDecision, undefined);
+
+    const invoke = data.results.find((res) => res.action === "lambda:InvokeFunction");
+    assert.ok(invoke);
+    assert.equal(invoke.decision, "allowed");
+    assert.equal(invoke.organizationsDecision, "denied");
+    assert.equal(invoke.permissionsBoundaryDecision, "allowed");
+    assert.deepEqual(invoke.matchedStatementIds, ["OrgAllowed"]);
+
+    const terminate = data.results.find((res) => res.action === "ec2:TerminateInstances");
+    assert.ok(terminate);
+    assert.equal(terminate.decision, "explicitDeny");
+    // string "KeepThis" kept; null + missing SourcePolicyId dropped.
+    assert.deepEqual(terminate.matchedStatementIds, ["KeepThis"]);
+  });
+
+  it("accepts a 2048-char resource and rejects a 2049-char one (length cap boundary)", async () => {
+    // iam-simulate.ts:204 rejects resources longer than 2048 chars. The cap is
+    // inclusive: exactly 2048 passes validation, 2049 fails. Both strings
+    // start with a non-hyphen char so only the length branch is under test.
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
+    const at2048 = `arn:aws:s3:::${"a".repeat(2048 - "arn:aws:s3:::".length)}`;
+    assert.equal(at2048.length, 2048);
+    const passes = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject"],
+      resources: [at2048],
+    } as never);
+    // 2048 passes the resource check, so the handler runs the fake scenario.
+    assert.equal(passes.ok, true);
+
+    const at2049 = `${at2048}a`;
+    assert.equal(at2049.length, 2049);
+    const rejected = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject"],
+      resources: [at2049],
+    } as never);
+    assert.equal(rejected.ok, false);
+    assert.match(rejected.error ?? "", /Invalid resource/);
+  });
+
   it("translates contextEntries camelCase -> PascalCase in the CLI argv (regression guard)", async () => {
     // The schema accepts contextEntries: [{ contextKeyName, contextKeyType,
     // contextKeyValues }] from the model; the AWS CLI requires PascalCase
     // ContextKeyName / ContextKeyType / ContextKeyValues inside
-    // --cli-input-json. iam-simulate.ts:215-220 does the case translation.
+    // --cli-input-json. iam-simulate.ts:221-225 does the case translation.
     // A refactor dropping the map would leave camelCase in the CLI payload;
     // the CLI would silently produce missingContextValues for every
     // tag-based policy sim -- a quiet false negative. We capture the argv

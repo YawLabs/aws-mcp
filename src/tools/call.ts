@@ -77,7 +77,14 @@ export const callTools: readonly Tool[] = [
         return {
           ok: false,
           error: result.error,
-          rawBody: result.rawStderr ?? result.rawStdout,
+          // Treat an empty-string rawStderr as "no stderr" so a nonzero exit
+          // that wrote its diagnostic to stdout (rare but observed: some
+          // `aws` operations route through stdout when stderr is closed or
+          // when a wrapper script swallows stderr) still surfaces the
+          // stdout body. Pinned by call.test.ts -- the failure-shape
+          // contract is "diagnostic text first, stdout second" rather
+          // than "stderr always wins even when empty".
+          rawBody: result.rawStderr ? result.rawStderr : result.rawStdout,
         };
       }
       return {

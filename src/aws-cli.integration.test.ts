@@ -305,6 +305,76 @@ describe("runAwsCall — failure paths", () => {
     assert.match(r.error, /timed out/);
   });
 
+  it("reports 'exited with code N and no stderr' on nonzero exit with empty stderr", async () => {
+    // call_fail_stdout_only writes to stdout and exits 1 with EMPTY stderr.
+    // classifyAuthError(new Error("")) -> "other", so kind=nonzero_exit; the
+    // empty trimmed stderr is falsy, so baseMsg falls back to the
+    // "exited with code N and no stderr" string (aws-cli.ts:345). parseAwsError("")
+    // returns {} so no Suggestion is appended.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_fail_stdout_only"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "nonzero_exit");
+    assert.equal(r.error, "aws CLI exited with code 1 and no stderr");
+    assert.equal(r.exitCode, 1);
+    // The stdout it did emit is preserved for diagnosis even on the failure.
+    assert.match(r.rawStdout ?? "", /partial-output-on-stdout/);
+  });
+
+  it("appends a recognized Suggestion onto a nonzero_exit error", async () => {
+    // call_access_denied emits the canonical AccessDenied stderr. parseAwsError
+    // recognizes code=AccessDenied with no User: line, so it appends the generic
+    // IAM suggestion (errors.ts:137) after a blank-line separator.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_access_denied"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "nonzero_exit");
+    assert.match(r.error, /AccessDenied/);
+    assert.match(r.error, /\n\nSuggestion: Check IAM permissions for this operation\./);
+  });
+
+  it("includes the truncated stderr after 'Underlying error: ' for no_creds", async () => {
+    // The no_creds branch (aws-cli.ts:342) suffixes the underlying stderr so the
+    // agent can see WHY creds resolution failed, not just that it did.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_no_creds"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "no_creds");
+    assert.match(r.error, /Underlying error: /);
+    // The actual stderr text follows the prefix.
+    assert.match(r.error, /Underlying error: Unable to locate credentials/);
+  });
+
+  it("preserves partial stdout when a timeout kills a subprocess mid-stream", async () => {
+    // call_partial_then_hang flushes a JSON fragment, lets the parent drain it,
+    // then hangs past our short timeoutMs. The timeout branch (aws-cli.ts:311)
+    // attaches the partial rawStdout to the failure so the bytes that DID arrive
+    // before the kill aren't lost. The fragment is not valid JSON on its own --
+    // the timeout path never parses stdout, it just preserves the raw bytes.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_partial_then_hang", { timeoutMs: 200 }),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "timeout");
+    assert.match(r.error, /timed out/);
+    assert.match(r.rawStdout ?? "", /this-arrived-before-the-timeout/);
+  });
+
   it("returns output_too_large when stdout exceeds 5 MB cap", async () => {
     const r = await runAwsCall({
       service: "s3api",

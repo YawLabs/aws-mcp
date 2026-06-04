@@ -258,4 +258,32 @@ describe("aws_paginate handler — end-to-end via AWS_MCP_TEST_AWS_* env overrid
       afterEachEnv();
     }
   });
+
+  it("handler surfaces ok:false + rawBody (from stderr) when the underlying CLI call fails", async () => {
+    // Drive an access-denied failure through the FULL handler. The
+    // call_access_denied scenario writes the AWS error to stderr and exits
+    // 255, so runAwsCall returns ok:false with rawStderr populated. The
+    // handler's failure branch must propagate ok:false and surface the
+    // stderr blob under rawBody (the `result.rawStderr ?? result.rawStdout`
+    // half of the envelope) -- the error path callers rely on to see what
+    // AWS actually said.
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
+      const r = (await tool.handler({ service: "s3api", operation: "list-buckets", maxItems: 2 })) as {
+        ok: boolean;
+        error?: string;
+        rawBody?: string;
+        data?: unknown;
+      };
+      assert.equal(r.ok, false);
+      assert.ok(r.error && r.error.length > 0, "failure must carry an error message");
+      // rawBody comes from the CLI's stderr, which carries the AccessDenied text.
+      assert.match(r.rawBody ?? "", /AccessDenied|Access Denied/);
+      // No data envelope on the failure path.
+      assert.equal(r.data, undefined);
+    } finally {
+      afterEachEnv();
+    }
+  });
 });

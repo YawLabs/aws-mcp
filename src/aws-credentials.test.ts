@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -199,6 +210,111 @@ aws_secret_access_key = default-secret
   it("releases the lock after a successful upsert (no lingering <path>.lock)", async () => {
     await upsertProfile(path, "mcp-dev", CREDS);
     assert.ok(!existsSync(`${path}.lock`), "lock file should be unlinked after a clean upsert");
+  });
+});
+
+/**
+ * Direct coverage of the sidecar-lock subsystem (acquireLock + the atomic
+ * write path inside upsertProfile). The cross-process race test below exercises
+ * the lock end-to-end via the outcome (both profiles survive); these tests
+ * target the individual lock behaviors -- stale recovery, acquire timeout,
+ * non-EEXIST propagation, and tmp-file cleanup -- without needing two forked
+ * children.
+ *
+ * The LOCK_* constants are not exported from aws-credentials.ts; the values
+ * mirrored here (10_000ms max wait, 30_000ms stale threshold) are duplicated
+ * from the source. If those constants change, these tests must change too --
+ * an intentional coupling so a wait/stale-window edit is a conscious update.
+ */
+describe("upsertProfile — lock subsystem", () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "aws-mcp-lock-"));
+    path = join(dir, "credentials");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("force-unlinks a stale lock (mtime older than LOCK_STALE_AFTER_MS) and succeeds", async () => {
+    // Plant a lock file as if a prior writer crashed before releasing it.
+    const lockPath = `${path}.lock`;
+    writeFileSync(lockPath, "pid=99999 time=0\n");
+    // Backdate mtime well past the 30s stale threshold so acquireLock's
+    // stat-then-unlink stale-recovery branch fires on the first EEXIST.
+    const staleSeconds = Math.floor(Date.now() / 1000) - 120; // 2 minutes ago
+    utimesSync(lockPath, staleSeconds, staleSeconds);
+
+    // Should NOT time out -- stale recovery unlinks the orphan and claims it.
+    await upsertProfile(path, "mcp-dev", CREDS);
+
+    const text = readFileSync(path, "utf-8");
+    assert.match(text, /\[mcp-dev\]/);
+    assert.match(text, /AKIA-NEW-1/);
+    // The lock we planted was swept and the one we took was released.
+    assert.ok(!existsSync(lockPath), "stale lock should be gone after a successful upsert");
+  });
+
+  it("throws 'failed to acquire lock' when a fresh lock is held past LOCK_MAX_WAIT_MS", {
+    timeout: 20_000,
+  }, async () => {
+    // Hold the lock continuously with a CURRENT mtime so stale-recovery never
+    // fires -- acquireLock sees EEXIST every iteration, backs off, and after
+    // LOCK_MAX_WAIT_MS (10s) throws. We keep the fd open (and refresh mtime)
+    // for the whole window so the held lock never looks stale.
+    const lockPath = `${path}.lock`;
+    const heldFd = openSync(lockPath, "wx"); // claim it the same way acquireLock does
+    const keepFresh = setInterval(() => {
+      try {
+        const now = Date.now() / 1000;
+        utimesSync(lockPath, now, now);
+      } catch {
+        // lock vanished -- nothing to refresh
+      }
+    }, 2_000);
+
+    try {
+      await assert.rejects(
+        upsertProfile(path, "mcp-dev", CREDS),
+        (err: Error) => {
+          assert.match(err.message, /failed to acquire lock/);
+          assert.match(err.message, new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          return true;
+        },
+        "upsertProfile should reject with the lock-timeout error when the lock is held the whole window",
+      );
+      // The held lock is still ours; upsertProfile must not have written creds.
+      assert.ok(!existsSync(path), "credentials file should not be written when the lock was never acquired");
+    } finally {
+      clearInterval(keepFresh);
+      closeSync(heldFd);
+    }
+  });
+
+  it("propagates the real errno (ENOENT) instead of a lock-timeout when the lock dir is missing", async () => {
+    // Point at a path whose PARENT directory does not exist. openSync on
+    // `<path>.lock` then fails with ENOENT (non-EEXIST), which acquireLock
+    // rethrows immediately -- it must NOT mask it as "failed to acquire lock"
+    // after a 10s wait.
+    const missingParent = join(dir, "does-not-exist", "credentials");
+    await assert.rejects(upsertProfile(missingParent, "mcp-dev", CREDS), (err: NodeJS.ErrnoException) => {
+      assert.equal(err.code, "ENOENT", `expected ENOENT, got ${err.code}`);
+      assert.doesNotMatch(
+        err.message,
+        /failed to acquire lock/,
+        "non-EEXIST openSync failure must surface the real errno, not a misleading lock-timeout",
+      );
+      return true;
+    });
+  });
+
+  it("leaves no .tmp-* file behind after a successful upsert (atomic-write cleanup)", async () => {
+    await upsertProfile(path, "mcp-dev", CREDS);
+    const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
+    assert.deepEqual(leftovers, [], `no .tmp-* files should remain, found: ${leftovers.join(", ")}`);
   });
 });
 

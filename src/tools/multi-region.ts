@@ -42,6 +42,13 @@ export interface RegionResult {
  * window pointer -- no external dep. Each task gets a slot; when one
  * finishes, the next pending task starts. Order of `results` matches the
  * order of `inputs`.
+ *
+ * Contract: `fn` MUST resolve, never reject. A rejection propagates out of the
+ * worker's `await` and rejects the whole `Promise.all`, abandoning every other
+ * in-flight task and surfacing as an unhandled error rather than a per-input
+ * result. The lone caller (aws_multi_region) honors this by catching inside
+ * `fn` and returning an `{ok: false, error}` RegionResult; any new caller must
+ * do the same.
  */
 export async function runWithConcurrency<I, R>(
   inputs: readonly I[],
@@ -84,7 +91,7 @@ export const multiRegionTools: readonly Tool[] = [
         .min(1)
         .max(MAX_REGIONS)
         .describe(
-          `Region IDs (e.g. ['us-east-1','us-west-2','eu-west-1']). 1-${MAX_REGIONS}. Validated for argv-safety; bad region names fail per-region rather than poisoning the batch.`,
+          `Region IDs (e.g. ['us-east-1','us-west-2','eu-west-1']). 1-${MAX_REGIONS}. Validated for argv-safety; a bad region name yields a clear per-region error and skips its CLI spawn (per-region isolation comes from each region being a separate call, not from this pre-check).`,
         ),
       params: z
         .record(z.string(), z.unknown())

@@ -76,6 +76,21 @@ describe("classifyAuthError — canonical AWS SSO messages", () => {
     const err = new Error("Error when retrieving token from sso: Token has expired and refresh failed");
     assert.equal(classifyAuthError(err).kind, "sso_expired");
   });
+
+  it("keeps the adjacent token-retrieval vs credentials-retrieval patterns from swallowing each other", () => {
+    // The SSO TokenRetrievalError CLI shape ("Error when retrieving token from
+    // sso: ...") and the no-creds CredentialRetrievalError CLI shape ("Error
+    // when retrieving credentials from ...") differ by one word ("token" vs
+    // "credentials"). Pin that the SSO string classifies sso_expired (matched by
+    // the trailing "Token has expired and refresh failed" anchor, NOT the
+    // prefix) and is NOT swallowed by the no_creds CredentialRetrievalError
+    // pattern -- and vice versa.
+    const ssoStr = "Error when retrieving token from sso: Token has expired and refresh failed";
+    assert.equal(classifyAuthError(new Error(ssoStr)).kind, "sso_expired");
+
+    const noCredsStr = "Error when retrieving credentials from container-role: HTTPSConnectionPool error";
+    assert.equal(classifyAuthError(new Error(noCredsStr)).kind, "no_creds");
+  });
 });
 
 describe("classifyAuthError — canonical AWS no-creds messages", () => {
@@ -231,6 +246,15 @@ describe("parseAwsError -- non-standard shapes", () => {
     const r = parseAwsError('Could not connect to the endpoint URL: "https://lambda.us-east-9.amazonaws.com/"');
     assert.match(r.suggestion ?? "", /region/i);
     assert.match(r.suggestion ?? "", /lambda\.us-east-9/);
+  });
+
+  it("extracts the URL when the endpoint is UNQUOTED", () => {
+    // BAD_ENDPOINT_RE has optional quotes (`"?...?"`). The aws CLI usually quotes
+    // the URL, but a wrapper or older CLI version may not. The `[^"\s]+` capture
+    // stops at the first whitespace/quote, so the bare URL extracts cleanly.
+    const r = parseAwsError("Could not connect to the endpoint URL: https://x");
+    assert.match(r.suggestion ?? "", /https:\/\/x/);
+    assert.match(r.suggestion ?? "", /region/i);
   });
 
   it("flags parameter validation failures with a schema hint", () => {

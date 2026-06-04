@@ -217,6 +217,11 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
 
   return new Promise((resolve) => {
     const args = [...prefixArgs, "sso", "login", "--no-browser"];
+    // Vestigial: this empty-profile guard (and the `profile || "default"`
+    // fallback at the resolve below) is unreachable from the only public
+    // entry. startSsoLogin rejects an empty profile at the isValidProfileName
+    // gate (PROFILE_NAME_RE requires >=1 char), so `profile` is always a
+    // non-empty string by the time doStartSsoLogin runs.
     if (profile) {
       args.push("--profile", profile);
     }
@@ -302,6 +307,8 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
           sessionId,
           verificationUrl: urlSeen,
           userCode: codeSeen,
+          // `|| "default"` is vestigial -- see the empty-profile note above;
+          // `profile` is always non-empty here (startSsoLogin rejects "").
           profile: profile || "default",
         });
       }
@@ -444,7 +451,7 @@ export async function waitForLogin(sessionId: string): Promise<LoginWaitResult> 
     return {
       ok: false,
       exitCode: null,
-      error: `No active login session with id '${sessionId}'. Call aws_login_start first.`,
+      error: `No active login session with id '${sessionId}'. It may have already completed (waitForLogin is fire-once -- the session is dropped after the first call resolves) or it may never have started. If a prior aws_login_complete already returned success for this id, the login is done; run aws_whoami to confirm rather than starting over. Otherwise call aws_login_start first.`,
     };
   }
   try {

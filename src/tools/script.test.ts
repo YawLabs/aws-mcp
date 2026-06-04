@@ -355,6 +355,122 @@ describe("runScript sandbox isolation", () => {
   });
 });
 
+describe("runScript realm intrinsic contract", () => {
+  // Pins the exact membership of the three global categories documented in
+  // script.ts (the header comment + the inputSchema description):
+  //   1. "available" Node-injected intrinsics (Intl/Atomics/SharedArrayBuffer/
+  //      WebAssembly) -- present, but WebAssembly compile/instantiate is
+  //      blocked by codeGeneration.wasm:false.
+  //   2. "NOT injected" globals (URL, TextEncoder, crypto, ...) -- a BARE
+  //      reference throws ReferenceError. (typeof would mask this as
+  //      "undefined", so we reference each without typeof.)
+  //   3. explicitly shadowed globals (setTimeout, clearInterval, global, ...)
+  //      -- actively set to `undefined` in the context, so `typeof X` is
+  //      "undefined". Membership read off the shadow block in script.ts.
+  it("exposes the available intrinsics (Intl/Atomics/SharedArrayBuffer/WebAssembly)", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          return {
+            Intl: typeof Intl,
+            Atomics: typeof Atomics,
+            SharedArrayBuffer: typeof SharedArrayBuffer,
+            WebAssembly: typeof WebAssembly,
+          };
+        `,
+      },
+      handlers,
+    );
+    const present = plain(r.data) as Record<string, string>;
+    assert.notEqual(present.Intl, "undefined", "Intl must be available");
+    assert.notEqual(present.Atomics, "undefined", "Atomics must be available");
+    assert.equal(present.SharedArrayBuffer, "function", "SharedArrayBuffer must be available");
+    assert.notEqual(present.WebAssembly, "undefined", "WebAssembly must be available");
+  });
+
+  it("blocks WebAssembly.compile under codeGeneration.wasm:false", async () => {
+    // codeGeneration.wasm:false makes WebAssembly.compile reject (the
+    // returned promise rejects with a CompileError -- 'Wasm code generation
+    // disallowed by embedder'). A bare un-awaited call surfaces the rejection
+    // out-of-band, so we await it inside try/catch to capture it cleanly.
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          let threw = false, name = "";
+          try {
+            // Minimal valid wasm magic+version header; compilation is refused
+            // by the embedder before it ever parses the bytes.
+            await WebAssembly.compile(new Uint8Array([0,97,115,109,1,0,0,0]));
+          } catch (e) {
+            threw = true; name = e && e.name;
+          }
+          return { threw, name };
+        `,
+      },
+      handlers,
+    );
+    const out = plain(r.data) as { threw: boolean; name: string };
+    assert.equal(out.threw, true, "WebAssembly.compile must throw/reject under wasm:false");
+    assert.match(out.name, /CompileError/, "expected a CompileError from the disabled wasm codegen");
+  });
+
+  it("throws ReferenceError for the NOT-injected globals", async () => {
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          // Bare reference (NOT typeof) so an absent binding throws rather
+          // than reporting "undefined". Each must be a ReferenceError.
+          const probe = (fn) => { try { fn(); return "no-throw"; } catch (e) { return e.name; } };
+          return {
+            URL: probe(() => URL),
+            TextEncoder: probe(() => TextEncoder),
+            crypto: probe(() => crypto),
+            structuredClone: probe(() => structuredClone),
+            EventTarget: probe(() => EventTarget),
+            MessageChannel: probe(() => MessageChannel),
+            performance: probe(() => performance),
+          };
+        `,
+      },
+      handlers,
+    );
+    const out = plain(r.data) as Record<string, string>;
+    for (const [name, result] of Object.entries(out)) {
+      assert.equal(result, "ReferenceError", `${name} must throw ReferenceError when referenced`);
+    }
+  });
+
+  it("leaves the explicitly shadowed globals undefined", async () => {
+    // These are actively set to `undefined` in the context (the shadow block
+    // in script.ts), so `typeof` is "undefined" rather than a ReferenceError.
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `
+          return {
+            setInterval: typeof setInterval,
+            setImmediate: typeof setImmediate,
+            clearTimeout: typeof clearTimeout,
+            clearInterval: typeof clearInterval,
+            clearImmediate: typeof clearImmediate,
+            queueMicrotask: typeof queueMicrotask,
+            global: typeof global,
+            BroadcastChannel: typeof BroadcastChannel,
+          };
+        `,
+      },
+      handlers,
+    );
+    const out = plain(r.data) as Record<string, string>;
+    for (const [name, t] of Object.entries(out)) {
+      assert.equal(t, "undefined", `${name} must be shadowed to undefined`);
+    }
+  });
+});
+
 describe("runScript paginateAll", () => {
   it("loops aws_paginate until hasMore=false and concatenates items", async () => {
     let page = 0;
@@ -422,6 +538,68 @@ describe("runScript paginateAll", () => {
     );
     assert.equal(r.data, 3);
     assert.equal(paginateCalls, 3);
+  });
+
+  it("terminates when a page reports hasMore:true but a null nextToken", async () => {
+    // The loop breaks on `!data.hasMore || !data.nextToken` (script.ts:165).
+    // A page that claims hasMore:true but hands back a null nextToken would
+    // loop forever on the same token if the nextToken guard were missing --
+    // assert it stops after the first page.
+    let paginateCalls = 0;
+    const fakePaginateTool: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+      handler: async () => {
+        paginateCalls++;
+        return { ok: true, data: { result: ["only-page"], nextToken: null, hasMore: true } };
+      },
+    };
+    const { handlers } = makeMockHandlers();
+    const customHandlers: ScriptHandlers = { ...handlers, paginateAll: buildPaginateAll(fakePaginateTool) };
+    const r = await runScript(
+      {
+        code: `
+          const all = await aws.paginateAll({ service: "s3api", operation: "list-objects-v2" });
+          return { items: all.items, pages: all.pages };
+        `,
+      },
+      customHandlers,
+    );
+    assert.deepEqual(plain(r.data), { items: ["only-page"], pages: 1 });
+    assert.equal(paginateCalls, 1, "a null nextToken must stop the loop after one page");
+  });
+
+  it("clamps a caller maxPages above MAX_PAGES_HARD_CAP (1000)", async () => {
+    // maxPages is `Math.min(input.maxPages ?? 50, 1000)` (script.ts:146). A
+    // caller asking for 5000 pages against an endless paginator must be
+    // clamped to exactly 1000 calls -- the hard cap, not the requested value.
+    let paginateCalls = 0;
+    const fakePaginateTool: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+      handler: async () => {
+        paginateCalls++;
+        // Always more pages -- only the hard cap can stop the loop.
+        return { ok: true, data: { result: [paginateCalls], nextToken: `t${paginateCalls}`, hasMore: true } };
+      },
+    };
+    const { handlers } = makeMockHandlers();
+    const customHandlers: ScriptHandlers = { ...handlers, paginateAll: buildPaginateAll(fakePaginateTool) };
+    const r = await runScript(
+      {
+        code: `
+          const all = await aws.paginateAll({ service: "s3api", operation: "list-objects-v2", maxPages: 5000 });
+          return all.pages;
+        `,
+      },
+      customHandlers,
+    );
+    assert.equal(r.data, 1000, "maxPages above the hard cap must clamp to 1000");
+    assert.equal(paginateCalls, 1000);
   });
 });
 
@@ -512,6 +690,80 @@ describe("runScript cross-realm error bridging", () => {
     assert.equal(out.type, "string");
     assert.equal(out.value, "plain string boom");
     assert.equal(out.isError, false);
+  });
+
+  it("bridges a NESTED binding error (aws.resource.*) across the realm with custom props", async () => {
+    // wrapForRealm is applied to every nested binding too, not just the
+    // top-level aws.call. An error thrown from aws.resource.get must arrive
+    // in-realm as `instanceof Error` with its custom props (rawBody,
+    // toolName) copied -- same contract as aws.call (script.ts:355-362).
+    const { handlers } = makeMockHandlers({
+      resource: {
+        get: async () => {
+          const e = new Error("ResourceNotFound") as Error & { rawBody?: string; toolName?: string };
+          e.rawBody = "<error>missing</error>";
+          e.toolName = "aws_resource_get";
+          throw e;
+        },
+        list: async () => ({}),
+        create: async () => ({}),
+        update: async () => ({}),
+        delete: async () => ({}),
+        status: async () => ({}),
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          try {
+            await aws.resource.get({ typeName: "AWS::Lambda::Function", identifier: "fn1" });
+            return null;
+          } catch (e) {
+            return { isError: e instanceof Error, message: e.message, rawBody: e.rawBody, toolName: e.toolName };
+          }
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), {
+      isError: true,
+      message: "ResourceNotFound",
+      rawBody: "<error>missing</error>",
+      toolName: "aws_resource_get",
+    });
+  });
+
+  it("bridges a NESTED binding error (aws.docs.*) across the realm with custom props", async () => {
+    const { handlers } = makeMockHandlers({
+      docs: {
+        search: async () => ({}),
+        read: async () => {
+          const e = new Error("DocFetchFailed") as Error & { rawBody?: string; toolName?: string };
+          e.rawBody = "<html>error</html>";
+          e.toolName = "aws_docs_read";
+          throw e;
+        },
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          try {
+            await aws.docs.read({ url: "https://docs.aws.amazon.com/x.html" });
+            return null;
+          } catch (e) {
+            return { isError: e instanceof Error, message: e.message, rawBody: e.rawBody, toolName: e.toolName };
+          }
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), {
+      isError: true,
+      message: "DocFetchFailed",
+      rawBody: "<html>error</html>",
+      toolName: "aws_docs_read",
+    });
   });
 
   it("captureLog survives an object with a throwing toString / @@toPrimitive", async () => {

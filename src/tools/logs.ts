@@ -155,6 +155,17 @@ export const logsTools: readonly Tool[] = [
           }
         }
       }
+      // A prefix is a partial stream name, so the same validator applies:
+      // reject a leading hyphen (argv-injection defense -- the value is
+      // appended after --log-stream-name-prefix as its own argv entry),
+      // control characters, and the AWS-forbidden ':'/'*'. A legitimate
+      // prefix like '2026/04/21/' passes cleanly.
+      if (i.logStreamNamePrefix && !isValidLogStreamName(i.logStreamNamePrefix)) {
+        return {
+          ok: false,
+          error: `Invalid logStreamNamePrefix '${i.logStreamNamePrefix}'. Must be 1-512 chars, not start with '-', and contain no ':', '*', or control characters.`,
+        };
+      }
 
       // aws logs tail expects the log group name as a positional before any
       // flags. We inject it as the first entry of extraFlags so runAwsCall
