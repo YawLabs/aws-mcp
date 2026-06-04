@@ -11,6 +11,54 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-04
+
+### Changed
+- `src/index.ts` re-exports `allTools` -- the same array the MCP
+  registration loop iterates. The export is documented as test-only
+  (not on the MCP surface) and exists so a test can pin the tool
+  count and assert every individual tool array is non-empty and
+  every name is unique. No runtime behavior change for end users.
+
+### Internal
+- Extracted `toMcpResult` and `errorToMcpResult` from inline code
+  in the registration loop as pure exported functions, and gated
+  the stdio-server bootstrap behind an `isEntryPoint` check. The
+  refactor lets `index.test.ts` import and test the per-tool
+  envelope mapping without spinning up a transport.
+- Added `src/index.test.ts` with a "tool registry snapshot"
+  describe that pins the live tool count at 25 and asserts every
+  individual tool array contributes and every tool name is
+  unique. Catches forgotten exports, name collisions, and typos
+  in the registration-loop spread.
+- Substantive test coverage added across the registry, all green
+  (628/628):
+  - `aws-credentials`: 40-trial forked-child cross-process
+    concurrency guard for the sidecar lock (zero profile losses
+    across all trials).
+  - `kill-proc`: SIGTERM->SIGKILL escalation and the
+    `procHasExited` race guard.
+  - `sso`: in-flight dedupe via `pendingStarts` map, TTL
+    killswitch, completed-session exclusion from
+    `findActiveSessionByProfile`.
+  - `tools/script`: vm sandbox, console capture, realm-bridge
+    Error-wrapping, `paginateAll` loop.
+  - `tools/resource`: CCAPI mutation polling, `awaitCompletion`
+    recovery hints, json-patch diff preview.
+  - `tools/auth`: SSO cache read with multi-org startUrl filter,
+    login-reuse fast paths, refresh-if-expiring-soon.
+  - `tools/metrics`: query input validation, canonical statistic
+    casing, auto-period picker.
+  - `tools/iam-simulate`: advisory fields, filter branches for
+    non-string `SourcePolicyId`.
+  - `tools/logs`: NDJSON normalization, log-stream-name
+    validation.
+  - `tools/docs`: docs-search result parsing, paginated read.
+  - `tools/call`: stdout-only diagnostic fallback when stderr is
+    empty.
+  - `testing/fake-aws`: 30+ new scenarios covering the above
+    branches.
+
 ## [1.3.1] - 2026-05-22
 
 ### Changed
