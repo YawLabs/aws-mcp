@@ -314,10 +314,15 @@ else
 fi
 
 step 7 "Publish to MCP Registry"
-# Downstream catalogs (Glama, PulseMCP, mcpservers.org) auto-source from the
-# Official MCP Registry; publishing here is what makes the new version visible
-# to them. server.json was already bumped in step 3 so the version matches the
-# tag.
+# Publishing here updates the Official MCP Registry, which is the canonical
+# source MCP clients query directly. Some downstream catalogs CAN auto-source
+# from the registry, but it is NOT guaranteed or universal: as of 2026-06-07,
+# @yawlabs/aws-mcp had been in the registry since 2026-05-15 yet still did not
+# appear on PulseMCP, and mcpservers.org/Glama presence was unconfirmed. Treat
+# registry publish as necessary-but-not-sufficient for third-party catalog
+# visibility -- those typically require a one-time manual submission per catalog
+# and/or sync on their own (sometimes slow) schedule. server.json was already
+# bumped in step 3 so the version matches the tag.
 if [ ! -f server.json ]; then
   info "No server.json -- not an MCP server, skipping registry publish"
 else
