@@ -237,7 +237,7 @@ export const metricsTools: readonly Tool[] = [
   {
     name: "aws_metrics_query",
     description:
-      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept ISO 8601 or relative shorthand ('15m', '1h', '1d', '1w'); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. When CloudWatch truncates a large response, `hasMore` is true and `nextToken` carries the resume cursor -- call again with `nextToken` set to fetch the next page (rare for typical agent queries that stay within the per-request cap). Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
+      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept ISO 8601 or relative shorthand ('15m', '1h', '1d', '1w'); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, period?, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. Each series' `period` is the effective granularity for that query (its explicit period, or the auto-pick it inherited); it is omitted for an expression query that didn't set one. The top-level `periodSeconds` is always the auto-pick. When CloudWatch truncates a large response, `hasMore` is true and `nextToken` carries the resume cursor -- call again with `nextToken` set to fetch the next page (rare for typical agent queries that stay within the per-request cap). Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
     annotations: {
       title: "Query CloudWatch metrics (GetMetricData)",
       readOnlyHint: true,
@@ -467,13 +467,26 @@ export const metricsTools: readonly Tool[] = [
       }
 
       const raw = (result.data ?? {}) as CloudWatchMetricDataResponse;
-      const series = (raw.MetricDataResults ?? []).map((r) => ({
-        id: r.Id ?? "",
-        ...(r.Label !== undefined ? { label: r.Label } : {}),
-        timestamps: r.Timestamps ?? [],
-        values: r.Values ?? [],
-        ...(r.StatusCode !== undefined ? { statusCode: r.StatusCode } : {}),
-      }));
+      // Echo each series' EFFECTIVE period by mapping it back to its input
+      // query. The top-level `periodSeconds` only reflects the auto-pick; a
+      // query that supplies its own `period` uses that instead, and without a
+      // per-series period the caller can't tell the real granularity apart
+      // from the auto-pick. Metric-stat queries without an explicit period
+      // inherit the auto-pick; expression queries without one let CloudWatch
+      // decide, so we emit nothing rather than a value that was never sent.
+      const queryById = new Map(i.queries.map((q) => [q.id, q]));
+      const series = (raw.MetricDataResults ?? []).map((r) => {
+        const q = queryById.get(r.Id ?? "");
+        const effectivePeriod = q?.period ?? (q && q.expression === undefined ? periodSeconds : undefined);
+        return {
+          id: r.Id ?? "",
+          ...(r.Label !== undefined ? { label: r.Label } : {}),
+          timestamps: r.Timestamps ?? [],
+          values: r.Values ?? [],
+          ...(effectivePeriod !== undefined ? { period: effectivePeriod } : {}),
+          ...(r.StatusCode !== undefined ? { statusCode: r.StatusCode } : {}),
+        };
+      });
       const messages = raw.Messages?.filter((m) => m.Code || m.Value).map((m) => ({
         code: m.Code,
         value: m.Value,

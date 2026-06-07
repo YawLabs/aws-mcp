@@ -132,6 +132,97 @@ region = us-east-1
   it("returns an empty list on empty input", () => {
     assert.deepEqual(parseAwsConfig(""), []);
   });
+
+  it("only emits [default] and [profile X]; every other section is ignored (allowlist)", () => {
+    // parseAwsConfig must match `aws configure list-profiles`: ONLY default +
+    // profile sections are profiles. Services/plugins endpoint blocks, [preview],
+    // arbitrary/unknown sections, and any casing variant must NOT surface. A
+    // skipped section's keys must also not leak onto an adjacent profile.
+    const text = `
+[default]
+region = us-east-1
+
+[services my-svc]
+s3 =
+  endpoint_url = https://s3.local
+
+[plugins]
+cwlogs = cwlogs
+
+[Services cap-svc]
+s3 =
+  endpoint_url = https://cap.local
+
+[Plugins]
+foo = bar
+
+[preview]
+cloudfront = true
+
+[some-random-section]
+key = value
+
+[profile prod]
+region = us-west-2
+`;
+    const profiles = parseAwsConfig(text);
+    assert.deepEqual(
+      profiles.map((p) => p.name),
+      ["default", "prod"],
+    );
+    // None of the skipped sections' keys leaked onto the adjacent profile.
+    assert.equal(profiles.find((p) => p.name === "prod")?.region, "us-west-2");
+  });
+
+  it("keeps a real profile literally named 'services' or 'plugins' (it carries the 'profile ' prefix)", () => {
+    // The allowlist matches on the `profile ` prefix, not on the bare name, so a
+    // user who names a profile "services" -- written `[profile services]` -- is
+    // unaffected by the non-profile-section skip.
+    const text = `
+[profile services]
+region = us-east-1
+
+[profile plugins]
+region = eu-west-1
+`;
+    const profiles = parseAwsConfig(text);
+    assert.deepEqual(
+      profiles.map((p) => p.name),
+      ["services", "plugins"],
+    );
+    assert.equal(profiles.find((p) => p.name === "services")?.region, "us-east-1");
+  });
+
+  it("drops nameless section headers ([profile], [sso-session], [plugins]) instead of leaking a bogus profile", () => {
+    // A header carrying the keyword but no name -- a user typo -- must not
+    // surface as a profile literally named the keyword. The allowlist requires
+    // `profile ` + a name, and the sso-session branch requires `sso-session ` +
+    // a name, so each bare keyword falls through to the skip. Its keys must not
+    // leak onto an adjacent profile either.
+    const text = `
+[default]
+region = us-east-1
+
+[profile]
+region = nowhere
+
+[sso-session]
+sso_start_url = https://x.awsapps.com/start
+
+[plugins]
+foo = bar
+
+[profile real]
+region = us-west-2
+`;
+    const profiles = parseAwsConfig(text);
+    assert.deepEqual(
+      profiles.map((p) => p.name),
+      ["default", "real"],
+    );
+    assert.equal(profiles.find((p) => p.name === "default")?.region, "us-east-1");
+    assert.equal(profiles.find((p) => p.name === "real")?.region, "us-west-2");
+  });
 });
 
 describe("resolveProfileStartUrl", () => {
