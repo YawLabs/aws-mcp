@@ -11,6 +11,43 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-06-07
+
+### Changed
+- `aws_metrics_query` now emits a per-series `period` -- the effective
+  granularity for each query (its explicit `period`, or the auto-pick it
+  inherited), omitted for an expression query that didn't set one. The
+  top-level `periodSeconds` remains the auto-pick. Additive field on the
+  stable success envelope; documented in the README "Stability" section and
+  the tool description. Before this, a caller that set an explicit per-query
+  period could not tell the real granularity apart from the auto-pick.
+- `aws_list_profiles` now parses `~/.aws/config` with an allowlist: only
+  `[default]` and `[profile X]` sections are treated as profiles. Every
+  other bracketed section (`[services ...]` endpoint blocks, `[plugins]`,
+  `[preview]`, unknown keywords, and any casing variant) is ignored, matching
+  `aws configure list-profiles`. Previously every bracketed section surfaced
+  as a profile, so non-profile and capital-cased sections leaked as bogus
+  entries. A real profile literally named `services`/`plugins` (written
+  `[profile services]`) is unaffected.
+
+### Fixed
+- README: the `aws_metrics_query` Stability envelope and Tools-table summary
+  now list the full emitted shape (`profile`, `region`, `nextToken`,
+  `hasMore`, and per-series `period`), and the `aws_script` sandbox surface
+  in the feature bullet and Tools table now lists every bound helper
+  (`metricsQuery`, `iamSimulate`, `multiRegion`, `assumeRole`,
+  `docs.{search,read}`). Doc-only; no behavior change.
+- `extractNextToken` doc comment corrected -- it is the top-level `NextToken`
+  reader shared by `aws_paginate`, `aws_resource_list`, and
+  `aws_metrics_query`, not `aws_paginate`-only.
+
+### Internal
+- Added coverage for the per-series `period` (explicit, inherited, and
+  expression-with-explicit-period branches), and for the profiles allowlist
+  (non-profile/`services`/`plugins`/`preview` sections, casing variants,
+  nameless headers, and a real profile named `services`/`plugins`). Suite at
+  634/634 green.
+
 ## [1.4.0] - 2026-06-04
 
 ### Changed

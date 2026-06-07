@@ -506,6 +506,64 @@ describe("aws_metrics_query handler (fake-aws integration)", () => {
     assert.equal(data.series[1].id, "expr");
   });
 
+  it("echoes each query's effective period (explicit per-query period, not just the top-level auto-pick)", async () => {
+    // cpu carries an explicit period that differs from the 1h auto-pick (60s);
+    // expr is an expression with no period. The fake returns series ids cpu+expr.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_success";
+    const r = await tool.handler({
+      queries: [
+        { id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 300 },
+        { id: "expr", expression: "cpu * 2", label: "cpu_x2" },
+      ],
+      startTime: "1h",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { periodSeconds: number; series: Array<{ id: string; period?: number }> };
+    assert.equal(data.periodSeconds, 60); // top-level stays the auto-pick
+    assert.equal(data.series[0].id, "cpu");
+    assert.equal(data.series[0].period, 300); // explicit period echoed, not the 60s auto-pick
+    assert.equal(data.series[1].id, "expr");
+    assert.equal(data.series[1].period, undefined); // expression, no period sent -> omitted
+  });
+
+  it("inherits the auto-picked period for a metric-stat query that omits one", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_success";
+    const r = await tool.handler({
+      queries: [
+        { id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" },
+        { id: "expr", expression: "cpu * 2", label: "cpu_x2" },
+      ],
+      startTime: "1h",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { periodSeconds: number; series: Array<{ period?: number }> };
+    assert.equal(data.series[0].period, data.periodSeconds); // metric-stat inherits the auto-pick (60s)
+    assert.equal(data.series[1].period, undefined); // expression still omits
+  });
+
+  it("echoes an expression query's EXPLICIT period (not omitted, not the auto-pick)", async () => {
+    // An expression query can carry a period -- buildMetricDataQueries sends it
+    // as base.Period -- so the per-series period must reflect it. This is the
+    // branch the other two tests miss: expression WITH a period (q?.period fires
+    // for an expression query, distinct from expression-without-period which is
+    // omitted). The fake returns series ids cpu+expr regardless of input.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_success";
+    const r = await tool.handler({
+      queries: [
+        { id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" },
+        { id: "expr", expression: "cpu * 2", period: 300, label: "cpu_x2" },
+      ],
+      startTime: "1h",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { periodSeconds: number; series: Array<{ id: string; period?: number }> };
+    assert.equal(data.periodSeconds, 60); // top-level stays the 1h auto-pick
+    const expr = data.series.find((s) => s.id === "expr");
+    assert.equal(expr?.period, 300); // explicit period on the expression query is echoed, not omitted
+    const cpu = data.series.find((s) => s.id === "cpu");
+    assert.equal(cpu?.period, 60); // metric-stat without a period still inherits the auto-pick
+  });
+
   it("returns empty series + empty values when no datapoints exist", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
     const r = await tool.handler({

@@ -62,6 +62,19 @@ export function parseAwsConfig(text: string): AwsProfile[] {
         currentSsoSession = { name: ssoName, data: {} };
         continue;
       }
+      // Allowlist, not denylist: ONLY [default] and [profile X] are profiles.
+      // Every other bracketed section -- [services <name>] endpoint blocks,
+      // [plugins], [preview], a typo'd or unknown keyword, any casing variant --
+      // is NOT a profile and must be ignored so it can't surface in
+      // aws_list_profiles as a bogus entry. This mirrors `aws configure
+      // list-profiles`, which emits only default + profile sections.
+      // finishSection() above already cleared current/currentSsoSession, so a
+      // skipped section's keys fall through the `!current` guard and are dropped.
+      // A real profile literally named "services"/"plugins" is still written
+      // `[profile services]`, so it carries the `profile ` prefix and matches here.
+      if (sectionName !== "default" && !/^profile\s+/.test(sectionName)) {
+        continue;
+      }
       const name = sectionName === "default" ? "default" : sectionName.replace(/^profile\s+/, "");
       current = { name, isSso: false };
       continue;

@@ -10,7 +10,10 @@ import type { Tool, ToolResult } from "./tool.js";
  * aws_paginate (which always passes --max-items). Without --max-items the
  * raw API field names pass through verbatim (e.g. list-objects-v2 returns
  * NextContinuationToken), so this helper is NOT a general "find the next
- * token anywhere" -- it's specifically the aws_paginate envelope reader.
+ * token anywhere" reader -- it reads a top-level string `NextToken`. That is
+ * exactly what three callers need: aws_paginate's --max-items envelope, plus
+ * the natively-top-level `NextToken` that CCAPI list-resources
+ * (aws_resource_list) and GetMetricData (aws_metrics_query) already return.
  */
 export function extractNextToken(data: unknown): string | null {
   if (data && typeof data === "object" && "NextToken" in data) {
