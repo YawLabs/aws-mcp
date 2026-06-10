@@ -80,7 +80,8 @@ describe("pickAutoPeriodSeconds", () => {
     assert.equal(pickAutoPeriodSeconds(start, end), 60);
   });
 
-  it("picks 300s for ranges between 3h and 24h", () => {
+  it("picks 300s for ranges up to 24h (exact boundary)", () => {
+    // Code uses rangeMs <= PERIOD_24H_MS, so exactly 24h falls in this tier.
     const start = new Date("2026-05-15T12:00:00Z").getTime();
     const end = new Date("2026-05-16T12:00:00Z").getTime();
     assert.equal(pickAutoPeriodSeconds(start, end), 300);
@@ -301,6 +302,30 @@ describe("aws_metrics_query handler validation", () => {
   it("accepts extended percentile statistics (p99, p99.9, tm95)", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
     for (const stat of ["p99", "p99.9", "tm95", "tc90", "iqm"]) {
+      const r = await tool.handler({
+        queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
+      } as never);
+      assert.equal(r.ok, true, `expected stat '${stat}' to be accepted`);
+    }
+  });
+
+  it("rejects iqm with a numeric suffix (CloudWatch only accepts bare 'iqm')", async () => {
+    // CloudWatch's IQM (interquartile mean) stat takes no numeric suffix.
+    // 'iqm99' and 'iqm0.5' are rejected server-side; the validator must catch
+    // them before the wire call so the error is actionable. Pinning this so a
+    // future regex refactor that re-admits the suffix doesn't silently regress.
+    for (const stat of ["iqm99", "iqm0.5", "iqm1", "IQM99"]) {
+      const r = await tool.handler({
+        queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
+      } as never);
+      assert.equal(r.ok, false, `expected stat '${stat}' to be rejected`);
+      assert.match(r.error ?? "", /invalid statistic/);
+    }
+  });
+
+  it("accepts bare 'iqm' and 'IQM' (case-insensitive, no suffix)", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    for (const stat of ["iqm", "IQM", "Iqm"]) {
       const r = await tool.handler({
         queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
       } as never);

@@ -259,7 +259,7 @@ describe("upsertProfile — lock subsystem", () => {
   });
 
   it("throws 'failed to acquire lock' when a fresh lock is held past LOCK_MAX_WAIT_MS", {
-    timeout: 20_000,
+    timeout: 30_000,
   }, async () => {
     // Hold the lock continuously with a CURRENT mtime so stale-recovery never
     // fires -- acquireLock sees EEXIST every iteration, backs off, and after

@@ -99,7 +99,7 @@ function validateIdentifier(id: string): string | null {
   return null;
 }
 
-function validateOpaqueToken(token: string, fieldName: string): string | null {
+export function validateOpaqueToken(token: string, fieldName: string): string | null {
   if (!isValidOpaqueToken(token)) {
     return `Invalid ${fieldName}. Must be 1-128 chars, not start with '-', and contain no control characters.`;
   }
@@ -172,6 +172,13 @@ type AwsCaller = typeof runAwsCall | ((opts: Parameters<typeof runAwsCall>[0]) =
  * ProgressEvent.RetryAfter hint when present, otherwise paces with
  * `pollIntervalMs`. Always caps the wait at the remaining maxWaitMs budget so
  * we don't overshoot.
+ *
+ * One-shot guarantee: the first AWS call always fires before the timeout check,
+ * so the loop never returns without making at least one request. A
+ * maxWaitMs <= elapsed (notably maxWaitMs of 0, which a direct internal caller
+ * can pass -- the tool path's Zod floor of MIN_MAX_WAIT_MS only guards the
+ * public surface) returns ok:false after exactly one call, surfacing whatever
+ * status that single poll observed.
  *
  * Exposed with an injectable `awsCall` argument purely so unit tests can drive
  * the loop with scripted responses; production code uses the default.
@@ -781,7 +788,7 @@ export const resourceTools: readonly Tool[] = [
       const i = input as {
         typeName: string;
         identifier: string;
-        patchDocument: JsonPatchOp[];
+        patchDocument: SimulatedJsonPatchOp[];
         profile?: string;
         region?: string;
         timeoutMs?: number;
@@ -834,13 +841,32 @@ export const resourceTools: readonly Tool[] = [
 ];
 
 /**
- * RFC 6902 JSON Patch (subset) -- only add/remove/replace. move/copy/test
- * are intentionally unimplemented; CCAPI updates use the basic three in
- * practice and the move/copy semantics require extra round-trips through
- * the path resolver that aren't worth the complexity for a preview tool.
+ * Full RFC 6902 op set. Used by aws_resource_update, which JSON.stringifies
+ * the patch straight to CCAPI (CCAPI accepts move/copy/test) and never runs
+ * the local simulator, so the wide op union is correct there.
+ *
+ * The local simulator (applyJsonPatch / summarizePatch, used by
+ * aws_resource_diff) only implements add/remove/replace -- those callers take
+ * the narrow SimulatedJsonPatchOp below, which makes the unimplemented ops
+ * type-unrepresentable rather than relying on a runtime throw alone. The
+ * runtime throw in _applyJsonPatchInPlace stays as defense for any caller
+ * that widens to JsonPatchOp.
  */
 export interface JsonPatchOp {
   op: "add" | "remove" | "replace" | "move" | "copy" | "test";
+  path: string;
+  value?: unknown;
+  from?: string;
+}
+
+/**
+ * The add/remove/replace subset the local patch simulator actually
+ * implements. aws_resource_diff's Zod schema only admits these three ops, so
+ * its handler narrows to this type before calling applyJsonPatch /
+ * summarizePatch.
+ */
+export interface SimulatedJsonPatchOp {
+  op: "add" | "remove" | "replace";
   path: string;
   value?: unknown;
   from?: string;
@@ -875,7 +901,7 @@ function isObj(v: unknown): v is Record<string, unknown> {
  * result. Original is not mutated. Throws on bad paths, unimplemented ops,
  * or array-bounds violations -- callers catch and translate.
  */
-export function applyJsonPatch(original: unknown, ops: readonly JsonPatchOp[]): unknown {
+export function applyJsonPatch(original: unknown, ops: readonly SimulatedJsonPatchOp[]): unknown {
   // Clone once at entry so callers' inputs stay immutable, then delegate to
   // the in-place helper. The helper is also called directly by
   // summarizePatch's per-op replay (it owns its own working copy, so the
@@ -950,6 +976,9 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
           if (op.op === "add") {
             parent[segment] = {};
             parent = parent[segment];
+            // Descend into the freshly-created container and skip the shared
+            // `parent = parent[segment]` below -- we already advanced parent
+            // here, so re-running it would be a redundant (harmless) re-read.
             continue;
           }
           throw new Error(`Path '${op.path}' segment '${segment}' does not exist at index ${i}.`);
@@ -1023,8 +1052,8 @@ export interface PatchChange {
 /**
  * Walk the patch and resolve the before/after value at each op's path so the
  * agent gets a compact diff list without having to compare full Properties
- * trees by hand. For ops we don't implement, the entry surfaces the op name
- * verbatim with no before/after.
+ * trees by hand. Takes the add/remove/replace subset (SimulatedJsonPatchOp);
+ * the other RFC 6902 ops are type-unrepresentable here.
  *
  * `after` is captured per-op by replaying the patch one step at a time, so
  * the snapshot reflects what THIS op produced rather than the final
@@ -1037,7 +1066,7 @@ export interface PatchChange {
  * that's what the user asked to mutate, and reporting "before relative to
  * the prior op" would conflate change-tracking with replay-tracking.
  */
-export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, after: unknown): PatchChange[] {
+export function summarizePatch(ops: readonly SimulatedJsonPatchOp[], before: unknown, after: unknown): PatchChange[] {
   // Replay ops one at a time against a working copy so we can snapshot the
   // value at op[i]'s path AFTER op[i] applies but BEFORE op[i+1] applies.
   // Fall back to the final `after` doc if replay throws -- summarizePatch
@@ -1061,13 +1090,10 @@ export function summarizePatch(ops: readonly JsonPatchOp[], before: unknown, aft
 
   const out: PatchChange[] = [];
   for (const op of ops) {
-    if (op.op === "move" || op.op === "copy" || op.op === "test") {
-      // Surface as a no-op for visibility; applyJsonPatch already threw on
-      // these so we only reach this branch if a caller calls summarizePatch
-      // directly (e.g. for tests).
-      out.push({ op: "replace", path: op.path });
-      continue;
-    }
+    // ops is SimulatedJsonPatchOp[], so move/copy/test are type-unrepresentable
+    // here -- no unimplemented-op branch is needed. The runtime throw in
+    // _applyJsonPatchInPlace remains the defense for any caller that widens to
+    // JsonPatchOp.
     const beforeAt = resolvePointer(before, op.path);
 
     let afterAt: unknown;

@@ -66,7 +66,7 @@ export function setProfile(name: string): void {
   const trimmed = name.trim();
   if (!isValidProfileName(trimmed)) {
     throw new Error(
-      `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '=', no whitespace or shell metacharacters.`,
+      `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`,
     );
   }
   sessionProfile = trimmed;

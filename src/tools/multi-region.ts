@@ -43,12 +43,20 @@ export interface RegionResult {
  * finishes, the next pending task starts. Order of `results` matches the
  * order of `inputs`.
  *
- * Contract: `fn` MUST resolve, never reject. A rejection propagates out of the
- * worker's `await` and rejects the whole `Promise.all`, abandoning every other
- * in-flight task and surfacing as an unhandled error rather than a per-input
- * result. The lone caller (aws_multi_region) honors this by catching inside
- * `fn` and returning an `{ok: false, error}` RegionResult; any new caller must
- * do the same.
+ * Contract: `fn` MUST resolve, never reject. This invariant is MECHANICALLY
+ * UNCHECKED -- there is no try/catch around the `await fn(...)` in the worker,
+ * by design (the cost of wrapping every task to convert a rejection into a
+ * result would defeat the per-input-isolation the sole caller already
+ * provides). A single rejection therefore propagates out of the worker's
+ * `await`, rejects the whole `Promise.all`, abandons every other still-running
+ * task (their results are never collected), and surfaces to the caller of
+ * runWithConcurrency as a thrown error rather than a per-input result.
+ *
+ * The current sole caller (aws_multi_region) is safe because its `fn` wraps
+ * each region in a try/catch and runAwsCall is itself resolve-only -- it
+ * returns an `{ok: false, ...}` result on failure instead of rejecting. Any
+ * NEW caller must uphold the same discipline: catch inside `fn` and return a
+ * result, never let `fn` reject.
  */
 export async function runWithConcurrency<I, R>(
   inputs: readonly I[],

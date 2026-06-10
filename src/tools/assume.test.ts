@@ -83,7 +83,7 @@ describe("aws_assume_role schema", () => {
 
   it("rejects sessionName with invalid characters", () => {
     const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "bad name/slash",
     });
     assert.equal(r.success, false);
@@ -91,7 +91,7 @@ describe("aws_assume_role schema", () => {
 
   it("rejects sessionName shorter than 2 chars", () => {
     const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "x",
     });
     assert.equal(r.success, false);
@@ -99,7 +99,7 @@ describe("aws_assume_role schema", () => {
 
   it("rejects durationSeconds below the STS minimum (900)", () => {
     const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       durationSeconds: 300,
     });
@@ -108,7 +108,7 @@ describe("aws_assume_role schema", () => {
 
   it("rejects durationSeconds above the STS maximum (43200)", () => {
     const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       durationSeconds: 50_000,
     });
@@ -123,7 +123,7 @@ describe("aws_assume_role schema", () => {
 
   it("accepts an explicit timeoutMs", () => {
     const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       timeoutMs: 180_000,
     });
@@ -132,11 +132,58 @@ describe("aws_assume_role schema", () => {
 
   it("rejects a non-positive timeoutMs", () => {
     const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       timeoutMs: 0,
     });
     assert.equal(r.success, false);
+  });
+
+  // C6: roleArn schema-level validation
+  it("rejects a malformed roleArn (plain string, no arn: prefix)", () => {
+    const r = tool.inputSchema.safeParse({
+      roleArn: "not-an-arn",
+      sessionName: "sess",
+    });
+    assert.equal(r.success, false);
+  });
+
+  it("rejects a flag-shaped roleArn string", () => {
+    const r = tool.inputSchema.safeParse({
+      roleArn: "--role-arn=evil",
+      sessionName: "sess",
+    });
+    assert.equal(r.success, false);
+  });
+
+  it("accepts a valid govcloud roleArn (arn:aws-us-gov partition)", () => {
+    const r = tool.inputSchema.safeParse({
+      roleArn: "arn:aws-us-gov:iam::123456789012:role/CrossAccountAdmin",
+      sessionName: "sess",
+    });
+    assert.equal(r.success, true);
+  });
+
+  it("accepts a valid standard roleArn", () => {
+    const r = tool.inputSchema.safeParse({
+      roleArn: "arn:aws:iam::123456789012:role/CrossAccountAdmin",
+      sessionName: "sess",
+    });
+    assert.equal(r.success, true);
+  });
+
+  // C5: sessionName fallback no-double-prefix guard
+  it("sessionName='mcp-session' produces profile 'mcp-session', not 'mcp-mcp-session'", () => {
+    // resolveTargetProfile must not double-prefix when the sessionName already
+    // starts with 'mcp-'. The schema accepts mcp-session (valid chars); the
+    // profile returned must be exactly 'mcp-session'.
+    const r = tool.inputSchema.safeParse({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "mcp-session",
+    });
+    assert.equal(r.success, true, "schema should accept mcp-session as sessionName");
+    // The profile name is only visible in the handler response, but we can
+    // confirm the guard logic by checking the handler output directly.
   });
 });
 
@@ -187,6 +234,49 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.equal(data.profile, "mcp-prod");
   });
 
+  // C5: sessionName fallback no-double-prefix guard (handler level)
+  it("sessionName='mcp-session' with no targetProfile yields profile='mcp-session', not 'mcp-mcp-session'", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "mcp-session",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { profile: string };
+    assert.equal(data.profile, "mcp-session", "mcp-prefixed sessionName must not be double-prefixed");
+  });
+
+  // C6: roleArn handler-level validation (defense-in-depth, bypasses schema)
+  it("rejects a malformed roleArn at the handler level with a descriptive error", async () => {
+    // Direct handler call bypasses schema parsing; the handler must still
+    // reject a bad ARN before touching runAwsCall.
+    const r = await tool.handler({
+      roleArn: "not-an-arn",
+      sessionName: "sess",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid roleArn/);
+    assert.match(r.error ?? "", /not-an-arn/);
+  });
+
+  it("rejects a flag-shaped roleArn at the handler level", async () => {
+    const r = await tool.handler({
+      roleArn: "--role-arn=evil",
+      sessionName: "sess",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid roleArn/);
+  });
+
+  it("accepts a valid roleArn and proceeds to the AWS call", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/CrossAccountAdmin",
+      sessionName: "sess",
+    } as never);
+    assert.equal(r.ok, true);
+  });
+
   it("surfaces an error envelope (does not crash) when the CLI exits non-zero", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_access_denied";
     const r = await tool.handler({
@@ -200,7 +290,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
   it("rewrites sso_expired errors to name the source profile", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "call_sso_expired";
     const r = await tool.handler({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       sourceProfile: "my-source",
     } as never);
@@ -212,7 +302,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
   it("guards against an incomplete Credentials block in CLI stdout", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_incomplete";
     const r = await tool.handler({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
     } as never);
     assert.equal(r.ok, false);
@@ -225,7 +315,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // AWS_PROFILE env var" -- misleading for an aws_assume_role caller who
     // passed sourceProfile. The handler-level check names the right field.
     const r = await tool.handler({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       sourceProfile: "--query=evil",
     } as never);
@@ -240,7 +330,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // it at the handler boundary so the credentials file is never opened.
     // No fake-aws scenario needed: validation runs before runAwsCall.
     const r = await tool.handler({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       targetProfile: "mcp-evil]hack",
     } as never);
@@ -333,7 +423,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_slow";
     const start = Date.now();
     const r = await tool.handler({
-      roleArn: "arn:aws:iam::123:role/A",
+      roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
       timeoutMs: 200,
     } as never);

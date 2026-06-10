@@ -222,10 +222,10 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     } as never);
     assert.equal(r.ok, true);
     const data = r.data as {
-      summary: { allowed: number; denied: number; total: number };
+      summary: { allowed: number; denied: number; unknown: number; total: number };
       results: { action: string; decision: string; matchedStatementIds?: string[] }[];
     };
-    assert.deepEqual(data.summary, { allowed: 1, denied: 0, total: 1 });
+    assert.deepEqual(data.summary, { allowed: 1, denied: 0, unknown: 0, total: 1 });
     assert.equal(data.results[0].action, "lambda:CreateFunction");
     assert.equal(data.results[0].decision, "allowed");
     assert.deepEqual(data.results[0].matchedStatementIds, ["AdministratorAccess"]);
@@ -240,10 +240,10 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     } as never);
     assert.equal(r.ok, true);
     const data = r.data as {
-      summary: { allowed: number; denied: number; total: number };
+      summary: { allowed: number; denied: number; unknown: number; total: number };
       results: { action: string; decision: string; missingContextValues?: string[] }[];
     };
-    assert.deepEqual(data.summary, { allowed: 1, denied: 1, total: 2 });
+    assert.deepEqual(data.summary, { allowed: 1, denied: 1, unknown: 0, total: 2 });
     const deletes = data.results.find((res) => res.action === "s3:DeleteObject");
     assert.ok(deletes);
     assert.equal(deletes.decision, "explicitDeny");
@@ -285,7 +285,7 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     } as never);
     assert.equal(r.ok, true);
     const data = r.data as {
-      summary: { allowed: number; denied: number; total: number };
+      summary: { allowed: number; denied: number; unknown: number; total: number };
       results: {
         action: string;
         decision: string;
@@ -295,8 +295,9 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
       }[];
     };
 
-    // unknown (entry [0]) AND explicitDeny (entry [2]) both land in denied.
-    assert.deepEqual(data.summary, { allowed: 1, denied: 2, total: 3 });
+    // unknown (entry [0]) is now counted separately; explicitDeny (entry [2])
+    // is the only real deny.
+    assert.deepEqual(data.summary, { allowed: 1, denied: 1, unknown: 1, total: 3 });
 
     const get = data.results.find((res) => res.action === "s3:GetObject");
     assert.ok(get);

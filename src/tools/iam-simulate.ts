@@ -124,7 +124,7 @@ export const iamSimulateTools: readonly Tool[] = [
   {
     name: "aws_iam_simulate",
     description:
-      "Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide -- common for tag-based policies). Use this BEFORE a risky operation to avoid a 403; pairs with the post-failure Suggestion you get from aws_call. Requires iam:SimulatePrincipalPolicy on the caller.",
+      "Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny / unknown -- unknown is the malformed-response fallback when EvalDecision is missing or unrecognised), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide -- common for tag-based policies). Use this BEFORE a risky operation to avoid a 403; pairs with the post-failure Suggestion you get from aws_call. Requires iam:SimulatePrincipalPolicy on the caller.",
     annotations: {
       title: "Simulate IAM permissions for a principal",
       readOnlyHint: true,
@@ -137,7 +137,7 @@ export const iamSimulateTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "ARN of the principal whose policies you want to evaluate, e.g. 'arn:aws:iam::123456789012:user/jeff' or 'arn:aws:iam::123:role/my-role'.",
+          "ARN of the principal whose policies you want to evaluate, e.g. 'arn:aws:iam::123456789012:user/jeff' or 'arn:aws:iam::123456789012:role/my-role'.",
         ),
       actions: z
         .array(z.string().min(1))
@@ -150,7 +150,7 @@ export const iamSimulateTools: readonly Tool[] = [
         .array(z.string().min(1))
         .optional()
         .describe(
-          "Resource ARNs to test against, e.g. ['arn:aws:s3:::my-bucket/*']. Omit to default to ['*'] (best-case 'is this action ever allowed?').",
+          "Resource ARNs to test against, e.g. ['arn:aws:s3:::my-bucket/*']. When omitted, AWS applies its own default of ['*'] server-side (best-case 'is this action ever allowed?') -- this tool does not inject a ['*'] itself.",
         ),
       contextEntries: z
         .array(
@@ -241,14 +241,18 @@ export const iamSimulateTools: readonly Tool[] = [
       const raw = result.data as { EvaluationResults?: unknown[] } | null;
       const results = parseSimulationResults(raw?.EvaluationResults);
       const allowed = results.filter((r) => r.decision === "allowed").length;
-      const denied = results.length - allowed;
+      // Count unknown separately so it isn't silently folded into denied.
+      // unknown is the malformed-response fallback (EvalDecision missing or
+      // unrecognised); real denies are explicitDeny + implicitDeny only.
+      const unknown = results.filter((r) => r.decision === "unknown").length;
+      const denied = results.length - allowed - unknown;
 
       return {
         ok: true,
         data: {
           command: result.command,
           principalArn: i.principalArn,
-          summary: { allowed, denied, total: results.length },
+          summary: { allowed, denied, unknown, total: results.length },
           results,
           evaluationResults: raw?.EvaluationResults ?? [],
         },

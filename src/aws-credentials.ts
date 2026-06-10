@@ -180,9 +180,13 @@ const LOCK_MAX_RETRY_MS = 250;
  *
  * Stale-lock recovery: if the existing lock is older than
  * `LOCK_STALE_AFTER_MS`, the prior holder is presumed dead and we force-
- * unlink. The stat-then-unlink window is racy in the worst case (two
- * processes both spot the same stale lock, both unlink, both try to claim),
- * but the next retry loop iteration recovers cleanly.
+ * unlink. The stat-then-unlink window is racy in the worst case: two
+ * processes both stat the same stale lock and both unlink it (the second
+ * unlink hits an already-gone file and swallows ENOENT). NEITHER claims the
+ * lock on that iteration -- both just set shouldRetryImmediately and loop.
+ * On the next iteration both race a fresh O_EXCL openSync, so one wins and
+ * the other falls back to EEXIST. Recovery is clean, just one iteration
+ * later than the wording above might suggest.
  *
  * Limitation: a process killed (SIGKILL, power loss) leaves a lock that
  * blocks new writers for up to `LOCK_STALE_AFTER_MS` before recovery kicks
@@ -250,12 +254,14 @@ async function acquireLock(lockPath: string): Promise<void> {
         try {
           unlinkSync(lockPath);
         } catch {
-          // Someone else unlinked it; fine, loop and try to claim.
+          // Someone else already unlinked this stale lock (swallowed ENOENT).
+          // We don't claim it here -- just loop and race openSync fresh.
         }
         shouldRetryImmediately = true;
       }
     } catch {
-      // Lock removed under us between EEXIST and statSync; loop and claim.
+      // Lock removed under us between EEXIST and statSync; loop and race
+      // openSync fresh (we don't claim it on this iteration).
       shouldRetryImmediately = true;
     }
     if (shouldRetryImmediately) continue;

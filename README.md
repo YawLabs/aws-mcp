@@ -300,6 +300,14 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 
 **Deprecation policy:** breaking a stable shape requires a major bump. A deprecation lands first in a minor (the old shape continues to work and the new shape becomes available alongside it), with a removal scheduled for the next major. Both the deprecation and the removal show up in `CHANGELOG.md`.
 
+## Development
+
+`npm test` runs both unit tests and integration tests. The integration suites
+spawn a local `fake-aws` subprocess that stubs the AWS CLI -- no AWS credentials
+or network access required. The only tests that need real AWS credentials are
+the live tests gated behind the `AWS_MCP_LIVE_TESTS` environment variable, which
+are skipped in a standard `npm test` run.
+
 ## License
 
 MIT

@@ -11,6 +11,57 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+Next release should be a MINOR bump (1.5.0): the `aws_iam_simulate` summary
+change below alters what the stable `denied` field counts.
+
+### Changed
+- `aws_iam_simulate` summary now reports `unknown` separately:
+  `{ allowed, denied, unknown, total }`. `denied` counts only real denies
+  (explicitDeny + implicitDeny); the `unknown` malformed-response fallback
+  (EvalDecision missing or unrecognised) is no longer silently folded into
+  `denied`. The per-result `decision` values gain documented `unknown`.
+- `aws_assume_role` validates `roleArn` against the IAM role ARN shape at
+  both the schema and handler level, rejecting malformed or flag-shaped
+  values before any CLI spawn. The `mcp-` profile prefix guard now also
+  applies to the `sessionName` fallback, so `sessionName: "mcp-session"`
+  yields profile `mcp-session`, not `mcp-mcp-session`.
+- `aws_paginate` validates `startingToken` (opaque-token guard shared with
+  the CCAPI tools) and caps `maxItems` at 10000 (schema + handler clamp).
+- `aws_call` caps `--query` expressions at 2048 chars, and `runAwsCall`'s
+  display command now redacts every `--cli-input-json` occurrence, not just
+  the first.
+- `aws_docs_read` caps `url` at 2048 chars; both docs handlers clamp
+  `limit`/`maxLength`/`startIndex` defensively for non-MCP callers.
+- `aws_logs_tail` log-stream validation pins that embedded spaces are
+  allowed (AWS permits them; only argv-unsafe shapes are rejected).
+- `aws_metrics_query` rejects extended statistics like `iqm99` -- IQM takes
+  no numeric suffix and CloudWatch would bounce it server-side.
+- SSO login start-failure detection moved from the child's `exit` event to
+  `close`, eliminating a load-dependent race where a final stdout chunk
+  (the verification-URL banner) could be processed after `exit`, spuriously
+  failing an otherwise-healthy login start.
+- Profile-name validation errors now describe the allowed first characters
+  positively instead of listing two of many forbidden ones.
+- `aws_script` now carries `destructiveHint: true` -- scripts can invoke
+  resource.create/update/delete, so the annotation reflects the worst case.
+  Clients that gate confirmation on annotations may now prompt for
+  aws_script calls that were previously unflagged.
+
+### Internal
+- Published package now ships `dist/index.js.map`. tsconfig upgraded to
+  NodeNext module resolution. Dependabot github-actions cadence weekly.
+- `release.sh`: dead CI-handoff branch removed (release.yml was dropped at
+  v1.3.2); version re-read at the step-3 boundary.
+- fake-aws: unset `AWS_MCP_FAKE_SCENARIO` now fails loud (exit 2) instead of
+  silently running the SSO happy path; happy-scenario exit delay is
+  overridable via `AWS_MCP_FAKE_HAPPY_EXIT_MS` (NaN-guarded, default 200ms)
+  for slow-CI widening.
+- CHANGELOG backfill: v1.3.2 / v1.3.3 entries and all missing version
+  compare-links; README gains a Development section on the test layout.
+- Test coverage: `aws_refresh_if_expiring_soon` fresh-spawn path,
+  malformed-NDJSON logs fallback end-to-end, multi-occurrence redaction,
+  boundary and rejection cases for every new validation above.
+
 ## [1.4.1] - 2026-06-07
 
 ### Changed
@@ -95,6 +146,55 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
     empty.
   - `testing/fake-aws`: 30+ new scenarios covering the above
     branches.
+
+## [1.3.3] - 2026-06-02
+
+### Fixed
+- `release.sh` tag-drift guard now compares tag-object SHAs (via
+  `git rev-parse "v${VERSION}^{}"`) instead of the annotated-tag
+  object SHA, so resume runs where the tag already matches the
+  bump commit no longer false-abort with a "drift" error.
+- `release.sh` SKIP_LINT=1 escape hatch: wraps `npm`/`pnpm` so any
+  `lint*` subcommand becomes a no-op when SKIP_LINT=1 is set.
+  Workaround for the MINGW64-ARM64 case where the npm-run-script
+  wrapper segfaults on exit-cleanup (see platform-windows rule);
+  CI biome on the ubuntu runner remains the authoritative format
+  check.
+- `release.sh` tag-drift pre-push check: refuse to push if origin
+  already has the tag at a different commit (rewound elsewhere,
+  parallel release race), preventing a silent non-fast-forward
+  after npm publish has already started.
+- README: "Add to Yaw MCP" badge URL updated to the correct https
+  forwarder.
+
+### Internal
+- Added test coverage for `aws_call` success/error envelope shapes
+  and `rawBody` field, and for the `aws_login_start` login-reuse
+  fast path.
+
+## [1.3.2] - 2026-05-28
+
+### Changed
+- `release.sh` now publishes to the MCP Registry as release step 7
+  (previously handled by `release.yml`). Auth switches from
+  GitHub Actions OIDC (Actions-only) to a PAT via
+  `mcp-publisher login github -token $MCP_REGISTRY_TOKEN`, so
+  releases run end-to-end from the workstation.
+- `release.sh` server.json sync now runs unconditionally (not only
+  inside the bump else-branch) so a resume run where package.json
+  was already bumped still keeps server.json in sync.
+- `release.sh` confirmation prompt is now gated on `[ -t 0 ]` so
+  the script runs non-interactively in piped / automated contexts
+  without hanging on `read`.
+- `release.sh` MCP Registry auth falls back to `gh auth token`
+  when `MCP_REGISTRY_TOKEN` is unset, so the common case (active
+  `gh` session with read:org scope) needs no extra env var.
+- `release.yml` removed; `.github/workflows/` directory dropped.
+  GitHub Actions is no longer in the release path.
+- README Install section pins the `npx` spawn to `@latest` so
+  MCP client configs get the auto-update path explicitly.
+- `dependabot.yml` added for weekly npm and monthly
+  GitHub Actions dependency updates.
 
 ## [1.3.1] - 2026-05-22
 
@@ -512,7 +612,15 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/YawLabs/aws-mcp/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/YawLabs/aws-mcp/compare/v1.3.3...v1.4.0
+[1.3.3]: https://github.com/YawLabs/aws-mcp/compare/v1.3.2...v1.3.3
+[1.3.2]: https://github.com/YawLabs/aws-mcp/compare/v1.3.1...v1.3.2
+[1.3.1]: https://github.com/YawLabs/aws-mcp/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/YawLabs/aws-mcp/compare/v1.2.2...v1.3.0
+[1.2.2]: https://github.com/YawLabs/aws-mcp/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/YawLabs/aws-mcp/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/YawLabs/aws-mcp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/YawLabs/aws-mcp/compare/v1.0.2...v1.1.0
 [1.0.2]: https://github.com/YawLabs/aws-mcp/compare/v1.0.1...v1.0.2

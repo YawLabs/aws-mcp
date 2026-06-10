@@ -7,6 +7,7 @@ import {
   parseJsonPointer,
   resolvePointer,
   resourceTools,
+  type SimulatedJsonPatchOp,
   summarizePatch,
 } from "./resource.js";
 
@@ -122,19 +123,23 @@ describe("applyJsonPatch -- arrays", () => {
 });
 
 describe("applyJsonPatch -- unimplemented ops", () => {
+  // applyJsonPatch now narrows to SimulatedJsonPatchOp (add/remove/replace), so
+  // move/copy/test are type-unrepresentable at the call site. These tests pin
+  // the runtime throw that stays as defense for callers who widen past the
+  // type -- the explicit cast simulates that widening.
   it("move throws with a clear message", () => {
-    assert.throws(
-      () => applyJsonPatch({ A: 1, B: 2 }, [{ op: "move", path: "/A", from: "/B" }]),
-      /move.*not implemented/i,
-    );
+    const ops: JsonPatchOp[] = [{ op: "move", path: "/A", from: "/B" }];
+    assert.throws(() => applyJsonPatch({ A: 1, B: 2 }, ops as SimulatedJsonPatchOp[]), /move.*not implemented/i);
   });
 
   it("copy throws", () => {
-    assert.throws(() => applyJsonPatch({ A: 1 }, [{ op: "copy", path: "/B", from: "/A" }]));
+    const ops: JsonPatchOp[] = [{ op: "copy", path: "/B", from: "/A" }];
+    assert.throws(() => applyJsonPatch({ A: 1 }, ops as SimulatedJsonPatchOp[]));
   });
 
   it("test throws", () => {
-    assert.throws(() => applyJsonPatch({ A: 1 }, [{ op: "test", path: "/A", value: 1 }]));
+    const ops: JsonPatchOp[] = [{ op: "test", path: "/A", value: 1 }];
+    assert.throws(() => applyJsonPatch({ A: 1 }, ops as SimulatedJsonPatchOp[]));
   });
 });
 
@@ -319,7 +324,7 @@ describe("summarizePatch -- per-op replay perf refactor", () => {
       Meta: { keep: "yes", drop: "soon" },
     };
 
-    const ops: JsonPatchOp[] = [];
+    const ops: SimulatedJsonPatchOp[] = [];
     // 40 alternating replace/add ops on Counters.*
     for (let i = 0; i < 40; i++) {
       const key = ["a", "b", "c", "d", `new${i}`][i % 5];
@@ -382,7 +387,7 @@ describe("summarizePatch -- per-op replay perf refactor", () => {
     // entry to summarizePatch, so the caller's original object is never
     // touched.
     const before = { Counters: { a: 0 } };
-    const ops: JsonPatchOp[] = [
+    const ops: SimulatedJsonPatchOp[] = [
       { op: "replace", path: "/Counters/a", value: 1 },
       { op: "replace", path: "/Counters/a", value: 2 },
     ];
@@ -529,7 +534,7 @@ describe("aws_resource_diff schema", () => {
     assert.equal(r.success, false);
   });
 
-  it("rejects malformed typeName", () => {
+  it("does not reject typeName at schema level (handler validates)", () => {
     const r = diffTool.inputSchema.safeParse({
       typeName: "lambda::function",
       identifier: "x",

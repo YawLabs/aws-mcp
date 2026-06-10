@@ -15,7 +15,9 @@ function resolveTargetProfile(input: { targetProfile?: string; sessionName: stri
   if (input.targetProfile) {
     return input.targetProfile.startsWith("mcp-") ? input.targetProfile : `mcp-${input.targetProfile}`;
   }
-  return `mcp-${input.sessionName}`;
+  // Apply the same no-double-prefix guard for the sessionName fallback: a
+  // sessionName of 'mcp-session' must yield 'mcp-session', not 'mcp-mcp-session'.
+  return input.sessionName.startsWith("mcp-") ? input.sessionName : `mcp-${input.sessionName}`;
 }
 
 /**
@@ -51,7 +53,13 @@ export const assumeTools: readonly Tool[] = [
       openWorldHint: true,
     },
     inputSchema: z.object({
-      roleArn: z.string().describe("Target role ARN, e.g. 'arn:aws:iam::123456789012:role/CrossAccountAdmin'."),
+      roleArn: z
+        .string()
+        .regex(
+          /^arn:aws[a-z-]*:iam::[0-9]{12}:role\/.+$/,
+          "roleArn must match arn:aws[partition]:iam::<12-digit-account>:role/<name>",
+        )
+        .describe("Target role ARN, e.g. 'arn:aws:iam::123456789012:role/CrossAccountAdmin'."),
       sessionName: z
         .string()
         .min(2)
@@ -108,7 +116,7 @@ export const assumeTools: readonly Tool[] = [
       if (!isValidProfileName(sourceProfile)) {
         return {
           ok: false,
-          error: `Invalid sourceProfile name '${sourceProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='. Check the 'sourceProfile' arg or AWS_PROFILE env var.`,
+          error: `Invalid sourceProfile name '${sourceProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Check the 'sourceProfile' arg or AWS_PROFILE env var.`,
         };
       }
       // The resolved name lands as a `[name]` section header in
@@ -120,7 +128,21 @@ export const assumeTools: readonly Tool[] = [
       if (!isValidProfileName(targetProfile)) {
         return {
           ok: false,
-          error: `Invalid targetProfile name '${targetProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='. Pick a different targetProfile or sessionName.`,
+          error: `Invalid targetProfile name '${targetProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Pick a different targetProfile or sessionName.`,
+        };
+      }
+      // Defense-in-depth ARN check: the schema regex already rejects obvious
+      // bad inputs, but the handler re-validates so that callers bypassing
+      // schema parsing (e.g. direct handler calls in tests or internal callers)
+      // get a clear error instead of a confusing CLI failure. Mirrors the
+      // isValidProfileName checks above. The regex is the same pattern used in
+      // the schema; keeping it in one place as a named constant would require
+      // exporting it -- duplicating a 30-char literal is the lower-friction
+      // choice given the "no new exports for trivial helpers" convention here.
+      if (!/^arn:aws[a-z-]*:iam::[0-9]{12}:role\/.+$/.test(i.roleArn)) {
+        return {
+          ok: false,
+          error: `Invalid roleArn '${i.roleArn}'. Must match arn:aws[partition]:iam::<12-digit-account>:role/<name>, e.g. 'arn:aws:iam::123456789012:role/CrossAccountAdmin'.`,
         };
       }
 

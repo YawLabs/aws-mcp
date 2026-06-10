@@ -35,6 +35,17 @@ afterEach(() => {
   _resetSession();
 });
 
+// Build a fake CLI response that mimics `aws cloudcontrol get-resource-request-status`.
+// Shared by the pollUntilTerminal describe blocks below.
+function progressResponse(event: Record<string, unknown> | null): AwsCallResult {
+  return {
+    ok: true,
+    data: { ProgressEvent: event },
+    command: "aws cloudcontrol get-resource-request-status --request-token tok-1",
+    rawStdout: JSON.stringify({ ProgressEvent: event }),
+  };
+}
+
 describe("TYPE_NAME_RE", () => {
   it("accepts standard AWS::* types", () => {
     for (const tn of [
@@ -385,16 +396,6 @@ describe("extractProgressFields", () => {
 });
 
 describe("pollUntilTerminal", () => {
-  // Build a fake CLI response that mimics `aws cloudcontrol get-resource-request-status`.
-  function progressResponse(event: Record<string, unknown> | null): AwsCallResult {
-    return {
-      ok: true,
-      data: { ProgressEvent: event },
-      command: "aws cloudcontrol get-resource-request-status --request-token tok-1",
-      rawStdout: JSON.stringify({ ProgressEvent: event }),
-    };
-  }
-
   it("returns immediately when the first poll is already terminal", async () => {
     let calls = 0;
     const awsCall = async (): Promise<AwsCallResult> => {
@@ -682,15 +683,6 @@ describe("pollUntilTerminal — malformed/past RetryAfter falls back to pollInte
   // check (ra <= 0). Both must fall back to the configured pollIntervalMs
   // rather than treating the bad value as a wait. Unit-style here so the
   // sleep duration is observable; fake-aws can't surface that.
-  function progressResponse(event: Record<string, unknown> | null): AwsCallResult {
-    return {
-      ok: true,
-      data: { ProgressEvent: event },
-      command: "aws cloudcontrol get-resource-request-status --request-token tok-1",
-      rawStdout: JSON.stringify({ ProgressEvent: event }),
-    };
-  }
-
   it("falls back to pollIntervalMs when RetryAfter is unparseable (Number.isNaN(Date.parse(...)))", async () => {
     const responses: Record<string, unknown>[] = [
       { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1", RetryAfter: "not-a-date" },

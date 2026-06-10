@@ -122,6 +122,10 @@ npm test || fail "Tests failed"
 info "All tests passed"
 
 step 3 "Bump version to $VERSION"
+# Re-read from disk -- the version in $CURRENT_VERSION was captured at script
+# start; if a prior interrupted run already bumped package.json, this ensures
+# the skip-or-bump decision below uses the actual current value.
+CURRENT_VERSION=$(node -p "require('./package.json').version")
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} — skipping"
 else
@@ -192,82 +196,19 @@ else
 fi
 
 step 5 "Publish to npm"
-# Three publish paths, picked by environment:
-#   1. IS_CI=true                    -> WE are CI. Do the publish (NODE_AUTH_TOKEN
-#                                       is set; --provenance for sigstore).
-#   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
-#      exists with a publish step       Watch `gh run watch` for that run and
-#                                       verify via `npm view`. The workstation
-#                                       MUST NOT also `npm publish` -- a stale
-#                                       ~/.npmrc session fails E404 (we hit this
-#                                       on 1.2.0) and a valid one races CI for
-#                                       the same version. CI is authoritative.
-#   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
-#      path                             with EOTP retry for fresh WebAuthn sessions.
+# Two publish paths, picked by environment:
+#   1. IS_CI=true   -> We are running inside CI (GITHUB_REF_NAME set the
+#                      version above). NODE_AUTH_TOKEN is set by the
+#                      workflow; publish with --provenance for sigstore.
+#   2. IS_CI=false  -> Workstation is the publisher. Try locally with
+#                      EOTP retry for fresh WebAuthn sessions. (release.yml
+#                      was removed at v1.3.2; there is no CI handoff path.)
 PUBLISHED_VERSION=$(npm view "@yawlabs/aws-mcp@${VERSION}" version 2>/dev/null || echo "")
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm — skipping"
-  # Resume-path safety: a prior interrupted run may have published but never
-  # observed `gh run watch` to completion. Later CI steps (smoke test, MCP
-  # Registry publish, attestation upload) could have failed silently. Look
-  # up the most recent Release run for this tag and warn if its conclusion
-  # was non-success. Best-effort -- if the tag isn't on origin yet or the
-  # run isn't visible, the warn just doesn't fire.
-  if [ "$IS_CI" != "true" ] && [ -f ".github/workflows/release.yml" ]; then
-    RESUME_TAG_SHA=$(git rev-parse "v${VERSION}^{}" 2>/dev/null || echo "")
-    if [ -n "$RESUME_TAG_SHA" ]; then
-      RESUME_CONCLUSION=$(gh run list --workflow=Release --event=push --commit="$RESUME_TAG_SHA" --limit=1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
-      if [ -n "$RESUME_CONCLUSION" ] && [ "$RESUME_CONCLUSION" != "success" ]; then
-        warn "Prior CI Release run for v${VERSION} ended with conclusion='$RESUME_CONCLUSION' (not 'success'). A post-publish step (smoke test, MCP Registry publish, attestation) may have failed silently. Inspect: gh run list --workflow=Release --commit=$RESUME_TAG_SHA --limit=3"
-      fi
-    fi
-  fi
 elif [ "$IS_CI" = "true" ]; then
   npm publish --access public --provenance
   info "Published @yawlabs/aws-mcp@${VERSION} to npm (with provenance)"
-elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_TOKEN" .github/workflows/release.yml; then
-  info "CI release.yml fires on v* tag push -- workstation hands off to CI"
-  # Verify the tag landed on origin BEFORE looking up the CI run. A local
-  # push that succeeded but the remote rejected (protected-tag rule, network
-  # blip) would otherwise dead-end in the lookup loop with a misleading
-  # "Push may have failed" error 62s later. ls-remote is one round-trip --
-  # cheap relative to gh run watch.
-  if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -q "refs/tags/v${VERSION}$"; then
-    fail "Tag v${VERSION} not visible on origin. Step 4's 'git push --follow-tags' may have failed silently (protected-tag rule, network blip), or the tag was deleted between push and now. Re-run step 4."
-  fi
-  TAG_SHA=$(git rev-parse "v${VERSION}^{}")
-  RUN_ID=""
-  # Exponential backoff: 2+4+8+16+32 = 62s upper bound on GitHub's
-  # tag-push -> actions queue visibility lag. Cheap relative to the CI run
-  # itself (~6 min on aws-mcp).
-  DELAY=2
-  for i in 1 2 3 4 5; do
-    RUN_ID=$(gh run list --workflow=Release --event=push --commit="$TAG_SHA" --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
-    [ -n "$RUN_ID" ] && break
-    sleep $DELAY
-    DELAY=$((DELAY * 2))
-  done
-  if [ -z "$RUN_ID" ]; then
-    fail "Could not find Release workflow run for tag v${VERSION} (commit $TAG_SHA) after 62s of polling. The actions queue may be backed up; check 'gh run list --limit 5' and rerun the script to retry."
-  fi
-  info "Watching CI Release run $RUN_ID"
-  gh run watch "$RUN_ID" --exit-status || fail "CI Release run $RUN_ID failed. See 'gh run view $RUN_ID --log-failed'."
-  # CI is authoritative on the publish itself -- if `gh run watch` exited 0,
-  # the package is live on npm regardless of how long the registry mirror
-  # takes to surface it. Verification here is a courtesy check; warn rather
-  # than fail when the mirror lags (existing memory: lag can exceed a minute).
-  NPM_NOW=""
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    NPM_NOW=$(npm view "@yawlabs/aws-mcp@${VERSION}" version 2>/dev/null || echo "")
-    [ "$NPM_NOW" = "$VERSION" ] && break
-    sleep 6
-  done
-  if [ "$NPM_NOW" = "$VERSION" ]; then
-    info "Published @yawlabs/aws-mcp@${VERSION} via CI Release run $RUN_ID"
-  else
-    DISPLAY_NPM="${NPM_NOW:-(not found)}"
-    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/aws-mcp@${VERSION} after 60s. Likely registry propagation lag -- verify with 'npm view @yawlabs/aws-mcp@${VERSION}' in a minute. Publish is authoritative on CI's exit code."
-  fi
 else
   # No CI publish path -- workstation is the publisher. Retry up to 3 times
   # on EOTP/EAUTH/OTP only (WebAuthn-fresh sessions sometimes need ~30s for

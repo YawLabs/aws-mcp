@@ -200,6 +200,15 @@ export const authTools: readonly Tool[] = [
         // hints stay consistent with every other tool's hints.
         return { ok: false, error: identity.error, rawBody: identity.rawBody };
       }
+      // startUrlForProfile returns undefined for non-SSO profiles (no
+      // sso_start_url in ~/.aws/config). When that happens, the startUrl
+      // filter is absent and findCachedSsoToken falls back to the legacy
+      // "any valid token" behavior (returns the freshest non-expired token
+      // regardless of which SSO instance it belongs to). This is best-effort
+      // -- callers with non-SSO profiles get a token hint when one is cached
+      // from any SSO login, and no hint when the cache is empty. The
+      // multi-org misread is only a risk when two SSO instances share one
+      // cache; a non-SSO profile has no SSO instance to misread against.
       const cachedToken = findCachedSsoToken(undefined, { startUrl: startUrlForProfile(useProfile) });
 
       return {

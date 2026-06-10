@@ -123,6 +123,35 @@ describe("runAwsCall — input validation (no spawn)", () => {
       else process.env.AWS_PROFILE = saved;
     }
   });
+
+  it("rejects query expressions longer than 2048 chars", async () => {
+    const longQuery = "a".repeat(2049);
+    const r = await runAwsCall({ service: "s3", operation: "list-buckets", query: longQuery });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /query expression too long/);
+    assert.match(r.error, /2049/);
+  });
+
+  it("accepts query expressions at exactly the 2048-char limit", async () => {
+    // At exactly 2048 the validation passes; the call may still fail for other
+    // reasons (no real CLI), but the rejection shape must NOT be bad_input.
+    const exactQuery = "a".repeat(2048);
+    const r = await runAwsCall({
+      service: "s3",
+      operation: "list-buckets",
+      query: exactQuery,
+      // Use a non-existent command so the call fails fast without touching
+      // the real AWS CLI, but not as bad_input.
+      command: "__no_such_binary__",
+    });
+    // The rejection may be spawn_failure or similar -- the important thing is
+    // it is not bad_input from the length check.
+    if (!r.ok) {
+      assert.notEqual(r.kind, "bad_input", "2048-char query must not be rejected by the length cap");
+    }
+  });
 });
 
 describe("redactDisplayArgs", () => {
@@ -146,6 +175,33 @@ describe("redactDisplayArgs", () => {
   it("does not crash when --cli-input-json has no following token", () => {
     const args = ["s3api", "list-buckets", "--cli-input-json"];
     assert.deepEqual(redactDisplayArgs(args), args);
+  });
+
+  it("redacts ALL occurrences of --cli-input-json, not just the first", () => {
+    // Both occurrences carry secrets; only redacting the first leaves the
+    // second payload exposed in the displayCommand string.
+    const payload1 = JSON.stringify({ SecretKey: "abc123" });
+    const payload2 = JSON.stringify({ Password: "hunter2" });
+    const args = [
+      "s3api",
+      "put-object",
+      "--cli-input-json",
+      payload1,
+      "--cli-input-json",
+      payload2,
+      "--profile",
+      "prod",
+    ];
+    const redacted = redactDisplayArgs(args);
+    assert.ok(!redacted.some((a) => a.includes("abc123")), "first payload secret must not appear");
+    assert.ok(!redacted.some((a) => a.includes("hunter2")), "second payload secret must not appear");
+    assert.equal(redacted[3], `<redacted len=${payload1.length}>`);
+    assert.equal(redacted[5], `<redacted len=${payload2.length}>`);
+    // Flag tokens and other args pass through.
+    assert.equal(redacted[2], "--cli-input-json");
+    assert.equal(redacted[4], "--cli-input-json");
+    assert.equal(redacted[6], "--profile");
+    assert.equal(redacted[7], "prod");
   });
 });
 

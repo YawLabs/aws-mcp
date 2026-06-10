@@ -68,6 +68,73 @@ describe("aws_paginate schema", () => {
       false,
     );
   });
+
+  it("caps maxItems at 10000", () => {
+    assert.equal(
+      tool.inputSchema.safeParse({ service: "s3api", operation: "list-buckets", maxItems: 10_000 }).success,
+      true,
+    );
+    assert.equal(
+      tool.inputSchema.safeParse({ service: "s3api", operation: "list-buckets", maxItems: 10_001 }).success,
+      false,
+    );
+  });
+});
+
+describe("aws_paginate handler — startingToken validation (no spawn)", () => {
+  it("rejects a leading-hyphen startingToken (argv-injection defense)", async () => {
+    const r = (await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      startingToken: "--profile",
+    })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startingToken/);
+  });
+
+  it("rejects an over-length (>128 char) startingToken", async () => {
+    const r = (await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      startingToken: "a".repeat(129),
+    })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startingToken/);
+  });
+});
+
+describe("aws_paginate handler — normal startingToken passes through (fake-aws)", () => {
+  const beforeEachEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  };
+  const afterEachEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("a valid startingToken clears validation and reaches the CLI", async () => {
+    // A base64-ish resume cursor (the shape AWS hands back) must pass the
+    // opaque-token guard and drive a normal paginated call.
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "paginate_has_more";
+      const r = (await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        maxItems: 2,
+        startingToken: "eyJuZXh0IjoiYWJjIn0=",
+      })) as { ok: boolean; data?: { nextToken?: string | null; hasMore?: boolean } };
+      assert.equal(r.ok, true);
+      assert.equal(r.data?.nextToken, "eyJuZXh0IjoiYWJjIn0=");
+      assert.equal(r.data?.hasMore, true);
+    } finally {
+      afterEachEnv();
+    }
+  });
 });
 
 describe("runAwsCall with extraFlags (pagination plumbing)", () => {
@@ -133,9 +200,6 @@ describe("wrapQueryForPagination", () => {
     );
   });
 });
-
-const tokenTool = paginateTools.find((t) => t.name === "aws_paginate");
-if (!tokenTool) throw new Error("paginateTools missing aws_paginate");
 
 describe("aws_paginate handler — query+NextToken round-trip via fake-aws", () => {
   it("unwraps `items` and surfaces nextToken when query is supplied (truncated page)", async () => {

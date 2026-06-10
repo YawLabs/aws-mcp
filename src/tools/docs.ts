@@ -351,7 +351,10 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
       }),
       handler: async (input: unknown): Promise<ToolResult> => {
         const i = input as { query: string; limit?: number };
-        const limit = i.limit ?? DEFAULT_SEARCH_LIMIT;
+        // Defense-in-depth: clamp limit into the valid range so direct
+        // (non-MCP) callers that bypass schema validation can't send an
+        // out-of-range value to parseSearchResults.
+        const limit = Math.min(Math.max(1, i.limit ?? DEFAULT_SEARCH_LIMIT), MAX_SEARCH_LIMIT);
         let response: Response;
         try {
           response = await fetchWithTimeout(
@@ -426,6 +429,7 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
         url: z
           .string()
           .min(1)
+          .max(2048)
           .describe(
             "AWS docs page URL: https://docs.aws.amazon.com/<...>.html. Usually from an aws_docs_search result.",
           ),
@@ -451,8 +455,11 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             error: `Invalid url '${i.url}'. Must be an 'https://docs.aws.amazon.com/...html' page. Use aws_docs_search to find one.`,
           };
         }
-        const startIndex = i.startIndex ?? 0;
-        const maxLength = i.maxLength ?? DEFAULT_MAX_LENGTH;
+        const startIndex = Math.max(0, i.startIndex ?? 0);
+        // Defense-in-depth: clamp maxLength into the valid range so direct
+        // (non-MCP) callers that bypass schema validation can't pass an
+        // out-of-range value to paginateContent.
+        const maxLength = Math.min(Math.max(1, i.maxLength ?? DEFAULT_MAX_LENGTH), MAX_MAX_LENGTH);
 
         // Paginated reads of the same page hit the cache -- one fetch +
         // convert per URL, then every subsequent window is a slice.

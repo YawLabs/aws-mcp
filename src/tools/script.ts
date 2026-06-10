@@ -84,7 +84,7 @@ import type { Tool, ToolResult } from "./tool.js";
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 5 * 60_000;
 const MAX_LOG_LINES = 500;
-const MAX_LOG_LINE_BYTES = 4 * 1024;
+const MAX_LOG_LINE_CHARS = 4 * 1024;
 const DEFAULT_MAX_PAGES = 50;
 const MAX_PAGES_HARD_CAP = 1000;
 
@@ -277,7 +277,7 @@ export async function runScript(
         })
         .join(" ");
       const capped =
-        text.length > MAX_LOG_LINE_BYTES ? `${text.slice(0, MAX_LOG_LINE_BYTES)}... [line truncated]` : text;
+        text.length > MAX_LOG_LINE_CHARS ? `${text.slice(0, MAX_LOG_LINE_CHARS)}... [line truncated]` : text;
       logs.push(`[${level}] ${capped}`);
     };
 
@@ -473,9 +473,11 @@ export const scriptTools: readonly Tool[] = [
     annotations: {
       title: "Run a JS snippet that orchestrates AWS tool calls",
       // The script may invoke destructive tools (resource.create/update/delete)
-      // so we conservatively annotate as non-read-only.
+      // so annotate the worst case honestly: non-read-only AND destructive.
+      // Cautious clients may confirm read-only scripts too -- acceptable cost;
+      // an unflagged delete is not.
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },

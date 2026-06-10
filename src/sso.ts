@@ -192,7 +192,7 @@ export function startSsoLogin(
   if (!isValidProfileName(profile)) {
     return Promise.resolve({
       ok: false,
-      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='.`,
+      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '=').`,
     });
   }
   const key = dedupeKey(profile, opts);
@@ -250,7 +250,12 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
     // handler reads it through this reference so it can clear ttlTimer and
     // flip `completed` without having to look up by sessionId.
     let registeredSession: LoginSession | null = null;
-    let completionResolve: (r: LoginWaitResult) => void;
+    // The wait result computed by the 'exit' handler, stashed so the 'close'
+    // handler can phrase the start-failure fallback from it. 'close' always
+    // fires after 'exit' (Node guarantee), so this is set whenever the
+    // fallback below reads it.
+    let exitResult: LoginWaitResult | null = null;
+    let completionResolve!: (r: LoginWaitResult) => void;
     const completion = new Promise<LoginWaitResult>((res) => {
       completionResolve = res;
     });
@@ -367,15 +372,31 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
           rawOutput,
         };
       }
+      exitResult = result;
       completionResolve(result);
+      // The start-failure fallback (when the proc exits before URL+code ever
+      // arrive) lives in the 'close' handler below, NOT here. 'exit' can be
+      // dispatched before the stdout 'data' event that carries the URL banner
+      // (the OS reaps the process while a final chunk is still queued on the
+      // pipe), which would spuriously fail an otherwise-healthy start. 'close'
+      // fires only after the stdio streams flush, so any pending 'data' event
+      // has already run and `settled` reflects the real outcome.
+    });
 
+    proc.on("close", () => {
+      // Start-failure fallback: the subprocess closed without ever emitting a
+      // parseable URL+code, so the start Promise was never resolved by the
+      // stdout handler. 'close' guarantees all 'data' events have already
+      // fired, so a still-false `settled` here means there genuinely was no
+      // URL+code (not just a not-yet-delivered chunk). exitResult is set by
+      // the 'exit' handler, which always runs before 'close'.
       if (!settled) {
         settled = true;
         clearTimeout(urlTimeout);
         resolve({
           ok: false,
-          error: result.error ?? "aws sso login exited before printing a verification URL",
-          rawOutput: result.rawOutput,
+          error: exitResult?.error ?? "aws sso login exited before printing a verification URL",
+          rawOutput: exitResult?.rawOutput,
         });
       }
     });

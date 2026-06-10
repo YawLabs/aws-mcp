@@ -461,6 +461,16 @@ describe("aws_docs_* schema", () => {
     );
   });
 
+  it("read rejects a url longer than 2048 chars", () => {
+    // docs.ts url field carries .max(2048) for parity with iam-simulate's
+    // resource cap. A path segment that inflates the URL past 2048 chars
+    // must fail schema validation without reaching the fetch.
+    const base = "https://docs.aws.amazon.com/";
+    const padded = `${base}${"a".repeat(2048 - base.length + 1)}.html`;
+    assert.ok(padded.length > 2048);
+    assert.equal(readTool.inputSchema.safeParse({ url: padded }).success, false);
+  });
+
   it("read rejects a negative startIndex", () => {
     assert.equal(
       readTool.inputSchema.safeParse({ url: "https://docs.aws.amazon.com/x.html", startIndex: -1 }).success,

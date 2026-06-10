@@ -417,6 +417,11 @@ describe("runScript realm intrinsic contract", () => {
   });
 
   it("throws ReferenceError for the NOT-injected globals", async () => {
+    // `import` is intentionally omitted from the probe list: dynamic import()
+    // is blocked at the codeGeneration level (strings: false disables eval and
+    // Function; wasm: false disables WebAssembly instantiation), so it fails
+    // with a different error class (TypeError / EvalError / SyntaxError) rather
+    // than a ReferenceError -- a distinct failure category, not a missing binding.
     const { handlers } = makeMockHandlers();
     const r = await runScript(
       {
@@ -426,12 +431,15 @@ describe("runScript realm intrinsic contract", () => {
           const probe = (fn) => { try { fn(); return "no-throw"; } catch (e) { return e.name; } };
           return {
             URL: probe(() => URL),
+            URLSearchParams: probe(() => URLSearchParams),
             TextEncoder: probe(() => TextEncoder),
+            TextDecoder: probe(() => TextDecoder),
             crypto: probe(() => crypto),
             structuredClone: probe(() => structuredClone),
             EventTarget: probe(() => EventTarget),
             MessageChannel: probe(() => MessageChannel),
             performance: probe(() => performance),
+            fs: probe(() => fs),
           };
         `,
       },
@@ -458,6 +466,7 @@ describe("runScript realm intrinsic contract", () => {
             clearImmediate: typeof clearImmediate,
             queueMicrotask: typeof queueMicrotask,
             global: typeof global,
+            globalThis: typeof globalThis,
             BroadcastChannel: typeof BroadcastChannel,
           };
         `,
@@ -819,7 +828,7 @@ describe("runScript log capture limits", () => {
     assert.ok(!r.logs.some((l) => l.includes("line-500")), "line-500 should have been dropped after the cap was hit");
   });
 
-  it("truncates a single log line over MAX_LOG_LINE_BYTES (4096) with a `... [line truncated]` suffix", async () => {
+  it("truncates a single log line over MAX_LOG_LINE_CHARS (4096) with a `... [line truncated]` suffix", async () => {
     const { handlers } = makeMockHandlers();
     // 5000-char line: kept content is the first 4096 chars, then the marker.
     // The total emitted line is `[log] <4096 chars>... [line truncated]`.
@@ -842,16 +851,16 @@ describe("runScript log capture limits", () => {
     // prefix doesn't silently flip this assertion.
     const suffix = "... [line truncated]";
     const payload = line.slice("[log] ".length, line.length - suffix.length);
-    assert.equal(payload.length, 4096, `expected payload of exactly MAX_LOG_LINE_BYTES (4096), got ${payload.length}`);
+    assert.equal(payload.length, 4096, `expected payload of exactly MAX_LOG_LINE_CHARS (4096), got ${payload.length}`);
     assert.ok(
       payload.split("").every((c) => c === "x"),
       "payload should be the first 4096 chars of the input, unchanged",
     );
   });
 
-  it("does NOT truncate a line exactly at the byte limit (boundary case)", async () => {
+  it("does NOT truncate a line exactly at the char limit (boundary case)", async () => {
     const { handlers } = makeMockHandlers();
-    // The cap path is `text.length > MAX_LOG_LINE_BYTES`, so length == 4096
+    // The cap path is `text.length > MAX_LOG_LINE_CHARS`, so length == 4096
     // must pass through untouched. Anchor the boundary so a future `>=`
     // typo is caught.
     const r = await runScript(

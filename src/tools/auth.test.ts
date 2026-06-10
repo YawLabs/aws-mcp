@@ -197,7 +197,7 @@ describe("aws_whoami handler — error path consistency with aws_call (fake-aws)
 });
 
 describe("startUrlForProfile unknown-profile fallback", () => {
-  // startUrlForProfile (auth.ts:78-84) is internal: it reads ~/.aws/config and
+  // startUrlForProfile (auth.ts:115-122) is internal: it reads ~/.aws/config and
   // delegates to resolveProfileStartUrl, mapping null -> undefined. When the
   // config is readable but doesn't contain the requested profile, callers see
   // `undefined`, and findCachedSsoToken({ startUrl: undefined }) degrades to
@@ -256,7 +256,7 @@ region = us-east-1
       }),
     );
 
-    // Explicit undefined: this is what the auth.ts:160 / :278 / :318 call
+    // Explicit undefined: this is what the auth.ts:203, :315, :355 call
     // sites pass when startUrlForProfile returns undefined. The call must
     // neither throw nor return null -- it should ignore the absent filter
     // and surface the cached token.
@@ -650,6 +650,9 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
   afterEach(() => {
     _clearSessions();
     _resetSession();
+    // Restore the production startSsoLogin call so the fresh-spawn seam set by
+    // the fresh-spawn tests below can't bleed into any other test.
+    _resetStartSsoLoginImpl();
     if (homeBackup === undefined) delete process.env.HOME;
     else process.env.HOME = homeBackup;
     if (userprofileBackup === undefined) delete process.env.USERPROFILE;
@@ -732,42 +735,67 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
     assert.match(r.data?.instructions ?? "", new RegExp(seed.sessionId));
   });
 
-  it("reason 'No cached SSO token found.' when below threshold with no cached token (reuse-branch input)", () => {
-    // The fresh-spawn reason at auth.ts:397-399 is selected purely from whether
-    // a cached token exists. Driving the actual spawn would invoke `startSsoLogin`
-    // with NO fake-aws opts (the handler calls bare startSsoLogin at auth.ts:389),
-    // which would hit live AWS SSO -- so pin the branch INPUT instead: with no
-    // cached token under the HOME override, findCachedSsoToken returns null,
-    // which is the `cachedToken ? ... : "No cached SSO token found."` else arm.
+  it("fresh spawn: no cached token -> handler drives startSsoLogin and returns status:'refreshing' without reused flag", async () => {
+    // No cached token under HOME override -> findCachedSsoToken returns null
+    // (below threshold by definition). No in-flight session -> reuse branch
+    // not taken. Handler falls through to the fresh-spawn call via the
+    // _startSsoLoginImpl seam. Assert status='refreshing', no reused flag,
+    // sessionId present, and reason = "No cached SSO token found."
     writeConfig("nocache-prof", "https://nocache.awsapps.com/start");
     // No cache token written -> findCachedSsoToken returns null.
-    assert.equal(findCachedSsoToken(join(homeDir, ".aws", "sso", "cache")), null);
-    // And no in-flight session, so the handler would fall through to the
-    // fresh-spawn reason (the else arm), not the reuse branch.
-    assert.equal(findActiveSessionByProfile("nocache-prof"), null);
+    assert.equal(findCachedSsoToken(join(homeDir, ".aws", "sso", "cache")), null, "precondition: no cached token");
+    assert.equal(findActiveSessionByProfile("nocache-prof"), null, "precondition: no in-flight session");
+
+    _setStartSsoLoginImpl((profile) => startSsoLogin(profile, fakeOpts("happy")));
+
+    const r = (await refreshTool.handler({ profile: "nocache-prof" })) as {
+      ok: boolean;
+      data?: {
+        status?: string;
+        reason?: string;
+        sessionId?: string;
+        reused?: boolean;
+        verificationUrl?: string;
+        userCode?: string;
+      };
+    };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.status, "refreshing");
+    assert.equal(r.data?.reused, undefined, "fresh spawn must not carry the reuse marker");
+    assert.ok(r.data?.sessionId, "fresh spawn returns a sessionId");
+    assert.match(r.data?.sessionId ?? "", /^[0-9a-f-]{36}$/);
+    assert.equal(r.data?.reason, "No cached SSO token found.");
   });
 
-  it("reason 'Token has <n> min left (threshold <t>).' when below threshold WITH a cached token (reuse-branch input)", () => {
-    // Symmetric to the test above: a cached token below the threshold means the
-    // fresh-spawn reason takes the `cachedToken ? \`Token has ${minutesLeft}
-    // min left (threshold ${threshold}).\`` arm. We pin the inputs that select
-    // that arm (a non-null cached token with minutesLeft < threshold) rather
-    // than spawn the bare live login the handler would otherwise run. The
-    // reason-string formatting itself is exercised by reading minutesLeft here.
+  it("fresh spawn: cached token below threshold -> handler drives startSsoLogin, reason names minutes+threshold", async () => {
+    // Token with ~3 min left, threshold 10 -> below threshold. No in-flight
+    // session -> reuse branch not taken. Handler falls through to the
+    // fresh-spawn call. Assert status='refreshing', no reused flag, sessionId
+    // present, and reason = "Token has <n> min left (threshold 10)."
     const startUrl = "https://below.awsapps.com/start";
     writeConfig("below-prof", startUrl);
     writeCachedToken(startUrl, 3 * 60_000); // ~3 min left
 
     const cached = findCachedSsoToken(join(homeDir, ".aws", "sso", "cache"), { startUrl });
-    assert.ok(cached, "expected a non-null cached token (the truthy arm input)");
-    const threshold = 10;
-    assert.ok(
-      cached.minutesLeft < threshold,
-      "the cached token must be below the threshold to pick the fresh-spawn path",
-    );
-    // Reconstruct the exact reason string the handler would emit (auth.ts:398).
-    const reason = `Token has ${cached.minutesLeft} min left (threshold ${threshold}).`;
-    assert.match(reason, /^Token has \d+ min left \(threshold 10\)\.$/);
-    assert.equal(findActiveSessionByProfile("below-prof"), null, "no in-flight session -> not the reuse branch");
+    assert.ok(cached, "precondition: a non-null cached token below the threshold");
+    assert.ok(cached.minutesLeft < 10, "precondition: token is below default threshold");
+    assert.equal(findActiveSessionByProfile("below-prof"), null, "precondition: no in-flight session");
+
+    _setStartSsoLoginImpl((profile) => startSsoLogin(profile, fakeOpts("happy")));
+
+    const r = (await refreshTool.handler({ profile: "below-prof", thresholdMinutes: 10 })) as {
+      ok: boolean;
+      data?: {
+        status?: string;
+        reason?: string;
+        sessionId?: string;
+        reused?: boolean;
+      };
+    };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.status, "refreshing");
+    assert.equal(r.data?.reused, undefined, "fresh spawn must not carry the reuse marker");
+    assert.ok(r.data?.sessionId, "fresh spawn returns a sessionId");
+    assert.match(r.data?.reason ?? "", /^Token has \d+ min left \(threshold 10\)\.$/);
   });
 });

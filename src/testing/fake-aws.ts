@@ -16,9 +16,15 @@
  * enables intra-file parallelism, or a second file mutates the same var
  * concurrently, callers will need a serial guard. See metrics.test.ts for
  * the matching note on the test side.
+ *
+ * Scenario classes: argv-branching scenarios (e.g. ccapi_list_resources_paginated,
+ * mr_partial_failure, metrics_paginated) are per-process safe -- they carry all
+ * state in argv, not in a shared env var. The env-var scenario dispatch
+ * (AWS_MCP_FAKE_SCENARIO itself) is the shared-state surface that requires
+ * the sequential guard above.
  */
 
-const scenario = process.env.AWS_MCP_FAKE_SCENARIO ?? "happy";
+const scenario = process.env.AWS_MCP_FAKE_SCENARIO;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -39,12 +45,21 @@ async function main(): Promise<void> {
   switch (scenario) {
     case "happy": {
       // Realistic aws-cli output: banner text, URL, code, then successful auth.
-      // HARD CONSTRAINT: the 200ms exit timing is depended on by
+      // HARD CONSTRAINT: the default 200ms exit timing is the contract that
       // auth.test.ts and several sso.integration.test.ts cases (TTL
-      // killswitch, completed-session exclusion). Do not change it. If you
-      // need a session that stays active deterministically, use `happy_hold`.
+      // killswitch, completed-session exclusion) depend on. Do not change
+      // the default. AWS_MCP_FAKE_HAPPY_EXIT_MS exists only for slow-CI
+      // widening -- it must not be set in normal test runs. If you need a
+      // session that stays active deterministically, use `happy_hold`.
+      // A garbage env value would make Number() return NaN (and "" parses to
+      // 0, negatives are equally bogus) -- setTimeout with any of those fires
+      // immediately, silently shrinking the 200ms window the timing tests
+      // anchor on. Fall back to the contract default unless the value is a
+      // positive finite number.
+      const parsedExitMs = Number(process.env.AWS_MCP_FAKE_HAPPY_EXIT_MS ?? "200");
+      const exitMs = Number.isFinite(parsedExitMs) && parsedExitMs > 0 ? parsedExitMs : 200;
       process.stdout.write(HAPPY_URL_CODE_BANNER);
-      await sleep(200); // Simulate user auth delay
+      await sleep(exitMs); // Simulate user auth delay
       process.stdout.write("Successfully logged into Start URL: https://d-test.awsapps.com/start\n");
       process.exit(0);
       return;
@@ -194,6 +209,10 @@ async function main(): Promise<void> {
       // shape end-to-end -- one region returns {ok: true, data, command},
       // another returns {ok: false, errorKind: "sso_expired", error, command}.
       const argv = process.argv.slice(2);
+      // Coupling: --region position here must match the fixed argv layout in
+      // runAwsCall (aws-cli.ts:208-209), which places --region immediately
+      // before the region value. If that placement ever changes, regionIdx+1
+      // will silently resolve to the wrong token.
       const regionIdx = argv.indexOf("--region");
       const region = regionIdx >= 0 ? argv[regionIdx + 1] : "";
       if (region === "us-west-2") {
@@ -1018,7 +1037,15 @@ async function main(): Promise<void> {
     }
 
     default: {
-      process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
+      // Catches both unknown values and an unset AWS_MCP_FAKE_SCENARIO
+      // (undefined falls here -- there is no implicit default scenario).
+      if (scenario === undefined) {
+        process.stderr.write(
+          "fake-aws: AWS_MCP_FAKE_SCENARIO is not set. Every test that spawns fake-aws must set it explicitly.\n",
+        );
+      } else {
+        process.stderr.write(`fake-aws: unknown scenario '${scenario}'\n`);
+      }
       process.exit(2);
       return;
     }

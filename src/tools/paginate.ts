@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
+import { validateOpaqueToken } from "./resource.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -46,7 +47,7 @@ export const paginateTools: readonly Tool[] = [
   {
     name: "aws_paginate",
     description:
-      "Fetch one page of a paginated AWS list/describe operation. Identical to aws_call plus `maxItems` (page size) and `startingToken` (resume cursor). Returns the parsed response, a `nextToken` (null when the list is exhausted), and `hasMore`. Call again with the returned nextToken as startingToken until hasMore is false. Use this instead of aws_call for operations that might exceed the 5 MB stdout cap: list-objects-v2, describe-instances, describe-log-streams, list-roles, etc.",
+      "Fetch one page of a paginated AWS list/describe operation. Identical to aws_call plus `maxItems` (page size) and `startingToken` (resume cursor). When `query` is supplied it is wrapped server-side as {NextToken, items: <query>} so pagination survives a projection that would otherwise drop NextToken; the handler unwraps `items` before returning. Returns the parsed response, a `nextToken` (null when the list is exhausted), and `hasMore`. Call again with the returned nextToken as startingToken until hasMore is false. Use this instead of aws_call for operations that might exceed the 5 MB stdout cap: list-objects-v2, describe-instances, describe-log-streams, list-roles, etc.",
     annotations: {
       title: "Fetch one page of a paginated AWS operation",
       readOnlyHint: true,
@@ -73,8 +74,9 @@ export const paginateTools: readonly Tool[] = [
         .number()
         .int()
         .positive()
+        .max(10_000)
         .optional()
-        .describe("Items per page. Default 100. Lower this if hitting the 5 MB output cap."),
+        .describe("Items per page (1-10000). Default 100. Lower this if hitting the 5 MB output cap."),
       startingToken: z
         .string()
         .optional()
@@ -95,7 +97,18 @@ export const paginateTools: readonly Tool[] = [
         region?: string;
         timeoutMs?: number;
       };
-      const maxItems = i.maxItems ?? 100;
+      // startingToken lands in extraFlags as a bare --starting-token arg, so
+      // argv-safety it the same way resource.ts guards nextToken/clientToken:
+      // a leading-hyphen or over-length token would otherwise leak as a flag.
+      if (i.startingToken !== undefined) {
+        const stErr = validateOpaqueToken(i.startingToken, "startingToken");
+        if (stErr) return { ok: false, error: stErr };
+      }
+
+      // Defense-in-depth: the schema caps maxItems at 10_000, but direct
+      // (non-MCP) callers bypass schema validation -- clamp here for parity
+      // with the handler-level clamps in docs.ts.
+      const maxItems = Math.min(Math.max(1, i.maxItems ?? 100), 10_000);
       const extraFlags: string[] = ["--max-items", String(maxItems)];
       if (i.startingToken) {
         extraFlags.push("--starting-token", i.startingToken);

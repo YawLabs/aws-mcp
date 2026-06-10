@@ -38,7 +38,12 @@ import type { Tool, ToolResult } from "./tool.js";
 const SIMPLE_STATS = ["Average", "Sum", "Maximum", "Minimum", "SampleCount"] as const;
 // Matches "p99", "p99.9", "tm95", "tc90", "wm99", etc. -- the extended-stat
 // shapes documented at https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Statistics-definitions.html
-const EXTENDED_STAT_RE = /^(p|tm|tc|wm|pr|ts|iqm)(\d{1,3}(\.\d{1,3})?)?$/i;
+//
+// IQM (interquartile mean) takes NO numeric suffix; CloudWatch rejects
+// 'iqm99' / 'iqm0.5' with a ValidationError. Split it out so it only matches
+// the bare token 'iqm' (case-insensitive). All other prefixes still accept
+// an optional d{1,3}(.d{1,3})? suffix.
+const EXTENDED_STAT_RE = /^((p|tm|tc|wm|pr|ts)(\d{1,3}(\.\d{1,3})?)?|iqm)$/i;
 
 function isValidStatistic(s: string): boolean {
   // Case-fold the simple list so 'average', 'AVERAGE', 'Average' all pass --
@@ -476,6 +481,11 @@ export const metricsTools: readonly Tool[] = [
       // decide, so we emit nothing rather than a value that was never sent.
       const queryById = new Map(i.queries.map((q) => [q.id, q]));
       const series = (raw.MetricDataResults ?? []).map((r) => {
+        // queryById.get(r.Id ?? '') silently resolves to undefined when r.Id is
+        // absent, so effectivePeriod is also undefined and the `period` field is
+        // omitted from that series entry. CloudWatch always echoes the Id field
+        // in practice, so this case should not arise in production; the
+        // fallthrough is intentional defense-in-depth rather than a silent bug.
         const q = queryById.get(r.Id ?? "");
         const effectivePeriod = q?.period ?? (q && q.expression === undefined ? periodSeconds : undefined);
         return {

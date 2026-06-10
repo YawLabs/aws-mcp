@@ -52,7 +52,7 @@ export const sessionTools: readonly Tool[] = [
         if (!isValidProfileName(trimmed)) {
           return {
             ok: false,
-            error: `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '=', no whitespace or shell metacharacters.`,
+            error: `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`,
           };
         }
       }

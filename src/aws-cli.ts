@@ -30,12 +30,17 @@ export const SAFE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
  * --cli-input-json can carry secrets (IAM passwords, access keys, tags with
  * PII). Keep the flag visible in displayCommand so users see the shape of
  * what ran, but replace the JSON payload with a length stub.
+ *
+ * All occurrences of --cli-input-json are redacted -- a single call can
+ * theoretically carry the flag more than once (e.g. if callers splice extra
+ * flags), so indexOf-stop-at-first is not sufficient.
  */
 export function redactDisplayArgs(args: readonly string[]): string[] {
   const out = [...args];
-  const idx = out.indexOf("--cli-input-json");
-  if (idx >= 0 && idx < out.length - 1) {
-    out[idx + 1] = `<redacted len=${out[idx + 1].length}>`;
+  for (let i = 0; i < out.length - 1; i++) {
+    if (out[i] === "--cli-input-json") {
+      out[i + 1] = `<redacted len=${out[i + 1].length}>`;
+    }
   }
   return out;
 }
@@ -78,6 +83,14 @@ export type AwsCallFailureKind =
 
 export interface AwsCallSuccess {
   ok: true;
+  /**
+   * Parsed JSON value on a successful `--output json` run, OR a raw trimmed
+   * string when the CLI emits non-JSON stdout despite `--output json` (e.g.
+   * `--query` expressions that extract a scalar string/number return the value
+   * without JSON quoting). Callers must type-guard before assuming a structured
+   * object: `typeof data === "string"` vs `typeof data === "object"`.
+   * For `--output text/table/yaml` this is always the raw stdout string.
+   */
   data: unknown;
   command: string;
   rawStdout: string;
@@ -168,7 +181,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     return Promise.resolve({
       ok: false,
       kind: "bad_input",
-      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-], must not start with '-' or '='. Check the 'profile' arg or AWS_PROFILE env var.`,
+      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Check the 'profile' arg or AWS_PROFILE env var.`,
     });
   }
   if (!isValidRegionName(region)) {
@@ -209,12 +222,22 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     region,
   ];
   if (opts.query !== undefined && opts.query.trim().length > 0) {
+    if (opts.query.length > 2048) {
+      return Promise.resolve({
+        ok: false,
+        kind: "bad_input",
+        error: `query expression too long (${opts.query.length} chars; max 2048). Simplify the JMESPath expression.`,
+      });
+    }
     args.push("--query", opts.query);
   }
   if (opts.params !== undefined && Object.keys(opts.params).length > 0) {
     args.push("--cli-input-json", JSON.stringify(opts.params));
   }
 
+  // Display-only string for logging/MCP response -- NOT copy-paste shell-safe.
+  // The real invocation uses the argv array above (no shell, no quoting needed).
+  // Values containing spaces or shell metacharacters will look misleading here.
   const displayCommand = [command, ...redactDisplayArgs(args)].join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
@@ -265,6 +288,10 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       if (procHasExited(proc)) return;
       killed = true;
       timedOut = true;
+      // killProc sends SIGTERM then escalates to SIGKILL, so the process WILL
+      // exit and 'exit' WILL fire -- that is where settle() is called.
+      // No watchdog timeout is needed here by design: SIGKILL is unconditional
+      // on every platform the CLI targets, so the exit event is guaranteed.
       killProc(proc);
     }, timeoutMs);
 

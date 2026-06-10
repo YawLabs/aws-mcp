@@ -10,13 +10,34 @@
 
 import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
-import { describe, it } from "node:test";
+import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runAwsCall } from "../aws-cli.js";
-import { parseLogsJsonOutput } from "./logs.js";
+import { logsTools, parseLogsJsonOutput } from "./logs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
+
+// Wire the tool handler at the fake aws binary for handler-level tests (the
+// same knobs logs.test.ts uses so the handler's internal runAwsCall spawns it).
+let prevCommand: string | undefined;
+let prevPrefixArgs: string | undefined;
+before(() => {
+  prevCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+  prevPrefixArgs = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+  process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+  process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+});
+after(() => {
+  if (prevCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+  else process.env.AWS_MCP_TEST_AWS_COMMAND = prevCommand;
+  if (prevPrefixArgs === undefined) delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+  else process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = prevPrefixArgs;
+});
+
+afterEach(() => {
+  delete process.env.AWS_MCP_FAKE_SCENARIO;
+});
 
 function fakeOpts(scenario: string) {
   return {
@@ -106,5 +127,26 @@ describe("aws_logs_tail — NDJSON output end-to-end", () => {
     const events = parseLogsJsonOutput(r.data ?? "");
     assert.ok(Array.isArray(events));
     assert.equal(events.length, 0);
+  });
+});
+
+const handlerTool = logsTools.find((t) => t.name === "aws_logs_tail");
+if (!handlerTool) throw new Error("logsTools missing aws_logs_tail");
+
+describe("aws_logs_tail handler — malformed NDJSON fallback", () => {
+  it("surfaces eventCount=null and the raw blob when a line fails to parse", async () => {
+    // The fake-aws scenario logs_tail_ndjson_malformed emits three lines where
+    // the middle line is not valid JSON (see fake-aws.ts:437). The handler
+    // runs parseLogsJsonOutput on the raw stdout, which gives up on the bad
+    // line and returns the unparsed string. The handler then sets
+    // eventCount=null (because events is a string, not an array) and surfaces
+    // the raw blob under `events` for diagnosis.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_malformed";
+    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn" });
+    assert.equal(r.ok, true);
+    const data = r.data as { eventCount: number | null; events: unknown };
+    assert.equal(data.eventCount, null, "eventCount must be null when NDJSON contains an unparseable line");
+    assert.equal(typeof data.events, "string", "events must be the raw string fallback for diagnosis");
+    assert.ok((data.events as string).includes("this-line-is-not-json"), "raw blob should contain the offending line");
   });
 });

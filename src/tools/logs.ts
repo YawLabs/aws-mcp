@@ -25,7 +25,12 @@ const LOG_GROUP_RE = /^[.A-Za-z0-9_/#][.\-_/#A-Za-z0-9]{0,511}$/;
 // AWS log stream names: 1-512 chars, ':' and '*' disallowed by AWS. We also
 // reject leading '-' (argv-injection defense) and ASCII control characters.
 // Real-world stream names include slashes and brackets, e.g.
-// '2026/04/21/[$LATEST]abc' for Lambda — those must still match.
+// '2026/04/21/[$LATEST]abc' for Lambda -- those must still match.
+//
+// Embedded spaces ARE intentionally allowed here. AWS CreateLogStream's own
+// pattern is [^:*]*, which permits spaces. Our validator's job is
+// argv-safety (block leading '-', block ':' and '*', block control chars),
+// not strict AWS-name validity. A "stream with space" is a legal stream name.
 const LOG_STREAM_NAME_RE = /^[^-:*\s][^:*]{0,511}$/;
 
 /**
@@ -180,6 +185,12 @@ export const logsTools: readonly Tool[] = [
         extraFlags.push("--log-stream-name-prefix", i.logStreamNamePrefix);
       }
 
+      // outputFormat:'json' causes runAwsCall to append '--output json' to
+      // the argv. 'aws logs tail' ignores '--output' entirely (it is a
+      // high-level command that always writes its own NDJSON; the standard
+      // '--output' flag has no effect). The flag is a no-op here, not a
+      // conflict -- the actual JSON shaping comes from '--format json' in
+      // extraFlags above.
       const result = await runAwsCall({
         service: "logs",
         operation: "tail",

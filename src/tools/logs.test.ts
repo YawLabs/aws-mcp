@@ -140,6 +140,15 @@ describe("isValidLogStreamName", () => {
     assert.equal(isValidLogStreamName(":leading-colon"), false);
   });
 
+  it("allows embedded spaces (AWS permits them; only leading whitespace is blocked)", () => {
+    // CloudWatch's CreateLogStream pattern is [^:*]*, which allows spaces.
+    // Our validator blocks a leading space (argv-safety) but must not forbid
+    // spaces elsewhere -- a future 'fix' removing the space carve-out would
+    // reject real stream names.
+    assert.equal(isValidLogStreamName("stream with space"), true);
+    assert.equal(isValidLogStreamName("my stream/2026"), true);
+  });
+
   it("rejects control characters and whitespace leads", () => {
     assert.equal(isValidLogStreamName("bad\x01name"), false);
     assert.equal(isValidLogStreamName(" leading-space"), false);
