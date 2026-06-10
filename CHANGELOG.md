@@ -11,8 +11,10 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
-Next release should be a MINOR bump (1.5.0): the `aws_iam_simulate` summary
-change below alters what the stable `denied` field counts.
+## [1.5.0] - 2026-06-10
+
+Minor (not patch) because the `aws_iam_simulate` summary change alters what
+the stable `denied` field counts.
 
 ### Changed
 - `aws_iam_simulate` summary now reports `unknown` separately:
@@ -612,7 +614,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/YawLabs/aws-mcp/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/YawLabs/aws-mcp/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/YawLabs/aws-mcp/compare/v1.3.3...v1.4.0
 [1.3.3]: https://github.com/YawLabs/aws-mcp/compare/v1.3.2...v1.3.3
