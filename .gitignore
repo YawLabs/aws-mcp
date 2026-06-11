@@ -7,3 +7,8 @@ dist/
 
 # Playwright MCP browser-automation artifacts (page snapshots, console logs)
 .playwright-mcp/
+
+# Single-binary build pipeline (Node SEA): build-binary.mjs + stage-release-asset.mjs
+bin/
+build-tmp/
+dist-release/

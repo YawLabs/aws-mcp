@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -81,11 +82,32 @@ const version =
     ? __VERSION__
     : ((await import("node:module")).createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
+// True inside a Node Single Executable Application (the SEA binary). In the
+// CJS bundle esbuild emits for the binary, `import.meta.url` is empty, so the
+// argv[1] check below can never match -- without this short-circuit the binary
+// would do nothing. A SEA is always its own entry point (never imported as a
+// test module), so isSea() === true is a reliable "this is the entry" signal.
+// node:sea exists on Node >= 20.12 and isSea() is true only inside a SEA, so a
+// missing module or thrown call (plain `node`) safely falls through to false.
+const isSeaBinary = (() => {
+  try {
+    // In the CJS SEA bundle `import.meta.url` is empty, which makes
+    // createRequire(import.meta.url) throw -- fall back to a valid base
+    // (process.execPath) so node:sea still resolves inside the binary.
+    const base = import.meta.url || pathToFileURL(process.execPath).href;
+    const require = createRequire(base);
+    const sea = require("node:sea") as { isSea?: () => boolean };
+    return typeof sea.isSea === "function" && sea.isSea() === true;
+  } catch {
+    return false;
+  }
+})();
+
 // True when this module is the process entry point (run as the `aws-mcp` bin),
 // false when it's imported (e.g. by index.test.js for the exported pure
 // functions). Gates the stdio-server bootstrap below so importing the module
 // doesn't connect a transport or print the ready line as a side effect.
-const isEntryPoint = (() => {
+const isEntryPoint = isSeaBinary || (() => {
   const entry = process.argv[1];
   if (!entry) return false;
   return import.meta.url === pathToFileURL(entry).href;
@@ -140,6 +162,15 @@ if (isEntryPoint) {
   }
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error(`@yawlabs/aws-mcp v${version} ready (${allTools.length} tools)`);
+  // Non-top-level-await form so the CJS bundle (esbuild, for the SEA binary)
+  // builds -- CJS output cannot emit top-level await.
+  server
+    .connect(transport)
+    .then(() => {
+      console.error(`@yawlabs/aws-mcp v${version} ready (${allTools.length} tools)`);
+    })
+    .catch((err: unknown) => {
+      process.stderr.write(`aws-mcp: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    });
 }

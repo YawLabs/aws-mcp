@@ -45,6 +45,7 @@
     "@types/turndown": "^5.0.6",
     "esbuild": "^0.28.0",
     "node-html-parser": "^7.1.0",
+    "postject": "^1.0.0-alpha.6",
     "turndown": "^7.2.4",
     "typescript": "^6.0.3",
     "zod": "^4.3.6"
