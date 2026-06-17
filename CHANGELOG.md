@@ -11,6 +11,85 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-06-17
+
+Patch release. The headline is a prototype-pollution fix in
+`aws_resource_diff` -- a JSON Patch document with a `__proto__`,
+`constructor`, or `prototype` segment could write onto the host process's
+`Object.prototype` for the lifetime of the MCP server. Verified at
+runtime against `dist/tools/resource.js` v1.5.1 and now denied at the
+patch-walk boundary. Plus nine other low-risk hygiene fixes from a
+full-pass audit, a CI test workflow, and dependency hardening that
+closes all eleven open Dependabot alerts.
+
+### Security
+- `aws_resource_diff`: the JSON Patch simulator (`_applyJsonPatchInPlace`)
+  now rejects `__proto__`, `constructor`, and `prototype` segments at
+  every position in the patch walk. Existing-key checks in the descend
+  use `Object.prototype.hasOwnProperty.call` instead of the prototype-
+  chain-aware `in` operator. Previously, a patch like
+  `{op:'add', path:'/__proto__/polluted', value:'X'}` wrote onto the
+  server's host `Object.prototype` -- reachable from any model that can
+  call `aws_resource_diff`.
+
+### Fixed
+- `aws_multi_region`: per-region worker now catches synchronous throws
+  from `runAwsCall` (e.g. a script-shaped input missing `operation`),
+  surfacing them as a per-region `errorKind: 'unexpected'` rather than
+  rejecting the whole call and abandoning every other in-flight region.
+- `aws_assume_role`: on STS failure, the error envelope no longer falls
+  back to `result.rawStdout`. assume-role writes the credential blob to
+  stdout, so a partial JSON fragment from a non-zero exit could leak
+  token material into `rawBody`; stderr-only now.
+- `aws_assume_role`: EACCES/EROFS/EPERM from writing
+  `~/.aws/credentials` now surfaces as a friendly
+  `Cannot write <path> (permission denied)...` ToolResult rather than
+  the raw `.lock`-sidecar errno bubbling out.
+- `aws-credentials`: `mergeProfileBody` now case-folds the parsed key
+  before the managed-set check, so a hand-edited `AWS_ACCESS_KEY_ID`
+  is replaced in place rather than left intact while a duplicate
+  lowercase line gets appended below.
+- `aws_logs_tail`: `filterPattern` now rejects a leading `-`, matching
+  the uniform leading-hyphen guard the file-header comment promises
+  for every free-text field.
+- `aws_metrics_query`: an empty `dimensions: {}` is now treated as no
+  dimensions instead of emitting `Dimensions: []`, which CloudWatch
+  rejected with a ValidationError.
+- `aws_docs_search`: the URL allowlist that gates `aws_docs_read` is
+  now also applied to search results -- search never advertises a URL
+  the read tool would refuse to fetch.
+- `aws_iam_simulate`: inline-policy matches that carry
+  `SourcePolicyType` but no `SourcePolicyId` now synthesize an
+  `inline#L<line>` (or bare `inline`) identifier in
+  `matchedStatementIds` instead of being silently dropped. Malformed
+  entries (null/number SourcePolicyId) still drop -- those are
+  CLI-shape errors, not inline-policy signals.
+
+### Changed
+- `aws_metrics_query`: schema descriptions for `unit` and `expression`
+  now note that those fields are validated server-side by CloudWatch,
+  setting expectation for a downstream `ValidationError` on a malformed
+  value rather than a local rejection.
+
+### Internal
+- New CI workflow at `.github/workflows/ci.yml`: lint + test on
+  push-to-main and PRs, matrix across ubuntu/windows/macos with Node
+  22. Cancel-in-progress for newer-run-wins on the same branch.
+- New `.gitattributes` forcing LF line endings on every checkout so
+  the Windows CI runner's git autocrlf doesn't convert source files
+  to CRLF and trip biome's line-ending check.
+- New `CODEOWNERS` for SOC 2 compliance.
+- Close 11 Dependabot alerts via patch bumps: `esbuild` ^0.28.0 ->
+  ^0.28.1 (advisory in `esbuild --serve`, which the build path never
+  invokes -- `build.mjs` uses esbuild's bundle API), and `overrides`
+  for `hono` ^4.12.25 + `qs` ^6.15.2 (transitive via
+  `@modelcontextprotocol/sdk` -> `express` + `@hono/node-server`; all
+  in HTTP transports aws-mcp never loads -- it only imports
+  `StdioServerTransport`).
+- 23 new tests across 8 files, including 9 for the proto-pollution
+  fix (all three reserved segments x final/intermediate positions x
+  add/replace, each with an `Object.prototype` leakage assertion).
+
 ## [1.5.0] - 2026-06-10
 
 Minor (not patch) because the `aws_iam_simulate` summary change alters what
@@ -614,7 +693,9 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/YawLabs/aws-mcp/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/YawLabs/aws-mcp/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/YawLabs/aws-mcp/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/YawLabs/aws-mcp/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/YawLabs/aws-mcp/compare/v1.3.3...v1.4.0
