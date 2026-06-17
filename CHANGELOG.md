@@ -11,6 +11,18 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.5.3] - 2026-06-17
+
+Patch release. Fixes a bug in `scripts/update-manifests.mjs` where
+`git pull --rebase` ran after writing the manifest files to disk,
+causing `--push` to fail with a dirty-tree error. No change to the
+published npm package.
+
+### Fixed
+- `scripts/update-manifests.mjs`: reorder `commitPush` to
+  `add -> commit -> pull --rebase -> push` so the tree is clean when
+  git fetches upstream changes.
+
 ## [1.5.2] - 2026-06-17
 
 Patch release. The headline is a prototype-pollution fix in
@@ -693,7 +705,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/YawLabs/aws-mcp/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/YawLabs/aws-mcp/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/YawLabs/aws-mcp/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/YawLabs/aws-mcp/compare/v1.4.1...v1.5.0
