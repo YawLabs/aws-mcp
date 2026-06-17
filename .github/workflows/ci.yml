@@ -1,0 +1,51 @@
+# Lint + typecheck + tests on every push to main and every PR targeting main.
+# Release-tag pushes are handled by release.yml; this workflow filters them
+# out via `branches: [main]` (the tag push doesn't carry a branch ref).
+#
+# Matrix kept small (one Node major x three OS) because the package targets
+# Node 22+ (engines.node) and OS-specific failures here are usually
+# path-handling: line endings, the MSYS argv-translation gotcha, the
+# `path.join` skew on Windows runners. macOS coverage catches things that
+# pass on Linux but fail under Darwin's stricter SIGPIPE handling.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Newer runs on the same branch supersede in-flight ones -- saves runner
+# minutes when someone force-pushes a quick fixup. Releases use
+# cancel-in-progress: false; this is the inverse case (PR / main pushes
+# are cheap to redo).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # biome check (read-only -- never --write in CI). Format drift breaks
+      # release.yml on tag-push, so catching it here keeps tag-push green.
+      - run: npm run lint
+
+      # `npm test` already runs `npm run build` (tsc + esbuild) before
+      # node:test, so type errors surface via the build step -- no separate
+      # `tsc --noEmit` needed.
+      - run: npm test
