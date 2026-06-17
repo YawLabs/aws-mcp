@@ -162,9 +162,12 @@ console.log(`wrote ${formulaPath}`);
 const SSH = 'ssh -i ~/.ssh/gh_woods -o IdentitiesOnly=yes';
 function commitPush(dir, file, msg) {
   const git = (...a) => execFileSync('git', ['-C', dir, ...a], { stdio: 'inherit', env: { ...process.env, GIT_SSH_COMMAND: SSH } });
-  git('pull', '--rebase', 'origin', 'main');
+  // Commit the already-written manifest first (tree is dirty at this point),
+  // then rebase onto origin to pick up any upstream changes, then push.
+  // pull --rebase BEFORE the write would fail on a dirty tree.
   git('add', file);
   git('commit', '-m', msg);
+  git('pull', '--rebase', 'origin', 'main');
   git('push', 'origin', 'main');
 }
 if (push) {
