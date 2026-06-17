@@ -1,0 +1,19 @@
+# Force LF line endings on every checkout, including Windows runners.
+# Without this, the Windows CI checkout converts LF -> CRLF (git's
+# core.autocrlf default on Windows) and biome's lint step flags every
+# source file for line-ending mismatch ("Found 47 errors. Checked 47 files.")
+# while ubuntu and macOS runners pass cleanly.
+* text=auto eol=lf
+
+# Lockfiles and shell scripts that should always be LF, no autodetection.
+package-lock.json text eol=lf
+*.sh text eol=lf
+
+# Binaries that should NEVER be treated as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
