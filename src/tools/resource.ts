@@ -930,6 +930,11 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
       throw new Error(`op '${op.op}' at index ${i} is not implemented in aws_resource_diff (use add/remove/replace).`);
     }
     const tokens = parseJsonPointer(op.path);
+    for (const seg of tokens) {
+      if (seg === "__proto__" || seg === "constructor" || seg === "prototype") {
+        throw new Error(`Path '${op.path}' contains reserved segment '${seg}' at op index ${i}.`);
+      }
+    }
     if (tokens.length === 0) {
       // Whole-document replace/add/remove. RFC 6902 says `add` at the root
       // REPLACES the document when one exists (not an error) -- same effective
@@ -972,7 +977,7 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
         }
         parent = parent[idx];
       } else if (isObj(parent)) {
-        if (!(segment in parent)) {
+        if (!Object.hasOwn(parent, segment)) {
           if (op.op === "add") {
             parent[segment] = {};
             parent = parent[segment];
@@ -1022,12 +1027,12 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
       }
     } else if (isObj(parent)) {
       if (op.op === "remove") {
-        if (!(lastToken in parent)) {
+        if (!Object.hasOwn(parent, lastToken)) {
           throw new Error(`Cannot remove missing key '${lastToken}' at index ${i}.`);
         }
         delete parent[lastToken];
       } else if (op.op === "replace") {
-        if (!(lastToken in parent)) {
+        if (!Object.hasOwn(parent, lastToken)) {
           throw new Error(`Cannot replace missing key '${lastToken}' at index ${i} (use 'add' to create it).`);
         }
         parent[lastToken] = clone(op.value);

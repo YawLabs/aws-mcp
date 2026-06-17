@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -433,5 +433,54 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // Sanity check that the small timeout actually took effect rather than
     // waiting for the 5s sleep or the 120s default.
     assert.ok(elapsed < 4000, `expected fast timeout, got ${elapsed}ms`);
+  });
+
+  it("returns a friendly ToolResult when ~/.aws is not writable (EACCES; skipped on Windows)", async () => {
+    // STS returns valid creds; the failure is purely on the local write path.
+    // The handler must catch the EACCES that propagates out of upsertProfile
+    // and surface the friendly 'Cannot write ... permission denied' message
+    // -- otherwise the raw .lock-sidecar errno bubbles to errorToMcpResult and
+    // the agent has no actionable hint for what went wrong.
+    //
+    // Skipped on Windows: chmod against an NTFS directory does not reliably
+    // produce EACCES on a subsequent openSync via Node, so the scenario can
+    // only be simulated portably on Unix. The friendly-error mapping itself
+    // is platform-agnostic and exercised by the production path on either OS.
+    if (platform() === "win32") return;
+
+    // Use an isolated HOME so the chmod cannot leak to other tests in this
+    // file (the shared `fakeHome` in the before() block stays untouched).
+    const isolatedHome = mkdtempSync(join(tmpdir(), "aws-mcp-assume-eacces-"));
+    const awsDir = join(isolatedHome, ".aws");
+    mkdirSync(awsDir, { recursive: true });
+    const savedHome = process.env.HOME;
+    const savedUserprofile = process.env.USERPROFILE;
+    process.env.HOME = isolatedHome;
+    process.env.USERPROFILE = isolatedHome;
+
+    try {
+      // Deny all permissions on .aws: acquireLock's openSync(<path>.lock, 'wx')
+      // hits EACCES, which upsertProfile rethrows synchronously.
+      chmodSync(awsDir, 0o000);
+      process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+      const r = await tool.handler({
+        roleArn: "arn:aws:iam::123456789012:role/TestRole",
+        sessionName: "eacces-test",
+      } as never);
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /Cannot write/);
+      assert.match(r.error ?? "", /permission denied/);
+    } finally {
+      // Restore perms before cleanup so rmSync can descend.
+      try {
+        chmodSync(awsDir, 0o700);
+      } catch {
+        // best-effort
+      }
+      process.env.HOME = savedHome;
+      process.env.USERPROFILE = savedUserprofile;
+      delete process.env.AWS_MCP_FAKE_SCENARIO;
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
   });
 });

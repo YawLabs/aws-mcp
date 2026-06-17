@@ -201,6 +201,38 @@ describe("aws_multi_region handler", () => {
     }
   });
 
+  it("catches synchronous throws from runAwsCall when input bypasses Zod (aws_script bridge case)", async () => {
+    // The aws_script bridge (script.ts) unwraps and re-dispatches without
+    // Zod re-validation, so a script can hand the handler an input shape
+    // that Zod would have rejected -- e.g. `operation` missing entirely.
+    // runAwsCall does `opts.operation.trim()` before its bad-input check,
+    // which throws synchronously when operation is undefined. Without the
+    // per-task try/catch in the region worker, that rejection escapes
+    // Promise.all and the whole multi_region call rejects instead of
+    // returning a per-region result array. With the catch, each region
+    // surfaces ok:false, errorKind:'unexpected'.
+    const result = await tool.handler({
+      service: "s3api",
+      // operation deliberately omitted -- mirrors aws_script bypassing Zod
+      regions: ["us-east-1", "us-west-2"],
+    } as never);
+    assert.equal(result.ok, true);
+    const data = result.data as {
+      regionCount: number;
+      okCount: number;
+      errorCount: number;
+      results: { region: string; ok: boolean; error?: string; errorKind?: string }[];
+    };
+    assert.equal(data.regionCount, 2);
+    assert.equal(data.okCount, 0);
+    assert.equal(data.errorCount, 2);
+    for (const r of data.results) {
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "unexpected");
+      assert.ok(r.error && r.error.length > 0, `region ${r.region} must carry an error message`);
+    }
+  });
+
   it("dedupes repeated regions before dispatching", async () => {
     const result = await tool.handler({
       service: "s3api",

@@ -171,6 +171,19 @@ export const logsTools: readonly Tool[] = [
           error: `Invalid logStreamNamePrefix '${i.logStreamNamePrefix}'. Must be 1-512 chars, not start with '-', and contain no ':', '*', or control characters.`,
         };
       }
+      // Argv-injection defense for filterPattern: the value lands as its own
+      // argv entry after --filter-pattern, which CloudWatch consumes as the
+      // pattern itself (so a leading '-' is not actually exploitable here).
+      // The reject still matches the uniform leading-hyphen guard the
+      // file-level comment promises, and a real CloudWatch filter pattern
+      // never legitimately starts with '-' -- patterns either start with a
+      // quote, a literal word, or '[' for structured matching.
+      if (i.filterPattern?.startsWith("-")) {
+        return {
+          ok: false,
+          error: "Invalid filterPattern: must not start with '-'.",
+        };
+      }
 
       // aws logs tail expects the log group name as a positional before any
       // flags. We inject it as the first entry of extraFlags so runAwsCall

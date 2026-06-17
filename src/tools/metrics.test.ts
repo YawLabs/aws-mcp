@@ -207,6 +207,18 @@ describe("buildMetricDataQueries", () => {
     const out = buildMetricDataQueries([{ id: "x", namespace: "AWS/SQS", metricName: "NumberOfMessagesReceived" }], 60);
     assert.equal((out[0].MetricStat?.Metric as { Dimensions?: unknown }).Dimensions, undefined);
   });
+
+  it("omits Dimensions when q.dimensions is an empty object (was a CloudWatch ValidationError)", () => {
+    // Object.entries({}) is [], and [] is truthy. A naive
+    // `dimensions ? { Dimensions: dimensions } : {}` would emit
+    // `Dimensions: []`, which CloudWatch rejects with a ValidationError.
+    // Treat empty the same as undefined.
+    const out = buildMetricDataQueries(
+      [{ id: "x", namespace: "AWS/SQS", metricName: "NumberOfMessagesReceived", dimensions: {} }],
+      60,
+    );
+    assert.equal((out[0].MetricStat?.Metric as { Dimensions?: unknown }).Dimensions, undefined);
+  });
 });
 
 describe("aws_metrics_query schema", () => {

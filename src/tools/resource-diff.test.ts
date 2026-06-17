@@ -558,3 +558,32 @@ describe("aws_resource_diff schema", () => {
     }
   });
 });
+
+describe("applyJsonPatch -- prototype pollution defense", () => {
+  // Proven at v1.5.1: applyJsonPatch({}, [{op:'add', path:'/__proto__/polluted', value:'PWNED'}])
+  // wrote 'PWNED' onto host Object.prototype. The denylist + hasOwnProperty
+  // guards block all three reserved segments at every position. Each test
+  // re-asserts ({} as any).polluted === undefined so a regression in the
+  // denylist surfaces as a leakage assertion rather than only a missing throw.
+  const reserved = ["__proto__", "constructor", "prototype"] as const;
+
+  for (const seg of reserved) {
+    it(`rejects 'add' on a final-position '${seg}' segment without polluting Object.prototype`, () => {
+      assert.throws(() => applyJsonPatch({}, [{ op: "add", path: `/${seg}`, value: "PWNED" }]), /reserved segment/);
+      assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    });
+
+    it(`rejects 'add' on an intermediate-position '${seg}' segment without polluting Object.prototype`, () => {
+      assert.throws(
+        () => applyJsonPatch({}, [{ op: "add", path: `/${seg}/polluted`, value: "PWNED" }]),
+        /reserved segment/,
+      );
+      assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    });
+
+    it(`rejects 'replace' on a final-position '${seg}' segment without polluting Object.prototype`, () => {
+      assert.throws(() => applyJsonPatch({}, [{ op: "replace", path: `/${seg}`, value: "PWNED" }]), /reserved segment/);
+      assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    });
+  }
+});

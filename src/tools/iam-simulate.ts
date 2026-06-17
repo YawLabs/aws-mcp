@@ -88,9 +88,36 @@ export function parseSimulationResults(raw: unknown): SimulationResult[] {
     const matched = Array.isArray(er.MatchedStatements) ? er.MatchedStatements : [];
     const ids: string[] = [];
     for (const m of matched) {
-      if (m && typeof m === "object" && typeof (m as Record<string, unknown>).SourcePolicyId === "string") {
-        ids.push((m as Record<string, unknown>).SourcePolicyId as string);
+      if (!m || typeof m !== "object") continue;
+      const ms = m as Record<string, unknown>;
+      const sourceId = ms.SourcePolicyId;
+      if (typeof sourceId === "string" && sourceId.length > 0) {
+        ids.push(sourceId);
+        continue;
       }
+      // SourcePolicyId is present-but-malformed (null, a number, an array, ...).
+      // Preserve the prior silent-drop behavior -- that's a CLI-shape error,
+      // not an inline-policy signal. Only the absent / empty-string cases fall
+      // through to the synthesize branch below.
+      if (sourceId !== undefined && sourceId !== "") continue;
+      // Inline-policy matches (and certain implicit sources) come back with
+      // an ABSENT (or empty-string) SourcePolicyId but still carry
+      // SourcePolicyType plus StartPosition.{Line,Column}. Synthesize an id
+      // so the flat matchedStatementIds field doesn't silently drop the
+      // match (the raw evaluationResults is still preserved for callers that
+      // want the full body). Decision/summary counts are unaffected -- they
+      // read EvalDecision, not these IDs.
+      const sourceType = ms.SourcePolicyType;
+      if (typeof sourceType !== "string") continue;
+      const startPos = ms.StartPosition;
+      if (startPos && typeof startPos === "object") {
+        const line = (startPos as Record<string, unknown>).Line;
+        if (typeof line === "number") {
+          ids.push(`inline#L${line}`);
+          continue;
+        }
+      }
+      ids.push("inline");
     }
     if (ids.length > 0) result.matchedStatementIds = ids;
 

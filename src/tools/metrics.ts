@@ -205,15 +205,16 @@ export function buildMetricDataQueries(
       return base;
     }
     // metric-stat flavor: namespace + metricName guaranteed by the caller-
-    // side guard. Defaults: Stat=Average, Period=autoPeriod.
-    const dimensions = q.dimensions
-      ? Object.entries(q.dimensions).map(([Name, Value]) => ({ Name, Value }))
-      : undefined;
+    // side guard. Defaults: Stat=Average, Period=autoPeriod. Treat an empty
+    // dimensions map ({}) the same as no dimensions: Object.entries({}) is []
+    // and [] is truthy, so a naive `dimensions ? ...` test would emit
+    // `Dimensions: []`, which CloudWatch rejects with a ValidationError.
+    const dimEntries = q.dimensions ? Object.entries(q.dimensions) : [];
     const stat: CloudWatchMetricStat = {
       Metric: {
         Namespace: q.namespace as string,
         MetricName: q.metricName as string,
-        ...(dimensions ? { Dimensions: dimensions } : {}),
+        ...(dimEntries.length > 0 ? { Dimensions: dimEntries.map(([Name, Value]) => ({ Name, Value })) } : {}),
       },
       Period: q.period ?? autoPeriod,
       Stat: q.statistic !== undefined ? canonicalizeStatistic(q.statistic) : "Average",
@@ -288,7 +289,7 @@ export const metricsTools: readonly Tool[] = [
               .min(1)
               .optional()
               .describe(
-                "CloudWatch metric math expression, e.g. 'SUM([m1, m2])' or 'AVG(METRICS(\"AWS/Lambda\"))'. Mutually exclusive with namespace/metricName/dimensions.",
+                "CloudWatch metric math expression, e.g. 'SUM([m1, m2])' or 'AVG(METRICS(\"AWS/Lambda\"))'. Mutually exclusive with namespace/metricName/dimensions. Validated server-side by CloudWatch; malformed values surface as a downstream ValidationError rather than a local rejection.",
               ),
             label: z.string().optional().describe("Human-readable label for the series in the response."),
             returnData: z
@@ -301,7 +302,7 @@ export const metricsTools: readonly Tool[] = [
               .string()
               .optional()
               .describe(
-                "Restrict to a specific Unit (e.g. 'Seconds', 'Bytes'). Default: no filter. Only meaningful on metric-stat queries.",
+                "Restrict to a specific Unit (e.g. 'Seconds', 'Bytes'). Default: no filter. Only meaningful on metric-stat queries. Validated server-side by CloudWatch; malformed values surface as a downstream ValidationError rather than a local rejection.",
               ),
           }),
         )

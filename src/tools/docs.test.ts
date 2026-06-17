@@ -657,3 +657,40 @@ describe("parseSearchResults — schema-drift warning", () => {
     assert.equal(warned.length, 0, "an empty suggestions array is the no-match case, not a schema break");
   });
 });
+
+describe("parseSearchResults -- URL allowlist", () => {
+  // The read tool gates on DOCS_URL_RE (https://docs.aws.amazon.com/...html).
+  // Mirror it on the search side so the agent never sees a result pointing at
+  // a URL the read tool would refuse to fetch -- the undocumented backend at
+  // proxy.search.docs.aws.com is a moving target.
+  it("drops results whose link fails the read-side allowlist", () => {
+    const json = {
+      suggestions: [
+        { textExcerptSuggestion: { link: "https://example.com/not-aws.html", title: "off-domain" } },
+        { textExcerptSuggestion: { link: "http://docs.aws.amazon.com/insecure.html", title: "non-https" } },
+        { textExcerptSuggestion: { link: "https://docs.aws.amazon.com/lambda/welcome", title: "missing .html" } },
+        { textExcerptSuggestion: { link: "https://docs.aws.amazon.com/lambda/welcome.html", title: "kept" } },
+      ],
+    };
+    const out = parseSearchResults(json, 10);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].title, "kept");
+    assert.equal(out[0].url, "https://docs.aws.amazon.com/lambda/welcome.html");
+  });
+
+  it("accepts a docs URL with query string and fragment (mirrors read-side regex)", () => {
+    const json = {
+      suggestions: [
+        {
+          textExcerptSuggestion: {
+            link: "https://docs.aws.amazon.com/lambda/welcome.html?query=1#section",
+            title: "with-query-and-fragment",
+          },
+        },
+      ],
+    };
+    const out = parseSearchResults(json, 10);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].title, "with-query-and-fragment");
+  });
+});

@@ -110,6 +110,12 @@ export function parseSearchResults(json: unknown, limit: number): DocsSearchResu
     const t = tes as Record<string, unknown>;
     const url = typeof t.link === "string" ? t.link : undefined;
     if (!url) continue;
+    // Apply the read-side allowlist here too so search and read agree on
+    // what counts as a valid AWS docs URL. The undocumented backend at
+    // proxy.search.docs.aws.com is a moving target, and an off-domain or
+    // non-https link surfaced to the agent would only be blocked when the
+    // agent tried to read it -- cheaper to drop the result up front.
+    if (!isValidDocsUrl(url)) continue;
     const title = typeof t.title === "string" ? t.title : url;
     const result: DocsSearchResult = { title, url };
     if (typeof t.summary === "string" && t.summary.length > 0) result.summary = t.summary;

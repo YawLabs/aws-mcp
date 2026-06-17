@@ -187,7 +187,14 @@ export const assumeTools: readonly Tool[] = [
             error: `SSO session expired for source profile '${sourceProfile}'. Call aws_login_start with profile='${sourceProfile}' before assuming.`,
           };
         }
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
+        // `aws sts assume-role --output json` writes the credential blob to
+        // STDOUT on success. On a non-zero exit the CLI still may have flushed
+        // a partial JSON fragment to stdout before failing; surfacing it as
+        // rawBody risks leaking secret material into error envelopes. Stick
+        // to stderr for this op specifically; if stderr is empty the upstream
+        // error string ("aws CLI exited with code X and no stderr") already
+        // carries enough signal for the caller.
+        return { ok: false, error: result.error, rawBody: result.rawStderr };
       }
 
       const data = (result.data ?? {}) as AssumeRoleCliResponse;
@@ -197,11 +204,29 @@ export const assumeTools: readonly Tool[] = [
       }
 
       const credentialsPath = join(homedir(), ".aws", "credentials");
-      await upsertProfile(credentialsPath, targetProfile, {
-        aws_access_key_id: creds.AccessKeyId,
-        aws_secret_access_key: creds.SecretAccessKey,
-        aws_session_token: creds.SessionToken,
-      });
+      try {
+        await upsertProfile(credentialsPath, targetProfile, {
+          aws_access_key_id: creds.AccessKeyId,
+          aws_secret_access_key: creds.SecretAccessKey,
+          aws_session_token: creds.SessionToken,
+        });
+      } catch (err) {
+        // acquireLock / openSync inside upsertProfile can throw a raw NodeJS
+        // ErrnoException when the credentials parent is read-only (EACCES /
+        // EROFS / EPERM). Surfacing the raw errno names the `.lock` sidecar
+        // instead of the credentials file and gives the caller no actionable
+        // hint. Translate the permission-class errnos to a friendly ToolResult;
+        // any other error propagates unchanged so the existing thrown-error
+        // path is preserved.
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EACCES" || code === "EROFS" || code === "EPERM") {
+          return {
+            ok: false,
+            error: `Cannot write ${credentialsPath} (permission denied). Check directory permissions or set AWS_SHARED_CREDENTIALS_FILE to a writable path.`,
+          };
+        }
+        throw err;
+      }
 
       const expiration = creds.Expiration;
       return {

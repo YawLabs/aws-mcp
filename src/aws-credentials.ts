@@ -109,7 +109,11 @@ function mergeProfileBody(existingBody: string, creds: AssumedCredentials): stri
       updated.push(line);
       continue;
     }
-    const key = line.slice(0, eqIdx).trim();
+    // AWS CLI / SDK treat credentials keys case-insensitively; a hand-edited
+    // `AWS_ACCESS_KEY_ID` line is the same key as our canonical lowercase.
+    // Lowercase before the managed-set check so the existing line is replaced
+    // in place rather than left untouched and shadowed by an appended dup.
+    const key = line.slice(0, eqIdx).trim().toLowerCase();
     if (managedKeys.has(key)) {
       seen.add(key);
       updated.push(`${key} = ${(creds as unknown as Record<string, string>)[key]}`);

@@ -284,4 +284,20 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid logStreamNamePrefix/);
   });
+
+  it("rejects a filterPattern that starts with '-'", async () => {
+    // filterPattern lands as the value position after --filter-pattern in
+    // argv, so a leading '-' is not actually exploitable -- but the file
+    // header comment promises uniform leading-hyphen defense across every
+    // free-text field. Real CloudWatch filter patterns never start with '-'
+    // (they start with a literal word, a quote, or '[' for structured
+    // matching), so the reject costs nothing and keeps the invariant honest.
+    const r = (await tool.handler({
+      logGroupName: "/aws/lambda/my-fn",
+      filterPattern: "-x",
+    })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /filterPattern/);
+    assert.match(r.error ?? "", /must not start with '-'/);
+  });
 });

@@ -811,8 +811,10 @@ async function main(): Promise<void> {
       //
       //  [2] A MatchedStatements array that MIXES a valid string SourcePolicyId
       //      ("KeepThis") with an entry whose SourcePolicyId is non-string
-      //      (null) and an entry missing SourcePolicyId entirely -> the filter
-      //      keeps ONLY "KeepThis". decision="explicitDeny" (denied bucket).
+      //      (null, malformed CLI shape -- stays dropped) and an entry
+      //      missing SourcePolicyId entirely (truly absent -- parseSimulationResults
+      //      now synthesizes 'inline' from SourcePolicyType for these). Result:
+      //      ["KeepThis", "inline"]. decision="explicitDeny" (denied bucket).
       //
       // Net summary: allowed=1, denied=2, total=3.
       process.stdout.write(

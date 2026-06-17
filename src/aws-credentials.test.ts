@@ -476,3 +476,54 @@ describe("upsertProfile — concurrent cross-process writers are serialized", ()
     );
   });
 });
+
+describe("upsertProfileIntoText -- case-insensitive managed-key merge", () => {
+  // The AWS CLI / SDK treat credentials keys case-insensitively; a hand-edited
+  // 'AWS_ACCESS_KEY_ID' is the same key as our canonical 'aws_access_key_id'.
+  // The merge must recognize the casing variant and REPLACE the line in place,
+  // not leave it untouched and append a duplicate lowercase line below.
+  it("replaces an uppercase AWS_ACCESS_KEY_ID in place rather than appending a duplicate", () => {
+    const existing = `[mcp-dev]
+AWS_ACCESS_KEY_ID = OLD
+aws_secret_access_key = old-secret
+aws_session_token = old-token
+`;
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    const accessKeyLines = out.split("\n").filter((l) => /aws_access_key_id/i.test(l));
+    assert.equal(
+      accessKeyLines.length,
+      1,
+      `expected exactly one access-key line, got ${accessKeyLines.length}: ${accessKeyLines.join(" | ")}`,
+    );
+    assert.equal(accessKeyLines[0], "aws_access_key_id = AKIA-NEW-1");
+    assert.doesNotMatch(out, /AWS_ACCESS_KEY_ID/);
+  });
+
+  it("normalizes mixed-case managed keys to canonical lowercase", () => {
+    const existing = `[mcp-dev]
+Aws_Access_Key_Id = OLD
+AWS_SECRET_ACCESS_KEY = old-secret
+aws_session_token = old-token
+`;
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    assert.match(out, /^aws_access_key_id = AKIA-NEW-1$/m);
+    assert.match(out, /^aws_secret_access_key = secret-new-1$/m);
+    assert.match(out, /^aws_session_token = token-new-1$/m);
+    assert.doesNotMatch(out, /Aws_Access_Key_Id/);
+    assert.doesNotMatch(out, /AWS_SECRET_ACCESS_KEY/);
+  });
+
+  it("does not double-append when all three managed keys are uppercase", () => {
+    const existing = `[mcp-dev]
+AWS_ACCESS_KEY_ID = OLD-AK
+AWS_SECRET_ACCESS_KEY = OLD-SK
+AWS_SESSION_TOKEN = OLD-TOK
+`;
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    // Exactly one of each managed key, all in canonical lowercase form.
+    for (const k of ["aws_access_key_id", "aws_secret_access_key", "aws_session_token"]) {
+      const lines = out.split("\n").filter((l) => l.startsWith(`${k} = `));
+      assert.equal(lines.length, 1, `expected one '${k}' line, got ${lines.length}`);
+    }
+  });
+});

@@ -107,11 +107,13 @@ const isSeaBinary = (() => {
 // false when it's imported (e.g. by index.test.js for the exported pure
 // functions). Gates the stdio-server bootstrap below so importing the module
 // doesn't connect a transport or print the ready line as a side effect.
-const isEntryPoint = isSeaBinary || (() => {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  return import.meta.url === pathToFileURL(entry).href;
-})();
+const isEntryPoint =
+  isSeaBinary ||
+  (() => {
+    const entry = process.argv[1];
+    if (!entry) return false;
+    return import.meta.url === pathToFileURL(entry).href;
+  })();
 
 const subcommand = process.argv[2];
 if (isEntryPoint && (subcommand === "version" || subcommand === "--version")) {

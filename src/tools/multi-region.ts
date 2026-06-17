@@ -145,34 +145,43 @@ export const multiRegionTools: readonly Tool[] = [
       const concurrency = i.concurrency ?? DEFAULT_CONCURRENCY;
 
       const results = await runWithConcurrency(regions, concurrency, async (region): Promise<RegionResult> => {
-        if (!isValidRegionName(region)) {
+        try {
+          if (!isValidRegionName(region)) {
+            return {
+              region,
+              ok: false,
+              error: `Invalid region '${region}'. Must match ${REGION_NAME_RE} (e.g. 'us-east-1').`,
+              errorKind: "bad_input",
+            };
+          }
+          const r = await runAwsCall({
+            service: i.service,
+            operation: i.operation,
+            params: i.params,
+            query: i.query,
+            profile: i.profile,
+            region,
+            outputFormat: i.outputFormat,
+            timeoutMs: i.timeoutMs,
+          });
+          if (!r.ok) {
+            return {
+              region,
+              ok: false,
+              command: r.command,
+              error: r.error,
+              errorKind: r.kind,
+            };
+          }
+          return { region, ok: true, command: r.command, data: r.data };
+        } catch (err) {
           return {
             region,
             ok: false,
-            error: `Invalid region '${region}'. Must match ${REGION_NAME_RE} (e.g. 'us-east-1').`,
-            errorKind: "bad_input",
+            error: err instanceof Error ? err.message : String(err),
+            errorKind: "unexpected",
           };
         }
-        const r = await runAwsCall({
-          service: i.service,
-          operation: i.operation,
-          params: i.params,
-          query: i.query,
-          profile: i.profile,
-          region,
-          outputFormat: i.outputFormat,
-          timeoutMs: i.timeoutMs,
-        });
-        if (!r.ok) {
-          return {
-            region,
-            ok: false,
-            command: r.command,
-            error: r.error,
-            errorKind: r.kind,
-          };
-        }
-        return { region, ok: true, command: r.command, data: r.data };
       });
 
       const okCount = results.filter((r) => r.ok).length;

@@ -277,7 +277,11 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     //      permissionsBoundaryDecision "allowed".
     //  [2] ec2:TerminateInstances -- EvalDecision "explicitDeny" (denied);
     //      MatchedStatements mixes string "KeepThis" + null + a missing
-    //      SourcePolicyId -> only ["KeepThis"] survives the filter.
+    //      SourcePolicyId. The null entry is malformed-but-present (CLI shape
+    //      error) and stays dropped; the truly-missing-SourcePolicyId entry
+    //      now synthesizes 'inline' from its SourcePolicyType (inline-policy
+    //      matches normally come back without a SourcePolicyId).
+    //      Result: ["KeepThis", "inline"].
     process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/jeff",
@@ -317,8 +321,10 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     const terminate = data.results.find((res) => res.action === "ec2:TerminateInstances");
     assert.ok(terminate);
     assert.equal(terminate.decision, "explicitDeny");
-    // string "KeepThis" kept; null + missing SourcePolicyId dropped.
-    assert.deepEqual(terminate.matchedStatementIds, ["KeepThis"]);
+    // string "KeepThis" kept; the present-but-null entry stays dropped
+    // (malformed CLI shape); the entry truly missing SourcePolicyId now
+    // synthesizes "inline" from its SourcePolicyType.
+    assert.deepEqual(terminate.matchedStatementIds, ["KeepThis", "inline"]);
   });
 
   it("accepts a 2048-char resource and rejects a 2049-char one (length cap boundary)", async () => {
@@ -407,5 +413,82 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
       delete process.env.AWS_MCP_FAKE_ARGV_OUT;
       rmSync(sideChannelDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("parseSimulationResults -- inline-policy matches (no SourcePolicyId)", () => {
+  // Inline policies (and certain implicit sources) come back from IAM with
+  // SourcePolicyType + StartPosition but no SourcePolicyId. Without a
+  // fallback, the flat matchedStatementIds is empty and the agent sees an
+  // allowed/denied decision with no statement attribution -- the flat field
+  // the tool exists to provide is wrong. The fallback only fires on TRULY-
+  // ABSENT SourcePolicyId; present-but-malformed (null, number) is still
+  // dropped (those are CLI-shape errors, not inline-policy signals).
+  it("synthesizes 'inline#L<line>' from SourcePolicyType + StartPosition.Line", () => {
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "arn:aws:s3:::b/*",
+        EvalDecision: "allowed",
+        MatchedStatements: [
+          { SourcePolicyType: "IAM Policy", StartPosition: { Line: 5, Column: 9 } },
+          { SourcePolicyType: "IAM Policy", StartPosition: { Line: 12 } },
+        ],
+      },
+    ]);
+    assert.deepEqual(out[0].matchedStatementIds, ["inline#L5", "inline#L12"]);
+  });
+
+  it("falls back to bare 'inline' when StartPosition.Line is absent", () => {
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "*",
+        EvalDecision: "allowed",
+        MatchedStatements: [{ SourcePolicyType: "IAM Policy" }],
+      },
+    ]);
+    assert.deepEqual(out[0].matchedStatementIds, ["inline"]);
+  });
+
+  it("prefers a present SourcePolicyId over the fallback, regardless of SourcePolicyType", () => {
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "*",
+        EvalDecision: "allowed",
+        MatchedStatements: [{ SourcePolicyId: "ReadOnly", SourcePolicyType: "IAM Policy", StartPosition: { Line: 1 } }],
+      },
+    ]);
+    assert.deepEqual(out[0].matchedStatementIds, ["ReadOnly"]);
+  });
+
+  it("still drops MALFORMED-but-present SourcePolicyId (null / number)", () => {
+    // CLI-shape errors stay invisible -- they are not inline-policy matches,
+    // and surfacing 'inline' for them would mask the upstream bug.
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "*",
+        EvalDecision: "allowed",
+        MatchedStatements: [
+          { SourcePolicyId: null, SourcePolicyType: "IAM Policy" },
+          { SourcePolicyId: 42, SourcePolicyType: "IAM Policy" },
+        ],
+      },
+    ]);
+    assert.equal(out[0].matchedStatementIds, undefined);
+  });
+
+  it("skips entries with no SourcePolicyType at all (cannot synthesize anything)", () => {
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "*",
+        EvalDecision: "allowed",
+        MatchedStatements: [{ StartPosition: { Line: 5 } }],
+      },
+    ]);
+    assert.equal(out[0].matchedStatementIds, undefined);
   });
 });
