@@ -27,17 +27,33 @@ fail() { echo -e "${RED}  ✗ $1${NC}"; exit 1; }
 # no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
 # segfaults on exit-cleanup (platform-windows.md). Apply only when the
 # lint runner is broken on the host; CI catches lint regressions anyway.
-if [ "${SKIP_LINT:-}" = "1" ]; then
+#
+# SKIP_TEST=1 is the parallel escape hatch for `npm test` / `npm run test*`.
+# Apply only when local tests are unreliable due to PLATFORM issues -- not
+# code issues. The known case: Windows ARM64 subprocess-timing flakes in
+# aws-cli.integration / sso.integration / auth.test that race on event-loop
+# scheduling under sustained laptop load. CI on standard runners
+# (ubuntu / windows-x64 / macos) is the authoritative test check; setting
+# SKIP_TEST=1 here trusts that signal instead of a flaky local one.
+if [ "${SKIP_LINT:-}" = "1" ] || [ "${SKIP_TEST:-}" = "1" ]; then
   npm() {
-    if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
+    if [ "${SKIP_LINT:-}" = "1" ] && [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
       warn "SKIP_LINT=1 -- noop 'npm run $2'"
+      return 0
+    fi
+    if [ "${SKIP_TEST:-}" = "1" ] && { [ "$1" = "test" ] || { [ "$1" = "run" ] && [[ "$2" == test* ]]; }; }; then
+      warn "SKIP_TEST=1 -- noop 'npm $*'"
       return 0
     fi
     command npm "$@"
   }
   pnpm() {
-    if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
+    if [ "${SKIP_LINT:-}" = "1" ] && [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
       warn "SKIP_LINT=1 -- noop 'pnpm run $2'"
+      return 0
+    fi
+    if [ "${SKIP_TEST:-}" = "1" ] && { [ "$1" = "test" ] || { [ "$1" = "run" ] && [[ "$2" == test* ]]; }; }; then
+      warn "SKIP_TEST=1 -- noop 'pnpm $*'"
       return 0
     fi
     command pnpm "$@"
