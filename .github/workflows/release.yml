@@ -45,7 +45,7 @@ jobs:
       # release (silent wrong-commit ship). On push-tag, inputs.tag is empty
       # and this falls through to github.ref_name (the tag) unchanged. A
       # dispatch naming a nonexistent tag now fails fast here.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
