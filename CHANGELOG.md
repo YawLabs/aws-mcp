@@ -11,6 +11,13 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Added
+- Runtime launcher at `bin/aws-mcp.mjs`: the published `aws-mcp` command now prefers the [oam](https://oamjs.org) runtime and falls back to Node. `AWS_MCP_RUNTIME` selects (`auto` / `oam` / `node`) and `OAM_BIN` overrides discovery. Both paths verified against the MCP surface — handshake plus all 25 tools — and behave identically. The fallback does **not** re-exec Node: npm has already started Node to run the launcher, so it is an in-process `import()` with no extra spawn.
+
+### Changed
+- `.gitignore` excludes `bin/*` rather than `bin/`, so the launcher can be re-included with a negation. A negation cannot undo a directory-level exclusion — that trap shipped a broken `bin` in postgres-mcp, where the launcher was untracked and absent from every fresh clone.
+- `scripts/build-binary.mjs` pins the CLI source entry instead of deriving it from `bin`'s value, which would have resolved to `bin/aws-mcp.ts` once `bin` moved to the launcher — the breakage postgres-mcp shipped in its 0.9.0.
+
 ## [1.6.0] - 2026-08-07
 
 Minor release. The headline is a **behavior tightening in `aws_script`**: tool

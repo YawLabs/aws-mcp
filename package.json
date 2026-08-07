@@ -20,9 +20,10 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "aws-mcp": "dist/index.js"
+    "aws-mcp": "bin/aws-mcp.mjs"
   },
   "files": [
+    "bin/aws-mcp.mjs",
     "dist/index.js",
     "dist/index.js.map",
     "LICENSE",
