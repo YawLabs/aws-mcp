@@ -9,7 +9,8 @@ dist/
 .playwright-mcp/
 
 # Single-binary build pipeline (Node SEA): build-binary.mjs + stage-release-asset.mjs
-bin/
+bin/*
+!bin/aws-mcp.mjs
 build-tmp/
 dist-release/
 
