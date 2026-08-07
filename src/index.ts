@@ -75,12 +75,24 @@ export function errorToMcpResult(err: unknown, toolName: string): McpResult {
   };
 }
 
-// Injected at build time by esbuild; falls back to reading package.json for tsc builds.
+// Injected at build time by esbuild; falls back to reading package.json for
+// plain-tsc builds.
+//
+// Uses the STATIC createRequire import above, not a dynamic
+// `(await import("node:module"))`. The dynamic form was both redundant (the
+// symbol is already imported for the isSeaBinary probe below) and a top-level
+// await -- which contradicts the deliberately TLA-free `server.connect().then()`
+// form at the bottom of this file, whose whole point is that the CJS SEA bundle
+// can't express top-level await. esbuild folds this ternary to `true ? "x" : ...`
+// but KEEPS the dead branch, and it used to rewrite the dynamic import to a bare
+// `null`, emitting `null.createRequire(...)`. So the fallback was dead code that
+// would also have thrown a TypeError had it ever run in a bundled build -- which
+// is every build we ship (package.json `files` publishes only the esbuild output).
 declare const __VERSION__: string | undefined;
 const version =
   typeof __VERSION__ !== "undefined"
     ? __VERSION__
-    : ((await import("node:module")).createRequire(import.meta.url)("../package.json") as { version: string }).version;
+    : (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
 // True inside a Node Single Executable Application (the SEA binary). In the
 // CJS bundle esbuild emits for the binary, `import.meta.url` is empty, so the

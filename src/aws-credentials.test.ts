@@ -527,3 +527,87 @@ AWS_SESSION_TOKEN = OLD-TOK
     }
   });
 });
+
+describe("upsertProfileIntoText header matching (regression)", () => {
+  const creds = {
+    aws_access_key_id: "AKIA_NEW",
+    aws_secret_access_key: "SEC_NEW",
+    aws_session_token: "TOK_NEW",
+  };
+  const body = "aws_access_key_id = OLD\naws_secret_access_key = OLD\naws_session_token = OLD\n";
+
+  // sectionName() used to do `header.slice(1, -1).trim()` on the RAW stored
+  // line. splitSections' regex tolerates trailing whitespace after `]`, so on
+  // "[mcp-dev]  " the slice dropped the final SPACE instead of the bracket and
+  // produced "mcp-dev]" -- matching nothing. upsertProfileIntoText then
+  // APPENDED a second [mcp-dev] section and left the stale credentials in the
+  // first one, so ~/.aws/credentials ended up with two same-named sections and
+  // whichever one botocore picked decided whether the caller got fresh creds.
+  for (const [label, header] of [
+    ["canonical", "[mcp-dev]"],
+    ["inner spaces", "[ mcp-dev ]"],
+    ["trailing space", "[mcp-dev]  "],
+    ["trailing tab", "[mcp-dev]\t"],
+  ] as const) {
+    it(`updates in place for a ${label} header instead of appending a duplicate`, () => {
+      const out = upsertProfileIntoText(`${header}\n${body}`, "mcp-dev", creds);
+      const headers = out.match(/^\[.*\]\s*$/gm) ?? [];
+      assert.equal(headers.length, 1, `expected exactly one section, got ${headers.length}: ${JSON.stringify(out)}`);
+      assert.ok(!out.includes("OLD"), `stale credentials must not survive: ${JSON.stringify(out)}`);
+      assert.ok(out.includes("aws_access_key_id = AKIA_NEW"));
+      // The matched section's header is normalized to the canonical form.
+      assert.equal(headers[0], "[mcp-dev]");
+    });
+  }
+
+  it("still appends when the profile genuinely is absent", () => {
+    const out = upsertProfileIntoText(`[other]\n${body}`, "mcp-dev", creds);
+    const headers = out.match(/^\[.*\]\s*$/gm) ?? [];
+    assert.deepEqual(headers, ["[other]", "[mcp-dev]"]);
+  });
+});
+
+describe("upsertProfile — trailing-whitespace header, through the real file path", () => {
+  // The sectionName fix is in the pure function, but the bug's real-world
+  // consequence lands in ~/.aws/credentials: a SECOND [mcp-dev] section
+  // appended below the first, with the stale credentials left in the one a
+  // parser may well read first. This drives the full path -- sidecar lock,
+  // temp-file write, atomic rename -- so the fix is pinned where it matters,
+  // not only in the string transform.
+  let dir: string;
+  let path: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "aws-mcp-creds-ws-"));
+    path = join(dir, "credentials");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  for (const [label, header] of [
+    ["trailing space", "[mcp-dev]  "],
+    ["trailing tab", "[mcp-dev]\t"],
+  ] as const) {
+    it(`updates in place on disk for a ${label} header`, async () => {
+      writeFileSync(
+        path,
+        `${header}
+aws_access_key_id = STALE
+aws_secret_access_key = stale-secret
+aws_session_token = stale-token
+`,
+      );
+      await upsertProfile(path, "mcp-dev", CREDS);
+      const text = readFileSync(path, "utf-8");
+      const headers = text.match(/^\[.*\]\s*$/gm) ?? [];
+      assert.equal(headers.length, 1, `expected one [mcp-dev] section on disk, got ${headers.length}: ${text}`);
+      assert.ok(!text.includes("STALE"), `stale credentials must not survive on disk: ${text}`);
+      assert.match(text, /AKIA-NEW-1/);
+      // No leftover lock or temp sidecar next to the credentials file.
+      const strays = readdirSync(dir).filter((f) => f !== "credentials");
+      assert.deepEqual(strays, [], `unexpected leftover files: ${strays.join(", ")}`);
+    });
+  }
+});

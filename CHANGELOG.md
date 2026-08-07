@@ -11,6 +11,89 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-08-07
+
+Minor release. The headline is a **behavior tightening in `aws_script`**: tool
+calls made from inside a script are now validated against each tool's schema,
+which they previously bypassed entirely. A script that exceeded a documented
+limit used to succeed silently and now throws -- see Changed below before
+upgrading. Alongside that, three fixes with real blast radius: secret material
+could leak back to the caller in a Cloud Control response, `~/.aws/credentials`
+could gain a duplicate profile section carrying stale keys, and abandoned SSO
+login sessions were never released from memory.
+
+### Security
+- `aws_resource_create` / `aws_resource_update` / `aws_resource_list`: the JSON
+  payload flags `--desired-state`, `--patch-document`, and `--resource-model`
+  are now redacted in the `command` string returned to the caller. Only
+  `--cli-input-json` was redacted before, so the CCAPI tools -- which pass their
+  payloads as dedicated flags instead -- echoed them verbatim. Creating an
+  `AWS::SSM::Parameter` of type `SecureString` returned its `Value` in full to
+  the model in `data.command`.
+
+### Changed
+- **`aws_script` now validates every bridged tool call against that tool's Zod
+  schema.** The MCP boundary always validated incoming calls, but the script
+  bridge invoked handlers directly, so any cap living only in a schema went
+  unenforced for scripted calls: `aws.multiRegion({regions: [...40 regions]})`
+  spawned all 40 CLI subprocesses despite `.max(32)`, and
+  `aws.resource.list({maxResults: 5000})` sent `--max-results 5000` despite
+  `.max(100)`. Such a script now throws
+  `Invalid input for '<tool>': <field>: <reason>`. Argv-safety was never
+  affected either way -- those validators run inside the handlers. This can
+  break a script that relied on the gap, which is why this is a minor rather
+  than a patch.
+- `aws_multi_region`: rejects more than 32 regions with an explicit error rather
+  than relying on the schema alone, and clamps `concurrency` into 1..32. A
+  non-positive `concurrency` previously produced `ok: true` with a full-length
+  array of `null` results, having run nothing at all.
+
+### Fixed
+- `~/.aws/credentials`: a profile header carrying trailing whitespace (a space
+  or a tab after the closing bracket) failed to match, so `aws_assume_role`
+  appended a SECOND section of the same name and left the stale credentials in
+  the first one. The header parser now shares one regex with the section
+  splitter instead of a hand-rolled `slice(1, -1)`.
+- SSO: completed login sessions are now reaped from the in-memory session map
+  after a grace window. The map was drained only by `aws_login_complete`, so a
+  caller that ran `aws_login_start` and never completed it leaked the entry, its
+  `ChildProcess` handle, and its captured stdout/stderr for the life of the
+  server process. The TTL killswitch already killed the subprocess but never
+  released the map entry -- exactly the abandoned case it exists for.
+- `resolvePointer`: uses `Object.hasOwn` instead of the prototype-chain-aware
+  `in`, so a JSON Pointer like `/constructor` resolves to `undefined` rather
+  than an inherited value. Not reachable through `aws_resource_diff` (the
+  reserved-segment guard rejects those paths first); this hardens the exported
+  helper for direct callers.
+- `truncateForErrorMsg`: no longer splits a UTF-16 surrogate pair at the
+  truncation boundary, which emitted a lone surrogate into the MCP response.
+  The constant is renamed `MAX_ERROR_MSG_CHARS` to match what it actually
+  measures -- it counts code units, not bytes.
+- `index.ts`: the package.json version fallback no longer uses a dynamic
+  `await import("node:module")`. esbuild kept the dead branch and rewrote it to
+  `null.createRequire(...)`, so it would have thrown a `TypeError` had it ever
+  run in a bundled build -- which is every build we publish.
+
+### Internal
+- Test suite is no longer timing-flaky. Several tests asserted against fixed
+  durations sized to a fake subprocess's 200ms exit, which raced the scheduler
+  under `node --test`'s parallel file execution and failed roughly 2 of 3 full
+  runs. Replaced with a fake that stays alive until killed, condition polling
+  instead of sleeps, and generous margins on timers that must not fire. Now
+  green across 8 consecutive full runs.
+
+## [1.5.4] - 2026-07-21
+
+Maintenance release. No source changes to the published package -- dependency
+updates and CI configuration only. Entry written retroactively in 1.6.0; this
+version originally shipped without one.
+
+### Changed
+- Removed the GitHub Actions workflows and Dependabot configuration (#25).
+- Dependency updates: `typescript` 6.0.3 -> 7.0.2, `node-html-parser` 7.1.0 ->
+  9.0.0, `@types/node` 25.6.0 -> 26.1.1, `@biomejs/biome` 2.4.12 -> 2.5.4,
+  `zod` 4.3.6 -> 4.4.3, plus GitHub Action bumps (#2, #8, #9, #12-#24).
+
 ## [1.5.3] - 2026-06-17
 
 Patch release. Fixes a bug in `scripts/update-manifests.mjs` where
@@ -101,6 +184,16 @@ closes all eleven open Dependabot alerts.
 - 23 new tests across 8 files, including 9 for the proto-pollution
   fix (all three reserved segments x final/intermediate positions x
   add/replace, each with an `Object.prototype` leakage assertion).
+
+## [1.5.1] - 2026-06-11
+
+Feature release. Entry written retroactively in 1.6.0; this version originally
+shipped without one.
+
+### Added
+- Cross-platform single-binary distribution pipeline: Node SEA build
+  (`scripts/build-binary.mjs`) plus Scoop and Homebrew manifest publishing
+  (`scripts/update-manifests.mjs`).
 
 ## [1.5.0] - 2026-06-10
 

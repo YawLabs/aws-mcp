@@ -214,7 +214,20 @@ describe("truncateForErrorMsg", () => {
     const huge = "x".repeat(10 * 1024);
     const result = truncateForErrorMsg(huge);
     assert.ok(result.length < huge.length);
-    assert.match(result, /\[truncated; \d+ bytes omitted\]/);
+    assert.match(result, /\[truncated; \d+ chars omitted\]/);
+  });
+
+  it("does not split a surrogate pair at the cut boundary", () => {
+    // Put a 4-byte astral char (2 UTF-16 units) so its HIGH surrogate sits at
+    // index 8191 and its LOW surrogate at 8192 -- a naive slice(0, 8192) would
+    // keep the high half alone and emit a lone surrogate.
+    const head = "x".repeat(8 * 1024 - 1);
+    const huge = `${head}\u{20BB7}${"y".repeat(100)}`;
+    const result = truncateForErrorMsg(huge);
+    const body = result.slice(0, result.indexOf("\n\n"));
+    assert.ok(!/[\uD800-\uDBFF]$/.test(body), "must not end on a lone high surrogate");
+    assert.equal(body, head, "backs off to just before the astral char");
+    assert.match(result, /\[truncated; \d+ chars omitted\]/);
   });
 });
 
@@ -278,5 +291,50 @@ describe("parseTestPrefixArgs", () => {
     const warn = mock.method(console, "warn", () => {});
     assert.deepEqual(parseTestPrefixArgs('["a","b"]'), ["a", "b"]);
     assert.equal(warn.mock.callCount(), 0);
+  });
+});
+
+describe("redactDisplayArgs -- CCAPI payload flags (regression)", () => {
+  // The CCAPI tools in tools/resource.ts do NOT go through --cli-input-json;
+  // they pass payloads as dedicated flags via extraFlags. Only --cli-input-json
+  // was redacted, so aws_resource_create on an AWS::SSM::Parameter echoed the
+  // SecureString Value straight back to the caller in `data.command`.
+  for (const flag of ["--desired-state", "--patch-document", "--resource-model"]) {
+    it(`redacts the payload after ${flag}`, () => {
+      const payload = JSON.stringify({ Name: "/prod/db", Type: "SecureString", Value: "hunter2" });
+      const args = ["cloudcontrol", "create-resource", flag, payload, "--profile", "prod"];
+      const redacted = redactDisplayArgs(args);
+      assert.ok(!redacted.some((a) => a.includes("hunter2")), `${flag} payload must not appear`);
+      assert.equal(redacted[3], `<redacted len=${payload.length}>`);
+      // The flag itself stays visible so the command shape is still readable.
+      assert.equal(redacted[2], flag);
+      assert.deepEqual(redacted.slice(4), ["--profile", "prod"]);
+    });
+  }
+
+  it("leaves non-payload flags alone", () => {
+    const args = ["cloudcontrol", "get-resource", "--type-name", "AWS::S3::Bucket", "--identifier", "my-bucket"];
+    assert.deepEqual(redactDisplayArgs(args), args);
+  });
+});
+
+describe("truncateForErrorMsg boundary", () => {
+  // The cap comparison is `text.length <= MAX_ERROR_MSG_CHARS`. At EXACTLY the
+  // cap the string must pass through untouched; an off-by-one flipping that to
+  // `<` would emit the nonsensical "[truncated; 0 chars omitted]" on a message
+  // that fit perfectly.
+  const CAP = 8 * 1024;
+
+  it("returns a string of exactly the cap unchanged", () => {
+    const exact = "x".repeat(CAP);
+    const result = truncateForErrorMsg(exact);
+    assert.equal(result, exact);
+    assert.doesNotMatch(result, /truncated/);
+  });
+
+  it("truncates at one char over the cap", () => {
+    const over = "x".repeat(CAP + 1);
+    const result = truncateForErrorMsg(over);
+    assert.match(result, /\[truncated; 1 chars omitted\]/);
   });
 });

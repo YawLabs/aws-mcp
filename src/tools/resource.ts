@@ -1162,7 +1162,14 @@ export function resolvePointer(doc: unknown, pointer: string): unknown {
       if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return undefined;
       cur = cur[idx];
     } else if (isObj(cur)) {
-      if (!(t in cur)) return undefined;
+      // Object.hasOwn, not `in`: `in` walks the prototype chain, so a pointer
+      // like '/constructor' or '/toString' would resolve to an INHERITED value
+      // instead of undefined. Not reachable through aws_resource_diff (the
+      // reserved-segment guard in _applyJsonPatchInPlace throws on those paths
+      // first), but summarizePatch and resolvePointer are both exported, and a
+      // direct caller shouldn't be able to read prototype members out of a
+      // document that doesn't own them.
+      if (!Object.hasOwn(cur, t)) return undefined;
       cur = cur[t];
     } else {
       return undefined;

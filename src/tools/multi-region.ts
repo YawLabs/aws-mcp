@@ -43,20 +43,26 @@ export interface RegionResult {
  * finishes, the next pending task starts. Order of `results` matches the
  * order of `inputs`.
  *
- * Contract: `fn` MUST resolve, never reject. This invariant is MECHANICALLY
- * UNCHECKED -- there is no try/catch around the `await fn(...)` in the worker,
- * by design (the cost of wrapping every task to convert a rejection into a
- * result would defeat the per-input-isolation the sole caller already
- * provides). A single rejection therefore propagates out of the worker's
- * `await`, rejects the whole `Promise.all`, abandons every other still-running
- * task (their results are never collected), and surfaces to the caller of
- * runWithConcurrency as a thrown error rather than a per-input result.
+ * Contract: `fn` MUST resolve, never reject. We do NOT convert a rejection
+ * into a per-input result -- the generic `R` can't express an error variant,
+ * and inventing one would silently reshape every caller's result type. A
+ * rejection still fails the whole batch (rejects the `Promise.all`, abandons
+ * every other still-running task). What the try/catch below buys is a LEGIBLE
+ * failure: the re-thrown error names the offending index and states the
+ * contract, instead of surfacing an opaque error from an anonymous worker with
+ * no indication of which input caused it.
  *
  * The current sole caller (aws_multi_region) is safe because its `fn` wraps
  * each region in a try/catch and runAwsCall is itself resolve-only -- it
  * returns an `{ok: false, ...}` result on failure instead of rejecting. Any
  * NEW caller must uphold the same discipline: catch inside `fn` and return a
  * result, never let `fn` reject.
+ *
+ * `concurrency` is floored at 1: a zero or negative value would spawn zero
+ * workers, so `Promise.all([])` resolves instantly and every slot of `results`
+ * stays a hole. Callers see a full-length array of `null`s (holes serialize as
+ * null) and a success envelope, having never run a single task. Clamping here
+ * makes that unrepresentable no matter who calls.
  */
 export async function runWithConcurrency<I, R>(
   inputs: readonly I[],
@@ -69,10 +75,18 @@ export async function runWithConcurrency<I, R>(
     while (true) {
       const i = next++;
       if (i >= inputs.length) return;
-      results[i] = await fn(inputs[i], i);
+      try {
+        results[i] = await fn(inputs[i], i);
+      } catch (err) {
+        throw new Error(
+          `runWithConcurrency: the task at index ${i} rejected, but fn must always resolve -- catch inside fn and return a result instead. Every other in-flight task was abandoned.`,
+          { cause: err },
+        );
+      }
     }
   };
-  const workerCount = Math.min(concurrency, inputs.length);
+  const safeConcurrency = Number.isFinite(concurrency) ? Math.max(1, Math.trunc(concurrency)) : 1;
+  const workerCount = Math.min(safeConcurrency, inputs.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
 }
@@ -130,6 +144,29 @@ export const multiRegionTools: readonly Tool[] = [
         concurrency?: number;
       };
 
+      // Defense-in-depth, matching the handler-level clamps in paginate.ts and
+      // docs.ts: the schema bounds regions at MAX_REGIONS and concurrency at
+      // 1..MAX_CONCURRENCY, but callers that reach the handler directly (the
+      // aws_script bridge before it began parsing, tests, future internal
+      // callers) never see those bounds.
+      //
+      // Bound the RAW list, BEFORE the dedup below, for two reasons:
+      //   - The schema's .max(MAX_REGIONS) also applies to the raw array.
+      //     Checking the deduped count instead would make this handler ACCEPT
+      //     input the MCP boundary REJECTS (e.g. 40 entries with 10 duplicates
+      //     = 30 distinct), so the same call would succeed or fail depending on
+      //     which entry point it came through.
+      //   - The dedup loop allocates proportional to the input, so guarding
+      //     after it means doing the unbounded work first.
+      // Reject rather than truncate: silently dropping regions the caller asked
+      // about is worse than an explicit error.
+      if (i.regions.length > MAX_REGIONS) {
+        return {
+          ok: false,
+          error: `Too many regions: ${i.regions.length} requested, max ${MAX_REGIONS}. Split the batch.`,
+        };
+      }
+
       // De-dupe regions: a model may accidentally pass us-east-1 twice. We
       // dedupe preserving first occurrence so the result order is the
       // dedup'd input order.
@@ -142,7 +179,10 @@ export const multiRegionTools: readonly Tool[] = [
         }
       }
 
-      const concurrency = i.concurrency ?? DEFAULT_CONCURRENCY;
+      const requestedConcurrency = Number(i.concurrency ?? DEFAULT_CONCURRENCY);
+      const concurrency = Number.isFinite(requestedConcurrency)
+        ? Math.min(Math.max(1, Math.trunc(requestedConcurrency)), MAX_CONCURRENCY)
+        : DEFAULT_CONCURRENCY;
 
       const results = await runWithConcurrency(regions, concurrency, async (region): Promise<RegionResult> => {
         try {

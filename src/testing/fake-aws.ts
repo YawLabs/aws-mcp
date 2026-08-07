@@ -275,6 +275,44 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "paginate_startingtoken_stateful": {
+      // Stateful by argv on --starting-token, for driving buildPaginateAll's
+      // auto-loop against the REAL aws_paginate tool (schema + handler), not a
+      // stub. First call (no --starting-token) returns page 1 PLUS a NextToken;
+      // the resume call returns the final page with NO NextToken, so the loop
+      // terminates after exactly 2 pages.
+      //
+      // This is what makes a dropped --starting-token detectable. If the token
+      // never reaches the CLI, every iteration takes the first-page branch,
+      // hasMore stays true, and the loop runs to maxPages returning N copies of
+      // page 1 -- a silent duplication rather than an error. Asserting
+      // pages === 2 and distinct items catches exactly that.
+      //
+      // Sibling to paginate_has_more / paginate_last_page, which are single-shot
+      // and cannot express the resume transition in one scenario.
+      const argv = process.argv.slice(2);
+      const tokenIdx = argv.indexOf("--starting-token");
+      const isResume = tokenIdx >= 0;
+      if (isResume) {
+        process.stdout.write(
+          `${JSON.stringify({
+            Buckets: [{ Name: "bucket-3" }],
+            StartingTokenSeen: argv[tokenIdx + 1],
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          Buckets: [{ Name: "bucket-1" }, { Name: "bucket-2" }],
+          NextToken: "page2-cursor",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     case "paginate_query_wrapped_has_more": {
       // Simulates what the aws CLI emits for a wrapped query like
       // {NextToken: NextToken, items: Buckets[].Name} on a truncated page.

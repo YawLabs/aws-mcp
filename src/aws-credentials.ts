@@ -58,11 +58,17 @@ interface Section {
   body: string;
 }
 
+// Single source of truth for what counts as a section header line. Both
+// splitSections (which decides where a section starts) and sectionName (which
+// extracts the name back out of the stored raw line) MUST use this -- they
+// previously disagreed, see the sectionName comment below.
+const SECTION_HEADER_RE = /^\[(.+)\]\s*$/;
+
 function splitSections(text: string): Section[] {
   const sections: Section[] = [];
   let current: Section = { header: null, body: "" };
   for (const rawLine of text.split(/\r?\n/)) {
-    const headerMatch = rawLine.match(/^\[(.+)\]\s*$/);
+    const headerMatch = SECTION_HEADER_RE.exec(rawLine);
     if (headerMatch) {
       if (current.header !== null || current.body !== "") {
         sections.push(current);
@@ -82,8 +88,23 @@ function splitSections(text: string): Section[] {
   return sections;
 }
 
+/**
+ * Extract the profile name from a stored raw header line.
+ *
+ * MUST parse with SECTION_HEADER_RE, not `slice(1, -1)`. splitSections stores
+ * the RAW line, and the regex tolerates trailing whitespace after the closing
+ * bracket (`\s*$`). A naive slice(1, -1) on `"[mcp-dev]  "` drops the final
+ * SPACE instead of the bracket, yielding `"mcp-dev]"` -- which matched no
+ * profile, so upsertProfileIntoText appended a SECOND `[mcp-dev]` section and
+ * left the stale credentials sitting in the first one. `[mcp-dev]\t` failed the
+ * same way; `[ mcp-dev ]` and CRLF files happened to work, which is why this
+ * hid for so long.
+ */
 function sectionName(header: string): string {
-  return header.slice(1, -1).trim();
+  const m = SECTION_HEADER_RE.exec(header);
+  // Fall back to the old slice only for a line that isn't in header shape at
+  // all -- unreachable via splitSections, which only stores matching lines.
+  return (m ? m[1] : header.slice(1, -1)).trim();
 }
 
 function buildProfileBody(creds: AssumedCredentials): string {

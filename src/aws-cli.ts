@@ -20,25 +20,50 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
 // Cap the stderr we surface as an error message to avoid flooding the MCP
 // response. Full stderr still lands in rawStderr for diagnosis.
-const MAX_ERROR_MSG_BYTES = 8 * 1024;
+//
+// CHARS, not bytes: truncateForErrorMsg measures with String#length and cuts
+// with String#slice, both of which count UTF-16 code units. MAX_OUTPUT_BYTES
+// above genuinely counts bytes (it sums Buffer.length on raw chunks); this one
+// does not, and the name says so. For non-ASCII stderr the two units diverge.
+const MAX_ERROR_MSG_CHARS = 8 * 1024;
 
 // Also defends against argv injection: leading-hyphen input like "--profile evil"
 // would otherwise become a flag to `aws`.
 export const SAFE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 /**
- * --cli-input-json can carry secrets (IAM passwords, access keys, tags with
- * PII). Keep the flag visible in displayCommand so users see the shape of
- * what ran, but replace the JSON payload with a length stub.
+ * Flags whose NEXT argv entry is a JSON blob that can carry secrets (IAM
+ * passwords, access keys, SecureString parameter values, tags with PII).
  *
- * All occurrences of --cli-input-json are redacted -- a single call can
- * theoretically carry the flag more than once (e.g. if callers splice extra
- * flags), so indexOf-stop-at-first is not sufficient.
+ * --cli-input-json is the aws_call / aws_assume_role / aws_metrics_query path.
+ * The CCAPI tools in tools/resource.ts do NOT use --cli-input-json: they pass
+ * their payloads as dedicated flags via extraFlags, so each one needs its own
+ * entry here or the payload lands verbatim in displayCommand -- which is
+ * returned to the caller as `data.command`. Observed leak before this set
+ * existed: aws_resource_create on AWS::SSM::Parameter echoed the SecureString
+ * Value back to the model in full.
+ *
+ * Keep this in sync with any new extraFlags entry that carries user data.
+ */
+const REDACTED_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "--cli-input-json",
+  "--desired-state", // aws_resource_create
+  "--patch-document", // aws_resource_update
+  "--resource-model", // aws_resource_list (parent identifiers)
+]);
+
+/**
+ * Keep each redacted flag visible in displayCommand so users see the shape of
+ * what ran, but replace its payload with a length stub.
+ *
+ * ALL occurrences of each flag are redacted -- a single call can theoretically
+ * carry the same flag more than once (e.g. if callers splice extra flags), so
+ * indexOf-stop-at-first is not sufficient.
  */
 export function redactDisplayArgs(args: readonly string[]): string[] {
   const out = [...args];
   for (let i = 0; i < out.length - 1; i++) {
-    if (out[i] === "--cli-input-json") {
+    if (REDACTED_VALUE_FLAGS.has(out[i])) {
       out[i + 1] = `<redacted len=${out[i + 1].length}>`;
     }
   }
@@ -46,9 +71,15 @@ export function redactDisplayArgs(args: readonly string[]): string[] {
 }
 
 export function truncateForErrorMsg(text: string): string {
-  if (text.length <= MAX_ERROR_MSG_BYTES) return text;
-  const omitted = text.length - MAX_ERROR_MSG_BYTES;
-  return `${text.slice(0, MAX_ERROR_MSG_BYTES)}\n\n[truncated; ${omitted} bytes omitted]`;
+  if (text.length <= MAX_ERROR_MSG_CHARS) return text;
+  // Don't cut between a high and low surrogate -- slicing mid-pair emits a
+  // lone surrogate, which JSON.stringify turns into a replacement char in the
+  // MCP response. Back off one unit when the boundary lands on a high surrogate.
+  let cut = MAX_ERROR_MSG_CHARS;
+  const boundary = text.charCodeAt(cut - 1);
+  if (boundary >= 0xd800 && boundary <= 0xdbff) cut -= 1;
+  const omitted = text.length - cut;
+  return `${text.slice(0, cut)}\n\n[truncated; ${omitted} chars omitted]`;
 }
 
 export interface AwsCallOptions {

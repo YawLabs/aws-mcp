@@ -587,3 +587,24 @@ describe("applyJsonPatch -- prototype pollution defense", () => {
     });
   }
 });
+
+describe("resolvePointer prototype safety (regression)", () => {
+  // resolvePointer used `t in cur`, which walks the prototype chain -- so
+  // '/constructor' resolved to Object's constructor function rather than
+  // undefined. aws_resource_diff never reaches it (applyJsonPatch rejects
+  // reserved segments first), but resolvePointer and summarizePatch are both
+  // exported, so a direct caller could read inherited members off a document.
+  for (const seg of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    it(`returns undefined for an inherited '${seg}' segment`, () => {
+      assert.equal(resolvePointer({ Real: 1 }, `/${seg}`), undefined);
+    });
+  }
+
+  it("still resolves an OWN property that shadows a prototype name", () => {
+    assert.equal(resolvePointer({ constructor: "mine" }, "/constructor"), "mine");
+  });
+
+  it("still resolves ordinary paths", () => {
+    assert.equal(resolvePointer({ A: { B: [10, 20] } }, "/A/B/1"), 20);
+  });
+});

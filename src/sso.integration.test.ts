@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { _clearSessions, findActiveSessionByProfile, startSsoLogin, waitForLogin } from "./sso.js";
+import { _clearSessions, _hasSession, findActiveSessionByProfile, startSsoLogin, waitForLogin } from "./sso.js";
 
 // This test file compiles to dist/sso.integration.test.js and the fake lives
 // at dist/testing/fake-aws.js. Resolve relative to the compiled location.
@@ -26,6 +26,32 @@ function fakeOpts(scenario: string, urlWaitMs = 500) {
 
 function fakeOptsWithTtl(scenario: string, sessionTtlMs: number, urlWaitMs = 500) {
   return { ...fakeOpts(scenario, urlWaitMs), sessionTtlMs };
+}
+
+/**
+ * Poll `predicate` until it holds or the deadline passes. Replaces
+ * `await sleep(400)`-style waits that assume the `happy` fake's ~200ms exit
+ * has landed.
+ *
+ * Why this exists: `node --test` runs test FILES in parallel (one child
+ * process each, defaulting to the CPU count). A fixed sleep sized against the
+ * fake's 200ms exit is fine on an idle machine and unreliable under a
+ * 26-file/12-core run, where scheduling delay routinely pushes the real exit
+ * past the sleep. Verified 2026-08-07: the full suite serialized with
+ * `--test-concurrency=1` was 711/711 green across a full run, while the same
+ * suite in parallel failed ~2 of 3 runs on a DIFFERENT timing test each time.
+ * Waiting on the condition instead of the clock removes the load coupling
+ * without weakening the assertion -- a predicate that never holds still fails,
+ * it just fails on a real timeout rather than on an unlucky scheduler.
+ */
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitUntil timed out after ${timeoutMs}ms waiting for: ${label}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 afterEach(() => {
@@ -207,15 +233,21 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
   });
 
   it("excludes completed sessions before waitForLogin is called", async () => {
-    // The 'happy' fake exits 200ms after emitting URL+code. Wait for the exit
-    // to fire (which marks completed=true) before querying.
+    // The 'happy' fake exits ~200ms after emitting URL+code, which flips the
+    // session to completed. This test is about the POST-exit exclusion.
     const start = await startSsoLogin("post-exit-profile", fakeOpts("happy", 5000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
-    // While the subprocess is still alive, the session is active.
-    assert.ok(findActiveSessionByProfile("post-exit-profile"));
-    // Wait for the fake to exit (~200ms) plus a small margin.
-    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    // NOTE: deliberately no "still alive" assertion here. It used to sit at
+    // this line and was the flakiest assertion in the suite -- it only holds if
+    // this synchronous check wins a race against the fake's 200ms exit, which
+    // it loses under a parallel full-suite run. The live-session property is
+    // covered deterministically by the `happy_hold` test above, which uses a
+    // fake that cannot exit on its own.
+    await waitUntil(
+      () => findActiveSessionByProfile("post-exit-profile") === null,
+      "the completed session to be excluded from findActiveSessionByProfile",
+    );
     // After exit but before waitForLogin: session is in the map but completed.
     // findActiveSessionByProfile must skip it so a follow-up aws_login_start
     // doesn't re-surface stale URL+code.
@@ -228,13 +260,16 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
 
 describe("startSsoLogin — TTL killswitch", () => {
   it("a stuck subprocess past the TTL is killed and the wait reports session expired", async () => {
-    // The 'happy' fake emits URL+code immediately, then sleeps 200ms before
-    // exiting 0. With sessionTtlMs=20ms the killswitch fires mid-sleep,
-    // SIGTERM lands, and the exit handler -- the SOLE writer of the
-    // completion result -- reports the expiry. Closes the prior race where
-    // the TTL handler resolved completion directly while the subprocess
-    // was simultaneously about to exit 0 with a successful token cache.
-    const start = await startSsoLogin("ttl-stuck-profile", fakeOptsWithTtl("happy", 20, 5000));
+    // Uses `happy_hold`, NOT `happy`. `happy_hold` emits URL+code and then
+    // stays alive until killed, so the TTL killswitch is the ONLY thing that
+    // can end it -- which is exactly the behavior under test. With `happy`
+    // (exits 0 at ~200ms) this raced: a 20ms TTL beats a 200ms exit on an idle
+    // machine, but under a parallel full-suite run the TTL callback can be
+    // delayed past 200ms, the fake exits 0 on its own, the exitCode guard in
+    // _ttlKillswitchTick correctly declines to kill an already-dead proc, and
+    // the wait reports natural SUCCESS -- failing an assertion that demanded
+    // expiry. The kill path is now load-independent.
+    const start = await startSsoLogin("ttl-stuck-profile", fakeOptsWithTtl("happy_hold", 20, 5000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -243,10 +278,15 @@ describe("startSsoLogin — TTL killswitch", () => {
   });
 
   it("a subprocess that finishes BEFORE the TTL fires reports natural success (clearTimeout suppresses TTL)", async () => {
-    // 'happy' exits 0 at ~200ms; with sessionTtlMs=5000ms the exit handler
-    // fires first, clears the timer, and reports success. Verifies the
-    // killswitch isn't gratuitously punishing a normal-cadence login.
-    const start = await startSsoLogin("ttl-quick-profile", fakeOptsWithTtl("happy", 5000, 5000));
+    // 'happy' exits 0 at ~200ms; the exit handler fires first, clears the
+    // timer, and reports success. Verifies the killswitch isn't gratuitously
+    // punishing a normal-cadence login.
+    //
+    // The TTL is deliberately enormous relative to the exit. For a test whose
+    // premise is "the TTL must NOT fire", the only thing a tight TTL buys is a
+    // race -- and it costs nothing to remove, because the test never WAITS for
+    // the TTL: it waits for the natural exit, which clears the (unref'd) timer.
+    const start = await startSsoLogin("ttl-quick-profile", fakeOptsWithTtl("happy", 30_000, 5000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -261,12 +301,19 @@ describe("startSsoLogin — TTL killswitch", () => {
     // ttlExpired and code. This test pins the natural-error branch:
     //
     //   'early_exit_failure' prints URL+code, writes "Error: connection
-    //   refused" to stderr, sleeps 50ms, then exits 1. With TTL=200ms,
-    //   the exit handler runs at ~50ms, clearTimeout suppresses the TTL,
-    //   ttlExpired stays false, and the wait result must report
-    //   "exited with code 1", NOT "session expired". A bug in the
-    //   ttlExpired logic (e.g. setting it on every exit) would surface
-    //   here as a misclassification.
+    //   refused" to stderr, sleeps 50ms, then exits 1. The exit handler runs
+    //   at ~50ms, clearTimeout suppresses the TTL, ttlExpired stays false, and
+    //   the wait result must report "exited with code 1", NOT "session
+    //   expired". A bug in the ttlExpired logic (e.g. setting it on every
+    //   exit) would surface here as a misclassification.
+    //
+    //   The TTL was 200ms against that 50ms exit -- a 4x margin, the tightest
+    //   in this file, and the last surviving flake after the happy_hold
+    //   migration. Under a parallel full-suite run the exit slips past 200ms,
+    //   the killswitch fires, and the result flips to "session expired",
+    //   failing the doesNotMatch below. Measured: 2 failures in 4 consecutive
+    //   full runs. Same reasoning as the sibling test above -- this test never
+    //   waits for the TTL, so a huge TTL costs nothing and removes the race.
     //
     // The microsecond TTL-vs-exit race window (proc.exitCode set but
     // 'exit' event not yet dispatched when the TTL callback runs) is
@@ -274,7 +321,7 @@ describe("startSsoLogin — TTL killswitch", () => {
     // inspection -- driving that exact ordering deterministically would
     // require timer mocks. The aws-cli.ts:199-200 guard uses the same
     // pattern and is similarly verified by inspection.
-    const start = await startSsoLogin("ttl-natural-fail-profile", fakeOptsWithTtl("early_exit_failure", 200, 5000));
+    const start = await startSsoLogin("ttl-natural-fail-profile", fakeOptsWithTtl("early_exit_failure", 30_000, 5000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -390,5 +437,75 @@ describe("startSsoLogin — concurrent dedup", () => {
     assert.equal(a.verificationUrl, b.verificationUrl);
     assert.equal(a.userCode, b.userCode);
     await waitForLogin(a.sessionId);
+  });
+});
+
+describe("completed-session reaping (bounds the sessions Map)", () => {
+  // The reap exists because `sessions` was otherwise drained ONLY by
+  // waitForLogin. A caller that runs aws_login_start and never
+  // aws_login_complete left its entry -- plus the ChildProcess handle and the
+  // captured stdout/stderr buffers -- alive for the life of the process. The
+  // TTL killswitch kills the SUBPROCESS but does not reap the MAP ENTRY, so
+  // the abandoned case it exists for still leaked.
+  //
+  // Production's grace window is 10 minutes, so these drive it through the
+  // `completedReapMs` seam (mirrors `sessionTtlMs`). The observable is
+  // waitForLogin: while the entry lives it returns the PRESERVED completion
+  // result; once reaped it reports the unknown-session error.
+
+  it("reaps an abandoned completed session out of the map", async () => {
+    // 'happy' exits ~200ms after URL+code, which completes the session. Nobody
+    // calls waitForLogin -- that IS the abandoned case, and before the reap it
+    // meant the entry lived for the whole process lifetime.
+    //
+    // Observe via _hasSession, NOT waitForLogin: waitForLogin CLAIMS the entry,
+    // so polling with it would delete the very thing under test and go green
+    // whether or not the reap works.
+    const start = await startSsoLogin("reaped-profile", { ...fakeOpts("happy", 5000), completedReapMs: 40 });
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    assert.ok(_hasSession(start.sessionId), "precondition: the session is registered");
+    // Poll rather than sleep -- the ~200ms exit plus the 40ms grace is real
+    // wall-clock, and a fixed sleep would reintroduce the load-coupled flake
+    // this suite was just cleaned of.
+    await waitUntil(() => !_hasSession(start.sessionId), "the abandoned session to be reaped out of the sessions map");
+  });
+
+  it("does NOT reap before the grace window -- a late aws_login_complete still works", async () => {
+    // The grace window is the whole reason the reap isn't immediate: a user who
+    // finishes auth slowly must still be able to claim the result. A generous
+    // window means the claim below cannot race the reap.
+    const start = await startSsoLogin("grace-profile", { ...fakeOpts("happy", 5000), completedReapMs: 30_000 });
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    // Let the subprocess exit (completing the session) without claiming it.
+    await waitUntil(
+      () => findActiveSessionByProfile("grace-profile") === null,
+      "the subprocess to exit and complete the session",
+    );
+    assert.ok(_hasSession(start.sessionId), "a completed session must survive its grace window");
+    const wait = await waitForLogin(start.sessionId);
+    assert.equal(wait.ok, true, "a completed-but-unreaped session must still be claimable");
+    assert.equal(wait.exitCode, 0);
+  });
+
+  it("claiming a session cancels its reap: no late side effect after the window elapses", async () => {
+    // Hygiene guard, not a behavioral one -- waitForLogin already deleted the
+    // entry, and session ids are UUIDs so a stray reap could not collide with a
+    // later session. What this pins is that the post-claim state stays stable
+    // across the moment the cancelled reap would have fired.
+    const start = await startSsoLogin("claimed-profile", { ...fakeOpts("happy", 5000), completedReapMs: 30 });
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const first = await waitForLogin(start.sessionId);
+    assert.equal(first.ok, true);
+    assert.equal(_hasSession(start.sessionId), false, "the claim removes the entry immediately");
+    // Let the (now-cancelled) reap window pass.
+    await new Promise<void>((resolve) => setTimeout(resolve, 120));
+    assert.equal(_hasSession(start.sessionId), false);
+    const second = await waitForLogin(start.sessionId);
+    assert.equal(second.ok, false);
+    assert.match(second.error ?? "", /No active login session/);
+    assert.equal(findActiveSessionByProfile("claimed-profile"), null);
   });
 });

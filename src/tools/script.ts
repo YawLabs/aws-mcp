@@ -96,12 +96,64 @@ function findTool(name: string, source: readonly Tool[]): Tool {
 }
 
 /**
- * Translate a ToolResult into a thrown Error on failure or the unwrapped
- * data on success. Script authors get JS-natural error handling
- * (try/catch) instead of inspecting ok/error fields by hand.
+ * Render a Zod failure as a compact one-liner. `ZodError.message` is a
+ * JSON-encoded issue array -- readable by a machine, noise for a model reading
+ * an error string. Duck-type on `.issues` rather than `instanceof z.ZodError`
+ * so this keeps working across zod major versions.
+ */
+function formatSchemaError(err: unknown): string {
+  // Guard before the property read: `(null).issues` throws a TypeError, which
+  // would replace the schema error with an unrelated crash from inside the
+  // error FORMATTER. Not reachable today (.parse only throws ZodError), but a
+  // helper whose whole job is rendering someone else's failure must not be able
+  // to fail itself.
+  if (!err || typeof err !== "object") return String(err);
+  const issues = (err as { issues?: unknown }).issues;
+  if (!Array.isArray(issues)) return err instanceof Error ? err.message : String(err);
+  return issues
+    .map((raw) => {
+      const it = raw as { path?: unknown[]; message?: unknown };
+      const path = Array.isArray(it.path) && it.path.length > 0 ? it.path.join(".") : "(root)";
+      return `${path}: ${typeof it.message === "string" ? it.message : "invalid"}`;
+    })
+    .join("; ");
+}
+
+/**
+ * Validate against the tool's own schema, then translate the ToolResult into a
+ * thrown Error on failure or the unwrapped data on success. Script authors get
+ * JS-natural error handling (try/catch) instead of inspecting ok/error fields.
+ *
+ * The parse is load-bearing, not belt-and-braces. The MCP boundary validates in
+ * index.ts via `server.tool(..., tool.inputSchema.shape, ...)`, but THIS bridge
+ * calls `tool.handler` directly -- so without a parse here, every cap that
+ * lives only in a Zod schema is unenforced for anything a script calls.
+ * Measured before this existed: `aws.multiRegion({regions: [...40 regions]})`
+ * spawned all 40 CLI subprocesses despite the schema's `.max(32)`, and
+ * `aws.resource.list({maxResults: 5000})` sent `--max-results 5000` despite
+ * `.max(100)`.
+ *
+ * Argv-safety was never at risk either way -- those validators (SAFE_NAME_RE,
+ * PROFILE_NAME_RE, TYPE_NAME_RE, isValidIdentifier, ...) all run inside the
+ * handlers. What this restores is the RESOURCE BOUNDS.
+ *
+ * Parsed (not raw) input is forwarded, so schema defaults and coercions apply
+ * to scripted calls exactly as they do to MCP calls. Unknown keys are stripped
+ * by zod's default object behavior -- which is what lets buildPaginateAll pass
+ * its own `maxPages` through without the paginate tool ever seeing it.
  */
 async function unwrap(tool: Tool, input: unknown): Promise<unknown> {
-  const r = await tool.handler(input);
+  let parsed: unknown;
+  try {
+    parsed = tool.inputSchema.parse(input);
+  } catch (err) {
+    const e = new Error(`Invalid input for '${tool.name}': ${formatSchemaError(err)}`) as Error & {
+      toolName?: string;
+    };
+    e.toolName = tool.name;
+    throw e;
+  }
+  const r = await tool.handler(parsed);
   if (!r.ok) {
     const e = new Error(r.error || `Tool '${tool.name}' failed`) as Error & {
       rawBody?: string;

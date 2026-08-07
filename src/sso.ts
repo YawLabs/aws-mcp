@@ -57,6 +57,16 @@ interface LoginSession {
   // findActiveSessionByProfile so a follow-up aws_login_start spawns fresh
   // instead of re-surfacing stale URL+code.
   completed: boolean;
+  // Reap timer, armed once the subprocess exits. `sessions` is otherwise only
+  // ever drained by waitForLogin (fire-once) -- so a caller that runs
+  // aws_login_start and never aws_login_complete leaves its entry, the
+  // ChildProcess handle, and the captured stdout/stderr buffers alive for the
+  // life of the process. The TTL killswitch kills the SUBPROCESS but does not
+  // reap the MAP ENTRY, so the abandoned case it exists for still leaked.
+  // The grace window keeps a just-exited session claimable by a late
+  // aws_login_complete; after that the entry is dropped. Cleared by
+  // waitForLogin and _clearSessions.
+  reapTimer: NodeJS.Timeout | null;
   // Set by the TTL killswitch BEFORE the proc is killed. The exit handler
   // (sole writer of `completionResolve`) reads this to phrase the wait
   // result as a TTL expiry instead of a generic non-zero exit. If the
@@ -103,6 +113,11 @@ function dedupeKey(profile: string, opts: SsoLoginOptions): string {
     prefixArgs: opts.prefixArgs ?? null,
     urlWaitMs: opts.urlWaitMs ?? null,
     sessionTtlMs: opts.sessionTtlMs ?? null,
+    // Included for the same reason as every sibling field: two callers passing
+    // DIFFERENT opts must not silently share one subprocess (the second
+    // caller's opts would be dropped). Omitting a new opt here is the specific
+    // regression this list exists to prevent.
+    completedReapMs: opts.completedReapMs ?? null,
     env: opts.env ? Object.entries(opts.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)) : null,
   });
   return createHash("sha256").update(payload).digest("hex");
@@ -117,6 +132,13 @@ const URL_WAIT_MS = 15_000;
 // complete in seconds-to-a-minute; 10 min is a forgiving upper bound that
 // still keeps a forgotten aws subprocess from pinning the server forever.
 const SESSION_TTL_MS = 10 * 60_000;
+// How long a COMPLETED session stays claimable by waitForLogin before its
+// `sessions` entry is dropped. Distinct from SESSION_TTL_MS (which bounds how
+// long a session may sit UNCLAIMED with a live subprocess); this one bounds how
+// long a dead session's record lingers. Generous enough that a normal
+// aws_login_start -> user auths -> aws_login_complete round-trip never races
+// it, short enough that abandoned logins can't accumulate.
+const COMPLETED_SESSION_REAP_MS = 10 * 60_000;
 
 export function parseLoginOutput(text: string): { url: string | null; code: string | null } {
   const urlMatch = text.match(URL_RE);
@@ -170,6 +192,13 @@ export interface SsoLoginOptions {
   urlWaitMs?: number;
   env?: NodeJS.ProcessEnv;
   sessionTtlMs?: number;
+  /**
+   * Grace window before a COMPLETED session's map entry is reaped. Exists for
+   * the same reason as `sessionTtlMs`: the production value is 10 minutes, so
+   * without a knob the reap is simply not testable. Mirrors that seam exactly
+   * -- production never sets it.
+   */
+  completedReapMs?: number;
 }
 
 /**
@@ -213,6 +242,7 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
   const prefixArgs = opts.prefixArgs ?? [];
   const urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
   const sessionTtlMs = opts.sessionTtlMs ?? SESSION_TTL_MS;
+  const completedReapMs = opts.completedReapMs ?? COMPLETED_SESSION_REAP_MS;
   const spawnEnv = opts.env;
 
   return new Promise((resolve) => {
@@ -250,6 +280,33 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
     // handler reads it through this reference so it can clear ttlTimer and
     // flip `completed` without having to look up by sessionId.
     let registeredSession: LoginSession | null = null;
+    // Captured alongside registeredSession so the exit/error handlers can arm
+    // the reap timer, which needs the key to delete from `sessions`.
+    let registeredSessionId: string | null = null;
+    /**
+     * Shared by the 'exit' and 'error' handlers -- the subprocess is gone, so:
+     * stop the TTL killswitch, stop findActiveSessionByProfile from handing out
+     * this session's now-stale URL+code, and arm the reap that bounds the
+     * `sessions` Map. Idempotent: 'error' can fire after 'exit', and re-arming
+     * would orphan the first timer.
+     */
+    const finalizeSession = (): void => {
+      if (!registeredSession) return;
+      if (registeredSession.ttlTimer) {
+        clearTimeout(registeredSession.ttlTimer);
+        registeredSession.ttlTimer = null;
+      }
+      registeredSession.completed = true;
+      if (registeredSession.reapTimer !== null || registeredSessionId === null) return;
+      const sid = registeredSessionId;
+      const reap = setTimeout(() => {
+        sessions.delete(sid);
+      }, completedReapMs);
+      // unref so a pending reap can't hold the event loop open at shutdown --
+      // same treatment as ttlTimer.
+      reap.unref();
+      registeredSession.reapTimer = reap;
+    };
     // The wait result computed by the 'exit' handler, stashed so the 'close'
     // handler can phrase the start-failure fallback from it. 'close' always
     // fires after 'exit' (Node guarantee), so this is set whenever the
@@ -302,10 +359,12 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
           completion,
           ttlTimer,
           completed: false,
+          reapTimer: null,
           ttlExpired: false,
           ttlMs: sessionTtlMs,
         };
         registeredSession = session;
+        registeredSessionId = sessionId;
         sessions.set(sessionId, session);
         resolve({
           ok: true,
@@ -333,13 +392,7 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
       // out its (now stale) URL+code to follow-up aws_login_start callers.
       const ttlExpired = registeredSession?.ttlExpired === true;
       const ttlMs = registeredSession?.ttlMs ?? SESSION_TTL_MS;
-      if (registeredSession) {
-        if (registeredSession.ttlTimer) {
-          clearTimeout(registeredSession.ttlTimer);
-          registeredSession.ttlTimer = null;
-        }
-        registeredSession.completed = true;
-      }
+      finalizeSession();
       const rawOutput = stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : "");
       let result: LoginWaitResult;
       if (ttlExpired && code !== 0) {
@@ -405,13 +458,7 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
       // Also resolve `completion` so any waitForLogin caller that already has
       // the sessionId doesn't hang forever when the subprocess errors after
       // URL+code were emitted (settled=true, session registered).
-      if (registeredSession) {
-        if (registeredSession.ttlTimer) {
-          clearTimeout(registeredSession.ttlTimer);
-          registeredSession.ttlTimer = null;
-        }
-        registeredSession.completed = true;
-      }
+      finalizeSession();
       const errorMsg = `Failed to run 'aws': ${err.message}. Is the AWS CLI installed and on PATH?`;
       completionResolve({
         ok: false,
@@ -480,14 +527,33 @@ export async function waitForLogin(sessionId: string): Promise<LoginWaitResult> 
     return result;
   } finally {
     if (session.ttlTimer) clearTimeout(session.ttlTimer);
+    // The reap timer only exists to bound sessions nobody claims; this call IS
+    // the claim, so drop it rather than leaving a timer pointing at a key we're
+    // about to delete.
+    if (session.reapTimer) clearTimeout(session.reapTimer);
     sessions.delete(sessionId);
   }
+}
+
+/**
+ * For tests — is `sessionId` still present in the sessions map?
+ *
+ * Needed because the map's SIZE is the thing the reap bounds, and nothing else
+ * exposes it non-destructively: findActiveSessionByProfile hides a completed
+ * session whether or not it has been reaped, and waitForLogin CLAIMS (deletes)
+ * the entry, so polling with it would destroy the state under observation and
+ * pass for the wrong reason. Underscore prefix = tests only, same convention as
+ * _clearSessions / _resetSession / _ttlKillswitchTick.
+ */
+export function _hasSession(sessionId: string): boolean {
+  return sessions.has(sessionId);
 }
 
 /** For tests — drop any in-flight sessions. Not exported via the MCP surface. */
 export function _clearSessions(): void {
   for (const session of sessions.values()) {
     if (session.ttlTimer) clearTimeout(session.ttlTimer);
+    if (session.reapTimer) clearTimeout(session.reapTimer);
     killProc(session.proc);
   }
   sessions.clear();

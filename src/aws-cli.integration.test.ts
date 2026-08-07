@@ -359,20 +359,33 @@ describe("runAwsCall — failure paths", () => {
 
   it("preserves partial stdout when a timeout kills a subprocess mid-stream", async () => {
     // call_partial_then_hang flushes a JSON fragment, lets the parent drain it,
-    // then hangs past our short timeoutMs. The timeout branch (aws-cli.ts:311)
+    // then hangs past our timeoutMs. The timeout branch (aws-cli.ts:311)
     // attaches the partial rawStdout to the failure so the bytes that DID arrive
     // before the kill aren't lost. The fragment is not valid JSON on its own --
     // the timeout path never parses stdout, it just preserves the raw bytes.
+    //
+    // timeoutMs is deliberately roomy, and must NOT be tuned back down. This is
+    // the one timeout in this file that races the WRONG way: every other case
+    // only needs the timeout to beat a sleeping fake, whereas this one needs the
+    // fragment to ARRIVE FIRST -- which means the budget has to cover Node's
+    // cold start, module load, and the first stdout drain. At 200ms that failed
+    // roughly 1 run in 6 under a parallel full-suite run (`node --test` runs
+    // files across all cores), surfacing as an empty rawStdout. Anything
+    // comfortably between startup+50ms and the fake's 10s hang works.
     const r = await runAwsCall({
       service: "s3api",
       operation: "list-buckets",
-      ...fakeOpts("call_partial_then_hang", { timeoutMs: 200 }),
+      ...fakeOpts("call_partial_then_hang", { timeoutMs: 2000 }),
     });
     assert.equal(r.ok, false);
     if (r.ok) return;
     assert.equal(r.kind, "timeout");
     assert.match(r.error, /timed out/);
-    assert.match(r.rawStdout ?? "", /this-arrived-before-the-timeout/);
+    assert.match(
+      r.rawStdout ?? "",
+      /this-arrived-before-the-timeout/,
+      "partial stdout must survive the kill -- an empty rawStdout here means the fragment never drained before the timeout",
+    );
   });
 
   it("returns output_too_large when stdout exceeds 5 MB cap", async () => {

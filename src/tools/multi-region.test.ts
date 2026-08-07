@@ -248,3 +248,106 @@ describe("aws_multi_region handler", () => {
     );
   });
 });
+
+describe("aws_multi_region input bounds (regression)", () => {
+  // These bounds live in the Zod schema, which only runs at the MCP boundary
+  // (index.ts registers via inputSchema.shape). Handlers reached directly --
+  // the aws_script bridge, tests, internal callers -- never saw them. A
+  // concurrency of 0 made runWithConcurrency spawn zero workers, so
+  // Promise.all([]) resolved instantly and every slot of `results` stayed a
+  // hole: the caller got ok:true plus a full-length array of nulls, having run
+  // nothing at all.
+  for (const concurrency of [0, -1, Number.NaN]) {
+    it(`clamps a concurrency of ${String(concurrency)} instead of running nothing`, async () => {
+      // The handler spawns real subprocesses, so point them at the fake-aws
+      // shim -- same save/restore shape the partial-failure test above uses.
+      const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+      process.env.AWS_MCP_FAKE_SCENARIO = "call_json_success";
+      try {
+        const res = await tool.handler({
+          service: "s3api",
+          operation: "list-buckets",
+          regions: ["us-east-1", "us-west-2"],
+          profile: "default",
+          concurrency,
+        });
+        assert.equal(res.ok, true);
+        const data = res.data as { okCount: number; errorCount: number; results: Array<{ region: string } | null> };
+        assert.ok(
+          data.results.every((r) => r !== null),
+          "every result slot must be filled, not a hole",
+        );
+        assert.equal(data.okCount, 2);
+        assert.equal(data.errorCount, 0);
+      } finally {
+        if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+        else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+      }
+    });
+  }
+
+  it("rejects more regions than MAX_REGIONS rather than truncating", async () => {
+    const regions = Array.from({ length: 40 }, (_, n) => `us-east-${n + 1}`);
+    const res = await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      regions,
+      profile: "default",
+    });
+    assert.equal(res.ok, false);
+    assert.match(res.error ?? "", /Too many regions: 40 requested, max 32/);
+  });
+
+  it("counts the RAW list, not the deduped one, so it agrees with the schema", async () => {
+    // 40 entries, 10 of them duplicates -> 30 distinct. The schema's
+    // .max(32) applies to the raw array and rejects this, so the handler must
+    // too; counting distinct regions here would make the same call succeed via
+    // a direct handler invocation and fail through the MCP boundary.
+    const regions = [
+      ...Array.from({ length: 30 }, (_, n) => `us-east-${n + 1}`),
+      ...Array.from({ length: 10 }, (_, n) => `us-east-${n + 1}`),
+    ];
+    assert.equal(regions.length, 40);
+    assert.equal(new Set(regions).size, 30);
+    assert.equal(
+      tool.inputSchema.safeParse({ service: "s3api", operation: "list-buckets", regions }).success,
+      false,
+      "precondition: the schema rejects this raw list",
+    );
+    const res = await tool.handler({ service: "s3api", operation: "list-buckets", regions, profile: "default" });
+    assert.equal(res.ok, false, "handler must agree with the schema");
+    assert.match(res.error ?? "", /Too many regions: 40 requested, max 32/);
+  });
+});
+
+describe("runWithConcurrency contract (regression)", () => {
+  it("names the offending index when fn rejects", async () => {
+    await assert.rejects(
+      () =>
+        runWithConcurrency([1, 2, 3], 1, async (n) => {
+          if (n === 2) throw new Error("boom");
+          return n;
+        }),
+      /task at index 1 rejected, but fn must always resolve/,
+    );
+  });
+
+  it("preserves the original error as `cause`", async () => {
+    const original = new Error("boom");
+    await assert.rejects(
+      () =>
+        runWithConcurrency([1], 1, async () => {
+          throw original;
+        }),
+      (err: Error) => {
+        assert.equal((err as Error & { cause?: unknown }).cause, original);
+        return true;
+      },
+    );
+  });
+
+  it("floors a non-positive concurrency at 1 instead of returning holes", async () => {
+    const r = await runWithConcurrency([1, 2, 3], 0, async (n) => n * 10);
+    assert.deepEqual(r, [10, 20, 30]);
+  });
+});

@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { dirname, join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { paginateTools } from "./paginate.js";
 import { buildPaginateAll, runScript, type ScriptHandlers, scriptTools } from "./script.js";
 import type { Tool } from "./tool.js";
 
@@ -1138,5 +1141,223 @@ describe("runScript timeouts", () => {
     // after Ns". Either path is acceptable -- we just need ok:false with a
     // non-empty message.
     assert.ok(handlerResult.error && handlerResult.error.length > 0);
+  });
+});
+
+describe("script bridge schema validation (regression)", () => {
+  // unwrap() calls tool.handler DIRECTLY. The MCP boundary validates via
+  // server.tool(..., inputSchema.shape, ...) in index.ts, but that never runs
+  // for a scripted call -- so before unwrap parsed, every cap living only in a
+  // Zod schema was unenforced here. Measured at the time:
+  // aws.multiRegion({regions: [...40]}) spawned all 40 CLI subprocesses despite
+  // .max(32), and aws.resource.list({maxResults: 5000}) sent --max-results 5000
+  // despite .max(100).
+  //
+  // These run against the DEFAULT handlers (no injected mocks) so the real
+  // unwrap runs. Every case fails validation before any spawn, so no fake-aws
+  // shim is needed.
+  const cases: Array<[string, string, RegExp]> = [
+    [
+      "resource.list maxResults above .max(100)",
+      `aws.resource.list({typeName:'AWS::SSM::Parameter', maxResults: 5000})`,
+      /Invalid input for 'aws_resource_list'.*maxResults/s,
+    ],
+    [
+      "multiRegion region list above .max(32)",
+      `aws.multiRegion({service:'s3api', operation:'list-buckets', regions: Array.from({length:40},(_,n)=>'us-east-'+(n+1))})`,
+      /Invalid input for 'aws_multi_region'.*regions/s,
+    ],
+    [
+      "multiRegion non-positive concurrency",
+      `aws.multiRegion({service:'s3api', operation:'list-buckets', regions:['us-east-1'], concurrency: 0})`,
+      /Invalid input for 'aws_multi_region'.*concurrency/s,
+    ],
+    [
+      "iamSimulate action list above .max(50)",
+      `aws.iamSimulate({principalArn:'arn:aws:iam::123456789012:user/x', actions: Array.from({length:60},()=> 's3:GetObject')})`,
+      /Invalid input for 'aws_iam_simulate'.*actions/s,
+    ],
+    [
+      "missing required field",
+      `aws.resource.get({typeName:'AWS::S3::Bucket'})`,
+      /Invalid input for 'aws_resource_get'.*identifier/s,
+    ],
+  ];
+
+  for (const [label, call, expected] of cases) {
+    it(`rejects ${label} before reaching the CLI`, async () => {
+      const r = await runScript({
+        code: `try { await ${call}; return 'NO THROW -- schema was not enforced'; } catch (e) { return e.message; }`,
+        timeoutMs: 10_000,
+      });
+      assert.match(String(r.data), expected);
+    });
+  }
+
+  it("throws a realm-local Error so script-side `instanceof Error` still works", async () => {
+    const r = await runScript({
+      code: `try { await aws.resource.get({typeName:'AWS::S3::Bucket'}); return 'NO THROW'; }
+             catch (e) { return {isError: e instanceof Error, toolName: e.toolName}; }`,
+      timeoutMs: 10_000,
+    });
+    assert.deepEqual(plain(r.data), { isError: true, toolName: "aws_resource_get" });
+  });
+});
+
+describe("script bridge -- payloads survive the schema parse (regression)", () => {
+  // Every OTHER test in this file injects mock handlers, which bypass unwrap
+  // entirely; the validation tests above only cover the REJECTION path, which
+  // returns before tool.handler is ever reached. So nothing exercised a
+  // successful call through the real unwrap -- meaning nothing would catch a
+  // future schema edit (adding .strict(), swapping z.record for z.object) that
+  // made `tool.inputSchema.parse` silently STRIP a scripted call's payload.
+  // Every aws.* call in every script would quietly lose its params, with the
+  // suite still green. These tests run the real bridge against the fake-aws
+  // shim and assert the payload reached the CLI intact.
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
+
+  let prevCommand: string | undefined;
+  let prevPrefixArgs: string | undefined;
+  let prevScenario: string | undefined;
+  before(() => {
+    prevCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+    prevPrefixArgs = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_echo_args";
+  });
+  after(() => {
+    if (prevCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    else process.env.AWS_MCP_TEST_AWS_COMMAND = prevCommand;
+    if (prevPrefixArgs === undefined) delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    else process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = prevPrefixArgs;
+    if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+    else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+  });
+
+  /** Pull the --cli-input-json payload out of a call_echo_args argv dump. */
+  function payloadFrom(argv: string[]): unknown {
+    const idx = argv.indexOf("--cli-input-json");
+    assert.ok(idx >= 0, `--cli-input-json missing from argv: ${JSON.stringify(argv)}`);
+    return JSON.parse(argv[idx + 1]);
+  }
+
+  it("forwards aws.call params through unwrap's parse unchanged", async () => {
+    const r = await runScript({
+      code: `const r = await aws.call({service:'s3api', operation:'put-object',
+               params:{Bucket:'b', Key:'k', Metadata:{nested:{deep:1}}, Tags:[{K:'v'}]},
+               profile:'default', region:'us-east-1'});
+             return r.result.argv;`,
+      timeoutMs: 30_000,
+    });
+    assert.deepEqual(payloadFrom(plain(r.data) as string[]), {
+      Bucket: "b",
+      Key: "k",
+      Metadata: { nested: { deep: 1 } },
+      Tags: [{ K: "v" }],
+    });
+  });
+
+  it("preserves nested arrays and objects inside a z.unknown() field", async () => {
+    // patchDocument-shaped payload: the op objects carry a `value` typed
+    // z.unknown(), the classic spot for a parse to flatten structure.
+    const r = await runScript({
+      code: `const r = await aws.call({service:'cloudcontrol', operation:'update-resource',
+               params:{PatchDocument:[{op:'replace', path:'/Env', value:{A:1, B:[2,3]}}]},
+               profile:'default', region:'us-east-1'});
+             return r.result.argv;`,
+      timeoutMs: 30_000,
+    });
+    assert.deepEqual(payloadFrom(plain(r.data) as string[]), {
+      PatchDocument: [{ op: "replace", path: "/Env", value: { A: 1, B: [2, 3] } }],
+    });
+  });
+
+  it("still reaches the CLI with the resolved profile and region", async () => {
+    const r = await runScript({
+      code: `const r = await aws.call({service:'s3api', operation:'list-buckets',
+               profile:'default', region:'eu-west-1'});
+             return r.result.argv;`,
+      timeoutMs: 30_000,
+    });
+    const argv = plain(r.data) as string[];
+    assert.equal(argv[argv.indexOf("--region") + 1], "eu-west-1");
+    assert.equal(argv[argv.indexOf("--profile") + 1], "default");
+  });
+});
+
+describe("buildPaginateAll against the REAL aws_paginate tool (regression)", () => {
+  // The existing paginateAll tests build their fake tool with
+  // `inputSchema: z.object({})`. Zod strips unknown keys by default, so that
+  // schema discards EVERY field -- and the fake handler ignores its input
+  // anyway. Those tests therefore cannot detect unwrap's parse dropping
+  // `startingToken`, which buildPaginateAll threads in on each iteration.
+  //
+  // The failure that would slip through is silent, not loud: with the token
+  // dropped, every call takes the first-page branch, hasMore stays true, and
+  // the loop runs to maxPages returning N duplicate copies of page 1. No error,
+  // just wrong data. This drives the loop against the real tool (real schema,
+  // real handler, real argv) so a dropped token shows up as a page count.
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
+
+  let prevCommand: string | undefined;
+  let prevPrefixArgs: string | undefined;
+  let prevScenario: string | undefined;
+  before(() => {
+    prevCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+    prevPrefixArgs = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "paginate_startingtoken_stateful";
+  });
+  after(() => {
+    if (prevCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    else process.env.AWS_MCP_TEST_AWS_COMMAND = prevCommand;
+    if (prevPrefixArgs === undefined) delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    else process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = prevPrefixArgs;
+    if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+    else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+  });
+
+  const realPaginate = paginateTools.find((t) => t.name === "aws_paginate");
+  if (!realPaginate) throw new Error("paginateTools missing aws_paginate");
+
+  it("threads startingToken through the real schema and stops after the final page", async () => {
+    const paginateAll = buildPaginateAll(realPaginate);
+    const out = (await paginateAll({
+      service: "s3api",
+      operation: "list-buckets",
+      profile: "default",
+      region: "us-east-1",
+      maxPages: 10,
+    })) as { items: unknown[]; pages: number; count: number };
+
+    // Exactly 2 pages: page 1 carries NextToken, the resume call (which only
+    // happens if --starting-token actually reached the CLI) returns the final
+    // page with none. A dropped token would loop to maxPages (10) instead.
+    assert.equal(out.pages, 2, "a dropped startingToken would re-fetch page 1 until maxPages");
+    assert.equal(out.count, 2, "one page-1 body + one page-2 body");
+    // Page 2's body echoes the token the CLI actually received.
+    const second = out.items[1] as { StartingTokenSeen?: string };
+    assert.equal(second.StartingTokenSeen, "page2-cursor", "the resume cursor must survive unwrap's parse");
+  });
+
+  it("still honors maxPages when the token IS threaded", async () => {
+    // maxPages is a buildPaginateAll-only field with no place in aws_paginate's
+    // schema; zod strips it, which is exactly why the loop can consume it
+    // without the tool ever seeing it. Capping at 1 must stop after page 1.
+    const paginateAll = buildPaginateAll(realPaginate);
+    const out = (await paginateAll({
+      service: "s3api",
+      operation: "list-buckets",
+      profile: "default",
+      region: "us-east-1",
+      maxPages: 1,
+    })) as { pages: number };
+    assert.equal(out.pages, 1);
   });
 });

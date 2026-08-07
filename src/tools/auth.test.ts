@@ -12,6 +12,23 @@ import { resolveProfileStartUrl } from "./profiles.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
+/**
+ * Poll `predicate` until it holds or the deadline passes, instead of sleeping
+ * a fixed interval sized against the `happy` fake's ~200ms exit. `node --test`
+ * runs test files in parallel across all cores, so on a full-suite run a fixed
+ * sleep is racing the scheduler, not just the fake. Mirrors the helper of the
+ * same name in sso.integration.test.ts.
+ */
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitUntil timed out after ${timeoutMs}ms waiting for: ${label}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe("findCachedSsoToken", () => {
   let cacheDir: string;
 
@@ -296,9 +313,16 @@ describe("aws_login_start handler — reuse vs fresh-spawn (auth.ts:195-236)", (
   // live session for the requested profile. We seed that by calling
   // startSsoLogin directly with the fake-aws shim (the handler itself calls
   // bare startSsoLogin(useProfile) with no opts, so the FRESH path can't be
-  // routed at the fake — see the gated block below). The 'happy' fake emits
-  // URL+code immediately and stays alive ~200ms before exiting, leaving a
-  // window where the session is registered and not yet completed.
+  // routed at the fake — see the gated block below).
+  //
+  // Seed with `happy_hold`, NOT `happy`. `happy` exits ~200ms after emitting
+  // URL+code, so every "the seeded session is live" assertion below was racing
+  // that exit. That window is plenty on an idle machine and unreliable under a
+  // parallel full-suite run (`node --test` runs files in parallel across all
+  // cores), which is what made this describe one of the suite's flakiest.
+  // `happy_hold` emits byte-identical URL+code stdout and then stays alive
+  // until killed, so "live" is a property of the fake rather than a race.
+  // afterEach's _clearSessions() SIGTERMs it, so teardown stays prompt.
   function fakeOpts(scenario: string, urlWaitMs = 5000) {
     return {
       command: process.execPath,
@@ -325,9 +349,10 @@ describe("aws_login_start handler — reuse vs fresh-spawn (auth.ts:195-236)", (
   });
 
   it("reuses an in-flight login instead of spawning a second subprocess", async () => {
-    // Seed a live session for 'reuse-prof'. startSsoLogin returns once URL+code
-    // are parsed; the subprocess is still alive at that instant.
-    const seed = await startSsoLogin("reuse-prof", fakeOpts("happy"));
+    // Seed a live session for 'reuse-prof'. `happy_hold` keeps the subprocess
+    // alive until teardown, so the session stays discoverable for both the
+    // sanity check and the handler call that follows it.
+    const seed = await startSsoLogin("reuse-prof", fakeOpts("happy_hold"));
     assert.equal(seed.ok, true);
     if (!seed.ok) return;
 
@@ -358,7 +383,7 @@ describe("aws_login_start handler — reuse vs fresh-spawn (auth.ts:195-236)", (
   });
 
   it("does not cross profiles: a session for one profile is not reused for another", async () => {
-    const seed = await startSsoLogin("prof-a", fakeOpts("happy"));
+    const seed = await startSsoLogin("prof-a", fakeOpts("happy_hold"));
     assert.equal(seed.ok, true);
     if (!seed.ok) return;
     // prof-b has no in-flight session -> findActiveSessionByProfile returns
@@ -369,16 +394,23 @@ describe("aws_login_start handler — reuse vs fresh-spawn (auth.ts:195-236)", (
   });
 
   it("reuse path is not taken once the seeded session has completed", async () => {
-    // The 'happy' fake exits ~200ms after URL+code, which flips the session to
-    // completed. findActiveSessionByProfile excludes completed sessions, so the
-    // handler's reuse guard (active === null) would fall through to a fresh
-    // spawn. Assert the guard input directly to avoid spawning the real binary.
+    // This case needs a fake that exits ON ITS OWN, so it keeps `happy` (which
+    // exits ~200ms after URL+code) rather than the `happy_hold` used to seed
+    // the live-session cases above. findActiveSessionByProfile excludes
+    // completed sessions, so the handler's reuse guard (active === null) falls
+    // through to a fresh spawn. Assert the guard input directly to avoid
+    // spawning the real binary.
     const seed = await startSsoLogin("expire-prof", fakeOpts("happy"));
     assert.equal(seed.ok, true);
     if (!seed.ok) return;
-    assert.ok(findActiveSessionByProfile("expire-prof"), "live immediately after start");
-    // Wait past the fake's ~200ms exit so the session is marked completed.
-    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    // NOTE: no "live immediately after start" assertion -- it raced the fake's
+    // 200ms exit and was one of the suite's flakiest lines. The live-session
+    // property is covered deterministically by the happy_hold-seeded reuse test
+    // above; this test only cares about the post-completion state.
+    await waitUntil(
+      () => findActiveSessionByProfile("expire-prof") === null,
+      "the seeded session to complete and drop out of findActiveSessionByProfile",
+    );
     assert.equal(
       findActiveSessionByProfile("expire-prof"),
       null,
