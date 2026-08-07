@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-08-07
+
 ### Added
 - Runtime launcher at `bin/aws-mcp.mjs`: the published `aws-mcp` command now prefers the [oam](https://oamjs.org) runtime and falls back to Node. `AWS_MCP_RUNTIME` selects (`auto` / `oam` / `node`) and `OAM_BIN` overrides discovery. Both paths verified against the MCP surface — handshake plus all 25 tools — and behave identically. The fallback does **not** re-exec Node: npm has already started Node to run the launcher, so it is an in-process `import()` with no extra spawn.
 
