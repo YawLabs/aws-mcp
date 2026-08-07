@@ -12,3 +12,6 @@ dist/
 bin/
 build-tmp/
 dist-release/
+
+# oam.js writes a bytecode cache here on any `oam run` / `oam check`
+oam/

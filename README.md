@@ -225,9 +225,80 @@ For multi-region reads:
 
 ## Requirements
 
-- Node.js 22+
+- Node.js 22+ (or [oam.js](https://oamjs.org) -- see [Runtime](#runtime))
 - AWS CLI v2 installed and on `PATH` (for `aws sso login --no-browser`)
 - An AWS profile configured for SSO / IAM Identity Center in `~/.aws/config`
+
+## Runtime
+
+This server runs on [oam.js](https://oamjs.org) and on Node, unmodified. Verified
+against oam 0.8.2 and Node 22: full MCP handshake, all 25 tools, `aws_script`'s
+`node:vm` sandbox, and byte-identical error messages -- from the shipped bundle
+*and* straight from the TypeScript source with no build step.
+
+To run it under oam, point your MCP client's `command` at it:
+
+```jsonc
+{
+  "mcpServers": {
+    "aws": {
+      "command": "oam",
+      "args": ["run", "/path/to/aws-mcp/dist/index.js"],
+      "env": { "AWS_PROFILE": "my-sso-profile", "AWS_REGION": "us-west-2" }
+    }
+  }
+}
+```
+
+**Node remains the packaged default, and that is a measurement, not a
+preference.** An MCP client cold-starts this server once per session, so startup
+is the cost that actually gets paid. On the machine this was measured on, to a
+completed `initialize` + `tools/list` handshake, median of 10 warmed runs:
+
+| Runtime | Cold start |
+|---------|-----------|
+| `node dist/index.js` | **359 ms** |
+| `oam run dist/index.js` | 650 ms |
+| `oam run src/index.ts` (no build step) | 947 ms |
+
+Preferring oam automatically would mean either probing for it on every start --
+a cost paid by everyone, including the majority who don't have it -- or making
+oam a hard requirement, which breaks the npm package for those users. Neither is
+worth it to reach a runtime that is not faster here. Measure on your own
+hardware before concluding anything; if oam wins on yours, the config above is
+all you need, and the `bin` shim keeps working under Node regardless.
+
+Two places oam *does* win for this repo, both opt-in and neither touching the
+published npm package:
+
+- **`npm run check:oam`** -- type-checks via `oam check` (tsgo, TypeScript 7
+  native). Measured **~1.0s against ~3.8-4.7s** for `tsc --noEmit`, resolving the
+  same `tsconfig.json` and covering the same files -- including tests, confirmed
+  by planting a type error in a test file and watching both reject it.
+  `npx tsc --noEmit` remains the portable default.
+- **`npm run build:binary:oam`** -- builds the standalone binary via
+  `oam compile` instead of Node SEA. Measured **58.60 MB against 76.28 MB**, plus
+  ~493 KB of embedded V8 bytecode the SEA path doesn't produce. Writes to the
+  same `bin/<platform>-<arch>/` path as `npm run build:binary`, so the release
+  staging script consumes either unchanged -- run one or the other, not both. If
+  you redistribute that binary it embeds oam's runtime, so ship oam's `LICENSE`,
+  `NOTICE` and `THIRD_PARTY_LICENSES.md` with it.
+
+The source stays runtime-agnostic on purpose: no `oam:` imports anywhere, and
+tests stay on `node:test`. That is what keeps the Node fallback real rather than
+nominal.
+
+One behavioral difference worth knowing if you run `aws_script` under oam: Node
+honors `codeGeneration: { strings: false }` on the `node:vm` context, so `eval`
+and `Function` throw; oam 0.8.2 does not, so they work. The containment that
+matters is unaffected -- under oam, `Function('return this')()` yields a global
+whose `process` and `require` are both `undefined`, and `Function('return
+require')` throws -- so a script gains nothing it couldn't already do by writing
+the same code in its body. `aws_script` was never a security boundary (see its
+description); the shadowed-globals list is the real defense, not that flag.
+
+Note that any `oam` invocation writes a bytecode cache to `oam/` in the working
+directory -- already in `.gitignore`.
 
 ## Environment
 

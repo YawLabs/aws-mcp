@@ -74,6 +74,22 @@ login sessions were never released from memory.
   `null.createRequire(...)`, so it would have thrown a `TypeError` had it ever
   run in a bundled build -- which is every build we publish.
 
+### Added
+- Verified support for the [oam.js](https://oamjs.org) runtime (oam 0.8.2)
+  alongside Node, from the shipped bundle and from TypeScript source with no
+  build step: full handshake, all 25 tools, `aws_script`'s `node:vm` sandbox,
+  identical error messages. Node stays the packaged default on measurement --
+  cold start to a completed handshake was 359ms under node against 650ms under
+  `oam run` (median of 10 warmed runs). See the README "Runtime" section.
+- `npm run check:oam` -- type-check via `oam check` (tsgo, TypeScript 7 native),
+  ~1.0s against ~3.8-4.7s for `tsc --noEmit`, same tsconfig and same file
+  coverage. `npx tsc --noEmit` remains the portable default.
+- `npm run build:binary:oam` -- standalone binary via `oam compile` instead of
+  Node SEA: 58.60 MB against 76.28 MB, plus embedded V8 bytecode. Writes to the
+  same `bin/<platform>-<arch>/` path as `build:binary`; run one or the other.
+- `npm run build:binary` -- an npm alias for `scripts/build-binary.mjs`, which
+  previously had none.
+
 ### Internal
 - Test suite is no longer timing-flaky. Several tests asserted against fixed
   durations sized to a fake subprocess's 200ms exit, which raced the scheduler

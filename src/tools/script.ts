@@ -26,6 +26,16 @@ import type { Tool, ToolResult } from "./tool.js";
  * the model can already call -- the threat surface is "model writes JS that
  * calls our tools," not "untrusted code from the internet."
  *
+ * RUNTIME CAVEAT (oam.js): `codeGeneration: { strings: false }` is honored by
+ * Node but NOT by oam 0.8.2 -- under oam, `eval` and `Function` still work
+ * inside the context. Measured, not assumed. The containment that actually
+ * matters still holds there: `Function('return this')()` yields a global whose
+ * `process` and `require` are both undefined, and `Function('return require')`
+ * throws, so a script gains no capability it didn't already have by writing
+ * the same code directly in its body. The practical effect is limited to
+ * dynamic code construction. Do not treat the codeGeneration flag as a
+ * portable guarantee; the shadow list below is the load-bearing defense.
+ *
  * Sandbox surface (explicitly bound):
  *   aws.call({service, operation, params?, query?, profile?, region?,
  *             outputFormat?, timeoutMs?}) -> {command, result}
@@ -538,7 +548,7 @@ export const scriptTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, process, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance, fs, import. eval/Function are disabled (codeGeneration off). Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
+          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, process, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance, fs, import. eval/Function are disabled under Node (codeGeneration off); under the oam.js runtime they remain callable, but reach no process/require either way, so don't rely on either behavior. Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
         ),
       timeoutMs: z
         .number()
