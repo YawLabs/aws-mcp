@@ -232,9 +232,16 @@ For multi-region reads:
 ## Runtime
 
 This server runs on [oam.js](https://oamjs.org) and on Node, unmodified. Verified
-against oam 0.8.2 and Node 22: full MCP handshake, all 25 tools, `aws_script`'s
+against oam 0.9.0 and Node 22: full MCP handshake, all 25 tools, `aws_script`'s
 `node:vm` sandbox, and byte-identical error messages -- from the shipped bundle
 *and* straight from the TypeScript source with no build step.
+
+**oam 0.9.0 is the minimum.** Older releases ran `child_process.execFile`
+arguments through a shell, accepted `exec`'s `timeout` and ignored it, and
+treated `stdio: 'inherit'` as `'pipe'`. This server shells out to the `aws` CLI
+on essentially every tool, so those were reachable bugs rather than theoretical
+ones. The launcher enforces the floor: given an older oam it falls back to Node
+and says so on stderr, and `AWS_MCP_RUNTIME=oam` turns that into a hard error.
 
 To run it under oam, point your MCP client's `command` at it:
 
@@ -290,7 +297,8 @@ nominal.
 
 One behavioral difference worth knowing if you run `aws_script` under oam: Node
 honors `codeGeneration: { strings: false }` on the `node:vm` context, so `eval`
-and `Function` throw; oam 0.8.2 does not, so they work. The containment that
+and `Function` throw; oam does not, so they work. Re-measured against oam 0.9.0
+and still divergent, so treat it as a standing difference. The containment that
 matters is unaffected -- under oam, `Function('return this')()` yields a global
 whose `process` and `require` are both `undefined`, and `Function('return
 require')` throws -- so a script gains nothing it couldn't already do by writing

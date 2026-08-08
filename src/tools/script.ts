@@ -27,14 +27,17 @@ import type { Tool, ToolResult } from "./tool.js";
  * calls our tools," not "untrusted code from the internet."
  *
  * RUNTIME CAVEAT (oam.js): `codeGeneration: { strings: false }` is honored by
- * Node but NOT by oam 0.8.2 -- under oam, `eval` and `Function` still work
- * inside the context. Measured, not assumed. The containment that actually
- * matters still holds there: `Function('return this')()` yields a global whose
- * `process` and `require` are both undefined, and `Function('return require')`
- * throws, so a script gains no capability it didn't already have by writing
- * the same code directly in its body. The practical effect is limited to
- * dynamic code construction. Do not treat the codeGeneration flag as a
- * portable guarantee; the shadow list below is the load-bearing defense.
+ * Node but NOT by oam -- under oam, `eval` and `Function` still work inside the
+ * context. Measured, not assumed, and re-measured against oam 0.9.0: still
+ * divergent, so this is a standing difference rather than a bug awaiting a fix.
+ * The containment that actually matters still holds there:
+ * `Function('return this')()` yields a global whose `process` and `require` are
+ * both undefined, and `Function('return require')` throws (ReferenceError on
+ * oam where Node raises EvalError -- different error, same refusal), so a
+ * script gains no capability it didn't already have by writing the same code
+ * directly in its body. The practical effect is limited to dynamic code
+ * construction. Do not treat the codeGeneration flag as a portable guarantee;
+ * the shadow list below is the load-bearing defense.
  *
  * Sandbox surface (explicitly bound):
  *   aws.call({service, operation, params?, query?, profile?, region?,
