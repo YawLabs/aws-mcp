@@ -110,7 +110,12 @@ describe("startSsoLogin — failure paths", () => {
   });
 
   it("returns an error when subprocess exits before emitting URL", async () => {
-    const result = await startSsoLogin("test-profile", fakeOpts("exits_before_url", 2000));
+    // Generous urlWaitMs on purpose. This asserts WHICH path wins (the exit
+    // handler, not the URL timeout), and the fake exits after 50ms -- so a
+    // healthy run settles in ~100ms and never approaches this bound. At 2000ms
+    // it lost the race under a loaded parallel run where the child had not
+    // finished booting yet, and reported a timeout instead of the exit.
+    const result = await startSsoLogin("test-profile", fakeOpts("exits_before_url", 10_000));
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.match(result.error, /exited before printing|exited with code/);
@@ -611,7 +616,7 @@ describe("startSsoLogin — CLI version probe", () => {
    * tests are about. Same side-channel shape as AWS_MCP_FAKE_ARGV_OUT
    * elsewhere in the suite.
    */
-  function counterOpts(scenario: string, extraEnv: Record<string, string> = {}, urlWaitMs = 5000) {
+  function counterOpts(scenario: string, extraEnv: Record<string, string> = {}, urlWaitMs = 10_000) {
     const dir = mkdtempSync(join(tmpdir(), "aws-mcp-version-probe-"));
     const countPath = join(dir, "probe-count");
     const base = fakeOpts(scenario, urlWaitMs);
