@@ -7,6 +7,15 @@
  * URL + short code to stdout instead — we parse them and surface them so the
  * user clicks one link in the window they're already in. Zero context switch.
  *
+ * `--no-browser` alone is NOT enough on a current AWS CLI. From v2.22.0 the
+ * default grant became the PKCE authorization-code flow, which prints only an
+ * `https://oidc.<region>.amazonaws.com/authorize?...` URL and no short code —
+ * so the parse below finds nothing and the start call dies on its 15s URL
+ * timeout. `--use-device-code` asks for the device-authorization grant that
+ * still emits the URL + code pair. That flag only exists from 2.22.0, so
+ * `probeDeviceCodeSupport` reads `aws --version` once per binary and omits it
+ * on older CLIs, where the device grant is already the default.
+ *
  * The token ends up cached in `~/.aws/sso/cache/<hash>.json` the same way a
  * normal `aws sso login` would, so the rest of the SDK ecosystem picks it up
  * transparently.
@@ -118,6 +127,7 @@ function dedupeKey(profile: string, opts: SsoLoginOptions): string {
     // caller's opts would be dropped). Omitting a new opt here is the specific
     // regression this list exists to prevent.
     completedReapMs: opts.completedReapMs ?? null,
+    useDeviceCode: opts.useDeviceCode ?? null,
     env: opts.env ? Object.entries(opts.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)) : null,
   });
   return createHash("sha256").update(payload).digest("hex");
@@ -127,6 +137,10 @@ function dedupeKey(profile: string, opts: SsoLoginOptions): string {
 // format shifts between versions, so they need direct coverage.
 export const URL_RE = /https:\/\/device\.sso[.\w-]*\.amazonaws\.com\/[^\s]*/;
 export const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
+// The authorize URL the PKCE flow prints instead. Never a success shape for
+// this server — no short code accompanies it — so matching it buys nothing but
+// the ability to fail with the real cause instead of a generic URL timeout.
+export const PKCE_URL_RE = /https:\/\/oidc\.[\w.-]+\.amazonaws\.com\/authorize\b[^\s]*/;
 const URL_WAIT_MS = 15_000;
 // Cap on how long a session can sit unclaimed. Real SSO device-auth flows
 // complete in seconds-to-a-minute; 10 min is a forgiving upper bound that
@@ -147,6 +161,146 @@ export function parseLoginOutput(text: string): { url: string | null; code: stri
     url: urlMatch ? urlMatch[0] : null,
     code: codeMatch ? codeMatch[1] : null,
   };
+}
+
+/**
+ * First AWS CLI version that understands `aws sso login --use-device-code`.
+ * 2.22.0 is also the release that made the PKCE authorization-code flow the
+ * default, so the flag and the need for it arrived together.
+ */
+export const DEVICE_CODE_MIN_CLI = { major: 2, minor: 22, patch: 0 } as const;
+
+interface CliVersion {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+/** Parse `aws-cli/2.34.3 Python/3.13.11 Windows/11 exe/AMD64` into its triple. */
+export function parseAwsCliVersion(text: string): CliVersion | null {
+  const m = text.match(/aws-cli\/(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+}
+
+/**
+ * Whether to pass `--use-device-code`.
+ *
+ * An unparseable version resolves to `true` on purpose. The two failure modes
+ * are not symmetric: omitting the flag on a modern CLI produces the silent
+ * 15-second URL timeout this whole probe exists to prevent, while passing it
+ * to a pre-2.22 CLI fails immediately with `Unknown options: --use-device-code`
+ * sitting in `rawOutput`. Prefer the loud failure.
+ */
+export function supportsDeviceCodeFlag(v: CliVersion | null): boolean {
+  if (!v) return true;
+  if (v.major !== DEVICE_CODE_MIN_CLI.major) return v.major > DEVICE_CODE_MIN_CLI.major;
+  if (v.minor !== DEVICE_CODE_MIN_CLI.minor) return v.minor > DEVICE_CODE_MIN_CLI.minor;
+  return v.patch >= DEVICE_CODE_MIN_CLI.patch;
+}
+
+/**
+ * Build the argv tail for `aws sso login` (everything after any test prefix).
+ *
+ * The empty-profile guard is vestigial — startSsoLogin rejects an empty
+ * profile at the isValidProfileName gate (PROFILE_NAME_RE requires >=1 char),
+ * so `profile` is always non-empty by the time this runs. Kept because the
+ * `profile || "default"` fallback at the resolve site mirrors it.
+ */
+export function _buildLoginArgs(profile: string, useDeviceCode: boolean): string[] {
+  const args = ["sso", "login", "--no-browser"];
+  if (useDeviceCode) args.push("--use-device-code");
+  if (profile) args.push("--profile", profile);
+  return args;
+}
+
+// Deliberately tight. This runs IN FRONT of the 15s URL wait on the one call
+// where the user is sitting there waiting, and `aws --version` answers in well
+// under a second on any healthy install — so a slow probe is a broken probe,
+// and the timeout resolves to "assume modern" anyway.
+const VERSION_PROBE_TIMEOUT_MS = 2_000;
+
+// A version line is ~50 bytes. Cap far above that so a misbehaving `aws` shim
+// can't balloon memory inside the probe window — same reasoning as
+// MAX_STDERR_BYTES on the login path.
+const MAX_VERSION_PROBE_BYTES = 64 * 1024;
+
+/**
+ * probe key -> in-flight/settled device-code-support promise.
+ * Cached because the answer is a property of the binary on PATH, not of the
+ * login attempt: paying a spawn per login would put ~200-400ms on the one
+ * interaction where the user is already waiting.
+ */
+const deviceCodeSupport = new Map<string, Promise<boolean>>();
+
+/** Test seam — drop the cached `aws --version` probe. */
+export function _clearCliVersionCache(): void {
+  deviceCodeSupport.clear();
+}
+
+function probeDeviceCodeSupport(command: string, prefixArgs: string[], env?: NodeJS.ProcessEnv): Promise<boolean> {
+  // PATH is part of the key because it decides WHICH `aws` a bare command name
+  // resolves to -- two callers with different PATHs are asking about different
+  // binaries. Same rule dedupeKey follows: anything that changes the subprocess
+  // belongs in the key. (Windows env objects may spell it `Path`.)
+  const key = JSON.stringify([command, prefixArgs, env?.PATH ?? env?.Path ?? null]);
+  const cached = deviceCodeSupport.get(key);
+  if (cached) return cached;
+
+  const probe = new Promise<boolean>((resolve) => {
+    let proc: ChildProcess;
+    try {
+      proc = spawn(command, [...prefixArgs, "--version"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(env ? { env } : {}),
+      });
+    } catch {
+      // Can't even spawn — let the login attempt itself report the missing
+      // binary, with the flag included per the asymmetry above.
+      resolve(true);
+      return;
+    }
+
+    let out = "";
+    let outBytes = 0;
+    let done = false;
+    const finish = (value: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => {
+      killProc(proc);
+      finish(true);
+    }, VERSION_PROBE_TIMEOUT_MS);
+    timer.unref();
+
+    // One decoder per stream, not one shared: interleaved partial multi-byte
+    // sequences from two pipes would corrupt each other through a single
+    // decoder. Matches how the login path below handles its own two pipes.
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    const append = (chunk: Buffer, decoder: StringDecoder): void => {
+      outBytes += chunk.length;
+      if (outBytes > MAX_VERSION_PROBE_BYTES) return;
+      out += decoder.write(chunk);
+    };
+
+    // aws v2 prints --version to stdout; some older builds used stderr. Read
+    // both rather than guessing which one this install writes to.
+    proc.stdout?.on("data", (c: Buffer) => append(c, stdoutDecoder));
+    proc.stderr?.on("data", (c: Buffer) => append(c, stderrDecoder));
+    proc.on("error", () => finish(true));
+    // 'close' rather than 'exit' so both pipes have flushed before parsing.
+    proc.on("close", () => {
+      out += stdoutDecoder.end() + stderrDecoder.end();
+      finish(supportsDeviceCodeFlag(parseAwsCliVersion(out)));
+    });
+  });
+
+  deviceCodeSupport.set(key, probe);
+  return probe;
 }
 
 /**
@@ -199,6 +353,12 @@ export interface SsoLoginOptions {
    * -- production never sets it.
    */
   completedReapMs?: number;
+  /**
+   * Force `--use-device-code` on or off instead of probing `aws --version`.
+   * Production leaves this unset. Tests use it to pin argv construction
+   * without standing up a version-reporting fake.
+   */
+  useDeviceCode?: boolean;
 }
 
 /**
@@ -237,24 +397,17 @@ export function startSsoLogin(
   return promise;
 }
 
-function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginStartResult | LoginStartError> {
+async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginStartResult | LoginStartError> {
   const command = opts.command ?? "aws";
   const prefixArgs = opts.prefixArgs ?? [];
   const urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
   const sessionTtlMs = opts.sessionTtlMs ?? SESSION_TTL_MS;
   const completedReapMs = opts.completedReapMs ?? COMPLETED_SESSION_REAP_MS;
   const spawnEnv = opts.env;
+  const useDeviceCode = opts.useDeviceCode ?? (await probeDeviceCodeSupport(command, prefixArgs, spawnEnv));
 
   return new Promise((resolve) => {
-    const args = [...prefixArgs, "sso", "login", "--no-browser"];
-    // Vestigial: this empty-profile guard (and the `profile || "default"`
-    // fallback at the resolve below) is unreachable from the only public
-    // entry. startSsoLogin rejects an empty profile at the isValidProfileName
-    // gate (PROFILE_NAME_RE requires >=1 char), so `profile` is always a
-    // non-empty string by the time doStartSsoLogin runs.
-    if (profile) {
-      args.push("--profile", profile);
-    }
+    const args = [...prefixArgs, ..._buildLoginArgs(profile, useDeviceCode)];
 
     let proc: ChildProcess;
     try {
@@ -333,6 +486,33 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
       }
     }, urlWaitMs);
 
+    /**
+     * Settle early when the CLI picked the authorization-code flow.
+     *
+     * Riding out the URL timeout instead would report "the profile may not be
+     * set up for SSO", which sends the operator down entirely the wrong path.
+     * Scans BOTH buffers and is called from BOTH pipe handlers: the device-code
+     * banner is a stdout fact we rely on, but which stream carries the PKCE
+     * banner is not something this server should be betting on.
+     */
+    const checkPkceFallback = (): boolean => {
+      if (urlSeen || settled) return false;
+      if (!PKCE_URL_RE.test(stdoutBuf + stderrBuf)) return false;
+      settled = true;
+      clearTimeout(urlTimeout);
+      killProc(proc);
+      resolve({
+        ok: false,
+        error: `'aws sso login' used the PKCE authorization-code flow, which prints a verification URL but no short code for this server to surface. ${
+          useDeviceCode
+            ? "aws-mcp passed --use-device-code and this AWS CLI did not honor it."
+            : "aws-mcp omitted --use-device-code because this AWS CLI reported a version older than 2.22.0."
+        } Upgrade the AWS CLI to 2.22.0 or newer, or run 'aws sso login --use-device-code --profile ${profile}' in a terminal and retry.`,
+        rawOutput: stdoutBuf + stderrBuf,
+      });
+      return true;
+    };
+
     proc.stdout?.on("data", (chunk: Buffer) => {
       stdoutBuf += stdoutDecoder.write(chunk);
       if (!urlSeen) {
@@ -343,6 +523,7 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
         const m = stdoutBuf.match(CODE_RE);
         if (m) codeSeen = m[1];
       }
+      if (checkPkceFallback()) return;
       if (urlSeen && codeSeen && !settled) {
         settled = true;
         clearTimeout(urlTimeout);
@@ -382,6 +563,7 @@ function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginS
       stderrBytes += chunk.length;
       if (stderrBytes > MAX_STDERR_BYTES) return;
       stderrBuf += stderrDecoder.write(chunk);
+      checkPkceFallback();
     });
 
     proc.on("exit", (code) => {

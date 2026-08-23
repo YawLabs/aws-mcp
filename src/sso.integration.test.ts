@@ -5,10 +5,19 @@
  */
 
 import assert from "node:assert/strict";
-import { dirname, join } from "node:path";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { _clearSessions, _hasSession, findActiveSessionByProfile, startSsoLogin, waitForLogin } from "./sso.js";
+import {
+  _clearCliVersionCache,
+  _clearSessions,
+  _hasSession,
+  findActiveSessionByProfile,
+  startSsoLogin,
+  waitForLogin,
+} from "./sso.js";
 
 // This test file compiles to dist/sso.integration.test.js and the fake lives
 // at dist/testing/fake-aws.js. Resolve relative to the compiled location.
@@ -507,5 +516,251 @@ describe("completed-session reaping (bounds the sessions Map)", () => {
     assert.equal(second.ok, false);
     assert.match(second.error ?? "", /No active login session/);
     assert.equal(findActiveSessionByProfile("claimed-profile"), null);
+  });
+});
+
+describe("startSsoLogin — PKCE / device-code flow selection", () => {
+  it("passes --use-device-code when the probed CLI is >= 2.22.0", async () => {
+    // Self-contained: the probe cache is shared by every test in this file, so
+    // clear it here rather than depending on execution order.
+    _clearCliVersionCache();
+    const start = await startSsoLogin("test-profile", fakeOpts("device_code_flag_echo", 5000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    assert.match(wait.rawOutput ?? "", /ARGV:.*--use-device-code/);
+    // Ordering matters: the flag must not land where --profile expects a value.
+    assert.match(wait.rawOutput ?? "", /--no-browser --use-device-code --profile test-profile/);
+  });
+
+  it("omits --use-device-code when the probed CLI predates 2.22.0", async () => {
+    // Self-contained: the probe cache is shared by every test in this file, so
+    // clear it here rather than depending on execution order.
+    _clearCliVersionCache();
+    const opts = fakeOpts("device_code_flag_echo", 5000);
+    const start = await startSsoLogin("test-profile", {
+      ...opts,
+      env: { ...opts.env, AWS_MCP_FAKE_CLI_VERSION: "2.21.9" },
+    });
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    // Positive first -- a bare doesNotMatch would also pass if rawOutput were
+    // empty or the scenario stopped echoing its argv at all.
+    assert.match(wait.rawOutput ?? "", /ARGV:sso login --no-browser --profile test-profile/);
+    assert.doesNotMatch(wait.rawOutput ?? "", /--use-device-code/);
+  });
+
+  it("names the PKCE flow instead of timing out when no short code is printed", async () => {
+    // urlWaitMs is deliberately long: a pass here must come from the PKCE
+    // detector firing, not from the URL timeout expiring first.
+    const result = await startSsoLogin("test-profile", {
+      ...fakeOpts("pkce_no_device_code", 10_000),
+      useDeviceCode: true,
+    });
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.match(result.error, /PKCE authorization-code flow/);
+    assert.match(result.error, /did not honor it/);
+    assert.doesNotMatch(result.error, /Timed out/);
+    assert.match(result.rawOutput ?? "", /oidc\.us-east-1\.amazonaws\.com\/authorize/);
+  });
+
+  it("detects the PKCE banner when it lands on stderr instead of stdout", async () => {
+    const result = await startSsoLogin("test-profile", {
+      ...fakeOpts("pkce_no_device_code_stderr", 10_000),
+      useDeviceCode: true,
+    });
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.match(result.error, /PKCE authorization-code flow/);
+    assert.doesNotMatch(result.error, /Timed out/);
+  });
+
+  it("blames the CLI version when the flag was skipped", async () => {
+    const result = await startSsoLogin("test-profile", {
+      ...fakeOpts("pkce_no_device_code", 10_000),
+      useDeviceCode: false,
+    });
+    assert.equal(result.ok, false);
+    if (result.ok) return;
+    assert.match(result.error, /older than 2\.22\.0/);
+  });
+
+  it("treats an unparseable `aws --version` as device-code-capable", async () => {
+    // Self-contained: the probe cache is shared by every test in this file, so
+    // clear it here rather than depending on execution order.
+    _clearCliVersionCache();
+    const opts = fakeOpts("device_code_flag_echo", 5000);
+    const start = await startSsoLogin("test-profile", {
+      ...opts,
+      env: { ...opts.env, AWS_MCP_FAKE_CLI_VERSION: "none" },
+    });
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    assert.match(wait.rawOutput ?? "", /--use-device-code/);
+  });
+});
+
+describe("startSsoLogin — CLI version probe", () => {
+  /**
+   * Throwaway dir plus a probe-spawn counter path. The counter file is
+   * APPENDED to (one byte per `aws --version` invocation), so its SIZE is the
+   * number of times the probe actually spawned -- which is the thing these
+   * tests are about. Same side-channel shape as AWS_MCP_FAKE_ARGV_OUT
+   * elsewhere in the suite.
+   */
+  function counterOpts(scenario: string, extraEnv: Record<string, string> = {}, urlWaitMs = 5000) {
+    const dir = mkdtempSync(join(tmpdir(), "aws-mcp-version-probe-"));
+    const countPath = join(dir, "probe-count");
+    const base = fakeOpts(scenario, urlWaitMs);
+    return {
+      dir,
+      probeCount: (): number => (existsSync(countPath) ? statSync(countPath).size : 0),
+      opts: { ...base, env: { ...base.env, AWS_MCP_FAKE_VERSION_COUNT_OUT: countPath, ...extraEnv } },
+    };
+  }
+
+  it("spawns 'aws --version' once for a binary, not once per login", async () => {
+    _clearCliVersionCache();
+    const { dir, probeCount, opts } = counterOpts("device_code_flag_echo");
+    try {
+      const a = await startSsoLogin("probe-cache-a", opts);
+      const b = await startSsoLogin("probe-cache-b", opts);
+      assert.equal(a.ok, true);
+      assert.equal(b.ok, true);
+      // Sanity first: proves the counter side channel is live, so the ===1
+      // below is a real measurement and not a file that never got written.
+      assert.ok(probeCount() >= 1, "probe never spawned -- counter side channel is broken");
+      assert.equal(probeCount(), 1, "second login re-probed; the version cache is not being consulted");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("shares one in-flight probe across concurrent logins for different profiles", async () => {
+    // The cache stores the PROMISE, not the resolved value, so two callers
+    // racing on the same tick collapse onto one subprocess. This is the probe's
+    // analogue of the pendingStarts guard; aws_login_start and
+    // aws_refresh_if_expiring_soon firing together is the motivating case.
+    _clearCliVersionCache();
+    const { dir, probeCount, opts } = counterOpts("device_code_flag_echo");
+    try {
+      const [a, b] = await Promise.all([startSsoLogin("race-a", opts), startSsoLogin("race-b", opts)]);
+      assert.equal(a.ok, true);
+      assert.equal(b.ok, true);
+      assert.equal(probeCount(), 1, "concurrent logins each spawned their own probe");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("probes separately when PATH changes, since PATH decides which binary resolves", async () => {
+    // Both PATHs stay valid -- the fake is invoked by absolute path, so PATH is
+    // not load-bearing for the spawn. Only the cache key should differ.
+    _clearCliVersionCache();
+    const { dir, probeCount, opts } = counterOpts("device_code_flag_echo");
+    const basePath = process.env.PATH ?? "";
+    try {
+      const first = await startSsoLogin("path-a", {
+        ...opts,
+        env: { ...opts.env, PATH: `${basePath}${delimiter}/nonexistent-a` },
+      });
+      const second = await startSsoLogin("path-b", {
+        ...opts,
+        env: { ...opts.env, PATH: `${basePath}${delimiter}/nonexistent-b` },
+      });
+      assert.equal(first.ok, true);
+      assert.equal(second.ok, true);
+      assert.equal(probeCount(), 2, "a different PATH reused another binary's cached verdict");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds a hung 'aws --version' and falls back to assume-modern", async () => {
+    // The fake never answers and never exits, so the only thing that can
+    // release this is the probe's own timeout -- the single bound on probe
+    // latency, which sits IN FRONT of the user-facing URL wait.
+    _clearCliVersionCache();
+    const { dir, opts } = counterOpts("device_code_flag_echo", { AWS_MCP_FAKE_CLI_VERSION: "hang" }, 10_000);
+    try {
+      const started = Date.now();
+      const start = await startSsoLogin("hung-probe", opts);
+      const elapsed = Date.now() - started;
+      assert.equal(start.ok, true);
+      if (!start.ok) return;
+      // Lower bound pins that the timeout is what released us. Upper bound
+      // pins that it is a SHORT timeout, with generous headroom because this
+      // file runs inside a loaded parallel test run.
+      assert.ok(elapsed >= 2000, `released before the probe timeout could fire (${elapsed}ms)`);
+      assert.ok(elapsed < 8000, `probe timeout is far longer than intended (${elapsed}ms)`);
+      const wait = await waitForLogin(start.sessionId);
+      assert.match(wait.rawOutput ?? "", /ARGV:sso login --no-browser --use-device-code/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses the version when the CLI prints it on stderr", async () => {
+    // Asserting the flag is OMITTED is the strong form: if the stderr pipe were
+    // ignored, the probe would see empty output, parse null, and assume-modern
+    // -- which ADDS the flag. Only an actually-parsed 2.21.9 drops it.
+    _clearCliVersionCache();
+    const { dir, opts } = counterOpts("device_code_flag_echo", {
+      AWS_MCP_FAKE_VERSION_STREAM: "stderr",
+      AWS_MCP_FAKE_CLI_VERSION: "2.21.9",
+    });
+    try {
+      const start = await startSsoLogin("stderr-version", opts);
+      assert.equal(start.ok, true);
+      if (!start.ok) return;
+      const wait = await waitForLogin(start.sessionId);
+      assert.match(wait.rawOutput ?? "", /ARGV:sso login --no-browser --profile stderr-version/);
+      assert.doesNotMatch(wait.rawOutput ?? "", /--use-device-code/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("drops probe output past the byte cap, which degrades to assume-modern", async () => {
+    // Two halves so the cap is provably the cause: same version string both
+    // times, only the preceding volume of noise differs.
+    _clearCliVersionCache();
+    const small = counterOpts("device_code_flag_echo", {
+      AWS_MCP_FAKE_CLI_VERSION: "2.21.9",
+      AWS_MCP_FAKE_VERSION_NOISE_BYTES: "1024",
+    });
+    try {
+      const start = await startSsoLogin("cap-under", small.opts);
+      assert.equal(start.ok, true);
+      if (!start.ok) return;
+      const wait = await waitForLogin(start.sessionId);
+      assert.doesNotMatch(
+        wait.rawOutput ?? "",
+        /--use-device-code/,
+        "1 KB of noise should not have lost the version line",
+      );
+    } finally {
+      rmSync(small.dir, { recursive: true, force: true });
+    }
+
+    _clearCliVersionCache();
+    const huge = counterOpts("device_code_flag_echo", {
+      AWS_MCP_FAKE_CLI_VERSION: "2.21.9",
+      AWS_MCP_FAKE_VERSION_NOISE_BYTES: String(256 * 1024),
+    });
+    try {
+      const start = await startSsoLogin("cap-over", huge.opts);
+      assert.equal(start.ok, true);
+      if (!start.ok) return;
+      const wait = await waitForLogin(start.sessionId);
+      // Past the cap the version line is never appended, so parsing yields
+      // null and supportsDeviceCodeFlag(null) assumes modern -- flag present.
+      assert.match(wait.rawOutput ?? "", /--use-device-code/, "version line past the cap should be dropped");
+    } finally {
+      rmSync(huge.dir, { recursive: true, force: true });
+    }
   });
 });

@@ -41,7 +41,73 @@ const HAPPY_URL_CODE_BANNER =
   "Then enter the code:\n\n" +
   "ABCD-EFGH\n";
 
+// What a real `aws sso login --no-browser` prints WITHOUT --use-device-code on
+// AWS CLI >= 2.22.0: an authorize URL and no short code. Modeled on the real
+// message template in awscli/customizations/sso/utils.py.
+const PKCE_BANNER =
+  "Attempting to open your default browser. If the browser does not open, open the following URL.\n" +
+  "If you are unable to open the URL on this device, run this command again with the '--use-device-code' option.\n\n" +
+  "https://oidc.us-east-1.amazonaws.com/authorize?response_type=code&client_id=fake&redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2Foauth%2Fcallback&code_challenge=fake&code_challenge_method=S256\n";
+
+/**
+ * `aws --version` intercept, ahead of the scenario switch.
+ *
+ * sso.ts probes the CLI version once per binary to decide whether to pass
+ * `--use-device-code`. Without this branch the probe would fall through to
+ * whatever AWS_MCP_FAKE_SCENARIO is set to and either parse a login banner as
+ * a version string or (for `happy_hold`) hang until the probe timeout, putting
+ * that penalty on every integration test in the file.
+ *
+ * Knobs, all optional:
+ *   AWS_MCP_FAKE_CLI_VERSION       version to report (default "2.34.3").
+ *                                  "none" prints nothing (unparseable path);
+ *                                  "hang" never responds and never exits, so
+ *                                  the probe's own timeout has to fire.
+ *   AWS_MCP_FAKE_VERSION_STREAM    "stderr" to print the line on stderr
+ *                                  instead of stdout. sso.ts reads both pipes;
+ *                                  this is what proves the stderr reader works.
+ *   AWS_MCP_FAKE_VERSION_NOISE_BYTES  emit N bytes of filler BEFORE the version
+ *                                  line, to push it past the probe's byte cap.
+ *   AWS_MCP_FAKE_VERSION_COUNT_OUT append one byte per probe invocation to this
+ *                                  path. The file's SIZE is the spawn count --
+ *                                  append, not overwrite, because the whole
+ *                                  point is counting repeats. Same side-channel
+ *                                  idea as AWS_MCP_FAKE_ARGV_OUT.
+ */
+async function handleVersionProbe(): Promise<boolean> {
+  if (process.argv[2] !== "--version") return false;
+
+  const countPath = process.env.AWS_MCP_FAKE_VERSION_COUNT_OUT;
+  if (countPath) {
+    const fs = await import("node:fs");
+    fs.appendFileSync(countPath, "1");
+  }
+
+  const version = process.env.AWS_MCP_FAKE_CLI_VERSION ?? "2.34.3";
+  if (version === "hang") {
+    // Never print, never exit. The parent must bound this itself.
+    await sleep(10 * 60_000);
+    process.exit(0);
+  }
+
+  const stream = process.env.AWS_MCP_FAKE_VERSION_STREAM === "stderr" ? process.stderr : process.stdout;
+  const noiseBytes = Number(process.env.AWS_MCP_FAKE_VERSION_NOISE_BYTES ?? "0");
+  if (Number.isFinite(noiseBytes) && noiseBytes > 0) {
+    stream.write(`${"x".repeat(noiseBytes)}\n`);
+  }
+  if (version !== "none") {
+    stream.write(`aws-cli/${version} Python/3.13.11 Windows/11 exe/AMD64\n`);
+  }
+  // Return rather than process.exit(0): writes to a pipe are asynchronous, and
+  // exiting in the same breath can truncate them. Observed on the stderr
+  // variant -- it passed alone and failed under a loaded full-file run, which
+  // is exactly the shape of a lost write. Falling out of main() lets Node exit
+  // on its own once stdio has flushed.
+  return true;
+}
+
 async function main(): Promise<void> {
+  if (await handleVersionProbe()) return;
   switch (scenario) {
     case "happy": {
       // Realistic aws-cli output: banner text, URL, code, then successful auth.
@@ -81,6 +147,36 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "pkce_no_device_code": {
+      // The regression this guards: `aws sso login --no-browser` on CLI
+      // >= 2.22.0 without --use-device-code. An authorize URL, no short code.
+      // startSsoLogin must name the PKCE flow rather than time out.
+      process.stdout.write(PKCE_BANNER);
+      await sleep(10 * 60_000); // real CLI blocks on its localhost callback
+      process.exit(0);
+      return;
+    }
+
+    case "pkce_no_device_code_stderr": {
+      // Same as pkce_no_device_code but on the other pipe. Pins that the PKCE
+      // detector runs from BOTH stream handlers -- a stdout-only check would
+      // silently regress this case to the 15s URL timeout.
+      process.stderr.write(PKCE_BANNER);
+      await sleep(10 * 60_000);
+      process.exit(0);
+      return;
+    }
+
+    case "device_code_flag_echo": {
+      // Echoes the login argv so a test can assert --use-device-code is
+      // actually on the command line, then behaves like `happy`.
+      process.stderr.write(`ARGV:${process.argv.slice(2).join(" ")}\n`);
+      process.stdout.write(HAPPY_URL_CODE_BANNER);
+      await sleep(200);
+      process.exit(0);
+      return;
+    }
+
     case "malformed": {
       // Output without a matching URL or code — tests the parse-fail path.
       process.stdout.write("Something went wrong. Try again.\n");
@@ -93,7 +189,15 @@ async function main(): Promise<void> {
       // Print URL+code, then die with nonzero before the "user" auths.
       process.stdout.write("Open: https://device.sso.us-east-1.amazonaws.com/\nCode: ABCD-EFGH\n");
       process.stderr.write("Error: connection refused\n");
-      await sleep(50);
+      // 250ms, not 50ms. sso.ts listens on proc 'exit', which Node can deliver
+      // BEFORE the last pipe 'data' event drains -- so too short a window lets
+      // a loaded machine see the exit first and report "exited before printing
+      // a URL", failing tests that require the URL+code to land first. Observed
+      // under a full parallel `npm test`; never reproduced running this file
+      // alone. 250ms matches the `happy` scenario's 200ms exit convention.
+      // Production is unaffected: the real CLI blocks on the user, it does not
+      // print and exit in the same breath.
+      await sleep(250);
       process.exit(1);
       return;
     }

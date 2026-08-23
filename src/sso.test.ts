@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import type { ChildProcess } from "node:child_process";
 import { describe, it } from "node:test";
-import { _ttlKillswitchTick, CODE_RE, parseLoginOutput, startSsoLogin, URL_RE } from "./sso.js";
+import {
+  _buildLoginArgs,
+  _ttlKillswitchTick,
+  CODE_RE,
+  DEVICE_CODE_MIN_CLI,
+  PKCE_URL_RE,
+  parseAwsCliVersion,
+  parseLoginOutput,
+  startSsoLogin,
+  supportsDeviceCodeFlag,
+  URL_RE,
+} from "./sso.js";
 
 describe("URL_RE", () => {
   it("matches standard AWS SSO device URLs across regions", () => {
@@ -193,5 +204,100 @@ describe("startSsoLogin -- profile validation", () => {
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.match(result.error, /Invalid profile name/);
+  });
+});
+
+describe("PKCE_URL_RE", () => {
+  it("matches the authorize URL the PKCE flow prints, across regions", () => {
+    assert.match("https://oidc.us-east-1.amazonaws.com/authorize?response_type=code", PKCE_URL_RE);
+    assert.match("https://oidc.eu-central-1.amazonaws.com/authorize?client_id=x", PKCE_URL_RE);
+  });
+
+  it("does not match the device-code URL", () => {
+    assert.doesNotMatch("https://device.sso.us-east-1.amazonaws.com/", PKCE_URL_RE);
+  });
+
+  it("does not match a non-authorize oidc endpoint", () => {
+    assert.doesNotMatch("https://oidc.us-east-1.amazonaws.com/token", PKCE_URL_RE);
+  });
+
+  it("is disjoint from URL_RE on both real banners", () => {
+    const pkce = "open the following URL.\n\nhttps://oidc.us-east-1.amazonaws.com/authorize?a=b\n";
+    const device = "open the following URL:\n\nhttps://device.sso.us-east-1.amazonaws.com/\n";
+    assert.match(pkce, PKCE_URL_RE);
+    assert.doesNotMatch(pkce, URL_RE);
+    assert.match(device, URL_RE);
+    assert.doesNotMatch(device, PKCE_URL_RE);
+  });
+});
+
+describe("parseAwsCliVersion", () => {
+  it("parses the real `aws --version` line", () => {
+    assert.deepEqual(parseAwsCliVersion("aws-cli/2.34.3 Python/3.13.11 Windows/11 exe/AMD64"), {
+      major: 2,
+      minor: 34,
+      patch: 3,
+    });
+  });
+
+  it("parses a v1 line", () => {
+    assert.deepEqual(parseAwsCliVersion("aws-cli/1.42.7 Python/3.11.2 Linux/6.1.0 botocore/1.35.0"), {
+      major: 1,
+      minor: 42,
+      patch: 7,
+    });
+  });
+
+  it("returns null when no version is present", () => {
+    assert.equal(parseAwsCliVersion(""), null);
+    assert.equal(parseAwsCliVersion("command not found: aws"), null);
+    // A login banner, i.e. what a mis-wired probe would actually be handed.
+    assert.equal(parseAwsCliVersion("https://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH"), null);
+  });
+});
+
+describe("supportsDeviceCodeFlag", () => {
+  it("is true from 2.22.0 onward", () => {
+    assert.equal(supportsDeviceCodeFlag({ major: 2, minor: 22, patch: 0 }), true);
+    assert.equal(supportsDeviceCodeFlag({ major: 2, minor: 22, patch: 5 }), true);
+    assert.equal(supportsDeviceCodeFlag({ major: 2, minor: 34, patch: 3 }), true);
+    assert.equal(supportsDeviceCodeFlag({ major: 3, minor: 0, patch: 0 }), true);
+  });
+
+  it("is false below 2.22.0", () => {
+    assert.equal(supportsDeviceCodeFlag({ major: 2, minor: 21, patch: 9 }), false);
+    assert.equal(supportsDeviceCodeFlag({ major: 2, minor: 0, patch: 0 }), false);
+    assert.equal(supportsDeviceCodeFlag({ major: 1, minor: 99, patch: 99 }), false);
+  });
+
+  it("defaults an unknown version to true (loud failure beats silent timeout)", () => {
+    assert.equal(supportsDeviceCodeFlag(null), true);
+  });
+
+  it("agrees with the exported minimum", () => {
+    assert.equal(supportsDeviceCodeFlag({ ...DEVICE_CODE_MIN_CLI }), true);
+    assert.equal(supportsDeviceCodeFlag({ ...DEVICE_CODE_MIN_CLI, minor: DEVICE_CODE_MIN_CLI.minor - 1 }), false);
+  });
+});
+
+describe("_buildLoginArgs", () => {
+  it("passes --use-device-code when supported", () => {
+    assert.deepEqual(_buildLoginArgs("prod", true), [
+      "sso",
+      "login",
+      "--no-browser",
+      "--use-device-code",
+      "--profile",
+      "prod",
+    ]);
+  });
+
+  it("omits --use-device-code when unsupported", () => {
+    assert.deepEqual(_buildLoginArgs("prod", false), ["sso", "login", "--no-browser", "--profile", "prod"]);
+  });
+
+  it("keeps --use-device-code ahead of --profile so the value can't be captured", () => {
+    const args = _buildLoginArgs("prod", true);
+    assert.ok(args.indexOf("--use-device-code") < args.indexOf("--profile"));
   });
 });

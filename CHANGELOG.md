@@ -11,6 +11,40 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [1.8.1] — 2026-08-22
+
+### Fixed
+- **SSO login was broken on AWS CLI 2.22.0 and newer.** `aws_login_start` spawned
+  `aws sso login --no-browser`, which since CLI 2.22.0 (Nov 2024) defaults to the
+  PKCE authorization-code flow. That flow prints an
+  `https://oidc.<region>.amazonaws.com/authorize?...` URL and **no short code**, so
+  the device-code parse never matched and the call died on its 15-second
+  "waiting for a verification URL" timeout -- with an error blaming the profile's
+  SSO configuration. The server now passes `--use-device-code` to request the
+  device-authorization grant it actually parses. The flag only exists from 2.22.0,
+  so `aws --version` is probed once per binary (cached; unparseable output is
+  treated as modern) and the flag is omitted on older CLIs, where the device grant
+  is already the default.
+- `aws_login_start` now recognizes PKCE output and fails immediately naming the
+  flow and the fix, instead of spending 15 seconds to report a misleading
+  "the profile may not be set up for SSO".
+
+### Changed
+- `@modelcontextprotocol/sdk` 1.29.0 -> 1.30.0 (stdio buffer-limit handling, Zod
+  3.25 compatibility fixes, Content-Type validation by parsed media type, and a
+  widened `@hono/node-server` range picking up a security fix). Bundled at build
+  time, so this ships in the published artifact.
+- README: AWS CLI requirement now states the 2.22.0 recommendation and notes that
+  AWS CLI v1 is unsupported (maintenance mode 2026-07-15, end of support
+  2027-07-15); the comparison table and the official-AWS-MCP-Server blurb are
+  refreshed for its May 2026 GA, June 2026 cross-account/cross-role support, and
+  March 2026 CloudWatch metrics + semantic Agent-SOP discovery.
+- The version probe is bounded at 2 seconds (it runs ahead of the existing
+  15-second URL wait), caps the output it will buffer, keys its cache on `PATH`
+  as well as the command, and reads both pipes -- so a CLI that prints its
+  version on stderr is still classified correctly. The PKCE detector likewise
+  scans stdout and stderr rather than assuming which stream carries the banner.
+
 ## [1.7.0] — 2026-08-07
 
 ### Added
@@ -823,7 +857,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.5.3...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/YawLabs/aws-mcp/compare/v1.8.0...v1.8.1
 [1.5.3]: https://github.com/YawLabs/aws-mcp/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/YawLabs/aws-mcp/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/YawLabs/aws-mcp/compare/v1.5.0...v1.5.1

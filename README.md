@@ -4,15 +4,15 @@ A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth b
 
 It's an **alternative to AWS's official MCP server**, not a complement -- both call any AWS API, so running both just gives the model two redundant tools. Pick one. The honest comparison:
 
-- **[AWS MCP Server](https://aws.amazon.com/blogs/aws/the-aws-mcp-server-is-now-generally-available/)** -- AWS's hosted server (`uvx mcp-proxy-for-aws`). Strong on AWS-team-curated skills, a server-side Python sandbox (`run_script`), and days-fresh API coverage. Requires Python + `uv`, routes through a proxy that bridges IAM SigV4 to OAuth, and assumes your local credentials already work.
+- **[AWS MCP Server](https://aws.amazon.com/blogs/aws/the-aws-mcp-server-is-now-generally-available/)** -- AWS's hosted server (`uvx mcp-proxy-for-aws`), GA since May 2026. Strong on AWS-team-curated skills, a server-side Python sandbox (`run_script`), days-fresh API coverage, per-tool CloudWatch metrics, and semantic Agent-SOP discovery. Since June 2026 it also takes a profile per request for cross-account / cross-role work in one session (that feature launched in `us-east-1` and `eu-central-1` only). Requires Python + `uv`, routes through a proxy that bridges IAM SigV4 to OAuth, and assumes your local credentials already work.
 - **`@yawlabs/aws-mcp`** (this server) -- Node/npm-only, runs locally. Wins on SSO re-login when `aws sso login`'s browser handoff drops (Windows especially), ergonomic CCAPI CRUD with dry-run diffs, multi-region fan-out, pre-flight IAM permission checks, and a JS scripting sandbox. Live AWS docs search + read is built in too -- parity with the official server's `search_documentation` / `read_documentation`, no second server needed either way.
 
 The one MCP that genuinely pairs with *either* choice is **[`awslabs/mcp`](https://github.com/awslabs/mcp)** -- AWS Labs' fleet of typed per-service servers (Lambda invoke, Bedrock retrieval, DynamoDB with type-marshalling). Those are per-service helpers, no overlap with a general AWS-API server.
 
 Five things this server tries to handle well:
 
-1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess -- on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + code, you click once, done. There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow. AWS's hosted server bridges IAM-to-OAuth via a local proxy; it doesn't help with the `aws sso login` browser-handoff failure.
-2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface -- including services AWS adds tomorrow -- with no SDK bundling and no service-by-service tool sprawl. `aws_paginate` handles paginated list/describe ops, `aws_multi_region` fans the same op out across N regions in parallel, and a JMESPath `query` parameter trims responses server-side (useful when a `describe-instances` result would otherwise blow past the 5 MB output cap).
+1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess -- on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + code, you click once, done. (`--no-browser` on its own is no longer enough -- AWS CLI 2.22.0 made the PKCE authorization-code flow the default, and it prints no short code -- so this server pairs it with `--use-device-code`, probing `aws --version` once to stay compatible with pre-2.22 CLIs.) There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow. AWS's hosted server bridges IAM-to-OAuth via a local proxy; it doesn't help with the `aws sso login` browser-handoff failure.
+2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface -- including services AWS adds tomorrow -- with no SDK bundling and no service-by-service tool sprawl. That is not aspirational: August 2026's arrivals (Lambda MicroVMs, Resilience Hub V2, ACM public ACME issuance, Agent Registry, Support AuthZ, EC2 account-level VPC encryption controls, the IPAM build-out) are reachable the moment your local `aws` CLI knows them -- no `@yawlabs/aws-mcp` upgrade required. `aws_paginate` handles paginated list/describe ops, `aws_multi_region` fans the same op out across N regions in parallel, and a JMESPath `query` parameter trims responses server-side (useful when a `describe-instances` result would otherwise blow past the 5 MB output cap).
 3. **Generic CRUD across services.** `aws_resource_*` (seven tools, including `aws_resource_diff` for dry-run previews) wraps AWS Cloud Control API, so the same lifecycle -- get / list / create / update / delete / status -- works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and a few hundred more. Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. CCAPI is control-plane only -- for data-plane ops (S3 reads, Lambda invokes, Bedrock inference, DynamoDB GetItem) drop down to `aws_call` or use a typed AWS Labs server.
 4. **Live AWS docs.** `aws_docs_search` queries the same backend that powers the docs.aws.amazon.com search box; `aws_docs_read` fetches a doc page and returns it as paginated markdown. Lets the agent discover new services and look up exact parameter names without a second MCP server installed.
 5. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet inside a constrained `node:vm` sandbox with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, `aws.logsTail`, `aws.metricsQuery`, `aws.iamSimulate`, `aws.multiRegion`, `aws.assumeRole`, and `aws.docs.{search,read}` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same shape as AWS's `run_script` (Python, sandboxed server-side) -- yours is JS-native and runs locally.
@@ -52,6 +52,7 @@ For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval
 | Batch N tool calls into one round-trip (JS) | **`@yawlabs/aws-mcp`** (`aws_script`) |
 | Check IAM permissions before attempting an op | **`@yawlabs/aws-mcp`** (`aws_iam_simulate`) |
 | Node/npm-only install (no Python) | **`@yawlabs/aws-mcp`** |
+| Cross-account / cross-role in one session | **Either** -- both take a `profile` per call; this server adds `aws_assume_role` for STS role-chaining |
 | Sandboxed Python script execution server-side | **AWS MCP Server** (`run_script`) |
 | AWS-team-curated best-practice skills | **AWS MCP Server** (skills) |
 | Days-fresh API coverage via hosted endpoint | **AWS MCP Server** (`call_aws`) |
@@ -73,7 +74,7 @@ The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-regio
 | Tool | What it does |
 |------|--------------|
 | `aws_whoami` | Current identity (account, ARN) + SSO token expiry countdown. Call this first. |
-| `aws_login_start` | Start `aws sso login --no-browser`, returns a verification URL + short code and a `sessionId`. |
+| `aws_login_start` | Start `aws sso login --no-browser --use-device-code`, returns a verification URL + short code and a `sessionId`. (`--use-device-code` is omitted on AWS CLI older than 2.22.0, where the device grant is already the default.) |
 | `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity. |
 | `aws_refresh_if_expiring_soon` | Check the cached SSO token and auto-start a refresh when < `thresholdMinutes` remain (default 10). One round-trip for "am I about to expire? if so, re-login." |
 | `aws_session_set` | Set the default profile and/or region for the rest of this MCP session. "Switch to prod," "use us-west-2." |
@@ -226,7 +227,7 @@ For multi-region reads:
 ## Requirements
 
 - Node.js 22+ (or [oam.js](https://oamjs.org) -- see [Runtime](#runtime))
-- AWS CLI v2 installed and on `PATH` (for `aws sso login --no-browser`)
+- AWS CLI v2 installed and on `PATH` (for `aws sso login`). 2.22.0+ recommended: that release added `--use-device-code`, which this server needs to keep the SSO short-code flow working. Older 2.x still works -- the server detects the version and adapts. AWS CLI **v1 is unsupported**; it entered maintenance mode on 2026-07-15 and reaches end of support on 2027-07-15.
 - An AWS profile configured for SSO / IAM Identity Center in `~/.aws/config`
 
 ## Runtime
@@ -323,7 +324,9 @@ If neither `AWS_PROFILE` is set nor `aws_session_set` has been called and there'
 
 ```
 1. Claude calls aws_login_start({ profile: "prod" })
-2. Server spawns: aws sso login --no-browser --profile prod
+2. Server spawns: aws sso login --no-browser --use-device-code --profile prod
+   (--use-device-code keeps the CLI on the device grant; without it, 2.22.0+
+    prints an authorize URL with no short code to surface)
 3. Server parses the URL + code from stdout, returns them to Claude
 4. Claude surfaces: "Open https://device.sso.us-east-1.amazonaws.com/ and enter ABCD-EFGH"
 5. You click — browser opens in your own user session — auth in ~10 seconds
