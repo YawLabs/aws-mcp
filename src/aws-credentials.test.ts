@@ -396,10 +396,21 @@ describe("upsertProfile — concurrent cross-process writers are serialized", ()
           stdio: "pipe",
           env: { ...process.env, RACE_PATH: path, RACE_PROFILE: profile, RACE_AKID: akid },
         });
-        const ready = new Promise<void>((res) => {
+        const ready = new Promise<void>((res, rej) => {
           child.once("message", (msg: { type?: string }) => {
             if (msg?.type === "ready") res();
           });
+          // A child that dies BEFORE signalling "ready" leaves this promise
+          // pending forever, so an import throw or a stale build turns the
+          // whole suite into an unbounded hang rather than a failure -- and
+          // `npm test` runs unattended inside release.sh, where a hang wedges
+          // the release instead of aborting it. Settling on exit reports the
+          // child's own exit code instead. A late exit after res() is a no-op
+          // on an already-settled promise, which is the normal path: these
+          // children are expected to exit once the race has been signalled.
+          child.once("exit", (code) =>
+            rej(new Error(`race child exited (code ${code}) before signalling ready`)),
+          );
         });
         resolve({ child, ready });
       });
