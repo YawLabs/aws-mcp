@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { runAwsCall } from "../aws-cli.js";
+import { runAwsCall, truncateForErrorMsg } from "../aws-cli.js";
 import { upsertProfile } from "../aws-credentials.js";
 import { getProfile, getRegion, isValidProfileName } from "../session.js";
 import type { Tool, ToolResult } from "./tool.js";
@@ -45,6 +45,29 @@ function resolveCredentialsPath(): string {
   if (fromEnv === "~") return homedir();
   if (fromEnv.startsWith("~/") || fromEnv.startsWith("~\\")) return join(homedir(), fromEnv.slice(2));
   return fromEnv;
+}
+
+/**
+ * The raw diagnostic to quote after "Underlying error:" when this tool
+ * REPLACES runAwsCall's message with a source-profile-specific one.
+ *
+ * Deliberately the stderr, not `result.error`. runAwsCall's auth-class messages
+ * are themselves "<remedy>. Underlying error: <stderr>", so quoting the whole
+ * thing nested a SECOND remedy inside ours -- and a differently scoped one: the
+ * arms below are about the SOURCE profile, while runAwsCall names whichever
+ * profile the CLI was invoked with. A caller reading "refresh the source
+ * profile ... Underlying error: ... call aws_login_start with profile='X'" gets
+ * two instructions naming two profiles for one failure.
+ *
+ * stdout is never used here, unlike rawBodyOf in resource.ts: `aws sts
+ * assume-role` writes the credential blob to stdout, and it may flush a partial
+ * one before failing, so stdout must not reach an error envelope.
+ */
+function underlyingOf(result: { rawStderr?: string; error: string }): string {
+  const stderr = result.rawStderr?.trim();
+  // No stderr should not happen on the auth-class kinds (they are classified BY
+  // matching stderr), but falling back to the summary beats an empty clause.
+  return stderr ? truncateForErrorMsg(stderr) : result.error;
 }
 
 /**
@@ -222,7 +245,7 @@ export const assumeTools: readonly Tool[] = [
         if (result.kind === "expired_creds") {
           return {
             ok: false,
-            error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${result.error}`,
+            error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${underlyingOf(result)}`,
           };
         }
         // invalid_creds is NOT an expiry and NOT a missing profile: the source
@@ -236,7 +259,7 @@ export const assumeTools: readonly Tool[] = [
         if (result.kind === "invalid_creds") {
           return {
             ok: false,
-            error: `Credentials for source profile '${sourceProfile}' were rejected by AWS (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition/account, or a drifted machine clock). Fix the credentials for that profile before assuming. Underlying error: ${result.error}`,
+            error: `Credentials for source profile '${sourceProfile}' were rejected by AWS (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition/account, or a drifted machine clock). Fix the credentials for that profile before assuming. Underlying error: ${underlyingOf(result)}`,
           };
         }
         // `aws sts assume-role --output json` writes the credential blob to

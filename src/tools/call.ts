@@ -9,10 +9,20 @@ export const callTools: readonly Tool[] = [
       "Run an arbitrary AWS API operation via the aws CLI. Use kebab-case service and operation names as in `aws help` (service='s3api', operation='list-buckets'). Pass params as a JSON object using the AWS API's PascalCase keys (e.g. {Bucket: 'foo'}); they go through --cli-input-json. Session profile/region (from aws_session_set) are used by default; override per-call when needed. For high-level wrappers like 'aws s3 cp' or 'aws ec2 wait', use your shell — this tool targets the low-level API. Returns parsed JSON output by default, plus the literal command that was run.",
     annotations: {
       title: "Call an AWS API operation",
-      // The operation being called determines read-only/destructive — annotate
-      // conservatively since we can't introspect.
+      // The operation being called determines read-only/destructive, and we
+      // cannot introspect it -- `operation` is a free string resolved by the
+      // CLI at spawn time. So annotate for the WORST case this tool can reach,
+      // which is the whole AWS API: ec2 terminate-instances, s3api
+      // delete-bucket, iam delete-user.
+      //
+      // destructiveHint MUST stay true. Per the MCP spec it defaults to true,
+      // and `false` positively asserts "performs only additive updates" -- a
+      // claim this tool cannot make. Hosts gate their confirmation prompt on
+      // it, so `false` here suppressed the confirm on the single most powerful
+      // tool in the server. A caller who wants a hint that means "read-only"
+      // should reach for aws_paginate (readOnlyHint: true) instead.
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },

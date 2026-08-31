@@ -46,8 +46,26 @@ export function toMcpResult(response: ToolResult): McpResult {
     // Include rawBody (e.g. aws CLI stderr) in the error so the model can
     // diagnose. Without it the caller only sees the one-line summary and
     // has to guess at the actual AWS-side failure.
+    //
+    // ...but skip it when the summary ALREADY carries that text. The auth-class
+    // messages in aws-cli.ts end with "Underlying error: <stderr>" so the
+    // stderr survives handlers that rebuild the message without forwarding
+    // rawBody (aws_assume_role does exactly that). Appending rawBody on top of
+    // those printed the same stderr twice in one response -- observed against
+    // the published 2.0.0 on a bad --profile, and worst on `no_creds` /
+    // `expired_creds` / `invalid_creds`, the errors a first-run user is most
+    // likely to hit.
+    //
+    // Compare on the TRIMMED rawBody: the embedded copy went through
+    // truncateForErrorMsg(stderr.trim()) while rawBody is the raw stream, so
+    // the two differ by trailing CR/LF even when the body is identical. When
+    // stderr is long enough to have been truncated the containment check fails
+    // and the full body is still appended -- which is the useful outcome, not
+    // a duplicate: the summary holds a clipped copy and rawBody completes it.
     const baseError = `Error: ${response.error || "Unknown error"}`;
-    const errorText = response.rawBody ? `${baseError}\n\n${response.rawBody}` : baseError;
+    const rawTrimmed = response.rawBody?.trim();
+    const alreadyInSummary = !!rawTrimmed && baseError.includes(rawTrimmed);
+    const errorText = rawTrimmed && !alreadyInSummary ? `${baseError}\n\n${response.rawBody}` : baseError;
     return {
       content: [{ type: "text" as const, text: errorText }],
       isError: true,

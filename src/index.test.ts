@@ -34,6 +34,41 @@ describe("toMcpResult — ok:false (error) branches", () => {
     });
   });
 
+  it("does NOT append rawBody the summary already quotes", () => {
+    // The auth-class messages from aws-cli.ts end with
+    // "Underlying error: <stderr>" so the stderr survives handlers that rebuild
+    // the message without forwarding rawBody (aws_assume_role does that).
+    // Appending rawBody on top printed the same stderr twice -- caught driving
+    // the published 2.0.0 with a bad --profile, on the errors a first-run user
+    // is most likely to see.
+    const stderr = "aws: [ERROR]: The config profile (nope) could not be found";
+    const r = toMcpResult({
+      ok: false,
+      error: `No credentials found for profile 'nope'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${stderr}`,
+      // The raw stream carries trailing CR/LF the embedded copy does not, which
+      // is why the check compares against the TRIMMED body.
+      rawBody: `${stderr}\r\n`,
+    });
+    const text = r.content[0].text;
+    const occurrences = text.split("could not be found").length - 1;
+    assert.equal(occurrences, 1, `stderr must appear exactly once, got ${occurrences}: ${text}`);
+    assert.equal(text.includes("\n\n"), false, "nothing appended, so no separator");
+  });
+
+  it("DOES append a rawBody the summary only quotes in truncated form", () => {
+    // The complement: when stderr was long enough to be clipped for the
+    // summary, containment fails and appending is the useful outcome -- the
+    // summary holds a clipped copy, rawBody completes it.
+    const r = toMcpResult({
+      ok: false,
+      error: "Something failed. Underlying error: aaaa[truncated; 999 chars omitted]",
+      rawBody: `${"a".repeat(200)}TAIL`,
+    });
+    const text = r.content[0].text;
+    assert.match(text, /TAIL$/, "the full body must still be appended when it is not already present");
+    assert.equal(text.includes("\n\n"), true);
+  });
+
   it("maps an error WITHOUT rawBody: bare 'Error: <msg>' (no trailing newlines)", () => {
     const r = toMcpResult({ ok: false, error: "AccessDenied" });
     assert.deepEqual(r, {

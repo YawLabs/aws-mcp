@@ -352,7 +352,7 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 **Stable in 1.x (anything below is a breaking change requiring a major bump):**
 
 - **Tool names** -- the 25 tool names listed in the Tools table above will not be renamed or removed.
-- **Tool annotations** -- `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. These signal to MCP hosts how to gate calls; flipping them silently would break host UIs.
+- **Tool annotations** -- `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. These signal to MCP hosts how to gate calls; flipping them silently would break host UIs. Note the direction of the guarantee: an annotation may be tightened (made more cautious) in a patch release when it was previously understating what a tool can do -- v2.0.1 set `destructiveHint: true` on `aws_call`, `aws_multi_region` and `aws_resource_update` for exactly that reason. It will not be *loosened* outside a major. If your host suppresses confirmation prompts based on these, treat `aws_call` and `aws_multi_region` as able to invoke any AWS API the caller's IAM identity permits, including deletes.
 - **Required input fields** -- the required fields per tool will not change shape or be removed. New *optional* fields may be added.
 - **Success envelope shape per tool** -- the `data` object on `{ok: true, data}` responses, specifically:
   - `aws_call` -> `{command, result}`

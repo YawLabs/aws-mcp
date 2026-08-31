@@ -434,15 +434,21 @@ async function buildMutationResponse(
         // to fall through to the bare poll error and drop the requestToken,
         // the same defect expired_creds had.
         const recovery = `call aws_resource_status with requestToken='${fields.requestToken}' to check whether the mutation completed server-side.`;
+        // Quote the RAW diagnostic, not `polled.error`. The poll error is
+        // itself "<remedy>. Underlying error: <stderr>", so embedding it nested
+        // a second remedy inside ours -- and ours is the one that matters here,
+        // because only it carries the requestToken. Falls back to the summary
+        // if there is no raw body, so the clause is never empty.
+        const underlying = polled.rawBody?.trim() || polled.error;
         let reLoginHint: string;
         if (polled.kind === "sso_expired") {
           reLoginHint = `SSO session expired while awaiting completion. Call aws_login_start with profile='${useProfile}' to re-authenticate, then ${recovery}`;
         } else if (polled.kind === "expired_creds") {
-          reLoginHint = `Temporary credentials for profile '${useProfile}' expired while awaiting completion. Re-authenticate (aws_login_start for an SSO profile, or re-run the assume for an STS session), then ${recovery} Underlying error: ${polled.error}`;
+          reLoginHint = `Temporary credentials for profile '${useProfile}' expired while awaiting completion. Re-authenticate (aws_login_start for an SSO profile, or re-run the assume for an STS session), then ${recovery} Underlying error: ${underlying}`;
         } else if (polled.kind === "invalid_creds") {
-          reLoginHint = `Credentials for profile '${useProfile}' were rejected by AWS while awaiting completion (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition, or a drifted clock). Fix the credentials for this profile, then ${recovery} Underlying error: ${polled.error}`;
+          reLoginHint = `Credentials for profile '${useProfile}' were rejected by AWS while awaiting completion (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition, or a drifted clock). Fix the credentials for this profile, then ${recovery} Underlying error: ${underlying}`;
         } else {
-          reLoginHint = `No credentials available while awaiting completion. After fixing credentials for profile '${useProfile}', ${recovery} Underlying error: ${polled.error}`;
+          reLoginHint = `No credentials available while awaiting completion. After fixing credentials for profile '${useProfile}', ${recovery} Underlying error: ${underlying}`;
         }
         return { ok: false, error: reLoginHint, rawBody: polled.rawBody };
       }
@@ -697,8 +703,15 @@ export const resourceTools: readonly Tool[] = [
       "Update an AWS resource via Cloud Control API using RFC 6902 JSON Patch. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Typical patch: [{op: 'replace', path: '/MemorySize', value: 512}].",
     annotations: {
       title: "Update an AWS resource (async via CCAPI)",
+      // destructiveHint is true because a CCAPI update is not reliably
+      // in-place: patching a property CloudFormation marks as requiring
+      // replacement makes the provider DELETE and re-create the resource --
+      // new physical id, and any data on it gone. The caller cannot tell which
+      // properties those are from here, so the hint has to assume the worst.
+      // `false` would assert "only additive updates" and suppress the host's
+      // confirmation prompt on exactly that case.
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },

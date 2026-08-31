@@ -148,10 +148,13 @@ export const multiRegionTools: readonly Tool[] = [
       "Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes `regions: string[]` instead of `region`. Returns an array of `{region, ok, data?, command?, error?, errorKind?}` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so `results.length` may be less than `regions.length`; use the returned `regionCount` for the actual count run. The whole batch is capped at 5 MB of results: if it would exceed that, later entries keep their status but lose `data` and are flagged `truncated: true`, with the affected regions listed in a top-level `truncatedRegions` -- re-run those regions individually or narrow with `query`/`params`. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.",
     annotations: {
       title: "Run an AWS operation across multiple regions in parallel",
-      // The operation can be anything -- we conservatively annotate as not
-      // read-only / not destructive. The caller chooses what to invoke.
+      // Same reasoning as aws_call (see call.ts), and strictly more so: this
+      // runs the caller's chosen operation across up to 32 regions at once, so
+      // a destructive one is destructive N times in parallel. destructiveHint
+      // MUST stay true -- `false` asserts "only additive updates", which this
+      // cannot promise, and it suppresses the host's confirmation prompt.
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },
