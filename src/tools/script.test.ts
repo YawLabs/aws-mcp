@@ -1237,6 +1237,40 @@ describe("runScript timeouts", () => {
   });
 });
 
+describe("isErrorLike matching rule (documented breadth)", () => {
+  // The duck-type is "non-null object with a string `message`" -- it has to be,
+  // because vm's cross-realm timeout error fails `instanceof Error`. These pin
+  // the consequence the docblock now states: the rule is broader than "an
+  // Error", so a thrown data payload carrying a string `message` IS treated as
+  // a failure, while primitives are not.
+  it("treats a thrown plain object with a string message as an error", async () => {
+    const handlerResult = await tool.handler({
+      code: `console.log("before the throw"); throw { message: "nope", code: 42 };`,
+    });
+    assert.equal(handlerResult.ok, false);
+    // Its own `message`, not String(err) ("[object Object]").
+    assert.equal(handlerResult.error, "nope");
+    const data = handlerResult.data as { logs?: string[] };
+    assert.ok(
+      data?.logs?.some((l) => l.includes("before the throw")),
+      `expected captured logs on the failure, got ${JSON.stringify(data?.logs)}`,
+    );
+  });
+
+  it("leaves a thrown primitive untouched and stringifies it", async () => {
+    const handlerResult = await tool.handler({ code: `throw "plain string boom";` });
+    assert.equal(handlerResult.ok, false);
+    assert.equal(handlerResult.error, "plain string boom");
+    assert.deepEqual((handlerResult.data as { logs?: string[] })?.logs, []);
+  });
+
+  it("leaves a thrown object WITHOUT a string message untouched", async () => {
+    const handlerResult = await tool.handler({ code: `throw { code: 42 };` });
+    assert.equal(handlerResult.ok, false);
+    assert.equal(handlerResult.error, "[object Object]");
+  });
+});
+
 describe("script bridge schema validation (regression)", () => {
   // unwrap() calls tool.handler DIRECTLY. The MCP boundary validates via
   // server.tool(..., inputSchema.shape, ...) in index.ts, but that never runs

@@ -360,9 +360,19 @@ interface ScriptFailure extends Error {
  * "Error"`, `e.message === "Script execution timed out after 200ms"`, and
  * `e instanceof Error === false`). The exact error a timed-out script
  * produces is the one whose logs matter most, so the check has to recognize
- * it. A thrown string or a plain data object has no string `message` and is
- * left alone, preserving the documented "non-Error throws pass through
- * unchanged" contract.
+ * it.
+ *
+ * The matching rule is exactly "a non-null object with a string `message`" --
+ * nothing narrower, because the timeout error is only recognizable by that
+ * shape. So it is BROADER than "an Error": a script that throws a plain data
+ * payload carrying a string `message` (`throw {message: "nope", code: 42}`)
+ * matches too, gets the logs/durationMs fields attached, and is reported with
+ * its own `message` as the tool error rather than as `String(err)`. Thrown
+ * primitives (strings, numbers, null/undefined) and objects WITHOUT a string
+ * `message` do not match and pass through untouched -- that is the extent of
+ * the "non-Error throws pass through unchanged" contract here. (The contract
+ * holds unconditionally in `wrapForRealm` below, which tests `instanceof
+ * Error` and so re-throws every non-Error verbatim.)
  */
 function isErrorLike(v: unknown): v is ScriptFailure {
   return typeof v === "object" && v !== null && typeof (v as { message?: unknown }).message === "string";
@@ -554,9 +564,11 @@ export async function runScript(
   } catch (err) {
     // Carry the captured output out with the failure. On a timeout the logs
     // are the only record of how far the script got before it stalled, and
-    // they were previously discarded with the rejected promise. Non-Error
-    // throws pass through untouched -- scripts can throw primitives, and the
-    // documented contract is that those reach the caller unchanged.
+    // they were previously discarded with the rejected promise. Throws that are
+    // not error-LIKE (primitives, and objects with no string `message` -- see
+    // isErrorLike for why the test is a duck-type and what else it catches)
+    // pass through untouched, so a script throwing a primitive reaches the
+    // caller unchanged.
     if (isErrorLike(err)) {
       try {
         err.logs = logs;

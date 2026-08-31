@@ -280,6 +280,19 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "awscli_expired_token": {
+      // The service-side expiry wrapper, as emitted for an expired STS session
+      // that has NOTHING to do with SSO. Sibling of call_sso_expired, and the
+      // pair is the point: both are "expired", but only one of them can be
+      // fixed by aws_login_start, so runAwsCall must not give them the same
+      // advice. Real shape, from an assume-role session past its Expiration.
+      process.stderr.write(
+        "An error occurred (ExpiredToken) when calling the ListBuckets operation: The provided token has expired.\n",
+      );
+      process.exit(255);
+      return;
+    }
+
     case "call_fail_stdout_only": {
       // Nonzero exit with output on stdout and a deliberately EMPTY stderr.
       // Forces the `?? rawStdout` half of the aws_call handler's
@@ -393,6 +406,77 @@ async function main(): Promise<void> {
       process.stdout.write(Buffer.concat([Buffer.from('{"name":"'), fourByteChar.slice(0, 2)]));
       await sleep(50);
       process.stdout.write(Buffer.concat([fourByteChar.slice(2), Buffer.from('"}\n')]));
+      process.exit(0);
+      return;
+    }
+
+    case "awscli_orphan_holds_pipes":
+    case "awscli_orphan_outlives_exit": {
+      // Both model the shape that hangs runAwsCall when it settles ONLY on
+      // 'close': a descendant that inherited our stdio and outlives us, so the
+      // write ends of the parent's pipes never close and 'close' never fires.
+      // That is what `aws ssm start-session` / `aws ecs execute-command` do when
+      // they hand off to session-manager-plugin, and both are reachable through
+      // aws_call (validateNames permits them; there is no interactive denylist).
+      //
+      // The two cases cover the two DISTINCT failure paths in runAwsCall:
+      //   awscli_orphan_holds_pipes  -- we stay alive past the caller's
+      //     timeoutMs, so the timeout callback kills US and then waits on
+      //     'close'. killProc guarantees this process dies; it says nothing
+      //     about the orphan holding the pipes.
+      //   awscli_orphan_outlives_exit -- we exit CLEANLY and fast, long before
+      //     timeoutMs. The timeout callback's procHasExited() guard then returns
+      //     early and never attempts a kill at all, so nothing bounds the wait.
+      //
+      // detached:true is load-bearing and must not be simplified away. libuv
+      // assigns a spawned child to its global job object ONLY when the child is
+      // not detached, and that job carries KILL_ON_JOB_CLOSE -- so on Windows a
+      // plainly-spawned grandchild dies WITH us and the bug is masked (measured
+      // here: 'close' at parent-exit +7ms non-detached, versus never within 6s
+      // detached). On POSIX detached makes the orphan a session leader, so
+      // killProc's SIGTERM to our process group does not reach it either.
+      //
+      // Knobs:
+      //   AWS_MCP_FAKE_ORPHAN_PID_OUT  path to write the orphan's pid to, so the
+      //                                test can reap it instead of leaving the
+      //                                parent's pipes (and the test file's event
+      //                                loop) pinned open for the full hold.
+      //   AWS_MCP_FAKE_ORPHAN_HOLD_MS  how long the orphan lives (default 30s).
+      //                                Must comfortably EXCEED the assertion
+      //                                window, or an unfixed runAwsCall settles
+      //                                on its own and the test passes vacuously.
+      const { spawn } = await import("node:child_process");
+      const parsedHold = Number(process.env.AWS_MCP_FAKE_ORPHAN_HOLD_MS ?? "30000");
+      const holdMs = Number.isFinite(parsedHold) && parsedHold > 0 ? parsedHold : 30_000;
+      const orphan = spawn(process.execPath, ["-e", `setTimeout(() => {}, ${holdMs})`], {
+        detached: true,
+        // stdout+stderr inherited: THIS is what keeps the parent's pipes open.
+        stdio: ["ignore", "inherit", "inherit"],
+      });
+      orphan.unref();
+
+      const pidPath = process.env.AWS_MCP_FAKE_ORPHAN_PID_OUT;
+      if (pidPath && orphan.pid !== undefined) {
+        const fs = await import("node:fs");
+        fs.writeFileSync(pidPath, String(orphan.pid));
+      }
+
+      if (scenario === "awscli_orphan_outlives_exit") {
+        // Valid, complete JSON: the assertion is that the caller gets this
+        // NATURAL result (exit 0, parsed payload) rather than hanging, which
+        // pins that the bound does not simply rewrite every held-pipe call as a
+        // timeout. The sleep gives the write time to land before we exit.
+        process.stdout.write(`${JSON.stringify({ orphan: "outlived-a-clean-exit" })}\n`);
+        await sleep(150);
+        process.exit(0);
+        return;
+      }
+
+      // awscli_orphan_holds_pipes: emit a fragment, then hang past timeoutMs so
+      // the timeout path runs. The fragment doubles as proof that buffered bytes
+      // still reach rawStdout when the fallback settles instead of 'close'.
+      process.stdout.write('{"partial":"emitted-before-the-orphan-hang"');
+      await sleep(10 * 60_000);
       process.exit(0);
       return;
     }

@@ -4,6 +4,9 @@
  */
 
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -381,6 +384,42 @@ describe("runAwsCall — failure paths", () => {
     assert.match(r.error, /aws_login_start/);
   });
 
+  it("classifies a service-reported token expiry as expired_creds, with advice for BOTH origins", async () => {
+    // AWS emits the ExpiredToken wrapper for any expired temporary credential.
+    // Classifying it sso_expired sent an assume-role user to aws_login_start,
+    // which cannot refresh an STS session -- and through aws_assume_role the
+    // underlying stderr was dropped, so nothing on screen contradicted the
+    // wrong advice. This kind names both remedies and keeps the raw stderr.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      profile: "assume-prof",
+      ...fakeOpts("awscli_expired_token"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "expired_creds");
+    assert.match(r.error, /assume-prof/);
+    assert.match(r.error, /aws_login_start/, "the SSO remedy must still be offered");
+    assert.match(r.error, /aws_assume_role/, "the STS remedy is the one that was missing");
+    // The stderr the assume path used to drop entirely.
+    assert.match(r.error, /Underlying error: An error occurred \(ExpiredToken\)/);
+    assert.equal(r.exitCode, 255);
+  });
+
+  it("keeps a genuinely SSO-sourced expiry on the SSO-specific message", async () => {
+    // The other half of the split: when the stderr DOES name botocore's SSO
+    // token provider, the origin is known and the re-login advice is right.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_sso_expired"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "sso_expired");
+  });
+
   it("classifies missing credentials", async () => {
     const r = await runAwsCall({
       service: "s3api",
@@ -564,5 +603,123 @@ describe("runAwsCall — failure paths", () => {
     // Belt-and-suspenders: explicitly assert no replacement characters in the
     // raw stdout. A naive .toString() per chunk would leave U+FFFD here.
     assert.ok(!r.rawStdout.includes("�"), "rawStdout must not contain U+FFFD replacement chars");
+  });
+});
+
+describe("runAwsCall — a descendant holding the stdio pipes must not hang the call", () => {
+  // Regression guard for the unbounded settle. 'close' is the right NORMAL
+  // settle (it is the only event that guarantees the pipes have been drained),
+  // but it fires when the LAST writer on those pipes goes away -- and `aws ssm
+  // start-session` / `aws ecs execute-command` hand off to
+  // session-manager-plugin with the stdio inherited. When runAwsCall depended on
+  // 'close' alone, such a call stayed pending forever, past its own timeoutMs.
+  // Both cases below hang without the pipe-close grace in aws-cli.ts.
+  //
+  // The fake spawns its orphan with detached:true deliberately -- see the note
+  // on the scenarios in testing/fake-aws.ts. A plainly-spawned grandchild is
+  // killed with its parent by libuv's job object on Windows, which masks the bug
+  // and makes both of these pass vacuously.
+
+  const PENDING = Symbol("still-pending");
+
+  /** Resolve to PENDING if `p` has not settled within `ms`, so a hang fails the
+   * assertion instead of hanging the test runner until its own timeout. */
+  async function settleWithin<T>(p: Promise<T>, ms: number): Promise<T | typeof PENDING> {
+    let timer: NodeJS.Timeout | undefined;
+    const guard = new Promise<typeof PENDING>((resolve) => {
+      timer = setTimeout(() => resolve(PENDING), ms);
+    });
+    try {
+      return await Promise.race([p, guard]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  function orphanOpts(scenario: string, timeoutMs: number) {
+    const pidPath = join(tmpdir(), `aws-mcp-orphan-${process.pid}-${randomUUID()}.pid`);
+    return {
+      pidPath,
+      opts: {
+        command: process.execPath,
+        prefixArgs: [FAKE_AWS],
+        timeoutMs,
+        env: {
+          ...process.env,
+          AWS_MCP_FAKE_SCENARIO: scenario,
+          AWS_MCP_FAKE_ORPHAN_PID_OUT: pidPath,
+        },
+      },
+    };
+  }
+
+  /** The orphan is by construction beyond runAwsCall's reach -- that is the
+   * whole bug -- so the TEST reaps it. Left running it keeps the parent's pipes,
+   * and therefore this file's event loop, pinned open for its full hold. */
+  function reapOrphan(pidPath: string): void {
+    try {
+      const pid = Number(readFileSync(pidPath, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) process.kill(pid);
+    } catch {
+      // Already gone, or the fake never got far enough to write its pid.
+    }
+    rmSync(pidPath, { force: true });
+  }
+
+  it("settles kind='timeout' when the child is killed but an orphan keeps the pipes open", async () => {
+    // Path (a): we outlive timeoutMs, so the timeout callback kills us and then
+    // waits. killProc guarantees the CHILD exits; it says nothing about a
+    // descendant holding the pipes, so 'close' never arrives.
+    const { opts, pidPath } = orphanOpts("awscli_orphan_holds_pipes", 2000);
+    try {
+      const r = await settleWithin(runAwsCall({ service: "ssm", operation: "start-session", ...opts }), 15_000);
+      if (r === PENDING) {
+        assert.fail(
+          "runAwsCall never settled: the orphan still holds the stdio pipes so 'close' cannot fire, and nothing bounds the wait",
+        );
+      }
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "timeout");
+      assert.match(r.error, /timed out/);
+      // Buffered bytes still reach the caller when the fallback settles rather
+      // than 'close' -- the flush is in the shared finish path, not in 'close'.
+      assert.match(
+        r.rawStdout ?? "",
+        /emitted-before-the-orphan-hang/,
+        "stdout read before the kill must survive the fallback settle",
+      );
+    } finally {
+      reapOrphan(pidPath);
+    }
+  });
+
+  it("settles with the natural result when the child exits cleanly but an orphan keeps the pipes open", async () => {
+    // Path (b), the worse one: we exit 0 long before timeoutMs. The timeout
+    // callback's procHasExited() guard then returns early and never attempts a
+    // kill at all, so before the grace existed nothing bounded this AT ALL -- it
+    // hung past a timeout it could never trip. timeoutMs is deliberately long so
+    // that a pass here cannot be coming from the timeout path.
+    const timeoutMs = 20_000;
+    const { opts, pidPath } = orphanOpts("awscli_orphan_outlives_exit", timeoutMs);
+    const started = Date.now();
+    try {
+      const r = await settleWithin(runAwsCall({ service: "s3api", operation: "list-buckets", ...opts }), 12_000);
+      if (r === PENDING) {
+        assert.fail("runAwsCall never settled after a clean child exit with the pipes held open by an orphan");
+      }
+      const elapsed = Date.now() - started;
+      assert.ok(
+        elapsed < timeoutMs,
+        `must settle from the pipe-close grace, well before timeoutMs; took ${elapsed}ms of ${timeoutMs}ms`,
+      );
+      // The natural result, not a synthesized timeout: the child really did
+      // succeed, and the payload really did arrive.
+      assert.equal(r.ok, true);
+      if (!r.ok) return;
+      assert.deepEqual(r.data, { orphan: "outlived-a-clean-exit" });
+    } finally {
+      reapOrphan(pidPath);
+    }
   });
 });

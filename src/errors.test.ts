@@ -46,34 +46,68 @@ describe("classifyAuthError — message text only, err.name is not consulted", (
   });
 });
 
-describe("classifyAuthError — service-reported expiry (ExpiredToken)", () => {
-  // The gap this closes: the standard-wrapper ExpiredToken shape is the most
-  // common way an expired session surfaces (the service rejects the request,
-  // rather than botocore failing to load a token), and the classifier used to
-  // call it "other" -- while parseAwsError, in the same file, already answered
-  // "Re-authenticate with aws_login_start." for the same code. The two halves
-  // disagreed; now they don't.
+describe("classifyAuthError — service-reported expiry (ExpiredToken) is NOT SSO-specific", () => {
+  // Two corrections, in order.
+  //
+  // First: the standard-wrapper ExpiredToken shape is the most common way an
+  // expired session surfaces (the service rejects the request, rather than
+  // botocore failing to load a token), and the classifier used to call it
+  // "other" -- so it fell through to a generic nonzero_exit.
+  //
+  // Then the over-correction: it was folded into SSO_EXPIRED_PATTERNS. AWS emits
+  // that wrapper for ANY expired temporary credential -- assume-role,
+  // web-identity, credential_process, SSO -- and the stderr does not say which.
+  // A plain assume-role user was told to run aws_login_start, which cannot
+  // refresh an STS session. These pin the third state: its own kind, whose
+  // message covers both remedies.
 
-  it("classifies the STS ExpiredToken wrapper as sso_expired", () => {
+  it("classifies the STS ExpiredToken wrapper as expired_creds, not sso_expired", () => {
     const err = new Error(
       "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired",
     );
-    assert.equal(classifyAuthError(err).kind, "sso_expired");
+    assert.equal(classifyAuthError(err).kind, "expired_creds");
   });
 
   it("classifies the ExpiredTokenException spelling too", () => {
     const err = new Error(
       "An error occurred (ExpiredTokenException) when calling the DescribeInstances operation: The security token included in the request is expired",
     );
-    assert.equal(classifyAuthError(err).kind, "sso_expired");
+    assert.equal(classifyAuthError(err).kind, "expired_creds");
   });
 
-  it("agrees with parseAwsError on the same stderr", () => {
-    // Both halves of the file now point at the same remedy for one input.
+  it("classifies an AssumeRole-derived session's expiry as expired_creds", () => {
+    // The case that made the SSO-specific advice wrong: nothing about this
+    // stderr involves SSO, and telling the caller to re-login would not help.
+    const err = new Error(
+      "An error occurred (ExpiredToken) when calling the ListBuckets operation: The provided token has expired.",
+    );
+    assert.equal(classifyAuthError(err).kind, "expired_creds");
+  });
+
+  it("still classifies a genuinely SSO-sourced expiry as sso_expired", () => {
+    // The SSO patterns name botocore's SSO token provider explicitly, so the
+    // origin IS known there and the SSO-specific remedy stays correct. Splitting
+    // the wrapper out must not weaken that half.
+    assert.equal(
+      classifyAuthError(new Error("Error loading SSO Token: Token for my-profile is expired.")).kind,
+      "sso_expired",
+    );
+    assert.equal(
+      classifyAuthError(new Error("Error when retrieving token from sso: Token has expired and refresh failed")).kind,
+      "sso_expired",
+    );
+  });
+
+  it("agrees with parseAwsError on the same stderr, and neither is SSO-only", () => {
+    // Both halves of the file point at the same remedy for one input, and that
+    // remedy now names the STS path too. A suggestion mentioning only
+    // aws_login_start is the regression this guards.
     const stderr =
       "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired";
-    assert.equal(classifyAuthError(new Error(stderr)).kind, "sso_expired");
-    assert.match(parseAwsError(stderr).suggestion ?? "", /aws_login_start/);
+    assert.equal(classifyAuthError(new Error(stderr)).kind, "expired_creds");
+    const suggestion = parseAwsError(stderr).suggestion ?? "";
+    assert.match(suggestion, /aws_login_start/);
+    assert.match(suggestion, /aws_assume_role/);
   });
 
   it("requires the wrapper -- a bare mention of the word does not match", () => {

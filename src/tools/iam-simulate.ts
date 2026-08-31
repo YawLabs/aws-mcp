@@ -12,10 +12,21 @@ import type { Tool, ToolResult } from "./tool.js";
  *
  * Maps to `aws iam simulate-principal-policy`. The response is flattened to
  * {action, resource, decision, matchedStatementIds, missingContextValues,
- * organizationsDecision, permissionsBoundaryDecision} per EvaluationResult.
- * The raw EvaluationResults array is NOT echoed back alongside it: every field
- * a caller was reaching into it for is promoted onto the flat shape, and
- * returning both doubled the payload of every response for no consumer.
+ * organizationsDecision, permissionsBoundaryDecision} per EvaluationResult,
+ * and the raw EvaluationResults array is NOT echoed back alongside it --
+ * returning both doubled the payload of every response.
+ *
+ * That drop is lossy, so be precise about what survives. Promoted: EvalDecision
+ * (as `decision`), EvalActionName, EvalResourceName, MissingContextValues, and
+ * the two decision details reduced to "allowed" / "denied" strings
+ * (AllowedByOrganizations -> organizationsDecision, AllowedByPermissionsBoundary
+ * -> permissionsBoundaryDecision). NOT promoted, and no longer reachable from
+ * this tool: the MatchedStatements BODIES. `matchedStatementIds` carries each
+ * match's SourcePolicyId (or a synthesized `inline` / `inline#L<n>` id when it
+ * has none) and nothing else -- SourcePolicyType, StartPosition and EndPosition
+ * are dropped. Also dropped: EvalDecisionDetails, ResourceSpecificResults, and
+ * any field AWS adds to EvaluationResult in future. A caller that needs one of
+ * those has to go around this tool (aws_call on iam simulate-principal-policy).
  *
  * IAM paginates this API (IsTruncated + Marker). The response surfaces
  * `hasMore` + `marker`, and `marker` is accepted as an input to resume --
@@ -86,7 +97,9 @@ interface SimulationResult {
  * Pull the fields callers actually want off the raw EvaluationResults[]
  * array. The CLI nests source-policy IDs inside MatchedStatements[]; we
  * surface just the IDs flat so the agent can read "decided by
- * AdminAccess#statement-2" at a glance. Raw is preserved by the caller.
+ * AdminAccess#statement-2" at a glance. The caller does NOT preserve the raw
+ * array alongside this -- what this function drops is dropped from the
+ * response (see the header comment for the exact promoted / dropped list).
  */
 export function parseSimulationResults(raw: unknown): SimulationResult[] {
   if (!Array.isArray(raw)) return [];

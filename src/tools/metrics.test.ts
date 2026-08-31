@@ -535,7 +535,83 @@ describe("aws_metrics_query handler validation", () => {
     } as never);
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /exceeding CloudWatch's per-request cap/);
-    assert.match(r.error ?? "", /Widen the period or narrow the time range/);
+    assert.match(r.error ?? "", /Widen the period, narrow the time range/);
+  });
+
+  it("accepts an over-cap query when maxDataPoints bounds the response", async () => {
+    // Same 71-day / 60s shape as the case above -- 102,240 estimated points --
+    // but the caller set maxDataPoints, so CloudWatch coarsens the period
+    // server-side and pages the rest behind NextToken. The estimate describes a
+    // response that never materializes; rejecting on it refuses a call
+    // CloudWatch serves happily.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-13T00:00:00Z",
+      maxDataPoints: 1000,
+    } as never);
+    assert.equal(r.ok, true);
+  });
+
+  it("accepts an over-cap AGGREGATE when maxDataPoints bounds the response", async () => {
+    // The aggregate arm has to agree with the per-query arm: 100 x 10,080 =
+    // 1,008,000 estimated points, all of them bounded by the caller's
+    // maxDataPoints, which is a PER-REQUEST bound just like the cap itself.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const queries = Array.from({ length: 100 }, (_, n) => ({
+      id: `q${n}`,
+      namespace: "AWS/EC2",
+      metricName: "CPUUtilization",
+      period: 60,
+    }));
+    const r = await tool.handler({
+      queries,
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-01-08T00:00:00Z",
+      maxDataPoints: 5000,
+    } as never);
+    assert.equal(r.ok, true);
+  });
+
+  it("accepts an over-cap AUTO-PICKED period when maxDataPoints bounds the response", async () => {
+    // The auto-pick arm agrees too: a 25-year range floors at 3600s and crosses
+    // the cap with no explicit period anywhere, but the caller's bound applies
+    // to it exactly as it does to an explicit one.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      startTime: "2001-01-01T00:00:00Z",
+      endTime: "2026-01-01T00:00:00Z",
+      maxDataPoints: 500,
+    } as never);
+    assert.equal(r.ok, true);
+  });
+
+  it("still rejects when maxDataPoints is itself above CloudWatch's cap", async () => {
+    // maxDataPoints only bounds the request below the ceiling when it is under
+    // it. A caller asking for 500,000 points has not bounded anything
+    // CloudWatch will honour, so the hard rejection stands and names why.
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-13T00:00:00Z",
+      maxDataPoints: 500_000,
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /exceeding CloudWatch's per-request cap/);
+    assert.match(r.error ?? "", /maxDataPoints \(500000\) is itself above the cap/);
+  });
+
+  it("still rejects an invalid period even when maxDataPoints is set", async () => {
+    // The bound excuses the datapoint ESTIMATE, not the period-shape check --
+    // CloudWatch rejects a non-multiple-of-60 period regardless.
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 45 }],
+      maxDataPoints: 100,
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /positive multiple of 60/);
   });
 
   it("rejects a batch whose datapoints only exceed the cap in AGGREGATE", async () => {

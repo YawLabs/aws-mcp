@@ -98,6 +98,15 @@ const MAX_QUERIES = 100;
 // auto-picked-period paths are checked (see pickAutoPeriodSeconds below for why
 // the auto-pick is not safe by construction). CloudWatch also requires `period`
 // to be a positive multiple of 60.
+//
+// The estimate is derived from the REQUESTED period, which is only what
+// CloudWatch returns when the caller has NOT bounded the response. `MaxDatapoints`
+// (this tool's `maxDataPoints`) is exactly such a bound: CloudWatch widens the
+// period server-side until the series fits it and pages the remainder behind
+// NextToken, which this tool already surfaces as nextToken / hasMore. So the
+// estimate is clamped to the caller's bound before it is compared -- otherwise a
+// batch the caller has ALREADY bounded, and that CloudWatch would serve happily,
+// gets rejected here on a count that never materializes.
 const CLOUDWATCH_MAX_DATAPOINTS = 100_800;
 
 // Pick a sane period granularity scaled to the requested range so a wide
@@ -350,7 +359,7 @@ export const metricsTools: readonly Tool[] = [
         .positive()
         .optional()
         .describe(
-          "Target datapoint count. CloudWatch does not truncate to the first N points -- it widens (coarsens) the period server-side so the series aggregates down to fit this many points. CloudWatch's own ceiling is ~100,800; lower this to make CloudWatch return a coarser, smaller series. Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
+          "Target datapoint count. CloudWatch does not truncate to the first N points -- it widens (coarsens) the period server-side so the series aggregates down to fit this many points. CloudWatch's own ceiling is ~100,800; lower this to make CloudWatch return a coarser, smaller series. Setting it also tells this tool the response is bounded, so a wide range or large batch that would otherwise be rejected locally against that ceiling is passed through (a value ABOVE the ceiling bounds nothing and is still rejected). Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
         ),
       nextToken: z
         .string()
@@ -449,8 +458,23 @@ export const metricsTools: readonly Tool[] = [
       // checks the auto-picked period as well as explicit ones (the auto-pick
       // floors at 3600s, so it is not safe by construction for very wide
       // ranges).
+      //
+      // `callerCap` is the caller's own bound on the response (see the note on
+      // CLOUDWATCH_MAX_DATAPOINTS): with maxDataPoints set, CloudWatch coarsens
+      // the period and pages the rest, so no more than that many points come
+      // back and the raw estimate is an over-count. Clamping to it on BOTH arms
+      // -- per query and the batch aggregate -- means a bounded request is never
+      // rejected on an estimate that cannot happen, while an unbounded one
+      // (callerCap = Infinity, the clamp a no-op) still gets the hard rejection.
+      // A maxDataPoints above the ceiling CloudWatch itself enforces clamps to a
+      // still-over-cap number and correctly bounces here.
       const rangeSeconds = (endDate.getTime() - startDate.getTime()) / 1000;
       const periodSeconds = pickAutoPeriodSeconds(startDate.getTime(), endDate.getTime());
+      const callerCap = i.maxDataPoints ?? Number.POSITIVE_INFINITY;
+      const overCapHint =
+        i.maxDataPoints !== undefined
+          ? ` Note that maxDataPoints (${i.maxDataPoints}) is itself above the cap, so it does not bound this request below it.`
+          : "";
       let totalDatapoints = 0;
       for (const q of i.queries) {
         if (q.period !== undefined && (q.period <= 0 || q.period % 60 !== 0)) {
@@ -464,20 +488,20 @@ export const metricsTools: readonly Tool[] = [
         if (q.returnData === false) continue;
         const effectivePeriod = q.period ?? periodSeconds;
         const datapoints = Math.ceil(rangeSeconds / effectivePeriod);
-        if (datapoints > CLOUDWATCH_MAX_DATAPOINTS) {
+        if (Math.min(datapoints, callerCap) > CLOUDWATCH_MAX_DATAPOINTS) {
           const periodPhrase =
             q.period !== undefined ? `period ${q.period}s` : `the auto-picked period ${effectivePeriod}s`;
           return {
             ok: false,
-            error: `Query '${q.id}' with ${periodPhrase} over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period or narrow the time range.`,
+            error: `Query '${q.id}' with ${periodPhrase} over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period, narrow the time range, or set maxDataPoints to let CloudWatch coarsen the series for you.${overCapHint}`,
           };
         }
         totalDatapoints += datapoints;
       }
-      if (totalDatapoints > CLOUDWATCH_MAX_DATAPOINTS) {
+      if (Math.min(totalDatapoints, callerCap) > CLOUDWATCH_MAX_DATAPOINTS) {
         return {
           ok: false,
-          error: `These ${i.queries.length} queries would request ${totalDatapoints} datapoints in a single GetMetricData call over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}), exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. The cap applies to the whole request, not to each query. Widen the periods, narrow the time range, or split the queries across calls.`,
+          error: `These ${i.queries.length} queries would request ${totalDatapoints} datapoints in a single GetMetricData call over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}), exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. The cap applies to the whole request, not to each query. Widen the periods, narrow the time range, set maxDataPoints to let CloudWatch coarsen the series, or split the queries across calls.${overCapHint}`,
         };
       }
 

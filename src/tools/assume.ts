@@ -71,7 +71,7 @@ export const assumeTools: readonly Tool[] = [
   {
     name: "aws_assume_role",
     description:
-      "Call STS AssumeRole and stash the returned temporary credentials as a named profile in ~/.aws/credentials. Subsequent calls to aws_call / aws_whoami / aws_paginate can use profile='mcp-<sessionName>' (or your overridden targetProfile name). The raw secret key / session token are NOT returned to the caller — only the profile name, expiration, and assumed identity. Use for cross-account access: a source profile (your SSO identity) assumes a role in another account. Default timeout is 120s (raise via timeoutMs for slow SAML / credential_process setups on cold start).",
+      "Call STS AssumeRole and stash the returned temporary credentials as a named profile in the shared credentials file ($AWS_SHARED_CREDENTIALS_FILE when set, otherwise ~/.aws/credentials; the resolved path is returned as credentialsPath). Subsequent calls to aws_call / aws_whoami / aws_paginate can use profile='mcp-<sessionName>' (or your overridden targetProfile name). The raw secret key / session token are NOT returned to the caller — only the profile name, expiration, and assumed identity. Use for cross-account access: a source profile (your SSO identity) assumes a role in another account. Default timeout is 120s (raise via timeoutMs for slow SAML / credential_process setups on cold start).",
     annotations: {
       title: "Assume an IAM role and stash creds as a profile",
       readOnlyHint: false,
@@ -146,8 +146,8 @@ export const assumeTools: readonly Tool[] = [
           error: `Invalid sourceProfile name '${sourceProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Check the 'sourceProfile' arg or AWS_PROFILE env var.`,
         };
       }
-      // The resolved name lands as a `[name]` section header in
-      // ~/.aws/credentials. Reject INI-breakers (brackets, newlines, `=`) up
+      // The resolved name lands as a `[name]` section header in the shared
+      // credentials file. Reject INI-breakers (brackets, newlines, `=`) up
       // front so a hostile or fat-fingered targetProfile can't corrupt the
       // credentials file. useRegion is validated inside runAwsCall via
       // isValidRegionName; this guards the remaining write path that
@@ -212,6 +212,17 @@ export const assumeTools: readonly Tool[] = [
           return {
             ok: false,
             error: `SSO session expired for source profile '${sourceProfile}'. Call aws_login_start with profile='${sourceProfile}' before assuming.`,
+          };
+        }
+        // expired_creds reaches here when the SOURCE profile is itself a
+        // temporary session (role chaining, or a profile fed by an earlier
+        // assume). runAwsCall's message already names both remedies and keeps
+        // the underlying stderr; this arm exists only to name the source
+        // profile, which the CLI's stderr does not reliably identify.
+        if (result.kind === "expired_creds") {
+          return {
+            ok: false,
+            error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${result.error}`,
           };
         }
         // `aws sts assume-role --output json` writes the credential blob to

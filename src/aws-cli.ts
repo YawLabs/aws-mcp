@@ -13,7 +13,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
-import { killProc, procHasExited } from "./kill-proc.js";
+import { KILL_ESCALATION_MS, killProc, procHasExited } from "./kill-proc.js";
 import {
   getProfile,
   getRegion,
@@ -33,6 +33,26 @@ const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
 // above genuinely counts bytes (it sums Buffer.length on raw chunks); this one
 // does not, and the name says so. For non-ASCII stderr the two units diverge.
 const MAX_ERROR_MSG_CHARS = 8 * 1024;
+
+/**
+ * How long to wait for the stdio pipes to close once the child itself is gone
+ * (or once we have given up on it).
+ *
+ * 'close' is the correct NORMAL settle -- it is the only event that guarantees
+ * every buffered byte has been read (see the 'close' handler below). But
+ * 'close' fires when the LAST writer on those pipes goes away, and the child is
+ * not necessarily the last writer: any descendant that inherited the stdio
+ * handles keeps them open after `aws` itself dies. `aws ssm start-session` and
+ * `aws ecs execute-command` do exactly that -- they hand off to
+ * session-manager-plugin with the pipes inherited -- and both are reachable
+ * from aws_call (validateNames permits them; there is no interactive-op
+ * denylist). Without a bound, such a call never settles, not even at timeoutMs.
+ *
+ * Sized to be comfortably longer than a real pipe drain (microseconds to low
+ * milliseconds, even for a 5 MB payload) so it can never preempt a legitimate
+ * 'close' and truncate stdout, while still bounding the pathological case.
+ */
+const PIPE_CLOSE_GRACE_MS = 2_000;
 
 // Also defends against argv injection: leading-hyphen input like "--profile evil"
 // would otherwise become a flag to `aws`.
@@ -158,7 +178,7 @@ interface AwsCallOptions {
 // "nonzero_exit" -- so "other" can never appear on an AwsCallResult, and
 // including it here would give every consumer switch a permanently dead arm.
 export type AwsCallFailureKind =
-  | Exclude<AuthErrorKind, "other"> // "sso_expired" | "no_creds" | "invalid_creds"
+  | Exclude<AuthErrorKind, "other"> // "sso_expired" | "expired_creds" | "no_creds" | "invalid_creds"
   | "bad_input"
   | "spawn_failure"
   | "timeout"
@@ -367,84 +387,43 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     let timedOut = false;
     let tooLarge = false;
     let settled = false;
+    // Handle + absolute deadline for the pipe-close fallback (armPipeCloseGrace
+    // below). The deadline is only ever moved EARLIER: the kill sites arm a long
+    // window because the child is still alive and killProc's SIGTERM grace plus
+    // SIGKILL escalation both have to elapse first, and the 'exit' listener then
+    // re-arms a short one because by then only the drain is left.
+    let graceHandle: NodeJS.Timeout | null = null;
+    let graceDeadline = Number.POSITIVE_INFINITY;
     // Per-stream UTF-8 decoders so a multi-byte character split across two
     // chunks doesn't decode to U+FFFD. AWS resource names / tags / S3 keys
     // routinely contain non-ASCII.
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
 
+    // The single choke point for resolving this promise. Also the single place
+    // the two timers are cancelled, so no exit path can leave one armed.
     const settle = (result: AwsCallResult): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeoutHandle);
+      if (graceHandle !== null) {
+        clearTimeout(graceHandle);
+        graceHandle = null;
+      }
       resolve(result);
     };
 
-    const timeoutHandle = setTimeout(() => {
-      // procHasExited closes the microsecond race where the subprocess exited
-      // cleanly in the last few microseconds with its 'exit' callback queued
-      // behind us in this same loop iteration -- libuv sets exitCode/signalCode
-      // synchronously BEFORE dispatching 'exit', so if either is populated we
-      // defer to the queued exit callback and a natural success isn't
-      // overwritten with a timeout error. See kill-proc.ts:procHasExited.
-      if (killed) return;
-      if (procHasExited(proc)) return;
-      killed = true;
-      timedOut = true;
-      // killProc sends SIGTERM then escalates to SIGKILL, so the process WILL
-      // exit and 'close' WILL fire -- that is where settle() is called.
-      //
-      // No watchdog timer here, but that is a DEPENDENCY, not a free property:
-      // it holds only because killProc's escalation actually fires. Its guard
-      // is procHasExited (exitCode/signalCode), not proc.killed -- a
-      // `!proc.killed` guard would be false on every platform the moment
-      // SIGTERM was dispatched, the SIGKILL would never be sent, and a child
-      // that ignores SIGTERM would leave this promise pending forever. If that
-      // guard is ever loosened, add a watchdog here. See kill-proc.ts.
-      killProc(proc);
-    }, timeoutMs);
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_OUTPUT_BYTES) {
-        if (!killed) {
-          killed = true;
-          tooLarge = true;
-          killProc(proc);
-        }
-        return;
-      }
-      stdoutBuf += stdoutDecoder.write(chunk);
-    });
-
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderrBytes += chunk.length;
-      // Deliberate asymmetry vs stdout: oversized stderr is silently truncated
-      // -- we stop appending past MAX_OUTPUT_BYTES but do NOT set tooLarge and
-      // do NOT kill the proc. stderr is diagnostic text (CLI warnings/errors),
-      // not the data payload we parse, so an output_too_large failure here would
-      // be noise. stdout is the parsed result, so only it trips that guard above.
-      if (stderrBytes > MAX_OUTPUT_BYTES) return;
-      stderrBuf += stderrDecoder.write(chunk);
-    });
-
-    proc.on("error", (err) => {
-      clearTimeout(timeoutHandle);
-      settle({
-        ok: false,
-        kind: "spawn_failure",
-        error: `Failed to run '${command}': ${err.message}. Is the AWS CLI installed and on PATH?`,
-        command: displayCommand,
-      });
-    });
-
-    // 'close', not 'exit': 'exit' fires as soon as the child is reaped, while
-    // its stdio pipes may still hold buffered data we have not read. Settling
-    // there truncates stdout on a fast-exiting child and the JSON parse below
-    // then fails on a payload that arrived complete. 'close' fires only once
-    // every pipe has been drained and closed. Matches the version probe in
-    // sso.ts, which settles on 'close' for the same reason.
-    proc.on("close", (code) => {
-      clearTimeout(timeoutHandle);
+    /**
+     * Build the result from whatever the pipes have given us. Called by 'close'
+     * on the normal path -- where it runs with a guaranteed-complete payload --
+     * and by the pipe-close grace timer when 'close' is never going to fire.
+     *
+     * `code` is the child's exit code, or null when it was killed by a signal
+     * or was never reaped at all; the nonzero_exit branch below already treats
+     * both the same way.
+     */
+    const finishFromPipes = (code: number | null): void => {
+      if (settled) return;
       // Flush any incomplete multi-byte sequence held in the decoder.
       stdoutBuf += stdoutDecoder.end();
       stderrBuf += stderrDecoder.end();
@@ -478,6 +457,15 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         if (classified.kind === "sso_expired") {
           kind = "sso_expired";
           errorMsg = `SSO session expired for profile '${profile}'. Call aws_login_start with profile='${profile}' to re-authenticate.`;
+        } else if (classified.kind === "expired_creds") {
+          // Deliberately NOT sso_expired. AWS emits the ExpiredToken wrapper for
+          // ANY expired temporary credential -- an assume-role session, a
+          // web-identity session, an SSO-derived one. Telling an assume-role
+          // user to run aws_login_start is wrong advice, so this message names
+          // both remedies and keeps the underlying stderr (which the
+          // aws_assume_role path otherwise drops entirely).
+          kind = "expired_creds";
+          errorMsg = `Temporary credentials for profile '${profile}' have expired. If this profile authenticates via AWS SSO, call aws_login_start with profile='${profile}'; if these credentials came from aws_assume_role or another STS session, request a fresh session (re-run the assume). Underlying error: ${truncateForErrorMsg(stderrBuf.trim())}`;
         } else if (classified.kind === "invalid_creds") {
           // Distinct from no_creds on purpose: credentials WERE found and sent,
           // and the service rejected them. "Check ~/.aws/credentials exists" is
@@ -554,6 +542,128 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       } else {
         settle({ ok: true, data: stdoutBuf, command: displayCommand, rawStdout: stdoutBuf });
       }
+    };
+
+    /**
+     * Arm (or bring forward) the bounded fallback that settles when 'close' is
+     * never going to fire. Idempotent, and only ever shortens the wait, so the
+     * long window a kill site arms is superseded by the short one the 'exit'
+     * listener arms once the child is confirmed reaped.
+     *
+     * Whichever of this timer and 'close' loses the race is free: settle()'s
+     * `settled` flag makes the second arrival a no-op, so the normal path keeps
+     * its full pipe flush and this only ever fires when there is nothing left
+     * to wait for.
+     */
+    const armPipeCloseGrace = (delayMs: number): void => {
+      if (settled) return;
+      const deadline = Date.now() + delayMs;
+      if (deadline >= graceDeadline) return;
+      graceDeadline = deadline;
+      if (graceHandle !== null) clearTimeout(graceHandle);
+      graceHandle = setTimeout(() => finishFromPipes(proc.exitCode), delayMs);
+      // A pending fallback must never be the reason this process stays alive.
+      // It still fires when it matters: the un-closed stdio streams that cause
+      // this situation are themselves ref'd handles holding the loop up.
+      graceHandle.unref();
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      if (killed) return;
+      // procHasExited closes the microsecond race where the subprocess exited
+      // cleanly in the last few microseconds with its 'exit' callback queued
+      // behind us in this same loop iteration -- libuv sets exitCode/signalCode
+      // synchronously BEFORE dispatching 'exit', so if either is populated we
+      // leave the natural result alone instead of overwriting it with a timeout
+      // error. See kill-proc.ts:procHasExited.
+      //
+      // Returning here is safe even when the pipes are being held open by a
+      // descendant, because the 'exit' listener below has already armed the
+      // pipe-close grace, so this call still settles. Before that listener
+      // existed this early return was the WORST hang of the two: the child was
+      // reaped, nothing here ever attempted a kill, and 'close' never came.
+      if (procHasExited(proc)) {
+        armPipeCloseGrace(PIPE_CLOSE_GRACE_MS);
+        return;
+      }
+      killed = true;
+      timedOut = true;
+      killProc(proc);
+      // killProc guarantees the CHILD dies -- SIGTERM, then SIGKILL after
+      // KILL_ESCALATION_MS, guarded on procHasExited rather than proc.killed so
+      // the escalation genuinely fires (see kill-proc.ts). It does NOT guarantee
+      // the stdio pipes CLOSE: a descendant that inherited them is not signalled
+      // and keeps its ends open, so 'close' can simply never arrive. Child-exit
+      // and pipe-close are different guarantees and only the first is delivered
+      // here, which is why the settle needs its own bound. The window covers the
+      // SIGTERM grace, the SIGKILL escalation and the drain; the 'exit' listener
+      // shortens it the moment the child is actually reaped.
+      armPipeCloseGrace(KILL_ESCALATION_MS + PIPE_CLOSE_GRACE_MS);
+    }, timeoutMs);
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_OUTPUT_BYTES) {
+        if (!killed) {
+          killed = true;
+          tooLarge = true;
+          killProc(proc);
+          // Same bound as the timeout kill site, for the same reason: killProc
+          // gets rid of the child, not of a descendant holding the pipes open.
+          armPipeCloseGrace(KILL_ESCALATION_MS + PIPE_CLOSE_GRACE_MS);
+        }
+        return;
+      }
+      stdoutBuf += stdoutDecoder.write(chunk);
+    });
+
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      // Deliberate asymmetry vs stdout: oversized stderr is silently truncated
+      // -- we stop appending past MAX_OUTPUT_BYTES but do NOT set tooLarge and
+      // do NOT kill the proc. stderr is diagnostic text (CLI warnings/errors),
+      // not the data payload we parse, so an output_too_large failure here would
+      // be noise. stdout is the parsed result, so only it trips that guard above.
+      if (stderrBytes > MAX_OUTPUT_BYTES) return;
+      stderrBuf += stderrDecoder.write(chunk);
+    });
+
+    proc.on("error", (err) => {
+      settle({
+        ok: false,
+        kind: "spawn_failure",
+        error: `Failed to run '${command}': ${err.message}. Is the AWS CLI installed and on PATH?`,
+        command: displayCommand,
+      });
+    });
+
+    // 'exit' is NOT the settle -- see the 'close' handler below for why it must
+    // not be. It is here purely to BOUND the wait. Once the child is reaped the
+    // only thing standing between us and a result is the pipe drain, so anything
+    // still holding those pipes open is a descendant we have no way to wait on.
+    // Arms the short window; if a kill site already armed the longer one to
+    // cover the SIGKILL escalation, that is now moot and gets superseded.
+    proc.on("exit", () => {
+      armPipeCloseGrace(PIPE_CLOSE_GRACE_MS);
+    });
+
+    // 'close', not 'exit': 'exit' fires as soon as the child is reaped, while
+    // its stdio pipes may still hold buffered data we have not read. Settling
+    // there truncates stdout on a fast-exiting child and the JSON parse below
+    // then fails on a payload that arrived complete. 'close' fires only once
+    // every pipe has been drained and closed, so it stays the NORMAL settle.
+    //
+    // What it is not is a GUARANTEED one, and sso.ts is the pattern that fixes
+    // that rather than the precedent for leaning on it. Its version probe does
+    // settle on 'close', but it also calls finish(true) from INSIDE its own
+    // timeout callback (sso.ts:284-293); its login path settles on 'exit'
+    // (sso.ts:591) and uses 'close' only as a start-failure fallback
+    // (sso.ts:646). Both sso.ts sites are bounded by something other than
+    // 'close'. This was the only site whose timeout path depended on 'close'
+    // alone -- which is exactly what let a descendant holding the pipes hang it
+    // past its own timeout, forever. The bound now lives in armPipeCloseGrace.
+    proc.on("close", (code) => {
+      finishFromPipes(code);
     });
   });
 }

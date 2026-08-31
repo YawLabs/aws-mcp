@@ -13,6 +13,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -346,6 +347,94 @@ describe("upsertProfile — lock subsystem", () => {
     } finally {
       chmodSync(path, 0o644);
     }
+  });
+});
+
+/**
+ * Short-write regression.
+ *
+ * `writeSync` may legally write FEWER bytes than it was asked to, and it does
+ * NOT throw when it does -- so the atomic-write try/catch inside upsertProfile
+ * never fires on this path. Before writeAllSync, the return value was dropped
+ * and the partially-written tmp file was renamed straight over the user's real
+ * credentials: every other profile in the file silently truncated away, and a
+ * half-written secret key in ours. The tmp-file + rename dance exists to make
+ * exactly that impossible, so the short write defeated it from the inside.
+ *
+ * The short write is FORCED here rather than hoped for: node:fs's CommonJS
+ * export is swapped for a one-shot truncating wrapper and
+ * syncBuiltinESMExports() republishes it to the ESM named-import binding that
+ * aws-credentials.ts holds. The wrapper fires on exactly one call -- the one
+ * carrying our marker -- so it cannot touch the test reporter's stdout (fd 1/2
+ * are excluded anyway) nor acquireLock's `pid=... time=...` stamp, and the
+ * loop under test still terminates. It handles the string overload too, so a
+ * revert to the old `writeSync(fd, nextText)` shape fails on content rather
+ * than quietly skipping the injection.
+ */
+describe("upsertProfile — a short write never lands a truncated credentials file", () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "aws-mcp-shortwrite-"));
+    path = join(dir, "credentials");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("loops until every byte lands when writeSync short-writes", async () => {
+    // The marker identifies our payload to the injector; the long values make
+    // the write big enough that halving it is unambiguous.
+    const MARKER = "AKIA-SHORT-WRITE-PROBE";
+    const creds = {
+      aws_access_key_id: MARKER,
+      aws_secret_access_key: `sk-${"s".repeat(512)}`,
+      aws_session_token: `tok-${"t".repeat(2048)}`,
+    };
+    // Seed an unrelated profile first: a truncated write eats it, so its
+    // survival is the data-loss half of the assertion.
+    writeFileSync(path, "[keep-me]\naws_access_key_id = PRESERVED\n");
+    const expected = upsertProfileIntoText(readFileSync(path, "utf-8"), "mcp-dev", creds);
+
+    const require = createRequire(import.meta.url);
+    const fs = require("node:fs");
+    const realWriteSync = fs.writeSync;
+    let shortened = 0;
+    fs.writeSync = (fd: number, data: unknown, ...rest: unknown[]) => {
+      let payload = "";
+      if (typeof data === "string") payload = data;
+      else if (Buffer.isBuffer(data)) payload = data.toString("utf-8");
+      if (shortened === 0 && fd !== 1 && fd !== 2 && payload.includes(MARKER)) {
+        shortened++;
+        if (typeof data === "string") {
+          // The pre-fix call shape: writeSync(fd, nextText), no byte accounting.
+          return realWriteSync(fd, data.slice(0, Math.max(1, Math.floor(data.length / 2))));
+        }
+        const [offset, length] = rest as [number, number];
+        return realWriteSync(fd, data, offset, Math.max(1, Math.floor(length / 2)));
+      }
+      return realWriteSync(fd, data, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      await upsertProfile(path, "mcp-dev", creds);
+    } finally {
+      fs.writeSync = realWriteSync;
+      syncBuiltinESMExports();
+    }
+
+    // If this fires, the injection missed its target and everything below
+    // passes vacuously -- fail loudly instead of reporting false coverage.
+    assert.equal(shortened, 1, "the short-write fault injection never fired; this test is not exercising the loop");
+    const text = readFileSync(path, "utf-8");
+    assert.equal(text, expected, "the credentials file must hold the FULL text, not just the first short write");
+    assert.match(text, /PRESERVED/, "the pre-existing profile must survive a short write");
+    assert.ok(text.includes(creds.aws_session_token), "the last managed key must survive the short write intact");
+    // No half-written tmp file left behind either.
+    const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
+    assert.deepEqual(leftovers, [], `no .tmp-* files should remain, found: ${leftovers.join(", ")}`);
   });
 });
 

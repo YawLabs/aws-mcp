@@ -14,6 +14,9 @@
  *
  * We write to a .tmp file first and rename on top of the original so a
  * crash mid-write can't leave the user with a truncated credentials file.
+ * The write itself loops until every byte lands (see writeAllSync) -- a SHORT
+ * write doesn't throw, so without the loop the rename would publish a
+ * truncated file through the very path that exists to prevent one.
  * The tmp file is opened with mode 0o600 (a no-op on Windows), so the
  * credentials file inherits those permissions through the rename -- matching
  * the AWS CLI's own behavior. If anything between the open and the rename
@@ -316,6 +319,42 @@ function releaseLock(lockPath: string): void {
 }
 
 /**
+ * Write EVERY byte of `text` to `fd`, looping until the buffer is drained.
+ *
+ * writeSync returns how many bytes it actually wrote, and POSIX permits that
+ * to be FEWER than requested -- pipes, network filesystems (a ~/.aws on NFS
+ * or a mounted share is not exotic) and EINTR-interrupted syscalls all
+ * produce short writes. Crucially a short write does NOT throw, so the
+ * caller's try/catch never sees it: dropping writeSync's return value would
+ * renameSync a TRUNCATED file over the user's real credentials. That is both
+ * data loss (the other profiles in the file are gone) and a broken-auth state
+ * (the profile we just wrote is half a secret key), and the atomic-rename
+ * dance above exists precisely to make that impossible.
+ *
+ * The loop tracks BYTE offsets into a Buffer rather than string indices: a
+ * multi-byte UTF-8 character split across a short write would desync a
+ * string-sliced retry and corrupt the output.
+ *
+ * A non-positive return would spin forever, so it is treated as a hard
+ * failure instead. That throws into the caller's catch, which unlinks the tmp
+ * file and propagates -- an error beats a hung assume-role call, and beats a
+ * truncated credentials file.
+ */
+function writeAllSync(fd: number, text: string): void {
+  const buf = Buffer.from(text, "utf-8");
+  let written = 0;
+  while (written < buf.byteLength) {
+    const n = writeSync(fd, buf, written, buf.byteLength - written);
+    if (n <= 0) {
+      throw new Error(
+        `upsertProfile: write stalled after ${written} of ${buf.byteLength} bytes; refusing to rename a truncated credentials file.`,
+      );
+    }
+    written += n;
+  }
+}
+
+/**
  * Read, modify, and atomically rewrite a credentials file. Creates the file
  * if it doesn't exist. The tmp file is opened 0o600, and renameSync replaces
  * the destination inode, so the resulting credentials file is 0o600 on Unix
@@ -346,7 +385,9 @@ export async function upsertProfile(
     const fd = openSync(tmpPath, "w", 0o600);
     try {
       try {
-        writeSync(fd, nextText);
+        // Loops on the byte count: a partial write must not be renamed over
+        // the real credentials file. See writeAllSync.
+        writeAllSync(fd, nextText);
       } finally {
         closeSync(fd);
       }

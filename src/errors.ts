@@ -17,7 +17,7 @@
  * prose can't trip them.
  */
 
-export type AuthErrorKind = "sso_expired" | "no_creds" | "invalid_creds" | "other";
+export type AuthErrorKind = "sso_expired" | "expired_creds" | "no_creds" | "invalid_creds" | "other";
 
 // Anchor on the exact strings botocore/aws-cli emit so we don't false-positive
 // on stderr that mentions "SSO", "session", and "expired" in unrelated
@@ -36,10 +36,11 @@ export type AuthErrorKind = "sso_expired" | "no_creds" | "invalid_creds" | "othe
 //     where {provider}="sso" and {error_msg}="Token has expired and refresh
 //     failed" comes from DeferredRefreshableToken._protected_refresh in
 //     botocore/tokens.py when a mandatory refresh fails on an expired token.
-//   - the service-side expiry, which does NOT come from botocore at all: STS
-//     and friends reject an expired session token with the standard wrapper
-//     "An error occurred (ExpiredToken) when calling the X operation: The
-//     security token included in the request is expired".
+//
+// Everything in THIS list is SSO-specific by construction: each string comes
+// from botocore's SSO token provider and from nothing else, so "run
+// aws_login_start" is unambiguously the right remedy. The service-side
+// ExpiredToken wrapper is deliberately NOT here -- see EXPIRED_CREDS_PATTERNS.
 const SSO_EXPIRED_PATTERNS: RegExp[] = [
   // "Error loading SSO Token: ..." -- the prefix is the load() failure;
   // the rest is variable (profile name, expiry phrasing) but the prefix is
@@ -53,19 +54,31 @@ const SSO_EXPIRED_PATTERNS: RegExp[] = [
   // "Error when retrieving token from sso: Token has expired and refresh
   // failed". The trailing fragment alone is specific enough.
   /Token has expired and refresh failed/,
-  // The most common expiry shape in practice, and the one this classifier
-  // used to miss entirely: the service rejects the request rather than
-  // botocore failing to load a token, so it arrives in the standard wrapper.
-  // Anchored on "An error occurred (" + the code so the bare word can't match
-  // prose. Covers both the STS spelling (ExpiredToken) and the
-  // service-exception spelling (ExpiredTokenException).
-  //
-  // parseAwsError below already attached "Re-authenticate with
-  // aws_login_start." to this code; until now classifyAuthError disagreed and
-  // called it "other", so the same stderr got a re-login suggestion appended
-  // to a generic nonzero_exit error instead of the sso_expired treatment.
-  /An error occurred \(ExpiredToken(?:Exception)?\)/,
 ];
+
+// Temporary credentials that were VALID and have since expired -- but whose
+// origin this text does not reveal.
+//
+// The service-side expiry does not come from botocore at all: STS and friends
+// reject an expired session token with the standard wrapper
+//   "An error occurred (ExpiredToken) when calling the X operation: The
+//    security token included in the request is expired"
+// and they emit it for ANY expired temporary credential -- an assume-role
+// session, a web-identity session, an SSO-derived one, a `credential_process`
+// one. The stderr carries nothing that distinguishes them.
+//
+// This is its own kind rather than an SSO_EXPIRED_PATTERNS entry precisely
+// because of that ambiguity. Folding it in classified a plain assume-role user
+// as sso_expired and told them to run aws_login_start, which does not refresh
+// an STS session -- wrong advice, and via aws_assume_role the underlying stderr
+// was dropped too, so nothing on screen contradicted it. The caller message for
+// this kind names both remedies (re-login for SSO, re-assume for STS) and keeps
+// the raw stderr.
+//
+// Anchored on "An error occurred (" + the code so a bare mention of the word in
+// prose cannot match. Covers the STS spelling (ExpiredToken) and the
+// service-exception spelling (ExpiredTokenException).
+const EXPIRED_CREDS_PATTERNS: RegExp[] = [/An error occurred \(ExpiredToken(?:Exception)?\)/];
 
 // Credentials that EXIST but the service refuses. Distinct from no_creds
 // (nothing resolved at all): the fix is different -- rotate / re-issue the key
@@ -107,8 +120,14 @@ export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message:
   // header.
   const message = err instanceof Error ? err.message : String(err);
 
+  // SSO first: its patterns name the SSO token provider explicitly, so when one
+  // of them matches we know the origin and can give the SSO-specific remedy.
+  // expired_creds is the fallback for the origin-agnostic wrapper.
   if (SSO_EXPIRED_PATTERNS.some((re) => re.test(message))) {
     return { kind: "sso_expired", message };
+  }
+  if (EXPIRED_CREDS_PATTERNS.some((re) => re.test(message))) {
+    return { kind: "expired_creds", message };
   }
   if (INVALID_CREDS_PATTERNS.some((re) => re.test(message))) {
     return { kind: "invalid_creds", message };
@@ -195,7 +214,12 @@ export function parseAwsError(stderr: string): ParsedAwsError {
     ) {
       out.suggestion = "Check the operation parameters against the API schema.";
     } else if (code === "ExpiredToken" || code === "ExpiredTokenException") {
-      out.suggestion = "Re-authenticate with aws_login_start.";
+      // Origin-agnostic on purpose, matching EXPIRED_CREDS_PATTERNS above: AWS
+      // emits this code for any expired temporary credential, so naming only
+      // aws_login_start sent assume-role users at a tool that cannot refresh
+      // their session.
+      out.suggestion =
+        "Temporary credentials have expired: re-run aws_login_start for an SSO profile, or aws_assume_role for an STS session.";
     } else if (code === "ResourceAlreadyExistsException" || code === "AlreadyExistsException") {
       out.suggestion = "The resource already exists -- use aws_resource_update or pick a different identifier.";
     } else if (code === "ConflictException") {
