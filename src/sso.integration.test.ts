@@ -769,3 +769,135 @@ describe("startSsoLogin — CLI version probe", () => {
     }
   });
 });
+
+/**
+ * clampRawOutput -- the gate on how much unfiltered `aws sso login` output
+ * reaches the model.
+ *
+ * Every rawOutput/error string sso.ts hands back runs through it, and
+ * tools/auth.ts forwards those straight into `rawBody` (auth.ts:345, :386,
+ * :482). It is not exported, so the only way to exercise it is through a real
+ * subprocess whose stdout length we control exactly -- hence the sso2_raw_*
+ * fake scenarios rather than a unit test.
+ *
+ * Determinism: the fake writes filler FIRST and the URL+code banner LAST.
+ * startSsoLogin settles only once both the URL and the code have been parsed,
+ * so `start.ok === true` is proof the whole payload is already buffered; the
+ * fake then holds for 250ms before exiting, so the 'exit' handler that computes
+ * rawOutput cannot be racing a still-queued stdout chunk. No sleeps, no polling.
+ */
+describe("clampRawOutput -- the raw `aws sso login` output forwarded to the model", () => {
+  // Mirrors MAX_RAW_OUTPUT_CHARS (sso.ts:42), which is module-private. The
+  // duplication is deliberate and load-bearing: if the cap moves, these tests
+  // must be a conscious update rather than silently re-deriving whatever the
+  // source now does.
+  const MAX_RAW_OUTPUT_CHARS = 4_000;
+  // Mirrors the tail `sso2_raw_sized` / `sso2_raw_surrogate_boundary` append
+  // (src/testing/fake-aws.ts). Byte-for-byte, or the exact-equality assertions
+  // below fail -- which is the intended drift alarm.
+  const SSO2_TAIL = "\nhttps://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n";
+
+  // startSsoLogin's options type is module-private; name it structurally rather
+  // than re-declaring a parallel shape that could drift.
+  type LoginOpts = NonNullable<Parameters<typeof startSsoLogin>[1]>;
+
+  /** Build opts that make the fake emit EXACTLY `totalChars` of stdout. */
+  function sizedRawOpts(totalChars: number): { expected: string; opts: LoginOpts } {
+    const filler = totalChars - SSO2_TAIL.length;
+    assert.ok(filler >= 0, `totalChars must be >= ${SSO2_TAIL.length} (the tail's own length)`);
+    // urlWaitMs is deliberately long: these tests must settle on the parsed
+    // URL+code, never on the URL timeout (a different clampRawOutput call site
+    // with a different input).
+    const base = fakeOpts("sso2_raw_sized", 10_000);
+    return {
+      expected: `${"x".repeat(filler)}${SSO2_TAIL}`,
+      opts: { ...base, env: { ...base.env, AWS_MCP_FAKE_SSO2_FILLER: String(filler) } },
+    };
+  }
+
+  async function rawOutputFor(profile: string, opts: LoginOpts): Promise<string> {
+    const start = await startSsoLogin(profile, opts);
+    assert.equal(start.ok, true, start.ok ? "" : `start failed: ${start.error}`);
+    if (!start.ok) throw new Error("unreachable");
+    const wait = await waitForLogin(start.sessionId);
+    assert.equal(wait.ok, true, `expected a clean exit, got: ${wait.error}`);
+    assert.ok(wait.rawOutput !== undefined, "rawOutput must be present on a clean exit");
+    return wait.rawOutput;
+  }
+
+  it("passes output under the cap through unchanged", async () => {
+    const { expected, opts } = sizedRawOpts(MAX_RAW_OUTPUT_CHARS - 1_000);
+    const raw = await rawOutputFor("clamp-under-profile", opts);
+    assert.equal(raw.length, MAX_RAW_OUTPUT_CHARS - 1_000, "a sub-cap payload must not change length");
+    assert.equal(raw, expected, "a sub-cap payload must be forwarded byte-identical");
+    assert.doesNotMatch(raw, /truncated/, "nothing under the cap may carry the truncation marker");
+  });
+
+  it("does NOT truncate at exactly the cap (the boundary is inclusive)", async () => {
+    // The off-by-one that matters: `text.length <= MAX_RAW_OUTPUT_CHARS`
+    // returns early. A `<` here would append a "[truncated 0 chars ...]" marker
+    // to output that lost nothing.
+    const { expected, opts } = sizedRawOpts(MAX_RAW_OUTPUT_CHARS);
+    const raw = await rawOutputFor("clamp-boundary-profile", opts);
+    assert.equal(raw.length, MAX_RAW_OUTPUT_CHARS, "output exactly at the cap must pass through at its own length");
+    assert.equal(raw, expected);
+    assert.doesNotMatch(raw, /truncated/, "exactly at the cap is NOT over the cap");
+  });
+
+  it("keeps the head and reports the exact omitted count when over the cap", async () => {
+    const OVER = 1_234;
+    const { expected, opts } = sizedRawOpts(MAX_RAW_OUTPUT_CHARS + OVER);
+    const raw = await rawOutputFor("clamp-over-profile", opts);
+    // Whole-string equality: pins the head, the marker wording, and the count
+    // in one assertion, so a change to any of the three is visible.
+    assert.equal(
+      raw,
+      `${expected.slice(0, MAX_RAW_OUTPUT_CHARS)}\n... [truncated ${OVER} chars of 'aws sso login' output]`,
+    );
+    // Spelled out separately because the count is the part a reader has to
+    // trust: head + omitted must reconstruct the original length exactly.
+    const omitted = Number(raw.match(/truncated (\d+) chars/)?.[1]);
+    assert.equal(omitted, OVER);
+    assert.equal(MAX_RAW_OUTPUT_CHARS + omitted, expected.length, "head + omitted must account for every input char");
+    // The head is the head, not the tail: the URL+code banner sat past the cap
+    // and is gone, while the leading filler survived.
+    assert.equal(raw.slice(0, MAX_RAW_OUTPUT_CHARS), "x".repeat(MAX_RAW_OUTPUT_CHARS));
+    assert.doesNotMatch(raw, /device\.sso/, "the tail past the cap must be dropped, not kept");
+  });
+
+  it("splits a surrogate pair at the cut, leaving a lone high surrogate (actual behavior)", async () => {
+    // FINDING, documented rather than asserted-as-correct: clampRawOutput cuts
+    // with a bare `text.slice(0, MAX_RAW_OUTPUT_CHARS)` (sso.ts:48).
+    // String#slice counts UTF-16 code units, so a non-BMP character straddling
+    // the boundary is severed and the head ends in a LONE HIGH SURROGATE.
+    // aws-cli.ts:truncateForErrorMsg (aws-cli.ts:131-141) backs the cut off by
+    // one unit for exactly this case; the clamp here does not. Both strings end
+    // up in the same MCP response body, so the divergence is real.
+    //
+    // The fake places U+20BB7 (4 UTF-8 bytes, 2 UTF-16 units) at indices
+    // 3999/4000 so the cut lands mid-pair every run -- nothing here is timing
+    // dependent.
+    const raw = await rawOutputFor("clamp-surrogate-profile", fakeOpts("sso2_raw_surrogate_boundary", 10_000));
+    const payload = `${"x".repeat(3_999)}${"\u{20BB7}".repeat(8)}${SSO2_TAIL}`;
+    const omitted = payload.length - MAX_RAW_OUTPUT_CHARS;
+    assert.equal(
+      raw,
+      `${payload.slice(0, MAX_RAW_OUTPUT_CHARS)}\n... [truncated ${omitted} chars of 'aws sso login' output]`,
+    );
+    const boundary = raw.charCodeAt(MAX_RAW_OUTPUT_CHARS - 1);
+    assert.ok(
+      boundary >= 0xd800 && boundary <= 0xdbff,
+      `expected the cut to land on a HIGH surrogate, got U+${boundary.toString(16).toUpperCase()}`,
+    );
+    // Nothing pairs with it: the very next code unit is the marker's newline,
+    // so the head is not well-formed UTF-16.
+    assert.equal(
+      raw.charCodeAt(MAX_RAW_OUTPUT_CHARS),
+      0x0a,
+      "the marker follows the high surrogate directly -- its low surrogate was cut away",
+    );
+    // The count is still measured in code units, so it is off by one relative
+    // to "characters" in the human sense. Pinned so the arithmetic is explicit.
+    assert.equal(omitted, payload.length - MAX_RAW_OUTPUT_CHARS);
+  });
+});

@@ -408,6 +408,27 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     assert.match(outside.error ?? "", /maximum is 30 days/);
   });
 
+  it("accepts EXACTLY the maximum window and rejects one day more (30d in, 31d out)", async () => {
+    // The 4w/5w case above brackets the ceiling but straddles it by 2 days on
+    // one side and 5 on the other, so an off-by-one in the comparison (`>=`
+    // instead of `>`) survives it. The cap is inclusive: sinceMs > MAX_SINCE_MS
+    // rejects, so exactly 30 days must still run.
+    assert.equal(relativeTimeMs("30d"), MAX_SINCE_MS, "precondition: '30d' is exactly the ceiling");
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_empty";
+    const atMax = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "30d" })) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(atMax.ok, true, `exactly 30 days must be allowed, got: ${atMax.error ?? ""}`);
+    const overMax = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "31d" })) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(overMax.ok, false, "31 days is one day over the ceiling");
+    assert.match(overMax.error ?? "", /maximum is 30 days/);
+    assert.match(overMax.error ?? "", /asks for a 31-day window/);
+  });
+
   it("rejects a filterPattern that starts with '-'", async () => {
     // filterPattern lands as the value position after --filter-pattern in
     // argv, so a leading '-' is not actually exploitable -- but the file

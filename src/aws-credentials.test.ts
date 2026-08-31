@@ -436,6 +436,94 @@ describe("upsertProfile — a short write never lands a truncated credentials fi
     const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
     assert.deepEqual(leftovers, [], `no .tmp-* files should remain, found: ${leftovers.join(", ")}`);
   });
+
+  /**
+   * The sibling case above proves the loop RESUMES; this one proves it resumes
+   * at the right OFFSET UNIT.
+   *
+   * Its payload is pure ASCII, where a string index and a byte offset are the
+   * same number -- so a resume written as `text.slice(written)` passes it while
+   * being wrong. The moment the file holds a single multi-byte character the two
+   * diverge: `Buffer.byteLength` counts 2 bytes for `é` and 4 for an astral
+   * emoji, `String#length` counts 1 and 2 UTF-16 units. Resuming a byte-counted
+   * write at a string index then re-sends bytes already on disk (duplicating
+   * them) or skips bytes that never landed, and either way can cut a multi-byte
+   * sequence in half -- which surfaces as U+FFFD in a credentials file the AWS
+   * CLI then fails to parse.
+   *
+   * A `[keep-me]` section with non-ASCII content is the realistic carrier: the
+   * shared credentials file is user-editable, so an accented comment or a
+   * non-Latin profile name in an UNRELATED section is enough. The assertion is
+   * on exact bytes, not on a substring, because that is the only form that
+   * catches a duplicated or dropped run in the middle.
+   */
+  it("resumes a short write at the correct BYTE offset when the file holds multi-byte UTF-8", async () => {
+    const MARKER = "AKIA-MULTIBYTE-PROBE";
+    const creds = {
+      aws_access_key_id: MARKER,
+      // Non-ASCII inside the managed values themselves: an accented run, a
+      // non-Latin script, and an astral-plane emoji (a surrogate pair in
+      // UTF-16, 4 bytes in UTF-8) so every divergence class is represented.
+      aws_secret_access_key: `sk-${"é".repeat(400)}`,
+      aws_session_token: `tok-${"キー".repeat(400)}${"🔑".repeat(200)}`,
+    };
+    // The unrelated section is non-ASCII too, so the divergence starts BEFORE
+    // our own payload rather than only inside it.
+    writeFileSync(path, "# clé de secours — ne pas supprimer\n[keep-me]\naws_access_key_id = PRÉSERVÉ\n", "utf-8");
+    const expected = upsertProfileIntoText(readFileSync(path, "utf-8"), "mcp-dev", creds);
+    // Guard the premise: if this ever stops holding, the test has quietly
+    // become a duplicate of the ASCII one above.
+    assert.notEqual(
+      Buffer.byteLength(expected, "utf-8"),
+      expected.length,
+      "premise broken: the payload must contain multi-byte UTF-8 for byte offset and string index to diverge",
+    );
+
+    const require = createRequire(import.meta.url);
+    const fs = require("node:fs");
+    const realWriteSync = fs.writeSync;
+    let shortened = 0;
+    fs.writeSync = (fd: number, data: unknown, ...rest: unknown[]) => {
+      let payload = "";
+      if (typeof data === "string") payload = data;
+      else if (Buffer.isBuffer(data)) payload = data.toString("utf-8");
+      if (shortened === 0 && fd !== 1 && fd !== 2 && payload.includes(MARKER)) {
+        shortened++;
+        if (typeof data === "string") {
+          return realWriteSync(fd, data.slice(0, Math.max(1, Math.floor(data.length / 2))));
+        }
+        const [offset, length] = rest as [number, number];
+        // Cut at an ODD byte count so the boundary has a good chance of landing
+        // mid-sequence -- the case a string-index resume mangles rather than
+        // merely misaligns.
+        const half = Math.max(1, Math.floor(length / 2));
+        return realWriteSync(fd, data, offset, half % 2 === 0 ? half - 1 : half);
+      }
+      return realWriteSync(fd, data, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      await upsertProfile(path, "mcp-dev", creds);
+    } finally {
+      fs.writeSync = realWriteSync;
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(shortened, 1, "the short-write fault injection never fired; this test is not exercising the loop");
+    // Compare BYTES, not the decoded string: a lone replacement char from a
+    // severed sequence is the exact corruption under test, and reading as
+    // utf-8 on both sides could mask a mismatch.
+    const actualBytes = readFileSync(path);
+    assert.deepEqual(
+      actualBytes,
+      Buffer.from(expected, "utf-8"),
+      "the credentials file bytes must match exactly -- a byte/char offset mix-up duplicates or drops a run",
+    );
+    assert.ok(!actualBytes.toString("utf-8").includes("�"), "no severed multi-byte sequence (U+FFFD) on disk");
+    assert.match(actualBytes.toString("utf-8"), /PRÉSERVÉ/, "the pre-existing non-ASCII profile must survive");
+    const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
+    assert.deepEqual(leftovers, [], `no .tmp-* files should remain, found: ${leftovers.join(", ")}`);
+  });
 });
 
 /**

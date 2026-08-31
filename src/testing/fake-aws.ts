@@ -614,6 +614,210 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "res2_diff_get_ok": {
+      // Feeds aws_resource_diff's HANDLER (not just its schema): one
+      // `cloudcontrol get-resource` whose ResourceDescription.Properties is a
+      // JSON-ENCODED STRING, exactly as CCAPI emits it. The handler then runs
+      // the whole local glue chain -- parseResourceProperties -> applyJsonPatch
+      // -> summarizePatch -> {before, after, changes, changeCount} -- with no
+      // second CLI call, so this single branch covers both the happy path and
+      // the patch-failure path at resource.ts's `Patch application failed`
+      // return (same fetch, a patch that throws).
+      //
+      // The document is shaped to exercise three op kinds against one fetch:
+      // a scalar (/MemorySize) for replace, a nested object
+      // (/Environment/Variables/DROP) for remove, and an array (/Tags) for the
+      // `add /Tags/-` end-of-array append whose `after` only resolves via
+      // summarizePatch's op.value fallback.
+      process.stdout.write(
+        `${JSON.stringify({
+          TypeName: "AWS::Lambda::Function",
+          ResourceDescription: {
+            Identifier: "my-fn",
+            Properties: JSON.stringify({
+              FunctionName: "my-fn",
+              MemorySize: 256,
+              Timeout: 3,
+              Environment: { Variables: { KEEP: "yes", DROP: "gone" } },
+              Tags: ["alpha"],
+            }),
+          },
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "res2_ccapi_initial_fail_stderr": {
+      // Fails EVERY cloudcontrol verb on the INITIAL call, with a populated
+      // stderr and empty stdout. Drives get/list/create/update/delete/diff into
+      // ccapiFailure -- the `if (!result.ok) return ccapiFailure(result)` line
+      // each verb has, which nothing in the suite reached -- and pins the
+      // stderr half of rawBodyOf's `rawStderr ? rawStderr : rawStdout`.
+      process.stderr.write(
+        "An error occurred (AccessDeniedException) when calling the GetResource operation: User is not authorized to perform: cloudformation:GetResource\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "res2_ccapi_initial_fail_stdout_only": {
+      // The OTHER half of rawBodyOf: nonzero exit, deliberately EMPTY stderr,
+      // diagnostic on stdout (a wrapper swallowing stderr, or stderr closed).
+      // Truthiness is what makes this work -- `rawStderr ?? rawStdout` would
+      // hand back the empty string and drop the only diagnosable bytes. No
+      // resource-side test covered this half anywhere in the repo.
+      //
+      // Deliberately NOT JSON: the nonzero-exit path never parses stdout, and
+      // a parseable payload would obscure that these are raw preserved bytes.
+      process.stdout.write("ccapi-diagnostic-on-stdout-only\n");
+      process.exit(1);
+      return;
+    }
+
+    case "res2_invalid_creds_stderr": {
+      // Generic (argv-independent) invalid_creds failure: credentials WERE
+      // resolved and sent, and the service refused them. Sibling of
+      // call_sso_expired / call_no_creds, for the classification arm neither
+      // of those reaches. InvalidClientTokenId is the STS/IAM spelling of the
+      // rotated-or-deleted-key family, so it fits an assume-role call.
+      process.stderr.write(
+        "An error occurred (InvalidClientTokenId) when calling the AssumeRole operation: The security token included in the request is invalid.\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "res2_props_unparseable": {
+      // A CCAPI Properties string that is NOT valid JSON, served for BOTH
+      // get-resource and list-resources. parseResourceProperties keeps the raw
+      // string under propertiesRaw; the two verbs' handlers must each surface
+      // it (get at the top level, list on the per-resource entry) or the only
+      // diagnosable artifact of the parse failure is lost.
+      const argv = process.argv.slice(2);
+      const badProps = "{not-valid-json";
+      if (argv.includes("list-resources")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ResourceDescriptions: [{ Identifier: "/my/param-bad", Properties: badProps }],
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          TypeName: "AWS::SSM::Parameter",
+          ResourceDescription: { Identifier: "/my/param-bad", Properties: badProps },
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "res2_update_expired_creds_mid_poll": {
+      //   1) cloudcontrol update-resource             -> IN_PROGRESS, RequestToken=req-tok-upd-exp
+      //   2) cloudcontrol get-resource-request-status -> ExpiredToken
+      // The expired_creds arm of buildMutationResponse's auth-recovery branch.
+      // ExpiredToken is the ORIGIN-AGNOSTIC expiry wrapper (an assume-role or
+      // web-identity session, not necessarily SSO), so it classifies as
+      // expired_creds rather than sso_expired.
+      const argv = process.argv.slice(2);
+      if (argv.includes("update-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::Lambda::Function",
+              Identifier: "my-fn",
+              RequestToken: "req-tok-upd-exp",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "UPDATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write(
+          "An error occurred (ExpiredToken) when calling the GetResourceRequestStatus operation: The provided token has expired.\n",
+        );
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: res2_update_expired_creds_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "res2_create_invalid_creds_mid_poll": {
+      //   1) cloudcontrol create-resource             -> IN_PROGRESS, RequestToken=req-tok-inv
+      //   2) cloudcontrol get-resource-request-status -> UnrecognizedClientException
+      // A key rotated or deleted MID-POLL: the credentials resolved and AWS
+      // refused them, which classifies as invalid_creds -- neither an expiry
+      // nor a missing profile. The mutation may still land server-side, so the
+      // recovery hint has to carry the requestToken like its sibling arms.
+      const argv = process.argv.slice(2);
+      if (argv.includes("create-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::SSM::Parameter",
+              Identifier: "/my/p",
+              RequestToken: "req-tok-inv",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "CREATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write(
+          "An error occurred (UnrecognizedClientException) when calling the GetResourceRequestStatus operation: The security token included in the request is invalid.\n",
+        );
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: res2_create_invalid_creds_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "res2_create_no_request_token": {
+      // create-resource returns a NON-TERMINAL ProgressEvent with NO
+      // RequestToken -- so a caller who passed awaitCompletion:true gets the
+      // not-awaited shape plus the explanatory `awaitSkipped` string, because
+      // there is nothing to poll. To PROVE no poll was attempted, the
+      // get-resource-request-status branch errors out: reaching it flips the
+      // result to ok:false. Sibling of ccapi_create_already_terminal, which
+      // skips the poll for the other reason (already terminal).
+      const argv = process.argv.slice(2);
+      if (argv.includes("create-resource")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            ProgressEvent: {
+              TypeName: "AWS::SSM::Parameter",
+              Identifier: "/my/p",
+              OperationStatus: "IN_PROGRESS",
+              Operation: "CREATE",
+            },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-resource-request-status")) {
+        process.stderr.write("fake-aws: res2_create_no_request_token polled, but there was no token to poll with\n");
+        process.exit(255);
+        return;
+      }
+      process.stderr.write(`fake-aws: res2_create_no_request_token hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
     case "ccapi_create_then_status_success": {
       // Routes a single AWS_MCP_FAKE_SCENARIO across the two CLI calls the
       // create-with-awaitCompletion HAPPY path makes:
@@ -745,6 +949,43 @@ async function main(): Promise<void> {
         })}\n`,
       );
       process.exit(0);
+      return;
+    }
+
+    case "awscli2_invalid_creds_unrecognized_client": {
+      // Credentials RESOLVED and were sent; the service refused them. The
+      // canonical shape for a deleted/rotated access key, or a key issued in a
+      // different partition. Sibling of call_no_creds, and the pair is the
+      // point: nothing resolved at all vs. something resolved and got rejected.
+      // "Check ~/.aws/credentials exists" is the wrong advice for this one.
+      process.stderr.write(
+        "An error occurred (UnrecognizedClientException) when calling the ListBuckets operation: The security token included in the request is invalid.\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "awscli2_invalid_creds_client_token_id": {
+      // Same family, the STS/IAM spelling of it. Kept as its own scenario
+      // rather than folded into the one above because INVALID_CREDS_PATTERNS
+      // is a three-way alternation and a regex edit can drop one arm without
+      // touching the others.
+      process.stderr.write(
+        "An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: The security token included in the request is invalid\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "awscli2_invalid_creds_signature_mismatch": {
+      // The third arm: a wrong secret key, or -- the classic -- a machine clock
+      // that has drifted far enough to invalidate the SigV4 signature. Real
+      // shape, including the two timestamps the service echoes back, which is
+      // what makes the clock-drift diagnosis possible from the stderr alone.
+      process.stderr.write(
+        "An error occurred (SignatureDoesNotMatch) when calling the ListObjectsV2 operation: Signature expired: 20260830T000000Z is now earlier than 20260830T010000Z (20260830T001500Z - 15 min.)\n",
+      );
+      process.exit(255);
       return;
     }
 
@@ -931,6 +1172,50 @@ async function main(): Promise<void> {
       // runAwsCall.
       await sleep(5000);
       process.stdout.write("{}\n");
+      process.exit(0);
+      return;
+    }
+
+    case "sso2_raw_sized": {
+      // Sized stdout for the clampRawOutput coverage in sso.integration.test.ts.
+      // Emits exactly AWS_MCP_FAKE_SSO2_FILLER 'x' characters followed by the
+      // URL+code tail below, then exits 0 after a drain window.
+      //
+      // The tail lands LAST on purpose. startSsoLogin only settles once BOTH
+      // the URL and the short code have been parsed out of stdout, so a
+      // successful start proves the entire payload is already in the parent's
+      // stdout buffer. That is what makes an exact-length assertion on
+      // rawOutput deterministic instead of a race against the pipe.
+      //
+      // COUPLING: sso.integration.test.ts mirrors SSO2_TAIL byte-for-byte to
+      // compute the expected rawOutput. Change one, change both -- the
+      // byte-identical passthrough assertion there fails loudly if they drift.
+      const SSO2_TAIL = "\nhttps://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n";
+      const raw = process.env.AWS_MCP_FAKE_SSO2_FILLER;
+      const filler = Number(raw ?? "-1");
+      if (!Number.isInteger(filler) || filler < 0) {
+        process.stderr.write(`fake-aws: sso2_raw_sized needs a non-negative integer filler, got '${raw}'\n`);
+        process.exit(2);
+        return;
+      }
+      process.stdout.write(`${"x".repeat(filler)}${SSO2_TAIL}`);
+      // Same 250ms drain convention as early_exit_failure: sso.ts computes
+      // rawOutput inside its 'exit' handler, which Node can dispatch before the
+      // final stdout 'data' event. Exiting in the same breath would race that.
+      await sleep(250);
+      process.exit(0);
+      return;
+    }
+
+    case "sso2_raw_surrogate_boundary": {
+      // Puts a NON-BMP character astride clampRawOutput's 4000-char cut so the
+      // test can pin what the clamp actually does with a surrogate pair.
+      // 3999 filler chars means the first U+20BB7 occupies UTF-16 indices 3999
+      // and 4000, so a slice(0, 4000) keeps only its HIGH surrogate. Same tail
+      // and drain contract as sso2_raw_sized.
+      const SSO2_TAIL = "\nhttps://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n";
+      process.stdout.write(`${"x".repeat(3999)}${"\u{20BB7}".repeat(8)}${SSO2_TAIL}`);
+      await sleep(250);
       process.exit(0);
       return;
     }
@@ -1297,6 +1582,90 @@ async function main(): Promise<void> {
           ],
         })}\n`,
       );
+      process.exit(0);
+      return;
+    }
+
+    case "obs2_iam_sim_truncated": {
+      // IAM paginates SimulatePrincipalPolicy with IsTruncated + Marker, and no
+      // other iam_simulate scenario emits either -- so hasMore:true and the
+      // echoed marker had never executed, only their false/null complements.
+      //
+      // Stateful by argv, the same way metrics_paginated is: parse the
+      // --cli-input-json payload and switch on whether it carries a Marker.
+      //   first call (no Marker)  -> a TRUNCATED page: one EvaluationResult
+      //                              plus IsTruncated:true and a Marker.
+      //   resume call (Marker set) -> the FINAL page: one EvaluationResult, no
+      //                              IsTruncated, no Marker.
+      // Parsing the payload rather than substring-matching '"Marker"' keeps a
+      // resource ARN or action name containing that literal from flipping the
+      // branch.
+      const argv = process.argv.slice(2);
+      const jsonIdx = argv.indexOf("--cli-input-json");
+      let isResume = false;
+      try {
+        const parsed = JSON.parse(jsonIdx >= 0 ? argv[jsonIdx + 1] : "") as { Marker?: unknown };
+        isResume = parsed.Marker !== undefined;
+      } catch {
+        // Malformed JSON can't reach us from runAwsCall (it serializes the
+        // payload itself). Default to the first-page branch so a test fails
+        // loud rather than silently looking like a resume.
+        isResume = false;
+      }
+      if (isResume) {
+        process.stdout.write(
+          `${JSON.stringify({
+            EvaluationResults: [
+              {
+                EvalActionName: "s3:DeleteObject",
+                EvalResourceName: "arn:aws:s3:::my-bucket/*",
+                EvalDecision: "explicitDeny",
+                MatchedStatements: [{ SourcePolicyId: "DenyDeletes", SourcePolicyType: "IAM Policy" }],
+              },
+            ],
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              EvalResourceName: "arn:aws:s3:::my-bucket/*",
+              EvalDecision: "allowed",
+              MatchedStatements: [{ SourcePolicyId: "ReadOnlyAccess", SourcePolicyType: "IAM Policy" }],
+            },
+          ],
+          IsTruncated: true,
+          Marker: "obs2-iam-marker-page2==",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "obs2_mr_big_payload": {
+      // Drives aws_multi_region's AGGREGATE byte cap (5 MB across the batch)
+      // through the real handler. Region-branching like mr_partial_failure:
+      //   us-west-2 -> an sso_expired FAILURE, so the batch also proves
+      //                okCount/errorCount count what the CALLS did, not what
+      //                survived the cap.
+      //   anything else -> ~2.75 MB of JSON, comfortably under the 5 MB
+      //                PER-CALL stdout cap in aws-cli.ts but enough that two
+      //                such regions cross the 5 MB aggregate budget.
+      const argv = process.argv.slice(2);
+      // Same coupling as mr_partial_failure: --region is immediately followed
+      // by its value in runAwsCall's fixed argv layout.
+      const regionIdx = argv.indexOf("--region");
+      const region = regionIdx >= 0 ? argv[regionIdx + 1] : "";
+      if (region === "us-west-2") {
+        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.exit(255);
+        return;
+      }
+      process.stdout.write(`${JSON.stringify({ Region: region, Blob: "x".repeat(2_750_000) })}\n`);
       process.exit(0);
       return;
     }

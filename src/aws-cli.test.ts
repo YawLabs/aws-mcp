@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
 import { afterEach, describe, it, mock } from "node:test";
 import {
   _resetParseTestPrefixArgsDedupe,
@@ -386,6 +389,101 @@ describe("redactDisplayArgs -- CCAPI payload flags (regression)", () => {
   it("leaves non-payload flags alone", () => {
     const args = ["cloudcontrol", "get-resource", "--type-name", "AWS::S3::Bucket", "--identifier", "my-bucket"];
     assert.deepEqual(redactDisplayArgs(args), args);
+  });
+});
+
+describe("runAwsCall — a child killed by a signal exits with code === null", () => {
+  // Every other failure test in this suite carries a NUMERIC exit code (255 or
+  // 1), so the nonzero_exit fallback message -- which interpolates `code` --
+  // had only ever rendered with a number. A child killed by a signal reaches
+  // the same branch with code === null, because that is how Node reports a
+  // signal death on 'close'.
+  //
+  // Why this substitutes spawn instead of using the fake aws binary: Node only
+  // maps a death to `code: null, signal: 'SIGTERM'` when the kill went through
+  // the spawning handle (child.kill()). runAwsCall's own killProc sites both
+  // set timedOut / tooLarge first, so they settle as timeout /
+  // output_too_large and never reach this branch. An EXTERNAL signal does
+  // produce code === null on POSIX (an OOM kill of `aws`, an operator's
+  // `kill -9`), but on Windows an external kill arrives as a numeric exit
+  // status -- measured on this machine: `process.kill(pid, 'SIGTERM')` from
+  // another process, and a self-signal from the child itself, both land as
+  // code 1, signal null. A self-signalling fake would therefore cover nothing
+  // on the platform this suite usually runs on. Substituting the spawn makes
+  // the branch reachable on every platform, deterministically.
+
+  /** Minimal stand-in for the ChildProcess surface runAwsCall touches: the two
+   * pipe emitters, the 'error' / 'exit' / 'close' events, and the exitCode /
+   * signalCode pair procHasExited reads. Emits a signal death one tick later
+   * so the caller's listeners are attached first. */
+  function signalKilledSpawn(stderrText: string) {
+    return () => {
+      const proc = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        // What libuv reports for a signal death: no exit status, a signal name.
+        exitCode: null as number | null,
+        signalCode: "SIGKILL" as string | null,
+        kill: () => true,
+      });
+      setImmediate(() => {
+        if (stderrText) proc.stderr.emit("data", Buffer.from(stderrText, "utf8"));
+        proc.emit("exit", null, "SIGKILL");
+        proc.emit("close", null, "SIGKILL");
+      });
+      return proc;
+    };
+  }
+
+  async function withMockedSpawn<T>(impl: ReturnType<typeof signalKilledSpawn>, fn: () => Promise<T>): Promise<T> {
+    const cp = childProcess as { spawn: typeof childProcess.spawn };
+    const original = cp.spawn;
+    cp.spawn = impl as unknown as typeof childProcess.spawn;
+    // aws-cli.ts does `import { spawn } from "node:child_process"`, and the ESM
+    // named binding for a builtin is a snapshot of the CJS export -- it has to
+    // be re-synced for the substitution to be visible on the other side of that
+    // import (and again on the way out, or the stub leaks to later tests).
+    syncBuiltinESMExports();
+    try {
+      return await fn();
+    } finally {
+      cp.spawn = original;
+      syncBuiltinESMExports();
+    }
+  }
+
+  it("settles nonzero_exit with exitCode null rather than treating the kill as success", async () => {
+    const r = await withMockedSpawn(signalKilledSpawn(""), () =>
+      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000 }),
+    );
+    assert.equal(r.ok, false, "a signal-killed child must not settle as a successful call");
+    if (r.ok) return;
+    assert.equal(r.kind, "nonzero_exit");
+    assert.equal(r.exitCode, null, "a signal death has no numeric exit status");
+    // Pinning the message EXACTLY as it renders today, including the bare
+    // "null". It reads poorly -- "exited with code null" tells the agent
+    // nothing about the signal that actually killed the process, and the
+    // signal name is available (proc.signalCode / the 'close' argument) but
+    // never surfaced. That is a message-quality issue in aws-cli.ts, not
+    // something to paper over here: this test records the current behavior so
+    // a deliberate rewording is a visible, intentional diff.
+    assert.equal(r.error, "aws CLI exited with code null and no stderr");
+  });
+
+  it("prefers the child's stderr over the code-null fallback when there is any", async () => {
+    // The fallback only fires on EMPTY stderr (`truncateForErrorMsg(...) || ...`),
+    // so a signal death that managed to emit something keeps the real text --
+    // the half of the branch that never renders "code null" at all.
+    const r = await withMockedSpawn(signalKilledSpawn("Killed\n"), () =>
+      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000 }),
+    );
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "nonzero_exit");
+    assert.equal(r.exitCode, null);
+    assert.equal(r.error, "Killed");
+    assert.doesNotMatch(r.error, /code null/);
+    assert.equal(r.rawStderr, "Killed\n");
   });
 });
 

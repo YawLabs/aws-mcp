@@ -606,6 +606,87 @@ describe("runAwsCall — failure paths", () => {
   });
 });
 
+describe("runAwsCall — invalid_creds: credentials resolved and the service refused them", () => {
+  // classifyAuthError has recognized this kind for a while, and errors.test.ts
+  // covers the regexes in isolation -- but no stderr shape carrying one of
+  // these three codes had ever travelled through runAwsCall, so the branch that
+  // builds the rotated-key / clock-drift message had never executed. Its three
+  // sibling kinds (sso_expired / expired_creds / no_creds) each had one.
+  //
+  // The distinction being pinned is against no_creds, not against nonzero_exit:
+  // no_creds means nothing resolved ("check ~/.aws/config and
+  // ~/.aws/credentials"), invalid_creds means something resolved and AWS
+  // rejected it -- rotate the key, fix the partition, or fix the clock. Telling
+  // a user with a deleted access key to check that their credentials file
+  // exists sends them looking at the one thing that is fine.
+
+  const CASES: Array<{ scenario: string; code: string; operation: string }> = [
+    {
+      scenario: "awscli2_invalid_creds_unrecognized_client",
+      code: "UnrecognizedClientException",
+      operation: "ListBuckets",
+    },
+    {
+      scenario: "awscli2_invalid_creds_client_token_id",
+      code: "InvalidClientTokenId",
+      operation: "GetCallerIdentity",
+    },
+    {
+      scenario: "awscli2_invalid_creds_signature_mismatch",
+      code: "SignatureDoesNotMatch",
+      operation: "ListObjectsV2",
+    },
+  ];
+
+  for (const { scenario, code, operation } of CASES) {
+    it(`classifies ${code} as invalid_creds, naming the rotated-key cause and keeping the stderr`, async () => {
+      const r = await runAwsCall({
+        service: "s3api",
+        operation: "list-buckets",
+        profile: "rotated-prof",
+        ...fakeOpts(scenario),
+      });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "invalid_creds", `${code} must not fall through to nonzero_exit`);
+      // The message identifies WHICH profile was refused...
+      assert.match(r.error, /rotated-prof/);
+      // ...says the credentials resolved and were rejected, rather than missing...
+      assert.match(r.error, /rejected by AWS/);
+      // ...and names the two causes that actually explain this class: a
+      // deleted/rotated access key, and a drifted clock breaking SigV4.
+      assert.match(r.error, /rotated/);
+      assert.match(r.error, /clock/);
+      // The underlying stderr is preserved -- the service's own text carries the
+      // detail (which operation, and for SignatureDoesNotMatch the two
+      // timestamps that make the drift diagnosable).
+      assert.match(r.error, new RegExp(`Underlying error: An error occurred \\(${code}\\)`));
+      assert.match(r.error, new RegExp(operation));
+      assert.match(r.rawStderr ?? "", new RegExp(code));
+      assert.equal(r.exitCode, 255);
+      // The wrong-advice regression: no_creds's message must not appear.
+      assert.doesNotMatch(r.error, /No credentials found/);
+      assert.doesNotMatch(r.error, /~\/\.aws\/credentials/);
+    });
+  }
+
+  it("keeps a genuine no-creds stderr on no_creds (the neighbouring kind is unaffected)", async () => {
+    // Guard against over-correcting the classifier in the other direction: the
+    // two kinds share a remedy shape ("your credentials are the problem") and
+    // differ in which remedy, so a regex loosened to catch more invalid_creds
+    // must not start swallowing this.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_no_creds"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "no_creds");
+    assert.match(r.error, /No credentials found/);
+  });
+});
+
 describe("runAwsCall — a descendant holding the stdio pipes must not hang the call", () => {
   // Regression guard for the unbounded settle. 'close' is the right NORMAL
   // settle (it is the only event that guarantees the pipes have been drained),

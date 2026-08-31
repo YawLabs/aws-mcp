@@ -670,6 +670,56 @@ describe("aws_metrics_query handler validation", () => {
     assert.equal(r.ok, true);
   });
 
+  it("accepts an estimate of EXACTLY the datapoint cap and rejects one point more", async () => {
+    // Every other cap case clears the ceiling by thousands of points, so an
+    // off-by-one in the comparison (`>=` instead of `>`) survives them all.
+    // The check is `estimate > 100800`, so exactly 100,800 must run.
+    // 70 days at period=60s -> 6,048,000s / 60 = 100,800 exactly.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const atCap = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-12T00:00:00Z",
+    } as never);
+    assert.equal(atCap.ok, true, `exactly 100800 datapoints is AT the cap, not over it: ${atCap.error ?? ""}`);
+
+    // One more minute of range is one more datapoint, and that one is over.
+    const overCap = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-12T00:01:00Z",
+    } as never);
+    assert.equal(overCap.ok, false);
+    assert.match(overCap.error ?? "", /would request 100801 datapoints/);
+    assert.match(overCap.error ?? "", /exceeding CloudWatch's per-request cap of 100800/);
+  });
+
+  it("treats maxDataPoints AT the cap as a real bound and one above it as no bound", async () => {
+    // The clamp is Math.min(estimate, callerCap) > CLOUDWATCH_MAX_DATAPOINTS.
+    // Both arms of the boundary matter: 100,800 clamps the estimate down TO the
+    // ceiling (allowed -- CloudWatch coarsens and pages), 100,801 clamps to one
+    // point ABOVE it and bounds nothing CloudWatch will honour.
+    // Same 71-day / 60s shape as the rejection case above: 102,240 estimated.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const bounded = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-13T00:00:00Z",
+      maxDataPoints: 100_800,
+    } as never);
+    assert.equal(bounded.ok, true, `maxDataPoints exactly at the cap must bound the request: ${bounded.error ?? ""}`);
+
+    const unbounded = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-03-13T00:00:00Z",
+      maxDataPoints: 100_801,
+    } as never);
+    assert.equal(unbounded.ok, false, "one point above the cap bounds nothing");
+    assert.match(unbounded.error ?? "", /exceeding CloudWatch's per-request cap/);
+    assert.match(unbounded.error ?? "", /maxDataPoints \(100801\) is itself above the cap/);
+  });
+
   it("accepts a valid explicit period (multiple of 60, under the datapoint cap)", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
     const r = await tool.handler({

@@ -355,6 +355,28 @@ describe("capAggregateResults -- aggregate response budget", () => {
     assert.ok(total <= 9_000 + 512, `capped payload should be near the budget, got ${total}`);
   });
 
+  it("keeps an entry that lands EXACTLY on the budget, and drops it one byte short", () => {
+    // The keep test is `used + size <= maxBytes`. The cases above clear or blow
+    // the budget by a wide margin, so flipping that to `<` (or the budget to
+    // `used + size < maxBytes`) passes them all while silently dropping a
+    // payload that fit perfectly. Compute the exact fit and pin both sides.
+    const a = okEntry("us-east-1");
+    const b = okEntry("us-west-2");
+    const exactFit = Buffer.byteLength(JSON.stringify(a), "utf8") + Buffer.byteLength(JSON.stringify(b), "utf8");
+
+    const fits = capAggregateResults([a, b], exactFit);
+    assert.deepEqual(fits.truncatedRegions, [], "an exact fit must not truncate anything");
+    assert.equal(fits.results[0].data, bigData);
+    assert.equal(fits.results[1].data, bigData, "the entry landing exactly on the budget must keep its payload");
+    assert.equal(fits.results[1].truncated, undefined);
+
+    const oneByteShort = capAggregateResults([a, b], exactFit - 1);
+    assert.deepEqual(oneByteShort.truncatedRegions, ["us-west-2"], "one byte short drops exactly the last entry");
+    assert.equal(oneByteShort.results[0].data, bigData, "the first entry still fits");
+    assert.equal(oneByteShort.results[1].data, undefined);
+    assert.equal(oneByteShort.results[1].truncated, true);
+  });
+
   it("never drops an error entry -- losing the reason a region failed is worse than the bytes", () => {
     const input: RegionResult[] = [
       okEntry("us-east-1"),
@@ -399,5 +421,62 @@ describe("runWithConcurrency contract (regression)", () => {
   it("floors a non-positive concurrency at 1 instead of returning holes", async () => {
     const r = await runWithConcurrency([1, 2, 3], 0, async (n) => n * 10);
     assert.deepEqual(r, [10, 20, 30]);
+  });
+});
+
+describe("aws_multi_region aggregate cap -- end-to-end envelope", () => {
+  it("flags truncated/truncatedRegions/maxTotalResultBytes and still counts what the CALLS did", async () => {
+    // capAggregateResults is unit-tested with a hand-built budget; the handler's
+    // own wiring -- the real 5 MB constant, the top-level envelope, and the
+    // ordering of the okCount/errorCount tally against the cap -- was not.
+    //
+    // obs2_mr_big_payload emits ~2.75 MB per successful region (under the 5 MB
+    // per-CALL stdout cap) and fails us-west-2 with an expired SSO token. Three
+    // regions in dedup'd input order: us-east-1 fits, the error entry is small
+    // and never dropped, and eu-west-1 pushes the aggregate past 5 MB.
+    const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_mr_big_payload";
+    try {
+      const res = await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        regions: ["us-east-1", "us-west-2", "eu-west-1"],
+        profile: "default",
+      } as never);
+      assert.equal(res.ok, true);
+      const data = res.data as {
+        regionCount: number;
+        okCount: number;
+        errorCount: number;
+        truncated?: boolean;
+        truncatedRegions?: string[];
+        maxTotalResultBytes?: number;
+        results: { region: string; ok: boolean; data?: unknown; error?: string; truncated?: boolean }[];
+      };
+
+      assert.equal(data.truncated, true, "the envelope must tell the caller the batch was capped");
+      assert.deepEqual(data.truncatedRegions, ["eu-west-1"], "only the region past the budget loses its data");
+      assert.equal(data.maxTotalResultBytes, 5 * 1024 * 1024, "the envelope names the budget that was applied");
+
+      // The counts describe the CALLS, not the survivors: eu-west-1's call
+      // succeeded and is still counted ok even though its payload was dropped.
+      assert.equal(data.regionCount, 3);
+      assert.equal(data.okCount, 2, "a truncated-but-successful call still counts as ok");
+      assert.equal(data.errorCount, 1);
+
+      const east = data.results.find((r) => r.region === "us-east-1");
+      assert.ok(east?.data, "the first region's payload fits and is kept");
+      const west = data.results.find((r) => r.region === "us-west-2");
+      assert.equal(west?.ok, false);
+      assert.equal(west?.truncated, undefined, "an error entry is never truncated");
+      assert.ok(west?.error && west.error.length > 0, "the failure reason survives the cap");
+      const eu = data.results.find((r) => r.region === "eu-west-1");
+      assert.equal(eu?.ok, true, "truncation must not restate a successful call as a failure");
+      assert.equal(eu?.truncated, true);
+      assert.equal(eu?.data, undefined, "the over-budget payload is dropped, not string-truncated");
+    } finally {
+      if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+      else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+    }
   });
 });

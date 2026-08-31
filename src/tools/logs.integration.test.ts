@@ -172,3 +172,37 @@ describe("aws_logs_tail handler — malformed NDJSON fallback", () => {
     assert.ok((data.events as string).includes("this-line-is-not-json"), "raw blob should contain the offending line");
   });
 });
+
+describe("aws_logs_tail handler — log-group ARN end to end", () => {
+  it("puts the ARN-extracted BARE NAME on the CLI and echoes it back as logGroupName", async () => {
+    // resolveLogGroupName is unit-tested, but nothing pinned what the handler
+    // actually SPAWNS for an ARN input. `aws logs tail` takes a bare group name
+    // as its first positional; handing it the ARN (or an ARN whose ':*' suffix
+    // survived) is a ResourceNotFound at runtime, and the echoed logGroupName
+    // would then disagree with the group that was really tailed.
+    //
+    // call_echo_args emits {"argv": [...]} as a single JSON line, so the
+    // handler's own NDJSON path parses it into events[0].argv -- no side
+    // channel needed.
+    for (const arn of [
+      "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
+      "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn:*",
+    ]) {
+      process.env.AWS_MCP_FAKE_SCENARIO = "call_echo_args";
+      const r = await handlerTool.handler({ logGroupName: arn, since: "5m" });
+      assert.equal(r.ok, true, `expected ${arn} to be accepted`);
+      const data = r.data as { logGroupName: string; since: string; events: unknown };
+      assert.equal(data.logGroupName, "/aws/lambda/my-fn", "the response must echo the RESOLVED bare name");
+
+      const events = data.events as Array<{ argv: string[] }>;
+      assert.ok(Array.isArray(events) && events.length === 1, "call_echo_args emits exactly one JSON line");
+      const argv = events[0].argv;
+      const tailIdx = argv.indexOf("tail");
+      assert.ok(tailIdx >= 0, "argv should contain the 'tail' operation");
+      assert.equal(argv[tailIdx + 1], "/aws/lambda/my-fn", "the first positional after 'tail' is the bare name");
+      assert.equal(argv.includes(arn), false, "the raw ARN must never reach the CLI");
+      const sinceIdx = argv.indexOf("--since");
+      assert.equal(argv[sinceIdx + 1], "5m");
+    }
+  });
+});

@@ -757,6 +757,95 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
   });
 });
 
+describe("buildMutationResponse auth-recovery — expired_creds and invalid_creds arms (fake-aws)", () => {
+  // The remaining two arms of the same recovery branch the sso_expired /
+  // no_creds tests above cover. All four exist for one reason: the mutation
+  // may already have landed server-side, so the requestToken MUST reach the
+  // caller. Each arm differs only in how it says "fix your auth".
+  const beforeEachEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  };
+  const afterEachEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("aws_resource_update surfaces the expired_creds hint with the requestToken", async () => {
+    beforeEachEnv();
+    try {
+      // ExpiredToken is the ORIGIN-AGNOSTIC expiry wrapper -- an assume-role
+      // or web-identity session, not necessarily SSO -- so the hint names both
+      // remedies rather than assuming SSO.
+      process.env.AWS_MCP_FAKE_SCENARIO = "res2_update_expired_creds_mid_poll";
+      const r = (await updateResource.handler({
+        typeName: "AWS::Lambda::Function",
+        identifier: "my-fn",
+        patchDocument: [{ op: "replace", path: "/MemorySize", value: 512 }],
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 2000,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /Temporary credentials for profile 'tester' expired while awaiting completion/);
+      assert.match(r.error ?? "", /re-run the assume/);
+      // The whole point of the arm: the recovery path survives the failure.
+      assert.match(r.error ?? "", /aws_resource_status/);
+      assert.match(r.error ?? "", /req-tok-upd-exp/);
+      // The underlying CLI error is kept, not swallowed.
+      assert.match(r.error ?? "", /Underlying error:/);
+      assert.match(r.error ?? "", /ExpiredToken/);
+      // Must NOT be rendered as the SSO arm: aws_login_start alone is wrong
+      // advice for an STS session. (The nested underlying error legitimately
+      // mentions aws_login_start as one of two remedies, so the discriminating
+      // string is the SSO arm's own opening clause.)
+      assert.doesNotMatch(r.error ?? "", /SSO session expired while awaiting completion/);
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("aws_resource_create surfaces the invalid_creds hint with the requestToken", async () => {
+    beforeEachEnv();
+    try {
+      // A key rotated or deleted MID-POLL. The credentials resolved and AWS
+      // REJECTED them, so this is neither an expiry (nothing to refresh) nor a
+      // missing profile. Before the invalid_creds arm existed, this kind fell
+      // through to the bare poll error and DROPPED the requestToken -- the
+      // identical defect that was fixed for expired_creds.
+      process.env.AWS_MCP_FAKE_SCENARIO = "res2_create_invalid_creds_mid_poll";
+      const r = (await createResource.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 2000,
+      })) as { ok: boolean; error?: string };
+      assert.equal(r.ok, false);
+      // These two are the load-bearing assertions: the bare poll error (what
+      // the un-fixed code returned) carries neither.
+      assert.match(r.error ?? "", /aws_resource_status/);
+      assert.match(r.error ?? "", /req-tok-inv/);
+      assert.match(r.error ?? "", /Fix the credentials for this profile/);
+      assert.match(r.error ?? "", /tester/);
+      assert.match(r.error ?? "", /Underlying error:/);
+      // Wrong-remedy guards: invalid_creds is not an expiry and not a
+      // missing-credentials case, so neither sibling's wording may appear.
+      assert.doesNotMatch(r.error ?? "", /SSO session expired/);
+      assert.doesNotMatch(r.error ?? "", /aws_login_start/);
+      assert.doesNotMatch(r.error ?? "", /No credentials available/);
+      assert.doesNotMatch(r.error ?? "", /expired while awaiting completion/);
+    } finally {
+      afterEachEnv();
+    }
+  });
+});
+
 describe("pollUntilTerminal — malformed/past RetryAfter falls back to pollIntervalMs", () => {
   // Companion to the "honors RetryAfter" test above. The RetryAfter parsing
   // path has two guards: Number.isNaN(Date.parse(raw)) and a past-time

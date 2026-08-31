@@ -413,7 +413,12 @@ async function buildMutationResponse(
       // complete server-side, so after re-logging in the caller can check
       // its final state via aws_resource_status. Without this, the bare
       // poll error buries the recovery path in stderr text.
-      if (polled.kind === "sso_expired" || polled.kind === "expired_creds" || polled.kind === "no_creds") {
+      if (
+        polled.kind === "sso_expired" ||
+        polled.kind === "expired_creds" ||
+        polled.kind === "invalid_creds" ||
+        polled.kind === "no_creds"
+      ) {
         const useProfile = i.profile ?? getProfile();
         // The recovery path is the same for every auth-class kind -- the
         // mutation may still complete server-side, so the requestToken has to
@@ -421,12 +426,21 @@ async function buildMutationResponse(
         // expired_creds is origin-agnostic (SSO, assume-role, or web-identity
         // can all produce an expired temporary session), so it names both
         // remedies rather than assuming SSO the way sso_expired can.
+        // invalid_creds is NOT an expiry: the credentials resolved and AWS
+        // REJECTED them (rotated/deleted key, wrong partition, clock skew), so
+        // its remedy is "fix the credentials", never "re-authenticate" (there
+        // is no session to refresh) and never "no credentials found" (there
+        // were credentials -- they were refused). A key rotated mid-poll used
+        // to fall through to the bare poll error and drop the requestToken,
+        // the same defect expired_creds had.
         const recovery = `call aws_resource_status with requestToken='${fields.requestToken}' to check whether the mutation completed server-side.`;
         let reLoginHint: string;
         if (polled.kind === "sso_expired") {
           reLoginHint = `SSO session expired while awaiting completion. Call aws_login_start with profile='${useProfile}' to re-authenticate, then ${recovery}`;
         } else if (polled.kind === "expired_creds") {
           reLoginHint = `Temporary credentials for profile '${useProfile}' expired while awaiting completion. Re-authenticate (aws_login_start for an SSO profile, or re-run the assume for an STS session), then ${recovery} Underlying error: ${polled.error}`;
+        } else if (polled.kind === "invalid_creds") {
+          reLoginHint = `Credentials for profile '${useProfile}' were rejected by AWS while awaiting completion (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition, or a drifted clock). Fix the credentials for this profile, then ${recovery} Underlying error: ${polled.error}`;
         } else {
           reLoginHint = `No credentials available while awaiting completion. After fixing credentials for profile '${useProfile}', ${recovery} Underlying error: ${polled.error}`;
         }

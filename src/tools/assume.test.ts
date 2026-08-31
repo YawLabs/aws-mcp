@@ -299,6 +299,30 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.match(r.error ?? "", /aws_login_start/);
   });
 
+  it("rewrites invalid_creds errors to name the source profile, without offering a re-auth", async () => {
+    // invalid_creds is the arm that sat between the two that existed: the
+    // source profile's credentials RESOLVED and STS refused them (rotated or
+    // deleted access key, wrong partition, drifted clock). No session exists
+    // to refresh, so the sso_expired / expired_creds remedies are both wrong
+    // advice here -- and the generic fallback says "profile 'x'", never
+    // "source profile 'x'", which is the whole reason these arms exist.
+    process.env.AWS_MCP_FAKE_SCENARIO = "res2_invalid_creds_stderr";
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/A",
+      sessionName: "sess",
+      sourceProfile: "my-source",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /source profile 'my-source'/);
+    assert.match(r.error ?? "", /rejected by AWS/);
+    assert.match(r.error ?? "", /Fix the credentials for that profile/);
+    assert.match(r.error ?? "", /Underlying error:/);
+    // Wrong-remedy guards: not an expiry, not a missing profile.
+    assert.doesNotMatch(r.error ?? "", /aws_login_start/);
+    assert.doesNotMatch(r.error ?? "", /have expired/);
+    assert.doesNotMatch(r.error ?? "", /No credentials found/);
+  });
+
   it("guards against an incomplete Credentials block in CLI stdout", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_incomplete";
     const r = await tool.handler({

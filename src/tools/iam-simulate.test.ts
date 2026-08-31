@@ -483,6 +483,116 @@ describe("aws_iam_simulate response shape", () => {
   });
 });
 
+describe("aws_iam_simulate pagination -- truncated page and resume", () => {
+  // The complete-page half (hasMore:false / marker:null) is covered above. The
+  // TRUNCATED half had never executed: no scenario emitted IsTruncated or
+  // Marker, so neither the echoed cursor nor the resume input ran. Silent
+  // undercounting on a truncated authorization answer is the exact failure
+  // hasMore/marker were added to prevent.
+  it("reports hasMore:true and echoes IAM's Marker verbatim on a truncated page", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject", "s3:DeleteObject"],
+      resources: ["arn:aws:s3:::my-bucket/*"],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      hasMore: boolean;
+      marker: string | null;
+      summary: { allowed: number; denied: number; unknown: number; total: number };
+      results: { action: string; decision: string }[];
+    };
+    assert.equal(data.hasMore, true, "IsTruncated:true must surface as hasMore:true");
+    assert.equal(data.marker, "obs2-iam-marker-page2==", "the resume cursor must be echoed byte-for-byte");
+    // summary covers only THIS page -- the whole point of surfacing hasMore is
+    // that total:1 is not the complete answer to a 2-action request.
+    assert.deepEqual(data.summary, { allowed: 1, denied: 0, unknown: 0, total: 1 });
+    assert.equal(data.results.length, 1);
+  });
+
+  it("resumes from the marker and reports the final page as complete", async () => {
+    // Same scenario: the fake switches on a Marker in --cli-input-json, so both
+    // pages are driven through the real handler in one self-contained pair.
+    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject", "s3:DeleteObject"],
+      resources: ["arn:aws:s3:::my-bucket/*"],
+      marker: "obs2-iam-marker-page2==",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      hasMore: boolean;
+      marker: string | null;
+      results: { action: string; decision: string }[];
+    };
+    assert.equal(data.hasMore, false, "the last page must not claim more");
+    assert.equal(data.marker, null);
+    assert.equal(data.results[0].action, "s3:DeleteObject", "the resume call must return the SECOND page");
+    assert.equal(data.results[0].decision, "explicitDeny");
+  });
+
+  it("forwards `marker` to the CLI as PascalCase Marker inside --cli-input-json", async () => {
+    // The resume input is only useful if it reaches IAM. The schema takes
+    // camelCase `marker`; the CLI requires PascalCase `Marker` in the
+    // --cli-input-json payload (iam-simulate.ts:298-300). A refactor dropping
+    // that assignment would leave the tool advertising a resume cursor it never
+    // sends -- every "next page" call would silently re-fetch page 1. Captured
+    // via the iam_sim_echo_argv side channel, as the contextEntries case does.
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-marker-out-"));
+    const argvOutPath = join(sideChannelDir, "argv.json");
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_sim_echo_argv";
+    try {
+      const r = await tool.handler({
+        principalArn: "arn:aws:iam::123456789012:user/jeff",
+        actions: ["s3:GetObject"],
+        marker: "obs2-resume-cursor-xyz",
+      } as never);
+      assert.equal(r.ok, true);
+
+      const argv = JSON.parse(readFileSync(argvOutPath, "utf-8")) as string[];
+      const cliInputIdx = argv.indexOf("--cli-input-json");
+      assert.ok(cliInputIdx >= 0, "argv should contain --cli-input-json");
+      const payload = JSON.parse(argv[cliInputIdx + 1]) as Record<string, unknown>;
+      assert.equal(payload.Marker, "obs2-resume-cursor-xyz");
+      assert.equal(Object.hasOwn(payload, "marker"), false, "camelCase marker must not leak to the CLI");
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+      rmSync(sideChannelDir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits Marker entirely on a first-page call", async () => {
+    // The other half of the forwarding contract: an absent `marker` must not
+    // materialize as Marker:undefined/null in the payload, which IAM rejects.
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-nomarker-out-"));
+    const argvOutPath = join(sideChannelDir, "argv.json");
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_sim_echo_argv";
+    try {
+      const r = await tool.handler({
+        principalArn: "arn:aws:iam::123456789012:user/jeff",
+        actions: ["s3:GetObject"],
+      } as never);
+      assert.equal(r.ok, true);
+      const argv = JSON.parse(readFileSync(argvOutPath, "utf-8")) as string[];
+      const payload = JSON.parse(argv[argv.indexOf("--cli-input-json") + 1]) as Record<string, unknown>;
+      assert.equal(Object.hasOwn(payload, "Marker"), false);
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+      rmSync(sideChannelDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("parseSimulationResults -- inline-policy matches (no SourcePolicyId)", () => {
   // Inline policies (and certain implicit sources) come back from IAM with
   // SourcePolicyType + StartPosition but no SourcePolicyId. Without a

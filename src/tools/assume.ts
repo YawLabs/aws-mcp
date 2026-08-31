@@ -225,6 +225,20 @@ export const assumeTools: readonly Tool[] = [
             error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${result.error}`,
           };
         }
+        // invalid_creds is NOT an expiry and NOT a missing profile: the source
+        // profile's credentials resolved and STS REJECTED them (a rotated or
+        // deleted access key, a key for the wrong partition, or a drifted
+        // clock breaking SigV4). Refreshing a session cannot fix that, so this
+        // arm must not say "re-authenticate" the way the two above do, nor
+        // "no credentials found" -- the remedy is to fix the credentials that
+        // profile resolves to. Like its siblings, this arm exists only to name
+        // the SOURCE profile, which the CLI's stderr does not reliably do.
+        if (result.kind === "invalid_creds") {
+          return {
+            ok: false,
+            error: `Credentials for source profile '${sourceProfile}' were rejected by AWS (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition/account, or a drifted machine clock). Fix the credentials for that profile before assuming. Underlying error: ${result.error}`,
+          };
+        }
         // `aws sts assume-role --output json` writes the credential blob to
         // STDOUT on success. On a non-zero exit the CLI still may have flushed
         // a partial JSON fragment to stdout before failing; surfacing it as
