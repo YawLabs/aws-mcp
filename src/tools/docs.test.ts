@@ -5,12 +5,16 @@ import {
   buildDocsTools,
   DOC_CACHE_MAX_ENTRIES,
   docsTools,
+  docTerms,
   extractMainContent,
   htmlToMarkdown,
   isValidDocsUrl,
+  LOW_RELEVANCE_OVERLAP,
   makeDocCache,
   paginateContent,
   parseSearchResults,
+  queryTerms,
+  scoreSearchResults,
 } from "./docs.js";
 
 const searchTool = docsTools.find((t) => t.name === "aws_docs_search");
@@ -815,5 +819,310 @@ describe("parseSearchResults -- URL allowlist", () => {
     const out = parseSearchResults(json, 10);
     assert.equal(out.length, 1);
     assert.equal(out[0].title, "with-query-and-fragment");
+  });
+});
+
+/**
+ * Lexical relevance signal (docs.ts). The defect it exists for, reproduced
+ * against the published 2.0.1 server: `aws_docs_search` with the nonsense
+ * query "zzzzqqq-nonexistent-service-xyzzy" returned `count: 10` whose top hit
+ * was a Ruby SDK `Route53::Errors::NoSuchHealthCheck` page. The backend has no
+ * "no good match" answer and ships no score, so a caller could not tell ten
+ * relevant results from ten irrelevant ones.
+ *
+ * The fixture below is that real result, shortened.
+ */
+const RUBY_ROUTE53_HIT = {
+  title: "Class: Aws::Route53::Errors::NoSuchHealthCheck",
+  url: "https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/Route53/Errors/NoSuchHealthCheck.html",
+  summary: "AWS SDK for Ruby V3 API reference for the Route 53 service.",
+  excerpt: "Raised when there is no such health check in this service account.",
+};
+
+const LAMBDA_URL_HIT = {
+  title: "Lambda function URLs",
+  url: "https://docs.aws.amazon.com/lambda/latest/dg/lambda-urls.html",
+  summary: "A function URL is a dedicated HTTP(S) endpoint for your Lambda function.",
+  excerpt: "You can create and configure a function URL through the Lambda console.",
+};
+
+describe("docTerms — AWS-shaped tokenizing", () => {
+  it("splits hyphens, colons, :: and underscores rather than treating them as one word", () => {
+    const terms = docTerms("aws-sdk-js s3:GetObject Route53::Errors dynamodb.describe_table");
+    for (const t of ["aws", "sdk", "js", "s3", "get", "object", "route53", "errors", "dynamodb", "describe", "table"]) {
+      assert.ok(terms.has(t), `expected term '${t}'`);
+    }
+  });
+
+  it("splits CamelCase and the acronym-then-word form, keeping the run as printed", () => {
+    const terms = docTerms("NoSuchHealthCheck HTTPSListener");
+    // The whole run survives (a caller may type it verbatim)...
+    assert.ok(terms.has("nosuchhealthcheck"));
+    // ...alongside its pieces.
+    for (const t of ["no", "such", "health", "check", "https", "listener"]) {
+      assert.ok(terms.has(t), `expected piece '${t}'`);
+    }
+  });
+
+  it("reconciles the digit-suffix spelling in BOTH directions", () => {
+    // Docs print "Route 53", users type "route53".
+    assert.ok(docTerms("Amazon Route 53 health checks").has("route53"));
+    // Docs print "Route53", users type "route 53".
+    const glued = docTerms("Route53::Errors");
+    assert.ok(glued.has("route"));
+    assert.ok(glued.has("53"));
+  });
+});
+
+describe("queryTerms — the published denominator", () => {
+  it("drops English stopwords so they cannot inflate every result's overlap", () => {
+    assert.deepEqual(queryTerms("How do I use a Lambda function URL?"), ["lambda", "function", "url"]);
+  });
+
+  it("falls back to every term when the query is nothing but stopwords", () => {
+    // Never divide by zero: a stopword-only query still gets a denominator.
+    assert.deepEqual(queryTerms("how do i"), ["how", "do", "i"]);
+  });
+
+  it("keeps a punctuation-glued identifier as ONE term, not four", () => {
+    // The denominator is what the USER typed. Counting NoSuchHealthCheck as
+    // four terms would reweight the query toward whichever word happened to
+    // be written as an identifier.
+    assert.deepEqual(queryTerms("s3:GetObject"), ["s3", "getobject"]);
+  });
+
+  it("dedupes repeated terms", () => {
+    assert.deepEqual(queryTerms("lambda LAMBDA lambda"), ["lambda"]);
+  });
+
+  it("returns nothing for a query with no alphanumerics", () => {
+    assert.deepEqual(queryTerms("???"), []);
+  });
+});
+
+describe("scoreSearchResults", () => {
+  it("flags the reproduced nonsense query as lowRelevance and names the missing terms", () => {
+    const r = scoreSearchResults("zzzzqqq-nonexistent-service-xyzzy", [RUBY_ROUTE53_HIT]);
+    assert.equal(r.lowRelevance, true);
+    assert.ok(
+      (r.bestLexicalOverlap ?? 1) < LOW_RELEVANCE_OVERLAP,
+      "the best hit must fall under the low-relevance bar",
+    );
+    const m = r.results[0].lexicalMatch;
+    assert.ok(m);
+    // "service" really does appear in the summary -- the signal reports what
+    // is literally there, it does not pretend the page is unrelated in full.
+    assert.deepEqual(m.matchedTerms, ["service"]);
+    assert.deepEqual(m.unmatchedTerms, ["zzzzqqq", "nonexistent", "xyzzy"]);
+    assert.match(r.relevanceNote ?? "", /full page of fuzzy matches/);
+    assert.match(r.relevanceNote ?? "", /not that this tool failed/);
+  });
+
+  it("does NOT flag a genuinely on-topic query", () => {
+    const r = scoreSearchResults("lambda function url", [LAMBDA_URL_HIT, RUBY_ROUTE53_HIT]);
+    assert.equal(r.lowRelevance, false);
+    assert.equal(r.bestLexicalOverlap, 1);
+    assert.equal(r.relevanceNote, undefined);
+    // Per-result, not just top-level: the irrelevant sibling still scores low.
+    assert.equal(r.results[0].lexicalMatch?.overlap, 1);
+    assert.ok((r.results[1].lexicalMatch?.overlap ?? 1) < LOW_RELEVANCE_OVERLAP);
+  });
+
+  it("counts a typed identifier when the page spells it out in words", () => {
+    // `s3:GetObject` vs a page that writes "get object" -- a whitespace split
+    // would score this 0 and call a correct page irrelevant.
+    const r = scoreSearchResults("s3:GetObject permission", [
+      {
+        title: "Amazon S3 API: get object",
+        url: "https://docs.aws.amazon.com/x.html",
+        summary: "Grants permissions to retrieve objects from a bucket.",
+      },
+    ]);
+    assert.equal(r.results[0].lexicalMatch?.overlap, 1);
+    assert.equal(r.lowRelevance, false);
+  });
+
+  it("requires ALL pieces of an identifier, not just one", () => {
+    // Matching on "check" alone would hand almost any AWS page a free point.
+    const partial = scoreSearchResults("NoSuchHealthCheck", [
+      { title: "Health check configuration", url: "https://docs.aws.amazon.com/a.html" },
+    ]);
+    assert.equal(partial.results[0].lexicalMatch?.overlap, 0);
+    // ...but a page that spells the whole thing out does match.
+    const full = scoreSearchResults("NoSuchHealthCheck", [RUBY_ROUTE53_HIT]);
+    assert.equal(full.results[0].lexicalMatch?.overlap, 1);
+  });
+
+  it("does not fail a match on a plain English plural", () => {
+    const singular = scoreSearchResults("lambda function url", [LAMBDA_URL_HIT]);
+    assert.equal(singular.results[0].lexicalMatch?.overlap, 1, "'url' must match the page's 'URLs'");
+    const plural = scoreSearchResults("lambda function urls", [
+      {
+        title: "Lambda function URL",
+        url: "https://docs.aws.amazon.com/lambda/latest/dg/lambda-urls.html",
+        summary: "A dedicated endpoint for your function.",
+      },
+    ]);
+    assert.equal(plural.results[0].lexicalMatch?.overlap, 1, "'urls' must match the page's 'URL'");
+  });
+
+  it("matches the digit-suffix spelling the user typed, not the one the docs used", () => {
+    const glued = scoreSearchResults("route53 health check", [
+      { title: "Amazon Route 53 health checks", url: "https://docs.aws.amazon.com/r.html" },
+    ]);
+    assert.equal(glued.results[0].lexicalMatch?.overlap, 1);
+    const spaced = scoreSearchResults("route 53 errors", [RUBY_ROUTE53_HIT]);
+    assert.equal(spaced.results[0].lexicalMatch?.overlap, 1);
+  });
+
+  it("publishes no signal at all when the query has no comparable terms", () => {
+    // Reporting 0% here would assert "the backend had nothing" when the truth
+    // is "this heuristic has no opinion".
+    const r = scoreSearchResults("???", [LAMBDA_URL_HIT]);
+    assert.equal(r.bestLexicalOverlap, null);
+    assert.equal(r.lowRelevance, false);
+    assert.equal(r.results[0].lexicalMatch, null);
+    assert.match(r.relevanceNote ?? "", /no comparable terms/);
+  });
+
+  it("flags an empty result page with a distinct note", () => {
+    const r = scoreSearchResults("lambda", []);
+    assert.equal(r.lowRelevance, true);
+    assert.match(r.relevanceNote ?? "", /returned no results/);
+  });
+
+  it("is additive: existing fields and the backend's ordering are untouched", () => {
+    const r = scoreSearchResults("lambda", [RUBY_ROUTE53_HIT, LAMBDA_URL_HIT]);
+    // Order preserved -- this annotates the backend's ranking, it does not
+    // re-rank, even though result 2 scores higher than result 1.
+    assert.equal(r.results[0].url, RUBY_ROUTE53_HIT.url);
+    assert.equal(r.results[1].url, LAMBDA_URL_HIT.url);
+    assert.equal(r.results[0].title, RUBY_ROUTE53_HIT.title);
+    assert.equal(r.results[0].summary, RUBY_ROUTE53_HIT.summary);
+    assert.equal(r.results[0].excerpt, RUBY_ROUTE53_HIT.excerpt);
+    // A result with no summary/excerpt does not gain empty ones.
+    const sparse = scoreSearchResults("lambda", [{ title: "t", url: "https://docs.aws.amazon.com/x.html" }]);
+    assert.deepEqual(Object.keys(sparse.results[0]).sort(), ["lexicalMatch", "title", "url"]);
+  });
+});
+
+describe("aws_docs_search handler — relevance signal", () => {
+  /** Wrap fixtures in the backend's suggestion envelope. */
+  function suggestionsFor(hits: ReadonlyArray<{ title: string; url: string; summary?: string; excerpt?: string }>) {
+    return {
+      suggestions: hits.map((h) => ({
+        textExcerptSuggestion: { link: h.url, title: h.title, summary: h.summary, suggestionBody: h.excerpt },
+      })),
+    };
+  }
+
+  it("flags a full page of fuzzy matches for a nonsense query", async () => {
+    // The shape of the real defect: ten confident-looking hits for a query
+    // that matches nothing.
+    const hits = Array.from({ length: 10 }, (_, n) => ({
+      ...RUBY_ROUTE53_HIT,
+      url: `https://docs.aws.amazon.com/sdk-for-ruby/v3/api/page-${n}.html`,
+    }));
+    const fetchImpl = (async () => fakeResponse({ json: suggestionsFor(hits) })) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl);
+    const r = await search.handler({ query: "zzzzqqq-nonexistent-service-xyzzy" });
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      count: number;
+      lowRelevance: boolean;
+      bestLexicalOverlap: number;
+      queryTerms: string[];
+      relevanceNote?: string;
+      results: Array<{ title: string; url: string; summary?: string; excerpt?: string; lexicalMatch: unknown }>;
+    };
+    assert.equal(data.lowRelevance, true);
+    assert.ok(data.bestLexicalOverlap < LOW_RELEVANCE_OVERLAP);
+    assert.deepEqual(data.queryTerms, ["zzzzqqq", "nonexistent", "service", "xyzzy"]);
+    assert.match(data.relevanceNote ?? "", /weak leads/);
+    // Additive: count and the existing per-result fields are unchanged.
+    assert.equal(data.count, 10);
+    assert.equal(data.results.length, 10);
+    assert.equal(data.results[0].title, RUBY_ROUTE53_HIT.title);
+    assert.equal(data.results[0].summary, RUBY_ROUTE53_HIT.summary);
+    assert.equal(data.results[0].excerpt, RUBY_ROUTE53_HIT.excerpt);
+    assert.ok(data.results[0].lexicalMatch, "every result carries the per-result signal");
+  });
+
+  it("does not flag an on-topic query", async () => {
+    const fetchImpl = (async () =>
+      fakeResponse({ json: suggestionsFor([LAMBDA_URL_HIT, RUBY_ROUTE53_HIT]) })) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl);
+    const r = await search.handler({ query: "lambda function url" });
+    const data = r.data as { count: number; lowRelevance: boolean; bestLexicalOverlap: number; relevanceNote?: string };
+    assert.equal(data.lowRelevance, false);
+    assert.equal(data.bestLexicalOverlap, 1);
+    assert.equal(data.relevanceNote, undefined, "no note when the page is fine");
+    assert.equal(data.count, 2);
+  });
+
+  it("reports lowRelevance on a genuinely empty result set", async () => {
+    const fetchImpl = (async () => fakeResponse({ json: { suggestions: [] } })) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl);
+    const r = await search.handler({ query: "lambda function url" });
+    const data = r.data as { count: number; lowRelevance: boolean; relevanceNote?: string };
+    assert.equal(data.count, 0);
+    assert.equal(data.lowRelevance, true);
+    assert.match(data.relevanceNote ?? "", /returned no results/);
+  });
+
+  it("documents the fixed-page-of-fuzzy-matches behavior in the tool description", () => {
+    // The number is only honest if the caller is told what it measures and
+    // what a low value means.
+    assert.match(searchTool.description, /fuzzy matches/);
+    assert.match(searchTool.description, /lexicalMatch/);
+    assert.match(searchTool.description, /NOT semantic ranking/);
+  });
+});
+
+/**
+ * Regression cover for the two ways the low-relevance verdict let a gibberish
+ * query through. Both were found by driving the built server against the LIVE
+ * docs backend, not by a fixture: the real result set for
+ * "zzzzqqq-nonexistent-service-xyzzy" contained one unrelated page carrying the
+ * ordinary English words "nonexistent" and "service", which put
+ * bestLexicalOverlap at exactly 0.5 -- escaping a `<` test and reporting
+ * lowRelevance:false for pure nonsense.
+ */
+describe("scoreSearchResults — low-relevance verdict boundaries", () => {
+  const hit = (title: string, summary = "", excerpt = "") => ({
+    title,
+    url: "https://docs.aws.amazon.com/x/latest/y/z.html",
+    summary,
+    excerpt,
+  });
+
+  it("flags a query sitting EXACTLY on the threshold (<= not <)", () => {
+    // 2 of 4 terms matched = 0.5 = LOW_RELEVANCE_OVERLAP exactly. The threshold
+    // is the boundary of "weak", so landing on it is weak.
+    const r = scoreSearchResults("alpha beta gamma delta", [hit("alpha beta only")]);
+    assert.equal(r.bestLexicalOverlap, 0.5, "fixture must sit exactly on the threshold");
+    assert.equal(r.lowRelevance, true, "exactly-at-threshold must be flagged");
+  });
+
+  it("flags a query with a term that matches NO result, even when the best overlap is high", () => {
+    // best = 0.67 (above threshold), but "xyzzy" appears nowhere -- the term
+    // that actually identifies the query. Taking the max across results would
+    // call this relevant; the per-term signal catches it.
+    const r = scoreSearchResults("lambda function xyzzy", [
+      hit("Creating and managing Lambda function URLs"),
+      hit("Lambda function configuration"),
+    ]);
+    assert.ok((r.bestLexicalOverlap ?? 0) > 0.5, "best must be above the threshold for this to be the deciding signal");
+    assert.deepEqual(r.termsMatchedNowhere, ["xyzzy"]);
+    assert.equal(r.lowRelevance, true);
+    assert.match(r.relevanceNote ?? "", /appear in NO result at all: xyzzy/);
+  });
+
+  it("does NOT flag a genuinely on-topic query", () => {
+    const r = scoreSearchResults("lambda function url", [hit("Creating and managing Lambda function URLs")]);
+    assert.equal(r.bestLexicalOverlap, 1);
+    assert.deepEqual(r.termsMatchedNowhere, []);
+    assert.equal(r.lowRelevance, false);
+    assert.equal(r.relevanceNote, undefined);
   });
 });

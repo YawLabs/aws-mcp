@@ -4,7 +4,7 @@ import { z } from "zod";
 import { runAwsCall, truncateForErrorMsg } from "../aws-cli.js";
 import { upsertProfile } from "../aws-credentials.js";
 import { getProfile, getRegion, isValidProfileName } from "../session.js";
-import type { Tool, ToolResult } from "./tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
  * Pick a target profile name. We prefix user-chosen names with 'mcp-' to
@@ -97,8 +97,14 @@ export const assumeTools: readonly Tool[] = [
       "Call STS AssumeRole and stash the returned temporary credentials as a named profile in the shared credentials file ($AWS_SHARED_CREDENTIALS_FILE when set, otherwise ~/.aws/credentials; the resolved path is returned as credentialsPath). Subsequent calls to aws_call / aws_whoami / aws_paginate can use profile='mcp-<sessionName>' (or your overridden targetProfile name). The raw secret key / session token are NOT returned to the caller — only the profile name, expiration, and assumed identity. Use for cross-account access: a source profile (your SSO identity) assumes a role in another account. Default timeout is 120s (raise via timeoutMs for slow SAML / credential_process setups on cold start).",
     annotations: {
       title: "Assume an IAM role and stash creds as a profile",
+      // Writes the shared credentials file, overwriting the three managed keys
+      // in place when the target section already exists -- the handler returns
+      // a `warning` for exactly that case, so the stomp is acknowledged rather
+      // than hypothetical. That is a destructive update to a file the user owns
+      // and other tooling reads, so the hint says so. Same reasoning applied to
+      // aws_call / aws_multi_region / aws_resource_update in v2.0.1.
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: true,
     },
@@ -144,7 +150,7 @@ export const assumeTools: readonly Tool[] = [
           "Timeout in milliseconds for the underlying STS AssumeRole CLI call. Default 120000 (120s) -- gives cold-start SAML / credential_process setups headroom over runAwsCall's 60s default. Raise further for unusually slow IdPs.",
         ),
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         roleArn: string;
         sessionName: string;
@@ -213,6 +219,22 @@ export const assumeTools: readonly Tool[] = [
         params.ExternalId = i.externalId;
       }
 
+      const timeoutMs = i.timeoutMs ?? 120_000;
+      // ONE report, and only one. The work here is a single STS round-trip
+      // that either returns or times out -- there is no second step to
+      // observe, so any "step 2 of 3" would be invented. What the caller
+      // genuinely gains is the difference between "hung" and "waiting on a
+      // slow IdP for up to N seconds", which this one line says.
+      //
+      // No `total`: with a single indivisible call there is no honest
+      // denominator (1/1 would claim completion before the call returns), and
+      // the spec permits progress without one.
+      ctx?.reportProgress(
+        0,
+        undefined,
+        `Calling sts:AssumeRole for ${i.roleArn} as source profile '${sourceProfile}' (timeout ${Math.round(timeoutMs / 1000)}s)`,
+      );
+
       const result = await runAwsCall({
         service: "sts",
         operation: "assume-role",
@@ -223,7 +245,8 @@ export const assumeTools: readonly Tool[] = [
         // SAML / credential_process flows can exceed runAwsCall's 60s default
         // on cold start (federated IdP round-trip, MFA prompt forwarding).
         // 120s is the assume-role-specific floor; callers can override.
-        timeoutMs: i.timeoutMs ?? 120_000,
+        // Resolved above so the progress message quotes the same number.
+        timeoutMs,
       });
 
       if (!result.ok) {

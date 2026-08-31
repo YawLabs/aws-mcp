@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { allTools, errorToMcpResult, findDuplicateToolNames, toMcpResult } from "./index.js";
+import { allTools, buildToolContext, errorToMcpResult, findDuplicateToolNames, toMcpResult } from "./index.js";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
@@ -14,7 +14,7 @@ import { profilesTools } from "./tools/profiles.js";
 import { resourceTools } from "./tools/resource.js";
 import { scriptTools } from "./tools/script.js";
 import { sessionTools } from "./tools/session.js";
-import type { Tool, ToolResult } from "./tools/tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tools/tool.js";
 
 // Direct tests for the result-mapping functions extracted from the
 // registration loop (src/index.ts). These were previously inline and untested;
@@ -340,5 +340,372 @@ describe("findDuplicateToolNames", () => {
 
   it("agrees with the live registry (which must be collision-free)", () => {
     assert.deepEqual(findDuplicateToolNames(allTools), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildToolContext — the per-call ToolContext the registration loop hands to
+// every tool handler.
+//
+// Worth direct coverage rather than leaning on the registration loop (which
+// sits behind the entry-point check and is unreachable from an import), for
+// two reasons:
+//
+//   1. Progress is opt-in per the MCP spec, so the no-token path MUST be a
+//      silent no-op. Handlers call reportProgress unconditionally and never
+//      branch on client support, so anything but a no-op here becomes a throw
+//      inside every handler that reports at once.
+//   2. The token-presence guard is undefined/null, NOT truthiness. A client
+//      that numbers its tokens from zero sends progressToken 0, which is falsy;
+//      a regression to a truthiness check would silently disable progress for
+//      that client with no error emitted anywhere. Same for an empty-string
+//      token.
+// ---------------------------------------------------------------------------
+
+/** The only notification shape buildToolContext is allowed to emit. */
+type ProgressNotification = {
+  method: "notifications/progress";
+  params: { progressToken: string | number; progress: number; total?: number; message?: string };
+};
+
+/**
+ * Recording stand-in for the SDK's sendNotification. `impl` replaces the
+ * returned promise so a test can make the send reject; the notification is
+ * recorded either way, which is how "the send was attempted but its failure was
+ * swallowed" is distinguished from "the send was skipped".
+ */
+function recordingSender(impl?: () => Promise<void>) {
+  const sent: ProgressNotification[] = [];
+  const send = (n: ProgressNotification): Promise<void> => {
+    sent.push(n);
+    return impl ? impl() : Promise.resolve();
+  };
+  return { sent, send };
+}
+
+/**
+ * Drain the microtask queue plus a couple of macrotask turns, which is when
+ * Node decides a rejected promise has no handler and emits unhandledRejection.
+ */
+async function drainTicks(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+describe("buildToolContext — falsy-but-PRESENT progress tokens", () => {
+  // The highest-value cases in this file. Both tokens below are falsy, both are
+  // legal per the MCP spec (progressToken is string | number, and a client
+  // numbering requests from zero produces exactly this), and both would be
+  // silently dropped by a truthiness guard while every other test here kept
+  // passing.
+
+  it("progressToken 0 is PRESENT: the notification is emitted with the number 0 verbatim", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: 0 }, sendNotification: send });
+
+    ctx.reportProgress(1, 4, "region 1/4");
+
+    assert.equal(sent.length, 1, "a truthiness guard on the token would silently send nothing here");
+    assert.ok(Object.is(sent[0].params.progressToken, 0), "the token must round-trip as the number 0, unconverted");
+    assert.deepEqual(sent[0], {
+      method: "notifications/progress",
+      params: { progressToken: 0, progress: 1, total: 4, message: "region 1/4" },
+    });
+  });
+
+  it("an empty-string progressToken is PRESENT: emitted with the empty string verbatim", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: "" }, sendNotification: send });
+
+    ctx.reportProgress(2);
+
+    assert.equal(sent.length, 1, "a truthiness guard on the token would silently send nothing here");
+    assert.equal(typeof sent[0].params.progressToken, "string");
+    assert.deepEqual(sent[0], {
+      method: "notifications/progress",
+      params: { progressToken: "", progress: 2 },
+    });
+  });
+
+  it("progress 0 is emitted too — the first tick of a long call is a real update", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: 0 }, sendNotification: send });
+
+    ctx.reportProgress(0);
+
+    assert.deepEqual(sent[0].params, { progressToken: 0, progress: 0 });
+  });
+});
+
+describe("buildToolContext — emitted notification shape", () => {
+  it("emits method notifications/progress with the token and progress, and NO total/message keys", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: "tok-1" }, sendNotification: send });
+
+    ctx.reportProgress(3);
+
+    assert.equal(sent.length, 1);
+    // deepEqual is deepSTRICTequal under node:assert/strict, which DOES
+    // distinguish { progress: 3 } from { progress: 3, total: undefined } — the
+    // params are spread conditionally, and this is what proves it.
+    assert.deepEqual(sent[0], {
+      method: "notifications/progress",
+      params: { progressToken: "tok-1", progress: 3 },
+    });
+    // Spelled out as well, so a failure names WHICH key leaked instead of
+    // dumping two near-identical objects.
+    assert.equal("total" in sent[0].params, false, "total must be ABSENT, not present-and-undefined");
+    assert.equal("message" in sent[0].params, false, "message must be ABSENT, not present-and-undefined");
+  });
+
+  it("includes total ONLY when supplied — including total 0, since the check is !== undefined", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: 1 }, sendNotification: send });
+
+    ctx.reportProgress(0, 0);
+
+    assert.deepEqual(sent[0].params, { progressToken: 1, progress: 0, total: 0 });
+    assert.equal("total" in sent[0].params, true, "total 0 is a supplied denominator, not an omitted one");
+    assert.equal("message" in sent[0].params, false);
+  });
+
+  it("includes message ONLY when supplied, with no total alongside it", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: 1 }, sendNotification: send });
+
+    ctx.reportProgress(7, undefined, "polling Cloud Control");
+
+    assert.deepEqual(sent[0].params, { progressToken: 1, progress: 7, message: "polling Cloud Control" });
+    assert.equal("total" in sent[0].params, false, "an explicit undefined total must not materialize the key");
+  });
+
+  it("includes both when both are supplied", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: "t" }, sendNotification: send });
+
+    ctx.reportProgress(12, 32, "region 12/32");
+
+    assert.deepEqual(sent[0], {
+      method: "notifications/progress",
+      params: { progressToken: "t", progress: 12, total: 32, message: "region 12/32" },
+    });
+  });
+
+  it("DROPS an empty-string message — documented asymmetry with total, not a token-style trap", () => {
+    // total uses !== undefined while message uses a truthiness check. An empty
+    // message carries nothing a client can render, so dropping it is harmless;
+    // pinned here so an edit that unifies the two has to notice the difference
+    // deliberately.
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: 1 }, sendNotification: send });
+
+    ctx.reportProgress(5, 10, "");
+
+    assert.deepEqual(sent[0].params, { progressToken: 1, progress: 5, total: 10 });
+    assert.equal("message" in sent[0].params, false);
+  });
+
+  it("emits one notification per call, in call order, with independent params objects", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: "tok" }, sendNotification: send });
+
+    ctx.reportProgress(1, 3, "a");
+    ctx.reportProgress(2, 3, "b");
+    ctx.reportProgress(3, 3, "c");
+
+    assert.equal(sent.length, 3);
+    assert.deepEqual(
+      sent.map((n) => n.params.progress),
+      [1, 2, 3],
+      "monotonic progress from the handler must reach the wire in the same order",
+    );
+    assert.deepEqual(
+      sent.map((n) => n.params.message),
+      ["a", "b", "c"],
+    );
+    assert.ok(sent.every((n) => n.method === "notifications/progress"));
+    assert.ok(
+      sent.every((n) => n.params.progressToken === "tok"),
+      "every call carries the request's own token",
+    );
+    // Each call builds a fresh params object — no shared buffer a later call
+    // could mutate out from under an in-flight send.
+    assert.notEqual(sent[0].params, sent[1].params);
+  });
+});
+
+describe("buildToolContext — no progressToken means reportProgress is a silent no-op", () => {
+  it("sends nothing when _meta is absent entirely", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ sendNotification: send });
+
+    assert.doesNotThrow(() => ctx.reportProgress(1, 2, "msg"));
+
+    assert.deepEqual(sent, [], "the MCP spec forbids progress for a request that carried no token");
+  });
+
+  it("sends nothing when _meta exists but carries no progressToken", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: {}, sendNotification: send });
+
+    assert.doesNotThrow(() => ctx.reportProgress(1));
+
+    assert.deepEqual(sent, []);
+  });
+
+  it("treats an explicit undefined progressToken as absent", () => {
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: undefined }, sendNotification: send });
+
+    assert.doesNotThrow(() => ctx.reportProgress(1));
+
+    assert.deepEqual(sent, []);
+  });
+
+  it("treats a null progressToken as absent — the guard checks null explicitly", () => {
+    // The declared type is string | number, but a client can put anything on
+    // the wire. The null arm of the guard is what stops a literal
+    // progressToken:null reaching the transport as a "valid" token.
+    const { sent, send } = recordingSender();
+    const ctx = buildToolContext({ _meta: { progressToken: null as unknown as number }, sendNotification: send });
+
+    assert.doesNotThrow(() => ctx.reportProgress(1, 2, "msg"));
+
+    assert.deepEqual(sent, []);
+  });
+});
+
+describe("buildToolContext — no sendNotification means reportProgress is a silent no-op", () => {
+  it("does not throw when a token is present but there is no sender", () => {
+    const ctx = buildToolContext({ _meta: { progressToken: 42 } });
+
+    assert.doesNotThrow(() => ctx.reportProgress(1));
+    assert.doesNotThrow(() => ctx.reportProgress(2, 5, "msg"));
+  });
+
+  it("does not throw when extra is undefined entirely", () => {
+    const ctx = buildToolContext(undefined);
+
+    assert.doesNotThrow(() => ctx.reportProgress(1));
+    assert.doesNotThrow(() => ctx.reportProgress(2, 5, "msg"));
+    assert.equal(ctx.reportProgress(3), undefined, "reportProgress returns void on every path");
+  });
+
+  it("returns a usable ToolContext on EVERY path — a handler can always call reportProgress", () => {
+    const { send } = recordingSender();
+    const paths: ToolContext[] = [
+      buildToolContext(undefined),
+      buildToolContext({}),
+      buildToolContext({ sendNotification: send }),
+      buildToolContext({ _meta: { progressToken: 0 } }),
+      buildToolContext({ _meta: { progressToken: 0 }, sendNotification: send }),
+    ];
+
+    for (const ctx of paths) {
+      assert.equal(typeof ctx.reportProgress, "function");
+      assert.doesNotThrow(() => ctx.reportProgress(1, 2, "msg"));
+    }
+  });
+});
+
+describe("buildToolContext — a failing sendNotification never fails the tool call", () => {
+  it("swallows a rejected send: reportProgress does not throw and no unhandled rejection escapes", async () => {
+    const { sent, send } = recordingSender(() => Promise.reject(new Error("transport gone")));
+    const ctx = buildToolContext({ _meta: { progressToken: 9 }, sendNotification: send });
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      assert.doesNotThrow(() => ctx.reportProgress(1));
+      assert.doesNotThrow(() => ctx.reportProgress(2, 10, "still going"));
+      await drainTicks();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    assert.deepEqual(unhandled, [], "the .catch() on the fire-and-forget send is what keeps this empty");
+    // Swallowing the failure is not the same as skipping the work: both sends
+    // were still attempted.
+    assert.equal(sent.length, 2);
+  });
+
+  it("keeps working after a send fails — one dropped update does not poison the context", async () => {
+    let calls = 0;
+    const { sent, send } = recordingSender(() => {
+      calls += 1;
+      return calls === 1 ? Promise.reject(new Error("blip")) : Promise.resolve();
+    });
+    const ctx = buildToolContext({ _meta: { progressToken: "t" }, sendNotification: send });
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      ctx.reportProgress(1);
+      ctx.reportProgress(2);
+      await drainTicks();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(
+      sent.map((n) => n.params.progress),
+      [1, 2],
+    );
+  });
+});
+
+describe("buildToolContext — signal passthrough", () => {
+  it("forwards extra.signal by identity on the progress-enabled path", () => {
+    const { send } = recordingSender();
+    const controller = new AbortController();
+
+    const ctx = buildToolContext({ signal: controller.signal, _meta: { progressToken: 7 }, sendNotification: send });
+
+    assert.equal(ctx.signal, controller.signal, "the same AbortSignal object, not a copy");
+  });
+
+  it("forwards extra.signal on the NO-OP path too — no token means no progress, not no signal", () => {
+    // Easy to lose: the early return builds its own object literal, so the
+    // signal has to be repeated there. A long-running handler on a client that
+    // never sends a progressToken still needs to see cancellation.
+    const controller = new AbortController();
+
+    const ctx = buildToolContext({ signal: controller.signal });
+
+    assert.equal(ctx.signal, controller.signal);
+    assert.equal(ctx.signal?.aborted, false);
+    controller.abort();
+    assert.equal(ctx.signal?.aborted, true, "it is the live signal, so a later abort is visible through ctx");
+  });
+
+  it("forwards an ALREADY-aborted signal unchanged", () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const ctx = buildToolContext({ signal: controller.signal, _meta: { progressToken: 1 } });
+
+    assert.equal(ctx.signal, controller.signal);
+    assert.equal(ctx.signal?.aborted, true);
+  });
+
+  it("is undefined when extra is undefined", () => {
+    const ctx = buildToolContext(undefined);
+
+    assert.equal(ctx.signal, undefined);
+  });
+
+  it("is undefined when extra carries no signal, on both paths", () => {
+    const { send } = recordingSender();
+
+    assert.equal(buildToolContext({}).signal, undefined);
+    assert.equal(buildToolContext({ _meta: { progressToken: 1 }, sendNotification: send }).signal, undefined);
   });
 });

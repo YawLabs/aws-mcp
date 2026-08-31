@@ -4,6 +4,7 @@ import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { capAggregateResults, multiRegionTools, type RegionResult, runWithConcurrency } from "./multi-region.js";
+import type { ToolContext } from "./tool.js";
 
 const tool = multiRegionTools.find((t) => t.name === "aws_multi_region");
 if (!tool) throw new Error("multiRegionTools missing aws_multi_region");
@@ -478,5 +479,158 @@ describe("aws_multi_region aggregate cap -- end-to-end envelope", () => {
       if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
       else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
     }
+  });
+});
+
+describe("aws_multi_region -- progress reporting", () => {
+  // Fanning out across up to 32 regions is the second-longest wait this server
+  // imposes, and unlike the CCAPI poll loop it has a REAL denominator: the
+  // deduped region list. So these reports carry (completed, total).
+  interface ProgressCall {
+    progress: number;
+    total?: number;
+    message?: string;
+  }
+  const recordingCtx = (): { ctx: ToolContext; calls: ProgressCall[] } => {
+    const calls: ProgressCall[] = [];
+    return {
+      ctx: {
+        reportProgress: (progress, total, message) => {
+          calls.push({ progress, total, message });
+        },
+      },
+      calls,
+    };
+  };
+  const withScenario = async (scenario: string, fn: () => Promise<void>): Promise<void> => {
+    const prev = process.env.AWS_MCP_FAKE_SCENARIO;
+    process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+      else process.env.AWS_MCP_FAKE_SCENARIO = prev;
+    }
+  };
+
+  it("reports one update per region, monotonically, with the region count as total", async () => {
+    await withScenario("call_json_success", async () => {
+      const { ctx, calls } = recordingCtx();
+      const regions = ["us-east-1", "us-west-2", "eu-west-1"];
+      const res = await tool.handler({ service: "s3api", operation: "list-buckets", regions, profile: "default" }, ctx);
+
+      assert.equal(res.ok, true);
+      assert.equal(calls.length, 3, "one report per region");
+      assert.deepEqual(
+        calls.map((c) => c.progress),
+        [1, 2, 3],
+        "the completion counter is the progress value",
+      );
+      for (let n = 1; n < calls.length; n++) {
+        assert.ok(calls[n].progress > calls[n - 1].progress, "progress must increase monotonically");
+      }
+      for (const c of calls) {
+        assert.equal(c.total, 3, "the denominator IS known here -- the deduped region count");
+      }
+      // Each report names the region that settled; across the batch that is
+      // every region, in whatever order they finished.
+      const named = regions.filter((r) => calls.some((c) => (c.message ?? "").startsWith(`${r}:`)));
+      assert.deepEqual(named.sort(), [...regions].sort(), "every region is named in exactly one message");
+    });
+  });
+
+  it("reports on COMPLETION, not dispatch -- each message carries the region's settled outcome", async () => {
+    // The real proof that the report fires after the region settles: the
+    // ok/failed label is unknowable at dispatch time. mr_partial_failure fails
+    // us-west-2 (expired SSO) and succeeds everywhere else, so a
+    // dispatch-time report could not produce these two different labels.
+    await withScenario("mr_partial_failure", async () => {
+      const { ctx, calls } = recordingCtx();
+      const res = await tool.handler(
+        { service: "s3api", operation: "list-buckets", regions: ["us-east-1", "us-west-2"], profile: "default" },
+        ctx,
+      );
+
+      assert.equal(res.ok, true);
+      const data = res.data as { okCount: number; errorCount: number };
+      assert.equal(data.okCount, 1);
+      assert.equal(data.errorCount, 1);
+
+      assert.equal(calls.length, 2);
+      const east = calls.find((c) => (c.message ?? "").startsWith("us-east-1:"));
+      const west = calls.find((c) => (c.message ?? "").startsWith("us-west-2:"));
+      assert.match(east?.message ?? "", /us-east-1: ok/, "the successful region is reported as ok");
+      assert.match(west?.message ?? "", /us-west-2: failed/, "the failed region is reported as failed");
+      // The counter never runs ahead of what has settled: the last report is
+      // the total, and no report exceeds it.
+      assert.equal(Math.max(...calls.map((c) => c.progress)), 2);
+      for (const c of calls) {
+        assert.ok(c.progress <= (c.total ?? 0), "completed can never exceed total");
+      }
+    });
+  });
+
+  it("uses the DEDUPED region count as the denominator", async () => {
+    // regionCount in the envelope is the deduped count, and the progress total
+    // has to agree with it -- otherwise a caller who repeated a region watches
+    // a bar that stops short of its own total.
+    await withScenario("call_json_success", async () => {
+      const { ctx, calls } = recordingCtx();
+      const res = await tool.handler(
+        {
+          service: "s3api",
+          operation: "list-buckets",
+          regions: ["us-east-1", "us-east-1", "us-west-2"],
+          profile: "default",
+        },
+        ctx,
+      );
+
+      const data = res.data as { regionCount: number };
+      assert.equal(data.regionCount, 2);
+      assert.equal(calls.length, 2, "the duplicate is collapsed before dispatch, so it never reports");
+      for (const c of calls) {
+        assert.equal(c.total, 2, "total tracks regionCount, not the raw input length");
+      }
+      assert.equal(calls[calls.length - 1].progress, 2, "the run ends exactly on the total");
+    });
+  });
+
+  it("a no-op ctx (the no-progressToken path) changes nothing about the result", async () => {
+    await withScenario("call_json_success", async () => {
+      const input = {
+        service: "s3api",
+        operation: "list-buckets",
+        regions: ["us-east-1", "us-west-2"],
+        profile: "default",
+      };
+      const reported = await tool.handler(input, { reportProgress: () => {} });
+      const bare = await tool.handler(input);
+
+      assert.equal(reported.ok, true);
+      assert.deepEqual(reported.data, bare.data, "the envelope must not depend on whether progress was reported");
+    });
+  });
+
+  it("a throwing reportProgress cannot abandon the batch", async () => {
+    // runWithConcurrency's contract is that `fn` MUST resolve: a rejection
+    // fails the whole Promise.all and abandons every other in-flight region.
+    // Progress is advisory, so a client-side notification failure must never
+    // cost the caller their results.
+    await withScenario("call_json_success", async () => {
+      const res = await tool.handler(
+        { service: "s3api", operation: "list-buckets", regions: ["us-east-1", "us-west-2"], profile: "default" },
+        {
+          reportProgress: () => {
+            throw new Error("transport exploded");
+          },
+        },
+      );
+
+      assert.equal(res.ok, true);
+      const data = res.data as { okCount: number; results: unknown[] };
+      assert.equal(data.okCount, 2, "every region still ran and reported its result");
+      assert.equal(data.results.length, 2);
+    });
   });
 });

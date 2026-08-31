@@ -143,6 +143,325 @@ export function isValidDocsUrl(url: string): boolean {
   return DOCS_URL_RE.test(url);
 }
 
+/* ---------------------------------------------------------------------------
+ * Lexical relevance signal for aws_docs_search.
+ *
+ * The backend at proxy.search.docs.aws.com ALWAYS returns a full page of fuzzy
+ * matches and has no way to answer "nothing here matches". Searching the
+ * nonsense string "zzzzqqq-nonexistent-service-xyzzy" against the published
+ * server returned ten confidently ranked hits topped by a Ruby SDK
+ * `Route53::Errors::NoSuchHealthCheck` reference page. The response carries no
+ * score, no confidence, and no relevance field of any kind, so there is nothing
+ * in it a caller could threshold on -- a model sees `count: 10` and cannot tell
+ * ten good hits from ten irrelevant ones, which is how an unrelated page ends
+ * up cited as authoritative. An empty result set would have been more useful.
+ *
+ * So the signal is computed LOCALLY and named for exactly what it is: lexical
+ * term overlap. How many of the query's own words literally appear in a
+ * result's title/summary/excerpt. It is NOT a backend score (there is none),
+ * NOT semantic ranking, and NOT a claim about which result is best. It answers
+ * one narrow question honestly: did the words you searched for show up at all?
+ *
+ * Results stay in the backend's own order -- this annotates the ranking, it
+ * does not replace it.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Below this fraction of query terms found in the best result, the whole
+ * response is flagged `lowRelevance`. Deliberately conservative: half the
+ * terms is an easy bar for a genuinely on-topic page to clear, so tripping it
+ * is evidence the backend had nothing rather than evidence of a strict
+ * threshold.
+ */
+export const LOW_RELEVANCE_OVERLAP = 0.5;
+
+/**
+ * Terms too common to carry signal, dropped from the QUERY only.
+ *
+ * The direction of the error is what matters: these words are near-certain to
+ * appear somewhere in any AWS doc excerpt, so leaving them in inflates overlap
+ * on every result -- it makes bad matches look good, which is the exact
+ * failure this signal exists to prevent. The list is deliberately tiny and
+ * holds English function words only, no AWS vocabulary: "service", "api" and
+ * "aws" are precisely the terms a caller may mean literally.
+ */
+const RELEVANCE_STOPWORDS: ReadonlySet<string> = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "can",
+  "do",
+  "does",
+  "for",
+  "from",
+  "how",
+  "i",
+  "in",
+  "is",
+  "it",
+  "of",
+  "on",
+  "or",
+  "that",
+  "the",
+  "to",
+  "use",
+  "using",
+  "what",
+  "when",
+  "where",
+  "which",
+  "with",
+  "you",
+  "your",
+]);
+
+/**
+ * Split text into runs of alphanumerics, preserving case for the CamelCase
+ * pass below.
+ *
+ * A naive whitespace split is wrong for this domain: `Route53::Errors::
+ * NoSuchHealthCheck`, `s3:GetObject`, `aws-sdk-js` and `dynamodb.describe_table`
+ * are each ONE whitespace token, so real matches would be scored as misses.
+ * Splitting on every non-alphanumeric run covers hyphens, colons, `::`, dots,
+ * slashes and underscores in a single rule.
+ */
+function alnumRuns(text: string): string[] {
+  return text.split(/[^A-Za-z0-9]+/).filter((r) => r.length > 0);
+}
+
+/**
+ * Split one run on CamelCase / PascalCase boundaries and lowercase the pieces.
+ * Two rules, because AWS identifiers use both forms:
+ *   `NoSuchHealthCheck` -> no such health check   (lower|digit then upper)
+ *   `HTTPSListener`     -> https listener         (acronym then word)
+ */
+function camelPieces(run: string): string[] {
+  return run
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .split(" ")
+    .filter((p) => p.length > 0);
+}
+
+/**
+ * Every term a reader could reasonably consider "present" in a piece of doc
+ * text, in each spelling AWS uses.
+ *
+ * Four expansions, each killing a false NEGATIVE that would otherwise make a
+ * real match look irrelevant:
+ *   1. the run as printed     -- a typed `getobject` matches `GetObject`
+ *   2. its CamelCase pieces   -- typed `get object` matches `GetObject`
+ *   3. glue [letters][digits] -- docs print "Route 53", users type "route53"
+ *   4. split `letters+digits` -- docs print "Route53", users type "route 53"
+ *
+ * The expansion lives on the HAYSTACK side only, never on the query's.
+ * Expanding the query would grow the denominator with words the user never
+ * typed, which silently changes what the published fraction means.
+ */
+export function docTerms(text: string): Set<string> {
+  const runs = alnumRuns(text);
+  const terms = new Set<string>();
+  for (let i = 0; i < runs.length; i++) {
+    const lower = runs[i].toLowerCase();
+    terms.add(lower);
+    for (const piece of camelPieces(runs[i])) terms.add(piece);
+    const split = /^([a-z]+)(\d+)$/.exec(lower);
+    if (split) {
+      terms.add(split[1]);
+      terms.add(split[2]);
+    }
+    const next = runs[i + 1]?.toLowerCase();
+    if (next && /^[a-z]+$/.test(lower) && /^\d+$/.test(next)) terms.add(lower + next);
+  }
+  return terms;
+}
+
+/**
+ * The query's terms -- the denominator of the published fraction, and so
+ * deliberately the words the USER typed rather than an expanded set.
+ *
+ * Runs, not CamelCase pieces: `NoSuchHealthCheck` is one word from the
+ * caller's point of view, and counting it as four would quietly reweight a
+ * query toward whichever term happened to be written as an identifier.
+ * Matching still understands the pieces -- see `queryTermMatches`.
+ */
+interface QueryTerm {
+  /** Lowercased run, as published in `queryTerms`. */
+  term: string;
+  /**
+   * The run's CamelCase pieces, derived from the ORIGINAL casing. Carried
+   * alongside because `term` is already lowercased and a typed `GetObject`
+   * would be unsplittable by then.
+   */
+  pieces: string[];
+}
+
+function queryTermList(query: string): QueryTerm[] {
+  const runs = alnumRuns(query);
+  const kept = runs.filter((r) => !RELEVANCE_STOPWORDS.has(r.toLowerCase()));
+  // A query that is nothing but stopwords ("how do i") still needs a
+  // denominator; fall back to every run rather than dividing by zero.
+  const chosen = kept.length > 0 ? kept : runs;
+  const seen = new Set<string>();
+  const out: QueryTerm[] = [];
+  for (const run of chosen) {
+    const term = run.toLowerCase();
+    if (seen.has(term)) continue;
+    seen.add(term);
+    out.push({ term, pieces: camelPieces(run) });
+  }
+  return out;
+}
+
+export function queryTerms(query: string): string[] {
+  return queryTermList(query).map((t) => t.term);
+}
+
+/**
+ * Is `term` present in a result's expanded term set?
+ *
+ * Beyond a literal hit, two allowances -- both for false negatives common
+ * enough to distort the number:
+ *   - English plural: "url" vs "URLs", "bucket" vs "buckets". Only a trailing
+ *     -s, and only on terms long enough that stripping it is not destructive
+ *     (so "aws" keeps its s). This is the ONLY normalization applied; no
+ *     stemming, because stemming makes the number look better without making
+ *     it truer, and a conservative under-count reads as "verify this yourself"
+ *     where an over-count reads as "cite this".
+ *   - A typed identifier counts as present when ALL of its CamelCase pieces
+ *     are: a query for `NoSuchHealthCheck` matches a page spelling it "no such
+ *     health check". All, not any -- matching on "check" alone would hand
+ *     almost any AWS page a free point.
+ */
+function queryTermMatches(qt: QueryTerm, terms: ReadonlySet<string>): boolean {
+  const has = (t: string): boolean =>
+    terms.has(t) || terms.has(`${t}s`) || (t.length > 3 && t.endsWith("s") && terms.has(t.slice(0, -1)));
+  if (has(qt.term)) return true;
+  return qt.pieces.length > 1 && qt.pieces.every(has);
+}
+
+/** Per-result lexical overlap. `null` when the query had no scorable terms. */
+export interface LexicalMatch {
+  /** Fraction (0-1) of `queryTerms` found in this result's title/summary/excerpt. */
+  overlap: number;
+  matchedTerms: string[];
+  unmatchedTerms: string[];
+}
+
+/** A search result plus its locally computed lexical signal. */
+export interface ScoredSearchResult extends DocsSearchResult {
+  lexicalMatch: LexicalMatch | null;
+}
+
+export interface SearchRelevance {
+  /** The terms the fraction is computed against -- published so the number is auditable. */
+  queryTerms: string[];
+  /** Highest per-result overlap; null when the query had no scorable terms. */
+  /** Query terms absent from EVERY result -- the backend having nothing. */
+  termsMatchedNowhere?: string[];
+  bestLexicalOverlap: number | null;
+  lowRelevance: boolean;
+  relevanceNote?: string;
+  results: ScoredSearchResult[];
+}
+
+/**
+ * Annotate a page of results with lexical overlap and decide whether the page
+ * as a whole should be flagged as a non-answer.
+ *
+ * Only title, summary and excerpt are scored. The URL is deliberately left
+ * out: every AWS docs URL contains docs/aws/amazon/com/latest, which would
+ * hand a free match to any query mentioning those, and the slug itself
+ * ("bucketnamingrules") is an unsegmentable run that scores nothing useful.
+ */
+export function scoreSearchResults(query: string, results: readonly DocsSearchResult[]): SearchRelevance {
+  const queryTermObjs = queryTermList(query);
+  const terms = queryTermObjs.map((t) => t.term);
+
+  if (terms.length === 0) {
+    // A query of pure punctuation. Reporting 0% here would assert "the backend
+    // had nothing" when the truth is "this heuristic has no opinion" -- so it
+    // asserts nothing instead.
+    return {
+      queryTerms: [],
+      bestLexicalOverlap: null,
+      lowRelevance: false,
+      relevanceNote:
+        "The query contained no comparable terms, so no lexical relevance signal was computed for these results.",
+      results: results.map((r) => ({ ...r, lexicalMatch: null })),
+    };
+  }
+
+  const scored: ScoredSearchResult[] = results.map((r) => {
+    const found = docTerms([r.title, r.summary ?? "", r.excerpt ?? ""].join(" "));
+    const matchedTerms = queryTermObjs.filter((t) => queryTermMatches(t, found)).map((t) => t.term);
+    const unmatchedTerms = queryTermObjs.filter((t) => !queryTermMatches(t, found)).map((t) => t.term);
+    return {
+      // Spread first so every existing field is passed through untouched --
+      // this signal is strictly additive to the result shape callers already
+      // parse.
+      ...r,
+      lexicalMatch: {
+        // 2dp: a coarse heuristic, and printing 0.3333333333333333 would imply
+        // a precision it does not have.
+        overlap: Math.round((matchedTerms.length / terms.length) * 100) / 100,
+        matchedTerms,
+        unmatchedTerms,
+      },
+    };
+  });
+
+  const best = scored.reduce((max, r) => Math.max(max, r.lexicalMatch?.overlap ?? 0), 0);
+
+  // Terms no result matched ANYWHERE in the page. This is the strongest signal
+  // available, and it is why `best` alone is not enough: best takes the MAX
+  // across results, so one incidental hit speaks for the whole set. Measured
+  // against the live backend, "zzzzqqq-nonexistent-service-xyzzy" scored
+  // best = 0.5 because a single unrelated page happened to contain the ordinary
+  // English words "nonexistent" and "service" -- while "zzzzqqq" and "xyzzy",
+  // the terms that actually identify the query, matched nothing at all. A term
+  // absent from every result is the backend saying it had nothing, in the one
+  // form it can.
+  const termsMatchedNowhere = terms.filter((t) => !scored.some((r) => r.lexicalMatch?.matchedTerms.includes(t)));
+
+  // <= not <: the threshold is the boundary of "weak", so landing exactly on it
+  // is weak. The gibberish query above sat at exactly 0.5 and escaped a `<`
+  // test, which is the case this signal exists to catch.
+  const lowRelevance = scored.length === 0 || best <= LOW_RELEVANCE_OVERLAP || termsMatchedNowhere.length > 0;
+
+  let relevanceNote: string | undefined;
+  if (scored.length === 0) {
+    relevanceNote = "The search backend returned no results for this query.";
+  } else if (lowRelevance) {
+    relevanceNote =
+      `No result matched more than ${Math.round(best * 100)}% of the query terms (${terms.join(", ")}). ` +
+      (termsMatchedNowhere.length > 0
+        ? `These terms appear in NO result at all: ${termsMatchedNowhere.join(", ")}. `
+        : "") +
+      "The AWS docs search backend always returns a full page of fuzzy matches and never reports 'no good match', " +
+      "so a low overlap means the backend had nothing close for these terms -- not that this tool failed. Treat " +
+      "these results as weak leads: re-query with different wording, or confirm with aws_docs_read before citing " +
+      "any of them. This is literal word overlap, not semantic relevance, so a correct page that shares no " +
+      "vocabulary with the query scores low too.";
+  }
+
+  return {
+    queryTerms: terms,
+    termsMatchedNowhere,
+    bestLexicalOverlap: best,
+    lowRelevance,
+    ...(relevanceNote !== undefined ? { relevanceNote } : {}),
+    results: scored,
+  };
+}
+
 // AWS doc pages wrap the real content in a lot of nav/chrome. Try these
 // selectors in order; the first that matches is the content root. Mirrors
 // the containers the AWS Labs documentation server looks for.
@@ -411,7 +730,7 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
     {
       name: "aws_docs_search",
       description:
-        "Search the live AWS documentation (the same backend that powers the docs.aws.amazon.com search box). Use this to discover the right doc page for a service, API, or concept the model may not know about -- new services, recently changed APIs, exact parameter names. Returns ranked results as {title, url, summary, excerpt}. Follow up with aws_docs_read on a result's url to get the full page as markdown.",
+        "Search the live AWS documentation (the same backend that powers the docs.aws.amazon.com search box). Use this to discover the right doc page for a service, API, or concept the model may not know about -- new services, recently changed APIs, exact parameter names. Returns ranked results as {title, url, summary, excerpt}. IMPORTANT: that backend always returns a full page of fuzzy matches and has no way to answer 'no good match' -- a nonsense query still comes back with ten confident-looking hits. So each result also carries `lexicalMatch` ({overlap 0-1, matchedTerms, unmatchedTerms}), computed locally by this server: literal word overlap between your query's terms and the result's title/summary/excerpt, NOT a backend score and NOT semantic ranking. The response adds `queryTerms`, `termsMatchedNowhere`, `bestLexicalOverlap`, and `lowRelevance: true` when the best result matched at or under half your terms OR any term appears in no result at all (a term matching nothing anywhere is the clearest sign the backend had nothing -- one incidental hit on a common word can otherwise carry the average) -- that means the backend had nothing close for those terms, NOT that the search failed, so re-query with different wording rather than citing a weak hit. Follow up with aws_docs_read on a result's url to get the full page as markdown.",
       annotations: {
         title: "Search live AWS documentation",
         readOnlyHint: true,
@@ -489,12 +808,24 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
           return { ok: false, error: `AWS docs search returned a non-JSON body: ${msg}.` };
         }
         const results = parseSearchResults(json, limit);
+        // Strictly additive: `count` and every pre-existing per-result field
+        // are untouched, and result order is the backend's. See
+        // scoreSearchResults for why the backend response on its own cannot
+        // tell a caller whether any of this was actually a match.
+        const relevance = scoreSearchResults(i.query, results);
         return {
           ok: true,
           data: {
             query: i.query,
             count: results.length,
-            results,
+            results: relevance.results,
+            queryTerms: relevance.queryTerms,
+            ...(relevance.termsMatchedNowhere !== undefined
+              ? { termsMatchedNowhere: relevance.termsMatchedNowhere }
+              : {}),
+            bestLexicalOverlap: relevance.bestLexicalOverlap,
+            lowRelevance: relevance.lowRelevance,
+            ...(relevance.relevanceNote !== undefined ? { relevanceNote: relevance.relevanceNote } : {}),
           },
         };
       },

@@ -19,7 +19,7 @@ import { profilesTools } from "./tools/profiles.js";
 import { resourceTools } from "./tools/resource.js";
 import { scriptTools } from "./tools/script.js";
 import { sessionTools } from "./tools/session.js";
-import type { Tool, ToolResult } from "./tools/tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tools/tool.js";
 
 /**
  * The MCP tool-call result shape this server emits.
@@ -34,6 +34,63 @@ interface McpResult {
   [x: string]: unknown;
   content: [{ type: "text"; text: string }];
   isError?: true;
+}
+
+/**
+ * The subset of the SDK's RequestHandlerExtra this server reads. Declared
+ * structurally rather than importing RequestHandlerExtra so the bundle does not
+ * pin a generic whose shape moves between SDK minors -- every field is
+ * optional, so a future SDK dropping one degrades to "no progress" instead of a
+ * type error.
+ */
+interface HandlerExtra {
+  signal?: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification?: (n: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; total?: number; message?: string };
+  }) => Promise<void>;
+}
+
+/**
+ * Build the per-call {@link ToolContext} from the SDK's handler extra.
+ *
+ * Progress is opt-in per the MCP spec: a server may only send
+ * `notifications/progress` for a request whose `_meta` carried a
+ * `progressToken`. When there is no token (or no transport to send on), the
+ * returned `reportProgress` is a no-op, so handlers call it unconditionally
+ * instead of every one of them re-implementing the same capability check.
+ *
+ * `sendNotification` is fire-and-forget: a progress update is advisory, and a
+ * transport hiccup delivering one must never fail the tool call that is
+ * otherwise succeeding. Rejections are swallowed deliberately -- an unhandled
+ * one here would surface as an unhandled rejection and take the process down.
+ *
+ * Exported for direct unit coverage; the registration loop it feeds sits behind
+ * the entry-point check and so is unreachable from an `import`.
+ */
+export function buildToolContext(extra: HandlerExtra | undefined): ToolContext {
+  const token = extra?._meta?.progressToken;
+  const send = extra?.sendNotification;
+  if (token === undefined || token === null || !send) {
+    return { reportProgress: () => {}, signal: extra?.signal };
+  }
+  return {
+    reportProgress: (progress, total, message) => {
+      void send({
+        method: "notifications/progress",
+        params: {
+          progressToken: token,
+          progress,
+          ...(total !== undefined ? { total } : {}),
+          ...(message ? { message } : {}),
+        },
+      }).catch(() => {
+        // Advisory only -- see the docblock. Never fail the call for this.
+      });
+    },
+    signal: extra?.signal,
+  };
 }
 
 /**
@@ -298,9 +355,9 @@ if (isEntryPoint) {
   });
 
   for (const tool of allTools) {
-    server.tool(tool.name, tool.description, tool.inputSchema.shape, tool.annotations, async (input) => {
+    server.tool(tool.name, tool.description, tool.inputSchema.shape, tool.annotations, async (input, extra) => {
       try {
-        return toMcpResult(await tool.handler(input));
+        return toMcpResult(await tool.handler(input, buildToolContext(extra)));
       } catch (err) {
         return errorToMcpResult(err, tool.name);
       }

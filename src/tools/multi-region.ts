@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
 import { isValidRegionName, REGION_NAME_RE } from "../session.js";
-import type { Tool, ToolResult } from "./tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
  * aws_multi_region runs the same AWS operation across N regions in parallel.
@@ -184,7 +184,7 @@ export const multiRegionTools: readonly Tool[] = [
         .optional()
         .describe(`Max regions in flight at once (1-${MAX_CONCURRENCY}). Default ${DEFAULT_CONCURRENCY}.`),
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         service: string;
         operation: string;
@@ -237,7 +237,14 @@ export const multiRegionTools: readonly Tool[] = [
         ? Math.min(Math.max(1, Math.trunc(requestedConcurrency)), MAX_CONCURRENCY)
         : DEFAULT_CONCURRENCY;
 
-      const results = await runWithConcurrency(regions, concurrency, async (region): Promise<RegionResult> => {
+      // Progress denominator: the DEDUPED region count, which is what actually
+      // gets dispatched (and what `regionCount` reports below). Using
+      // i.regions.length would leave the bar short of its own total whenever
+      // the caller repeated a region.
+      const total = regions.length;
+      let completed = 0;
+
+      const runRegion = async (region: string): Promise<RegionResult> => {
         try {
           if (!isValidRegionName(region)) {
             return {
@@ -275,6 +282,29 @@ export const multiRegionTools: readonly Tool[] = [
             errorKind: "unexpected",
           };
         }
+      };
+
+      const results = await runWithConcurrency(regions, concurrency, async (region): Promise<RegionResult> => {
+        const result = await runRegion(region);
+        // Report on COMPLETION, never on dispatch. The concurrency limiter
+        // keeps only `concurrency` regions in flight at a time, so counting at
+        // dispatch would race ahead of what has actually settled -- and would
+        // hit `total` while the last window was still running.
+        //
+        // `completed++` needs no lock: the workers interleave at await
+        // boundaries on one thread, so the increment is atomic with respect to
+        // them and the sequence 1..total is emitted in order, satisfying the
+        // spec's monotonicity requirement.
+        completed++;
+        try {
+          ctx?.reportProgress(completed, total, `${region}: ${result.ok ? "ok" : "failed"} (${completed}/${total})`);
+        } catch {
+          // Progress is advisory. runWithConcurrency's contract is that `fn`
+          // MUST resolve -- a throw here would abandon every other in-flight
+          // region over a notification, so swallow it and return the result we
+          // already have.
+        }
+        return result;
       });
 
       // Counted BEFORE the aggregate cap runs: okCount/errorCount describe what

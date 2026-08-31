@@ -15,6 +15,7 @@ import {
   TYPE_NAME_RE,
   validateCursorToken,
 } from "./resource.js";
+import type { ToolContext } from "./tool.js";
 
 const getTool = (name: string) => {
   const t = resourceTools.find((x) => x.name === name);
@@ -968,5 +969,338 @@ describe("schemas — awaitCompletion / pollIntervalMs / maxWaitMs", () => {
       }).success,
       true,
     );
+  });
+});
+
+describe("pollUntilTerminal -- progress reporting", () => {
+  // The awaitCompletion path is the longest-running thing this server does
+  // (maxWaitMs tops out at 30 minutes). A caller that hears nothing for that
+  // long cannot distinguish "still polling" from "hung", so the loop reports
+  // once per attempt. These tests pin the SHAPE of those reports, not just
+  // their existence.
+  interface ProgressCall {
+    progress: number;
+    total?: number;
+    message?: string;
+  }
+  const recordingCtx = (signal?: AbortSignal): { ctx: ToolContext; calls: ProgressCall[] } => {
+    const calls: ProgressCall[] = [];
+    return {
+      ctx: {
+        reportProgress: (progress, total, message) => {
+          calls.push({ progress, total, message });
+        },
+        signal,
+      },
+      calls,
+    };
+  };
+
+  it("reports once per poll attempt with monotonically increasing progress", async () => {
+    const responses: Record<string, unknown>[] = [
+      { OperationStatus: "PENDING", RequestToken: "tok-1" },
+      { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" },
+      { OperationStatus: "SUCCESS", RequestToken: "tok-1", Identifier: "id-1" },
+    ];
+    let i = 0;
+    const awsCall = async (): Promise<AwsCallResult> => progressResponse(responses[i++]);
+    const { ctx, calls } = recordingCtx();
+
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 5_000, ctx },
+      awsCall,
+      async () => undefined,
+    );
+
+    assert.equal(r.ok, true);
+    assert.equal(r.attempts, 3);
+    assert.equal(calls.length, 3, "one report per attempt, including the terminal one");
+    assert.deepEqual(
+      calls.map((c) => c.progress),
+      [1, 2, 3],
+      "progress is the attempt count, so it rises by construction",
+    );
+    for (let n = 1; n < calls.length; n++) {
+      assert.ok(calls[n].progress > calls[n - 1].progress, "progress must increase monotonically within one call");
+    }
+  });
+
+  it("omits `total` -- the denominator is genuinely unknown while polling", async () => {
+    // maxWaitMs bounds how long we WAIT, not how much work there is: the
+    // operation ends when AWS says so. Any total here would be invented, and
+    // the MCP spec allows progress without one precisely for this case.
+    const responses: Record<string, unknown>[] = [
+      { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" },
+      { OperationStatus: "SUCCESS", RequestToken: "tok-1" },
+    ];
+    let i = 0;
+    const awsCall = async (): Promise<AwsCallResult> => progressResponse(responses[i++]);
+    const { ctx, calls } = recordingCtx();
+
+    await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 5_000, ctx },
+      awsCall,
+      async () => undefined,
+    );
+
+    assert.equal(calls.length, 2);
+    for (const c of calls) {
+      assert.equal(c.total, undefined, "no fabricated denominator for open-ended polling");
+    }
+  });
+
+  it("puts the elapsed time and the observed OperationStatus in the message", async () => {
+    // What a human watching a 30-minute wait actually wants: how long it has
+    // been, and what AWS last said. The status must be THIS attempt's, not the
+    // previous one's -- hence the differing statuses below.
+    const responses: Record<string, unknown>[] = [
+      { OperationStatus: "PENDING", RequestToken: "tok-1" },
+      { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" },
+      { OperationStatus: "FAILED", RequestToken: "tok-1", ErrorCode: "NotUpdatable" },
+    ];
+    let i = 0;
+    const awsCall = async (): Promise<AwsCallResult> => progressResponse(responses[i++]);
+    const { ctx, calls } = recordingCtx();
+
+    await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 5_000, ctx },
+      awsCall,
+      async () => undefined,
+    );
+
+    assert.equal(calls.length, 3);
+    assert.match(calls[0].message ?? "", /PENDING/);
+    assert.match(calls[1].message ?? "", /IN_PROGRESS/);
+    assert.match(calls[2].message ?? "", /FAILED/, "the terminal attempt reports the status it observed");
+    for (const c of calls) {
+      assert.match(c.message ?? "", /after \d+s/, `message must carry elapsed time, got: ${c.message}`);
+    }
+  });
+
+  it("a no-op ctx (the no-progressToken path) changes nothing about the result", async () => {
+    // buildToolContext hands back a no-op reportProgress when the client sent
+    // no progressToken. Handlers call it unconditionally, so the no-op path is
+    // the COMMON one -- it must not perturb the returned PollResult.
+    const script = (): (() => Promise<AwsCallResult>) => {
+      const responses: Record<string, unknown>[] = [
+        { OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" },
+        { OperationStatus: "SUCCESS", RequestToken: "tok-1", Identifier: "id-1" },
+      ];
+      let i = 0;
+      return async () => progressResponse(responses[i++]);
+    };
+    const project = (r: Awaited<ReturnType<typeof pollUntilTerminal>>) => ({
+      ok: r.ok,
+      attempts: r.attempts,
+      command: r.command,
+      progressEvent: r.progressEvent,
+      error: r.error,
+      cancelled: r.cancelled,
+    });
+
+    const withNoOp = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 5_000, ctx: { reportProgress: () => {} } },
+      script(),
+      async () => undefined,
+    );
+    const withNothing = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 5_000 },
+      script(),
+      async () => undefined,
+    );
+
+    // elapsedMs is wall-clock and excluded from the projection; everything
+    // else the caller reads must be identical.
+    assert.deepEqual(project(withNoOp), project(withNothing));
+    assert.equal(withNoOp.ok, true);
+  });
+});
+
+describe("pollUntilTerminal -- client cancellation", () => {
+  it("stops polling early when the client cancels mid-wait", async () => {
+    // The budget here is 60s and the operation never reaches a terminal state,
+    // so an uncancelled loop would keep calling AWS for a full minute. The
+    // abort lands during the second sleep; the call count proves the loop
+    // stopped there instead of running the budget out.
+    const controller = new AbortController();
+    let calls = 0;
+    const awsCall = async (): Promise<AwsCallResult> => {
+      calls++;
+      return progressResponse({ OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" });
+    };
+    let sleeps = 0;
+    const sleep = async (): Promise<void> => {
+      sleeps++;
+      // Stands in for the client hanging up while we are between polls.
+      if (sleeps === 2) controller.abort();
+    };
+
+    const r = await pollUntilTerminal(
+      {
+        requestToken: "tok-1",
+        pollIntervalMs: 1_000,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: () => {}, signal: controller.signal },
+      },
+      awsCall,
+      sleep,
+    );
+
+    assert.equal(calls, 2, "polling must stop at the cancellation, not run the 60s budget out");
+    assert.equal(r.ok, false, "an unfinished operation is not a success");
+    assert.equal(r.cancelled, true, "the cancelled arm is distinct from a failure");
+  });
+
+  it("words the cancellation distinctly and hands back the requestToken", async () => {
+    const controller = new AbortController();
+    let sleeps = 0;
+    const awsCall = async (): Promise<AwsCallResult> =>
+      progressResponse({ OperationStatus: "IN_PROGRESS", RequestToken: "tok-abc" });
+    const sleep = async (): Promise<void> => {
+      sleeps++;
+      if (sleeps === 1) controller.abort();
+    };
+
+    const r = await pollUntilTerminal(
+      {
+        requestToken: "tok-abc",
+        pollIntervalMs: 100,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: () => {}, signal: controller.signal },
+      },
+      awsCall,
+      sleep,
+    );
+
+    assert.equal(r.cancelled, true);
+    assert.match(r.error ?? "", /Cancelled by the client/);
+    // Must not be mistakable for the budget-exhausted arm, which says
+    // "Polled for Ns without reaching a terminal state".
+    assert.doesNotMatch(r.error ?? "", /without reaching a terminal state/);
+    // The operation is still running server-side -- say so, and hand back the
+    // token needed to find out how it ended.
+    assert.match(r.error ?? "", /NOT cancelled/);
+    assert.match(r.error ?? "", /aws_resource_status/);
+    assert.match(r.error ?? "", /tok-abc/);
+    // Last-seen status survives so the caller knows where it stopped.
+    assert.equal((r.progressEvent as Record<string, unknown>)?.OperationStatus, "IN_PROGRESS");
+  });
+
+  it("makes no AWS call at all when the request was already cancelled", async () => {
+    // The one-shot guarantee (always poll at least once) exists so a caller
+    // always gets a result. A cancelled request has no caller left, so the
+    // signal check runs on the first pass too and that exemption does not
+    // apply.
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    const awsCall = async (): Promise<AwsCallResult> => {
+      calls++;
+      return progressResponse({ OperationStatus: "SUCCESS", RequestToken: "tok-1" });
+    };
+
+    const r = await pollUntilTerminal(
+      {
+        requestToken: "tok-1",
+        pollIntervalMs: 100,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: () => {}, signal: controller.signal },
+      },
+      awsCall,
+      async () => undefined,
+    );
+
+    assert.equal(calls, 0, "a pre-cancelled request must not spend an AWS call");
+    assert.equal(r.ok, false);
+    assert.equal(r.cancelled, true);
+    assert.equal(r.attempts, 0);
+  });
+
+  it("wakes out of the real (non-injected) sleep instead of waiting the interval out", async () => {
+    // Uses the DEFAULT sleep, so this pins the abort wiring in
+    // sleepUnlessAborted rather than a test double. pollIntervalMs is 5s: a
+    // plain setTimeout would return no sooner than that, while an abort-aware
+    // one returns as soon as the signal fires (~20ms here).
+    const controller = new AbortController();
+    let calls = 0;
+    const awsCall = async (): Promise<AwsCallResult> => {
+      calls++;
+      if (calls === 1) setTimeout(() => controller.abort(), 20);
+      return progressResponse({ OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" });
+    };
+
+    const started = Date.now();
+    const r = await pollUntilTerminal(
+      {
+        requestToken: "tok-1",
+        pollIntervalMs: 5_000,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: () => {}, signal: controller.signal },
+      },
+      awsCall,
+    );
+    const took = Date.now() - started;
+
+    assert.equal(r.cancelled, true);
+    assert.equal(calls, 1);
+    assert.ok(took < 2_000, `expected the sleep to abort early, took ${took}ms of a 5000ms interval`);
+  });
+});
+
+describe("aws_resource_create handler — progress threading (fake-aws)", () => {
+  // Proves the ctx actually reaches the poll loop through the handler ->
+  // buildMutationResponse -> pollUntilTerminal chain. The unit tests above
+  // call pollUntilTerminal directly, so a handler that dropped `ctx` on the
+  // floor would leave every one of them green.
+  const beforeEachEnv = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  };
+  const afterEachEnv = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  };
+
+  it("reports poll progress through awaitCompletion, and a no-op ctx returns the same result", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_then_status_success";
+      const calls: { progress: number; total?: number; message?: string }[] = [];
+      const input = {
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+        profile: "tester",
+        awaitCompletion: true,
+        pollIntervalMs: 500,
+        maxWaitMs: 5_000,
+      };
+
+      const reported = await createResource.handler(input, {
+        reportProgress: (progress, total, message) => {
+          calls.push({ progress, total, message });
+        },
+      });
+      assert.equal(reported.ok, true);
+      // The scenario reaches SUCCESS on the first poll, so exactly one report.
+      assert.equal(calls.length, 1, `expected one poll report, got ${JSON.stringify(calls)}`);
+      assert.equal(calls[0].progress, 1);
+      assert.equal(calls[0].total, undefined);
+      assert.match(calls[0].message ?? "", /SUCCESS/);
+
+      const silent = await createResource.handler(input, { reportProgress: () => {} });
+      assert.equal(silent.ok, true);
+      // Same envelope either way, minus the wall-clock `awaited` timings.
+      const strip = (r: { data?: unknown }): Record<string, unknown> => {
+        const d = { ...(r.data as Record<string, unknown>) };
+        delete d.awaited;
+        return d;
+      };
+      assert.deepEqual(strip(silent), strip(reported));
+    } finally {
+      afterEachEnv();
+    }
   });
 });

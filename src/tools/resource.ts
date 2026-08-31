@@ -2,7 +2,7 @@ import { z } from "zod";
 import { type AwsCallFailure, type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
 import { getProfile } from "../session.js";
 import { extractNextToken } from "./paginate.js";
-import type { Tool, ToolResult } from "./tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
  * AWS Cloud Control API (CCAPI) gives us a single typed CRUD surface over any
@@ -264,6 +264,14 @@ interface PollResult {
   // server-side regardless.
   kind?: AwsCallFailureKind;
   rawBody?: string;
+  /**
+   * True when the loop stopped because the CLIENT cancelled the request
+   * (ctx.signal aborted), not because the operation finished or the budget ran
+   * out. Distinct from every other `ok: false` arm: nothing failed, and the
+   * AWS-side operation is still running -- see the message `cancelledResult`
+   * builds.
+   */
+  cancelled?: boolean;
 }
 
 /**
@@ -274,6 +282,42 @@ interface PollResult {
  * written twice.
  */
 type AwsCaller = (opts: Parameters<typeof runAwsCall>[0]) => Promise<AwsCallResult>;
+
+/**
+ * Default pacing between polls: an ordinary timer that ALSO resolves early
+ * when the client cancels.
+ *
+ * The abort wiring is not decoration. `pollIntervalMs` goes up to 30s and
+ * ProgressEvent.RetryAfter can push a single wait higher still, so a
+ * cancellation that arrives one tick into a sleep would otherwise sit
+ * unobserved for the rest of it -- "stop promptly" has to cover the sleep, not
+ * just the check at the top of the loop.
+ *
+ * Resolving (rather than rejecting) on abort keeps the cancellation decision in
+ * ONE place: the loop's own `signal.aborted` check, which knows how to build
+ * the result. A rejecting sleep would need a second, duplicate handler here.
+ *
+ * `signal` is optional so the scripted `(ms) => void` doubles the tests inject
+ * still satisfy the parameter type.
+ */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /**
  * Loop `cloudcontrol get-resource-request-status` until the operation reaches
@@ -295,6 +339,11 @@ type AwsCaller = (opts: Parameters<typeof runAwsCall>[0]) => Promise<AwsCallResu
  * public surface) returns ok:false after exactly one call, surfacing whatever
  * status that single poll observed.
  *
+ * Reports one progress update per poll attempt when `opts.ctx` is present, and
+ * stops early if `ctx.signal` aborts -- this is the longest-running path in the
+ * server (up to 30 minutes), so a caller left with no output at all cannot tell
+ * it from a hung process.
+ *
  * Exposed with an injectable `awsCall` argument purely so unit tests can drive
  * the loop with scripted responses; production code uses the default.
  */
@@ -306,9 +355,14 @@ export async function pollUntilTerminal(
     timeoutMs?: number;
     pollIntervalMs: number;
     maxWaitMs: number;
+    // Rides in the opts bag rather than a fourth positional parameter: the
+    // production caller passes opts alone and takes the awsCall/sleep
+    // defaults, so a trailing parameter would force it to re-state both just
+    // to reach the context.
+    ctx?: ToolContext;
   },
   awsCall: AwsCaller = runAwsCall,
-  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void> = sleepUnlessAborted,
 ): Promise<PollResult> {
   const start = Date.now();
   let attempts = 0;
@@ -326,7 +380,27 @@ export async function pollUntilTerminal(
       error: `Polled for ${Math.round(elapsed / 1000)}s without reaching a terminal state (last status: ${lastStatus ?? "unknown"}). Increase maxWaitMs, or call aws_resource_status with requestToken='${opts.requestToken}' to keep checking.`,
     };
   };
+  // The client hung up. Deliberately NOT phrased as a success or as a plain
+  // failure: nothing went wrong, we simply stopped watching, and the AWS-side
+  // operation is still running -- so the message says so and hands back the
+  // requestToken to resume with.
+  const cancelledResult = (): PollResult => {
+    const elapsed = Date.now() - start;
+    return {
+      ok: false,
+      cancelled: true,
+      progressEvent: lastEvent,
+      command: lastCommand,
+      attempts,
+      elapsedMs: elapsed,
+      error: `Cancelled by the client after ${Math.round(elapsed / 1000)}s and ${attempts} poll(s) (last status: ${lastStatus ?? "unknown"}). Polling stopped; the AWS operation itself was NOT cancelled and is likely still running -- call aws_resource_status with requestToken='${opts.requestToken}' to check how it ended.`,
+    };
+  };
   while (true) {
+    // Cancellation outranks the budget check, and unlike it applies on the
+    // FIRST pass too: the one-shot guarantee exists so a caller always gets a
+    // result, and a cancelled request has no caller left to receive one.
+    if (opts.ctx?.signal?.aborted) return cancelledResult();
     // Budget first, call second -- `attempts > 0` keeps the one-shot
     // guarantee for the first pass. Checking after the call meant the loop
     // always burned one request past maxWaitMs.
@@ -357,10 +431,21 @@ export async function pollUntilTerminal(
     lastEvent = unwrapProgressEvent(result.data);
     lastStatus =
       lastEvent && typeof lastEvent.OperationStatus === "string" ? (lastEvent.OperationStatus as string) : null;
+    const elapsed = Date.now() - start;
+    // One report per attempt, AFTER the call returns so the message can name
+    // the status this attempt actually observed rather than the previous one.
+    // No `total`: the loop ends when AWS says the operation is done, so any
+    // denominator would be invented (maxWaitMs bounds the WAIT, not the work).
+    // `attempts` is the progress value, and it only ever increments -- the
+    // monotonicity the MCP spec requires falls out of the loop counter.
+    opts.ctx?.reportProgress(
+      attempts,
+      undefined,
+      `Poll ${attempts}: ${lastStatus ?? "unknown"} after ${Math.round(elapsed / 1000)}s`,
+    );
     if (lastStatus && TERMINAL_STATUSES.has(lastStatus)) {
       return { ok: true, progressEvent: lastEvent, command: lastCommand, attempts, elapsedMs: Date.now() - start };
     }
-    const elapsed = Date.now() - start;
     let waitMs = opts.pollIntervalMs;
     const retryAfterRaw =
       lastEvent && typeof lastEvent.RetryAfter === "string" ? (lastEvent.RetryAfter as string) : null;
@@ -372,7 +457,9 @@ export async function pollUntilTerminal(
       }
     }
     waitMs = Math.min(waitMs, opts.maxWaitMs - elapsed);
-    if (waitMs > 0) await sleep(waitMs);
+    // Hand the signal to the sleep so a cancellation arriving mid-wait wakes
+    // us immediately; the loop's own check at the top then builds the result.
+    if (waitMs > 0) await sleep(waitMs, opts.ctx?.signal);
   }
 }
 
@@ -392,6 +479,7 @@ async function buildMutationResponse(
     pollIntervalMs?: number;
     maxWaitMs?: number;
   },
+  ctx?: ToolContext,
 ): Promise<ToolResult> {
   const progressEvent = unwrapProgressEvent(initial.data);
   const fields = extractProgressFields(progressEvent);
@@ -406,6 +494,7 @@ async function buildMutationResponse(
       timeoutMs: i.timeoutMs,
       pollIntervalMs: i.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
       maxWaitMs: i.maxWaitMs ?? DEFAULT_MAX_WAIT_MS,
+      ctx,
     });
     if (!polled.ok) {
       // Auth-class failures during the poll loop deserve a recovery hint that
@@ -452,6 +541,12 @@ async function buildMutationResponse(
         }
         return { ok: false, error: reLoginHint, rawBody: polled.rawBody };
       }
+      // Also the client-cancelled arm (`polled.cancelled`): it carries no
+      // AwsCallFailureKind, so it lands here and surfaces pollUntilTerminal's
+      // own message, which already names the cancellation and the
+      // requestToken to resume with. Deliberately not reported as ok:true --
+      // the operation had not reached a terminal state when we stopped
+      // watching, and saying otherwise would be a fake success.
       return { ok: false, error: polled.error ?? "Poll failed", rawBody: polled.rawBody };
     }
     return progressResponse(polled.command, polled.progressEvent, {
@@ -672,7 +767,7 @@ export const resourceTools: readonly Tool[] = [
       ...baseFields,
       ...awaitFields,
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         typeName: string;
         desiredState: Record<string, unknown>;
@@ -693,7 +788,7 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("create-resource", extraFlags, i);
       if (!result.ok) return ccapiFailure(result);
 
-      return buildMutationResponse({ command: result.command, data: result.data }, i);
+      return buildMutationResponse({ command: result.command, data: result.data }, i, ctx);
     },
   },
 
@@ -737,7 +832,7 @@ export const resourceTools: readonly Tool[] = [
       ...baseFields,
       ...awaitFields,
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         typeName: string;
         identifier: string;
@@ -766,7 +861,7 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("update-resource", extraFlags, i);
       if (!result.ok) return ccapiFailure(result);
 
-      return buildMutationResponse({ command: result.command, data: result.data }, i);
+      return buildMutationResponse({ command: result.command, data: result.data }, i, ctx);
     },
   },
 
@@ -788,7 +883,7 @@ export const resourceTools: readonly Tool[] = [
       ...baseFields,
       ...awaitFields,
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         typeName: string;
         identifier: string;
@@ -809,7 +904,7 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("delete-resource", extraFlags, i);
       if (!result.ok) return ccapiFailure(result);
 
-      return buildMutationResponse({ command: result.command, data: result.data }, i);
+      return buildMutationResponse({ command: result.command, data: result.data }, i, ctx);
     },
   },
 

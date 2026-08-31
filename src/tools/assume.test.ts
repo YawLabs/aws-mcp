@@ -6,6 +6,7 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { assumeTools } from "./assume.js";
+import type { ToolContext } from "./tool.js";
 
 const tool = assumeTools.find((t) => t.name === "aws_assume_role");
 if (!tool) throw new Error("assumeTools missing aws_assume_role");
@@ -598,5 +599,113 @@ describe("aws_assume_role — credentials file location and overwrite warning", 
     // Still exactly one section -- the warning describes an in-place update.
     const text = readFileSync(target, "utf-8");
     assert.equal((text.match(/\[mcp-dup\]/g) ?? []).length, 1);
+  });
+});
+
+describe("aws_assume_role -- progress reporting", () => {
+  // One STS round-trip with a 120s default timeout: long enough that silence
+  // reads as a hang, but with no internal step boundary to report. So there is
+  // exactly ONE report, it happens up front, and it carries no total --
+  // anything more would be manufactured.
+  interface ProgressCall {
+    progress: number;
+    total?: number;
+    message?: string;
+  }
+  const recordingCtx = (): { ctx: ToolContext; calls: ProgressCall[] } => {
+    const calls: ProgressCall[] = [];
+    return {
+      ctx: {
+        reportProgress: (progress, total, message) => {
+          calls.push({ progress, total, message });
+        },
+      },
+      calls,
+    };
+  };
+
+  it("emits exactly one starting report, with no invented total", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    const { ctx, calls } = recordingCtx();
+    const r = await tool.handler(
+      { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "progress-one", sourceProfile: "src-prof" },
+      ctx,
+    );
+
+    assert.equal(r.ok, true);
+    assert.equal(calls.length, 1, "one long call means one report -- no fabricated intermediate steps");
+    assert.equal(calls[0].total, undefined, "a single indivisible call has no honest denominator");
+    // Names the role and the assuming identity: what a human staring at a
+    // stalled SAML round-trip needs to know.
+    assert.match(calls[0].message ?? "", /sts:AssumeRole/);
+    assert.match(calls[0].message ?? "", /arn:aws:iam::123456789012:role\/Admin/);
+    assert.match(calls[0].message ?? "", /src-prof/);
+  });
+
+  it("quotes the same timeout the call actually uses", async () => {
+    // The message reads as a promise about how long this can take, so it has
+    // to come from the resolved timeout rather than a hardcoded 120.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    const withDefault = recordingCtx();
+    await tool.handler(
+      { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "progress-default" },
+      withDefault.ctx,
+    );
+    assert.match(withDefault.calls[0].message ?? "", /timeout 120s/);
+
+    const withOverride = recordingCtx();
+    await tool.handler(
+      { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "progress-override", timeoutMs: 5_000 },
+      withOverride.ctx,
+    );
+    assert.match(withOverride.calls[0].message ?? "", /timeout 5s/);
+  });
+
+  it("reports before the call, so a FAILED assume still produced its one update", async () => {
+    // Pins the report as a "starting" signal rather than a completion one: the
+    // STS call is denied here, and the update must already have gone out.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_access_denied";
+    const { ctx, calls } = recordingCtx();
+    const r = await tool.handler(
+      { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "progress-denied" },
+      ctx,
+    );
+
+    assert.equal(r.ok, false);
+    assert.equal(calls.length, 1, "the starting report does not depend on the outcome");
+    assert.match(calls[0].message ?? "", /sts:AssumeRole/);
+  });
+
+  it("does not report before input validation rejects the call", async () => {
+    // A call that never reaches STS should not announce that it is calling it.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    const { ctx, calls } = recordingCtx();
+    const r = await tool.handler({ roleArn: "not-an-arn", sessionName: "progress-badarn" }, ctx);
+
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid roleArn/);
+    assert.equal(calls.length, 0, "validation failures short-circuit before the STS call and its report");
+  });
+
+  it("a no-op ctx (the no-progressToken path) changes nothing about the result", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    // Distinct sessionNames so the second call is a fresh write rather than an
+    // overwrite (which would add a `warning` key of its own); `profile` and
+    // `hint` embed that name and are compared separately.
+    const reported = await tool.handler(
+      { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "noop-a" },
+      { reportProgress: () => {} },
+    );
+    const bare = await tool.handler({ roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "noop-b" });
+
+    assert.equal(reported.ok, true);
+    assert.equal(bare.ok, true);
+    const strip = (r: { data?: unknown }): Record<string, unknown> => {
+      const { profile, hint, ...rest } = r.data as Record<string, unknown>;
+      return rest;
+    };
+    assert.deepEqual(strip(reported), strip(bare), "the envelope must not depend on whether progress was reported");
+    assert.equal((reported.data as { profile: string }).profile, "mcp-noop-a");
+    assert.equal((bare.data as { profile: string }).profile, "mcp-noop-b");
   });
 });
