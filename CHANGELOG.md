@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.0.0] — 2026-08-31
 
 Findings from a full-pass audit of all 21 source files. The recurring defect was
 not broken code but **comments asserting safety properties the code did not
