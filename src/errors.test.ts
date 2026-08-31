@@ -2,17 +2,32 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { classifyAuthError, parseAwsError } from "./errors.js";
 
-describe("classifyAuthError — SDK patterns", () => {
-  it("detects SSOTokenProviderFailure by name", () => {
+describe("classifyAuthError — message text only, err.name is not consulted", () => {
+  // The classifier used to have three branches keyed on AWS SDK error CLASS
+  // NAMES (SSOTokenProviderFailure / ExpiredTokenException /
+  // CredentialsProviderError). They were unreachable: this package has no
+  // @aws-sdk dependency, and the one production caller is aws-cli.ts doing
+  // `classifyAuthError(new Error(stderrBuf))`, where name is always "Error".
+  // These cases pin that the name is genuinely ignored, so nobody restores a
+  // branch that can never fire.
+
+  it("ignores err.name = SSOTokenProviderFailure when the message says nothing", () => {
     const err = new Error("No cached SSO token found");
     err.name = "SSOTokenProviderFailure";
-    assert.equal(classifyAuthError(err).kind, "sso_expired");
+    assert.equal(classifyAuthError(err).kind, "other");
   });
 
-  it("detects ExpiredTokenException by name", () => {
-    const err = new Error("The security token included in the request is expired");
-    err.name = "ExpiredTokenException";
-    assert.equal(classifyAuthError(err).kind, "sso_expired");
+  it("ignores err.name = CredentialsProviderError when the message says nothing", () => {
+    const err = new Error("Could not load credentials from any providers");
+    err.name = "CredentialsProviderError";
+    assert.equal(classifyAuthError(err).kind, "other");
+  });
+
+  it("classifies purely on the message, whatever the name is", () => {
+    // Same stderr text, a misleading name attached: the text wins.
+    const err = new Error("Unable to locate credentials");
+    err.name = "SSOTokenProviderFailure";
+    assert.equal(classifyAuthError(err).kind, "no_creds");
   });
 
   it("detects SSO expiry by message content", () => {
@@ -29,11 +44,78 @@ describe("classifyAuthError — SDK patterns", () => {
     const err = new Error("Error when retrieving token from sso: Token has expired and refresh failed");
     assert.equal(classifyAuthError(err).kind, "sso_expired");
   });
+});
 
-  it("detects missing credentials via CredentialsProviderError name", () => {
-    const err = new Error("Could not load credentials from any providers");
-    err.name = "CredentialsProviderError";
-    assert.equal(classifyAuthError(err).kind, "no_creds");
+describe("classifyAuthError — service-reported expiry (ExpiredToken)", () => {
+  // The gap this closes: the standard-wrapper ExpiredToken shape is the most
+  // common way an expired session surfaces (the service rejects the request,
+  // rather than botocore failing to load a token), and the classifier used to
+  // call it "other" -- while parseAwsError, in the same file, already answered
+  // "Re-authenticate with aws_login_start." for the same code. The two halves
+  // disagreed; now they don't.
+
+  it("classifies the STS ExpiredToken wrapper as sso_expired", () => {
+    const err = new Error(
+      "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired",
+    );
+    assert.equal(classifyAuthError(err).kind, "sso_expired");
+  });
+
+  it("classifies the ExpiredTokenException spelling too", () => {
+    const err = new Error(
+      "An error occurred (ExpiredTokenException) when calling the DescribeInstances operation: The security token included in the request is expired",
+    );
+    assert.equal(classifyAuthError(err).kind, "sso_expired");
+  });
+
+  it("agrees with parseAwsError on the same stderr", () => {
+    // Both halves of the file now point at the same remedy for one input.
+    const stderr =
+      "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired";
+    assert.equal(classifyAuthError(new Error(stderr)).kind, "sso_expired");
+    assert.match(parseAwsError(stderr).suggestion ?? "", /aws_login_start/);
+  });
+
+  it("requires the wrapper -- a bare mention of the word does not match", () => {
+    // Anchored on "An error occurred (" so prose can't trip it.
+    assert.equal(classifyAuthError(new Error("the ExpiredToken metric fired on the dashboard")).kind, "other");
+    assert.equal(classifyAuthError(new Error("An error occurred (ExpiredTokenFoo) when calling X")).kind, "other");
+  });
+});
+
+describe("classifyAuthError — invalid_creds (credentials present but rejected)", () => {
+  // Distinct from no_creds, and the distinction is the point: no_creds means
+  // nothing resolved ("check ~/.aws/credentials"), invalid_creds means
+  // something resolved and AWS refused it (rotated key, wrong partition,
+  // clock skew). The remedies do not overlap.
+
+  it("classifies UnrecognizedClientException", () => {
+    const err = new Error(
+      "An error occurred (UnrecognizedClientException) when calling the ListBuckets operation: The security token included in the request is invalid.",
+    );
+    assert.equal(classifyAuthError(err).kind, "invalid_creds");
+  });
+
+  it("classifies InvalidClientTokenId", () => {
+    const err = new Error(
+      "An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: The security token included in the request is invalid",
+    );
+    assert.equal(classifyAuthError(err).kind, "invalid_creds");
+  });
+
+  it("classifies SignatureDoesNotMatch (wrong secret, or a drifted clock)", () => {
+    const err = new Error(
+      "An error occurred (SignatureDoesNotMatch) when calling the ListObjectsV2 operation: Signature expired: 20260830T000000Z is now earlier than 20260830T010000Z",
+    );
+    assert.equal(classifyAuthError(err).kind, "invalid_creds");
+  });
+
+  it("does NOT swallow a plain no-creds message", () => {
+    assert.equal(classifyAuthError(new Error("Unable to locate credentials")).kind, "no_creds");
+  });
+
+  it("requires the wrapper -- prose mentioning the code does not match", () => {
+    assert.equal(classifyAuthError(new Error("we saw SignatureDoesNotMatch in the logs last week")).kind, "other");
   });
 });
 
@@ -128,17 +210,6 @@ describe("classifyAuthError — false-positive guards", () => {
     assert.equal(classifyAuthError(err).kind, "other");
   });
 
-  it("does NOT classify a bare ExpiredToken STS error (no name set)", () => {
-    // The STS-side ExpiredToken error code is surfaced via the standard
-    // `An error occurred (ExpiredToken) when calling ...` shape and handled
-    // by parseAwsError -- not classifyAuthError. As a bare message with no
-    // `err.name = "ExpiredTokenException"`, it must fall through to "other".
-    const err = new Error(
-      "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired",
-    );
-    assert.equal(classifyAuthError(err).kind, "other");
-  });
-
   it("does NOT classify random text mentioning 'token' and 'expired' far apart", () => {
     const err = new Error("the API token for the upstream service has been rotated; the cache entry expired");
     assert.equal(classifyAuthError(err).kind, "other");
@@ -153,14 +224,12 @@ describe("classifyAuthError — false-positive guards", () => {
     assert.equal(classifyAuthError(err).kind, "other");
   });
 
-  it("does NOT classify a generic 'could not load credentials' message without err.name set", () => {
-    // The old NO_CREDS_RE matched /could not load credentials/i on raw
-    // message text. The replacement relies on err.name ===
-    // "CredentialsProviderError" for the SDK class (always set by the
-    // @aws-sdk/property-provider class constructor) and anchored canonical
-    // botocore strings for the CLI side. A bare message without a name set
-    // is no longer auto-classified -- if a real-world case is found, add a
-    // specific anchored pattern.
+  it("does NOT classify a generic 'could not load credentials' message", () => {
+    // The old NO_CREDS_RE matched /could not load credentials/i on raw message
+    // text, which is loose enough to catch unrelated prose. The replacement is
+    // the set of anchored canonical botocore strings -- nothing else is
+    // auto-classified. If a real-world case turns up, add a specific anchored
+    // pattern for it rather than loosening these.
     const err = new Error("could not load credentials from some custom non-AWS provider");
     assert.equal(classifyAuthError(err).kind, "other");
   });
@@ -216,6 +285,20 @@ describe("parseAwsError -- standard CLI shape", () => {
     assert.match(r.suggestion ?? "", /retry/i);
   });
 
+  it("suggests retry/backoff for every service's spelling of rate-limited", () => {
+    // Throttling has no single code across AWS: S3 says SlowDown, API Gateway
+    // and Lambda say TooManyRequestsException, DynamoDB says
+    // ProvisionedThroughputExceededException. Only the ThrottlingException
+    // family was recognized, so the other three got no suggestion at all --
+    // the agent had no hint that BACKING OFF was the fix, which is exactly the
+    // case where an agent instead retries in a hot loop.
+    for (const code of ["TooManyRequestsException", "SlowDown", "ProvisionedThroughputExceededException"]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the PutItem operation: Rate exceeded`);
+      assert.equal(r.code, code);
+      assert.match(r.suggestion ?? "", /retry/i, `expected a backoff suggestion for ${code}`);
+    }
+  });
+
   it("suggests verifying identifier/region for ResourceNotFoundException", () => {
     const r = parseAwsError(
       "An error occurred (ResourceNotFoundException) when calling the GetFunction operation: Function not found: my-fn",
@@ -238,6 +321,43 @@ describe("parseAwsError -- standard CLI shape", () => {
       "An error occurred (ConflictException) when calling the UpdateResource operation: state conflict",
     );
     assert.match(r.suggestion ?? "", /aws_resource_get/);
+  });
+});
+
+describe("parseAwsError -- not-authorized text OUTSIDE the standard wrapper", () => {
+  // NOT_AUTHORIZED_RE only ever ran against the message captured INSIDE "An
+  // error occurred (...) when calling ...". The same sentence also arrives
+  // bare -- cloudcontrol/CCAPI and several higher-level `aws` customizations
+  // emit it unwrapped -- and those fell through to message-only with no
+  // suggestion, losing the single most actionable hint the CLI produces.
+
+  it("derives the IAM suggestion from a bare 'User: ... is not authorized to perform: ...'", () => {
+    const r = parseAwsError(
+      "User: arn:aws:iam::123456789012:user/jeff is not authorized to perform: cloudformation:DescribeStacks on resource: arn:aws:cloudformation:us-east-1:123456789012:stack/foo",
+    );
+    assert.match(r.suggestion ?? "", /IAM permissions/);
+    assert.match(r.suggestion ?? "", /arn:aws:iam::123456789012:user\/jeff/);
+    assert.match(r.suggestion ?? "", /cloudformation:DescribeStacks/);
+    // The raw text is still preserved for diagnosis.
+    assert.match(r.message ?? "", /not authorized/);
+  });
+
+  it("leaves code/operation undefined for the bare form (there is no wrapper to parse)", () => {
+    const r = parseAwsError("User: arn:aws:sts::1:assumed-role/R/s is not authorized to perform: s3:GetObject");
+    assert.equal(r.code, undefined);
+    assert.equal(r.operation, undefined);
+    assert.ok(r.suggestion);
+  });
+
+  it("still prefers the wrapped parse when the wrapper IS present", () => {
+    // The wrapped branch returns first and carries code + operation, so adding
+    // the bare check must not shadow it.
+    const r = parseAwsError(
+      "An error occurred (AccessDenied) when calling the GetBucketLocation operation: User: arn:aws:iam::123:user/foo is not authorized to perform: s3:GetBucketLocation",
+    );
+    assert.equal(r.code, "AccessDenied");
+    assert.equal(r.operation, "GetBucketLocation");
+    assert.match(r.suggestion ?? "", /s3:GetBucketLocation/);
   });
 });
 

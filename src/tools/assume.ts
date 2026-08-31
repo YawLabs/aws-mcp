@@ -8,8 +8,14 @@ import type { Tool, ToolResult } from "./tool.js";
 
 /**
  * Pick a target profile name. We prefix user-chosen names with 'mcp-' to
- * make it obvious which profiles this tool writes, and to avoid stomping
- * on a pre-existing profile the user cares about.
+ * make it obvious which profiles this tool writes, and to keep an unprefixed
+ * name (`prod`, `default`) from being written over by accident.
+ *
+ * The prefix is a NAMING convention, not a collision guard: nothing stops a
+ * user from having their own `mcp-*` profile, and mergeProfileBody overwrites
+ * the three managed keys in place when the target section already exists. The
+ * handler surfaces a `warning` in that case rather than pretending it can't
+ * happen.
  */
 function resolveTargetProfile(input: { targetProfile?: string; sessionName: string }): string {
   if (input.targetProfile) {
@@ -18,6 +24,27 @@ function resolveTargetProfile(input: { targetProfile?: string; sessionName: stri
   // Apply the same no-double-prefix guard for the sessionName fallback: a
   // sessionName of 'mcp-session' must yield 'mcp-session', not 'mcp-mcp-session'.
   return input.sessionName.startsWith("mcp-") ? input.sessionName : `mcp-${input.sessionName}`;
+}
+
+/**
+ * Where to write the assumed-role profile.
+ *
+ * botocore resolves the shared credentials file from AWS_SHARED_CREDENTIALS_FILE
+ * (expanding a leading `~`) before falling back to ~/.aws/credentials. Honoring
+ * it here keeps our write and the CLI's later read pointed at the same file: a
+ * user who had it set was previously handed a profile written where the CLI
+ * never looks, so the returned hint named a profile that did not exist from the
+ * CLI's point of view. It is also the remedy the EACCES message below suggests
+ * -- ignoring the variable made that advice a no-op.
+ */
+function resolveCredentialsPath(): string {
+  const fromEnv = process.env.AWS_SHARED_CREDENTIALS_FILE?.trim();
+  if (!fromEnv) return join(homedir(), ".aws", "credentials");
+  // Mirror botocore's expanduser() so `~/creds` means <home>/creds rather than
+  // a literal `~` directory next to the cwd.
+  if (fromEnv === "~") return homedir();
+  if (fromEnv.startsWith("~/") || fromEnv.startsWith("~\\")) return join(homedir(), fromEnv.slice(2));
+  return fromEnv;
 }
 
 /**
@@ -203,13 +230,14 @@ export const assumeTools: readonly Tool[] = [
         return { ok: false, error: "STS AssumeRole succeeded but returned incomplete credentials." };
       }
 
-      const credentialsPath = join(homedir(), ".aws", "credentials");
+      const credentialsPath = resolveCredentialsPath();
+      let existed = false;
       try {
-        await upsertProfile(credentialsPath, targetProfile, {
+        ({ existed } = await upsertProfile(credentialsPath, targetProfile, {
           aws_access_key_id: creds.AccessKeyId,
           aws_secret_access_key: creds.SecretAccessKey,
           aws_session_token: creds.SessionToken,
-        });
+        }));
       } catch (err) {
         // acquireLock / openSync inside upsertProfile can throw a raw NodeJS
         // ErrnoException when the credentials parent is read-only (EACCES /
@@ -220,9 +248,12 @@ export const assumeTools: readonly Tool[] = [
         // path is preserved.
         const code = (err as NodeJS.ErrnoException).code;
         if (code === "EACCES" || code === "EROFS" || code === "EPERM") {
+          const hint = process.env.AWS_SHARED_CREDENTIALS_FILE?.trim()
+            ? "That path comes from AWS_SHARED_CREDENTIALS_FILE -- point it at a writable file, or unset it to fall back to ~/.aws/credentials."
+            : "Check directory permissions, or set AWS_SHARED_CREDENTIALS_FILE to a writable path.";
           return {
             ok: false,
-            error: `Cannot write ${credentialsPath} (permission denied). Check directory permissions or set AWS_SHARED_CREDENTIALS_FILE to a writable path.`,
+            error: `Cannot write ${credentialsPath} (permission denied). ${hint}`,
           };
         }
         throw err;
@@ -238,6 +269,16 @@ export const assumeTools: readonly Tool[] = [
           assumedRoleArn: data.AssumedRoleUser?.Arn,
           assumedRoleId: data.AssumedRoleUser?.AssumedRoleId,
           sourceProfile,
+          // Only present when we overwrote a section that was already there.
+          // The 'mcp-' prefix makes collisions unlikely, not impossible -- the
+          // user may keep their own mcp-* profile, or re-assume into the same
+          // sessionName -- and the three managed keys are replaced in place
+          // either way.
+          ...(existed
+            ? {
+                warning: `Profile '${targetProfile}' already existed in ${credentialsPath}; its aws_access_key_id, aws_secret_access_key and aws_session_token were overwritten. Other keys in that section (region, output, ...) were left as-is.`,
+              }
+            : {}),
           hint: `Pass profile='${targetProfile}' to subsequent aws_call / aws_whoami / aws_paginate calls to use these credentials. They expire at ${expiration ?? "unknown"}.`,
         },
       };

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { allTools, errorToMcpResult, toMcpResult } from "./index.js";
+import { allTools, errorToMcpResult, findDuplicateToolNames, toMcpResult } from "./index.js";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
@@ -78,18 +78,41 @@ describe("toMcpResult — ok:true (success) branches", () => {
     assert.equal(r.isError, undefined);
   });
 
-  it("short-circuits to rawBody on success, bypassing JSON serialization of data", () => {
-    // rawBody wins over data on the success path: `response.rawBody ?? JSON...`.
-    const r = toMcpResult({ ok: true, data: { ignored: true }, rawBody: "raw output text" });
-    assert.equal(r.content[0].text, "raw output text");
-    // The data is NOT serialized when rawBody is present.
-    assert.equal(r.content[0].text.includes("ignored"), false);
+  it("emits BOTH data and rawBody when a handler sets both", () => {
+    // Regression: this used to be `response.rawBody ?? JSON.stringify(data)`,
+    // which silently DROPPED data whenever rawBody was also present. A handler
+    // returning a parsed summary alongside the raw CLI output had the summary
+    // thrown away and the model saw only the raw text.
+    const r = toMcpResult({ ok: true, data: { kept: true }, rawBody: "raw output text" });
+    assert.equal(r.content[0].text, `${JSON.stringify({ kept: true }, null, 2)}\n\nraw output text`);
+    assert.match(r.content[0].text, /"kept": true/);
+    assert.match(r.content[0].text, /raw output text/);
     assert.equal(r.isError, undefined);
   });
 
-  it("treats data:null as present, not as the success-fallback (?? guards null/undefined data)", () => {
-    // `response.data ?? { success: true }` — null data falls through to the
-    // fallback, so a null-data success serializes { success: true }.
+  it("emits rawBody alone when there is no data", () => {
+    const r = toMcpResult({ ok: true, rawBody: "raw output text" });
+    assert.equal(r.content[0].text, "raw output text");
+    // No blank-line separator when there is only one part.
+    assert.equal(r.content[0].text.includes("\n\n"), false);
+  });
+
+  it("emits data alone when there is no rawBody", () => {
+    const r = toMcpResult({ ok: true, data: { only: 1 } });
+    assert.equal(r.content[0].text, JSON.stringify({ only: 1 }, null, 2));
+  });
+
+  it("still uses the { success: true } fallback when data is null AND rawBody is present", () => {
+    // null data is "no data" (matching the old `?? { success: true }`), so the
+    // rawBody is the only part -- not `null\n\nraw`.
+    const r = toMcpResult({ ok: true, data: null, rawBody: "raw" });
+    assert.equal(r.content[0].text, "raw");
+  });
+
+  it("treats data:null as absent, so a null-data success serializes { success: true }", () => {
+    // Preserved from the old `response.data ?? { success: true }`: null and
+    // undefined both mean "no data", and with no rawBody either there is
+    // nothing to report, so the fallback stands in.
     const r = toMcpResult({ ok: true, data: null });
     assert.equal(r.content[0].text, JSON.stringify({ success: true }, null, 2));
   });
@@ -245,5 +268,42 @@ describe("tool registry snapshot", () => {
       }
       seen.set(t.name, i);
     }
+  });
+});
+
+describe("findDuplicateToolNames", () => {
+  // src/index.ts runs this over allTools at MODULE LOAD and throws on a hit,
+  // so a name collision can no longer ship as a tool that registers, counts
+  // toward the ready line, and is simply unreachable over MCP (server.tool is
+  // keyed by name -- the later registration shadows the earlier one, and the
+  // SDK says nothing). The assertion above proves the real registry is clean;
+  // these prove the detector itself works, which a clean registry cannot.
+  const stub = (name: string): Tool =>
+    ({
+      name,
+      description: "",
+      annotations: {},
+      inputSchema: {},
+      handler: async () => ({ ok: true }),
+    }) as unknown as Tool;
+
+  it("returns an empty array for a registry with unique names", () => {
+    assert.deepEqual(findDuplicateToolNames([stub("a"), stub("b"), stub("c")]), []);
+  });
+
+  it("returns an empty array for an empty registry", () => {
+    assert.deepEqual(findDuplicateToolNames([]), []);
+  });
+
+  it("names the collision once, however many times it repeats", () => {
+    assert.deepEqual(findDuplicateToolNames([stub("a"), stub("b"), stub("a"), stub("a")]), ["a"]);
+  });
+
+  it("reports every distinct collision", () => {
+    assert.deepEqual(findDuplicateToolNames([stub("a"), stub("b"), stub("a"), stub("b"), stub("c")]), ["a", "b"]);
+  });
+
+  it("agrees with the live registry (which must be collision-free)", () => {
+    assert.deepEqual(findDuplicateToolNames(allTools), []);
   });
 });

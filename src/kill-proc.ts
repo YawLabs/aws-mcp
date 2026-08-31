@@ -7,10 +7,18 @@
  * the uncatchable SIGKILL to die. The escalation timer is .unref()'d so a
  * still-pending kill can't keep the Node event loop alive past shutdown.
  *
- * On Windows the escalation branch is effectively dead: Node maps every
- * kill() signal to TerminateProcess, which terminates the child immediately
- * and unconditionally, so the SIGTERM call already killed it and the
- * post-window SIGKILL never has a live proc to act on.
+ * The escalation is guarded on procHasExited(), NOT on proc.killed. Node sets
+ * proc.killed when a signal is DISPATCHED (the kill() call itself), not when
+ * the child actually dies -- so `killed` is already true by the time the
+ * escalation timer fires, on every platform, and a `!proc.killed` guard would
+ * make the SIGKILL branch unreachable everywhere. exitCode / signalCode are
+ * the fields that actually report the child gone.
+ *
+ * Windows still reaches the escalation less often in practice: Node maps every
+ * kill() signal to TerminateProcess, so the SIGTERM above usually kills the
+ * child outright and libuv has populated exitCode before the window elapses.
+ * That is a timing observation, not a guarantee -- the guard is what makes it
+ * safe, and a Windows child that has not been reaped yet still gets SIGKILL.
  */
 
 import type { ChildProcess } from "node:child_process";
@@ -39,12 +47,15 @@ export function killProc(proc: ChildProcess, escalationMs: number = KILL_ESCALAT
     // proc may already be dead
   }
   setTimeout(() => {
-    // Unix escalation path. On Windows this is effectively unreachable: the
-    // SIGTERM above maps to TerminateProcess and kills the child immediately,
-    // so by the time this fires proc.killed is true (or exitCode is set) and
-    // the guard short-circuits. SIGKILL only does real work for a Unix child
-    // that ignored SIGTERM and is still alive after the grace window.
-    if (!proc.killed && proc.exitCode === null) {
+    // Escalate only if the child is still alive after the grace window --
+    // it ignored SIGTERM, or is wedged in uninterruptible sleep.
+    //
+    // procHasExited, NOT proc.killed: Node flips `killed` when the signal is
+    // SENT (the kill() call above), so it is unconditionally true here and a
+    // `!proc.killed` guard would kill this branch on every platform, not just
+    // Windows. procHasExited reads exitCode / signalCode, which libuv only
+    // populates once the child has actually been reaped.
+    if (!procHasExited(proc)) {
       try {
         proc.kill("SIGKILL");
       } catch {

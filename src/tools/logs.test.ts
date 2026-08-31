@@ -2,7 +2,17 @@ import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { isValidLogStreamName, LOG_GROUP_RE, LOG_STREAM_NAME_RE, logsTools, parseLogsJsonOutput } from "./logs.js";
+import {
+  isValidLogStreamName,
+  LOG_GROUP_RE,
+  LOG_STREAM_NAME_RE,
+  logsTools,
+  MAX_SINCE_MS,
+  parseLogsJsonOutput,
+  RELATIVE_TIME_RE,
+  relativeTimeMs,
+  resolveLogGroupName,
+} from "./logs.js";
 
 const tool = logsTools.find((t) => t.name === "aws_logs_tail");
 if (!tool) throw new Error("logsTools missing aws_logs_tail");
@@ -57,6 +67,66 @@ describe("LOG_GROUP_RE", () => {
 
   it("rejects empty string", () => {
     assert.doesNotMatch("", LOG_GROUP_RE);
+  });
+});
+
+describe("resolveLogGroupName", () => {
+  it("passes a bare group name through unchanged", () => {
+    assert.equal(resolveLogGroupName("/aws/lambda/my-fn"), "/aws/lambda/my-fn");
+    assert.equal(resolveLogGroupName("my-custom-group"), "my-custom-group");
+  });
+
+  it("extracts the group name from a log-group ARN (the console's copy-button shape)", () => {
+    // LOG_GROUP_RE rejects ':', so a pasted ARN used to bounce with a shape
+    // error even though the group it names is perfectly valid.
+    assert.equal(
+      resolveLogGroupName("arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn"),
+      "/aws/lambda/my-fn",
+    );
+  });
+
+  it("tolerates the trailing ':*' that IAM policies and the console carry", () => {
+    assert.equal(
+      resolveLogGroupName("arn:aws:logs:eu-west-1:123456789012:log-group:/aws/ecs/my-service:*"),
+      "/aws/ecs/my-service",
+    );
+  });
+
+  it("accepts non-commercial partitions", () => {
+    assert.equal(resolveLogGroupName("arn:aws-us-gov:logs:us-gov-west-1:123456789012:log-group:app/svc"), "app/svc");
+  });
+
+  it("holds an ARN-extracted name to the same argv-safety contract as a bare one", () => {
+    // The extracted name still runs through LOG_GROUP_RE, so a hostile or
+    // malformed group inside an otherwise well-formed ARN is still rejected.
+    assert.equal(resolveLogGroupName("arn:aws:logs:us-east-1:123456789012:log-group:-force"), null);
+    assert.equal(resolveLogGroupName("arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/foo;rm"), null);
+  });
+
+  it("rejects near-miss ARNs and non-group inputs", () => {
+    assert.equal(resolveLogGroupName("arn:aws:logs:us-east-1:12345:log-group:/aws/lambda/fn"), null); // short account
+    assert.equal(resolveLogGroupName("arn:aws:s3:::my-bucket"), null); // wrong service
+    assert.equal(resolveLogGroupName("--force"), null);
+    assert.equal(resolveLogGroupName(""), null);
+  });
+});
+
+describe("relativeTimeMs (shared with aws_metrics_query)", () => {
+  // The pattern lives here and metrics.ts imports it -- previously the two
+  // files each carried a byte-identical copy.
+  it("converts each documented unit", () => {
+    assert.equal(relativeTimeMs("30s"), 30_000);
+    assert.equal(relativeTimeMs("15m"), 15 * 60_000);
+    assert.equal(relativeTimeMs("2h"), 2 * 3_600_000);
+    assert.equal(relativeTimeMs("1d"), 86_400_000);
+    assert.equal(relativeTimeMs("1w"), 7 * 86_400_000);
+  });
+
+  it("returns null for anything RELATIVE_TIME_RE rejects", () => {
+    for (const bad of ["5", "m", "5x", "15M", "5 m", "-5m", ""]) {
+      assert.equal(relativeTimeMs(bad), null, `expected '${bad}' to be rejected`);
+      assert.doesNotMatch(bad, RELATIVE_TIME_RE);
+    }
   });
 });
 
@@ -283,6 +353,59 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     })) as { ok: boolean; error?: string };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid logStreamNamePrefix/);
+  });
+
+  it("accepts a log-group ARN where a bare name is expected", async () => {
+    // Reaches the spawn path, so only assert that validation let it through --
+    // the ARN branch itself is pinned by the resolveLogGroupName cases above.
+    const r = (await tool.handler({
+      logGroupName: "arn:aws:logs:us-east-1:123456789012:log-group:-force",
+    })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false, "a hostile group name inside an ARN is still rejected");
+    assert.match(r.error ?? "", /Invalid logGroupName/);
+    assert.match(r.error ?? "", /log-group ARN/, "the error must name the ARN form as accepted input");
+  });
+
+  it("rejects a zero-width since window", async () => {
+    // '0m' matched the shape regex, spawned the CLI, and came back ok:true with
+    // eventCount:0 -- indistinguishable from 'the log group is quiet'.
+    for (const since of ["0m", "0s", "0h", "0d", "0w"]) {
+      const r = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since })) as {
+        ok: boolean;
+        error?: string;
+      };
+      assert.equal(r.ok, false, `expected ${since} to be rejected`);
+      assert.match(r.error ?? "", /zero-width window/);
+    }
+  });
+
+  it("rejects a since window beyond the maximum", async () => {
+    // 'aws logs tail' drains FilterLogEvents internally; the 60s timeout and
+    // the 5MB stdout cap only fire AFTER the API calls are spent.
+    const r = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "520w" })) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /maximum is 30 days/);
+    assert.equal(MAX_SINCE_MS, 30 * 86_400_000, "error text above is anchored to MAX_SINCE_MS");
+  });
+
+  it("still runs the windows the description documents (boundary: 4w in, 5w out)", async () => {
+    // The cap must not shrink the vocabulary the tool advertises ('1w', '3d').
+    // 4w (28 days) is inside the 30-day ceiling and runs; 5w (35 days) is not.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_empty";
+    const inside = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "4w" })) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(inside.ok, true, "28 days must still be allowed");
+    const outside = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "5w" })) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(outside.ok, false, "35 days is over the ceiling");
+    assert.match(outside.error ?? "", /maximum is 30 days/);
   });
 
   it("rejects a filterPattern that starts with '-'", async () => {

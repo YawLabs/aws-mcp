@@ -14,7 +14,14 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { killProc, procHasExited } from "./kill-proc.js";
-import { getProfile, getRegion, isValidProfileName, isValidRegionName } from "./session.js";
+import {
+  getProfile,
+  getRegion,
+  invalidProfileMessage,
+  invalidRegionMessage,
+  isValidProfileName,
+  isValidRegionName,
+} from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
@@ -70,6 +77,37 @@ export function redactDisplayArgs(args: readonly string[]): string[] {
   return out;
 }
 
+// Characters that need no quoting in a POSIX shell word. Deliberately
+// conservative: anything outside this set gets single-quoted.
+const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
+/**
+ * Quote one argv entry for a POSIX shell, so displayCommand is something the
+ * reader can actually paste.
+ *
+ * The consumer of `data.command` is an LLM, which will paste it into a shell
+ * far more readily than a human would. The argv entries reaching it are not
+ * all shell-inert: isValidProfileName permits `:` and `@`, --query carries
+ * arbitrary JMESPath (spaces, `[`, `]`, `*`), and the redaction stub itself
+ * contains spaces and angle brackets. Joining those on a space produced a
+ * string that either fails to run or -- with a `$(...)`-bearing value --
+ * runs something the caller never asked for.
+ *
+ * Single-quoting is the safe form: inside single quotes a POSIX shell expands
+ * nothing. An embedded single quote closes, escapes, and reopens ('\'').
+ * cmd.exe and PowerShell quote differently, so this is still a display string
+ * rather than a universal one -- but it is now correct wherever `aws` is
+ * normally driven from.
+ *
+ * Exported for direct unit coverage: the quoting rules are the security
+ * boundary here, so they get asserted head-on rather than only through a
+ * spawned call.
+ */
+export function shellQuoteArg(arg: string): string {
+  if (SHELL_SAFE_ARG_RE.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
 export function truncateForErrorMsg(text: string): string {
   if (text.length <= MAX_ERROR_MSG_CHARS) return text;
   // Don't cut between a high and low surrogate -- slicing mid-pair emits a
@@ -82,7 +120,10 @@ export function truncateForErrorMsg(text: string): string {
   return `${text.slice(0, cut)}\n\n[truncated; ${omitted} chars omitted]`;
 }
 
-export interface AwsCallOptions {
+// Not exported: runAwsCall is the only consumer, and no .d.ts ships (the
+// published `files` list is dist/index.js alone), so there is no external
+// caller to name this type.
+interface AwsCallOptions {
   service: string;
   operation: string;
   params?: Record<string, unknown>;
@@ -98,27 +139,46 @@ export interface AwsCallOptions {
   // Internal callers only -- e.g. aws_paginate adds --max-items and
   // --starting-token here. Each entry is appended verbatim to argv.
   extraFlags?: string[];
+  // Set when the operation emits NEWLINE-DELIMITED JSON rather than one JSON
+  // document -- `aws logs tail --format json` is the only such op today.
+  //
+  // Load-bearing for the malformed_json check below, not just documentation.
+  // NDJSON opens with `{` and fails a whole-blob JSON.parse, which is exactly
+  // the signature that check uses to catch a truncated payload. Without this
+  // flag a perfectly complete multi-event log tail is reported as truncated.
+  ndjson?: boolean;
   // Test-injection knobs, mirrored from startSsoLogin. Not exposed via MCP.
   command?: string;
   prefixArgs?: string[];
   env?: NodeJS.ProcessEnv;
 }
 
+// AuthErrorKind MINUS "other". classifyAuthError returns "other" for anything
+// it doesn't recognize, but the exit handler below maps that case to
+// "nonzero_exit" -- so "other" can never appear on an AwsCallResult, and
+// including it here would give every consumer switch a permanently dead arm.
 export type AwsCallFailureKind =
-  | AuthErrorKind // "sso_expired" | "no_creds" | "other"
+  | Exclude<AuthErrorKind, "other"> // "sso_expired" | "no_creds" | "invalid_creds"
   | "bad_input"
   | "spawn_failure"
   | "timeout"
   | "output_too_large"
+  | "malformed_json"
   | "nonzero_exit";
 
-export interface AwsCallSuccess {
+// Not exported for the same reason as AwsCallOptions: consumers reference the
+// AwsCallResult union, never this arm by name.
+interface AwsCallSuccess {
   ok: true;
   /**
    * Parsed JSON value on a successful `--output json` run, OR a raw trimmed
    * string when the CLI emits non-JSON stdout despite `--output json` (e.g.
    * `--query` expressions that extract a scalar string/number return the value
-   * without JSON quoting). Callers must type-guard before assuming a structured
+   * without JSON quoting), or the raw NDJSON blob when the caller passed
+   * `ndjson: true`. Otherwise only genuinely scalar-looking stdout takes the
+   * string branch -- text that opens with `{` or `[` and fails to parse is a
+   * truncated payload and settles as a `malformed_json` FAILURE, not a
+   * success. Callers must type-guard before assuming a structured
    * object: `typeof data === "string"` vs `typeof data === "object"`.
    * For `--output text/table/yaml` this is always the raw stdout string.
    */
@@ -212,14 +272,14 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     return Promise.resolve({
       ok: false,
       kind: "bad_input",
-      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Check the 'profile' arg or AWS_PROFILE env var.`,
+      error: invalidProfileMessage(profile, "Check the 'profile' arg or AWS_PROFILE env var."),
     });
   }
   if (!isValidRegionName(region)) {
     return Promise.resolve({
       ok: false,
       kind: "bad_input",
-      error: `Invalid region '${region}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1'). Check the 'region' arg or AWS_REGION / AWS_DEFAULT_REGION env var.`,
+      error: invalidRegionMessage(region, "Check the 'region' arg or AWS_REGION / AWS_DEFAULT_REGION env var."),
     });
   }
   const outputFormat = opts.outputFormat ?? "json";
@@ -266,13 +326,24 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     args.push("--cli-input-json", JSON.stringify(opts.params));
   }
 
-  // Display-only string for logging/MCP response -- NOT copy-paste shell-safe.
-  // The real invocation uses the argv array above (no shell, no quoting needed).
-  // Values containing spaces or shell metacharacters will look misleading here.
-  const displayCommand = [command, ...redactDisplayArgs(args)].join(" ");
+  // Display string for logging / the MCP response, shell-quoted per entry so
+  // it survives a paste into a POSIX shell. The real invocation still uses the
+  // argv array above (no shell involved), so the quoting here is purely about
+  // what the caller SEES -- and the caller is a model that will paste it.
+  const displayCommand = [command, ...redactDisplayArgs(args)].map(shellQuoteArg).join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;
+    // This catch is near-unreachable and stays deliberately. ENOENT -- the
+    // failure that actually happens (no `aws` on PATH) -- arrives async on the
+    // 'error' event below, not here; spawn only throws synchronously on
+    // argument-shape errors (ERR_INVALID_ARG_TYPE and friends), which the
+    // validation above already rules out for every production path.
+    //
+    // What it buys: a throw inside a Promise executor REJECTS the promise. Every
+    // caller of runAwsCall consumes an AwsCallResult envelope and none of them
+    // wrap the call in try/catch, so without this the one exotic case would
+    // bypass the envelope entirely and surface as an unhandled rejection.
     try {
       proc = spawn(command, args, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -320,9 +391,15 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       killed = true;
       timedOut = true;
       // killProc sends SIGTERM then escalates to SIGKILL, so the process WILL
-      // exit and 'exit' WILL fire -- that is where settle() is called.
-      // No watchdog timeout is needed here by design: SIGKILL is unconditional
-      // on every platform the CLI targets, so the exit event is guaranteed.
+      // exit and 'close' WILL fire -- that is where settle() is called.
+      //
+      // No watchdog timer here, but that is a DEPENDENCY, not a free property:
+      // it holds only because killProc's escalation actually fires. Its guard
+      // is procHasExited (exitCode/signalCode), not proc.killed -- a
+      // `!proc.killed` guard would be false on every platform the moment
+      // SIGTERM was dispatched, the SIGKILL would never be sent, and a child
+      // that ignores SIGTERM would leave this promise pending forever. If that
+      // guard is ever loosened, add a watchdog here. See kill-proc.ts.
       killProc(proc);
     }, timeoutMs);
 
@@ -360,7 +437,13 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       });
     });
 
-    proc.on("exit", (code) => {
+    // 'close', not 'exit': 'exit' fires as soon as the child is reaped, while
+    // its stdio pipes may still hold buffered data we have not read. Settling
+    // there truncates stdout on a fast-exiting child and the JSON parse below
+    // then fails on a payload that arrived complete. 'close' fires only once
+    // every pipe has been drained and closed. Matches the version probe in
+    // sso.ts, which settles on 'close' for the same reason.
+    proc.on("close", (code) => {
       clearTimeout(timeoutHandle);
       // Flush any incomplete multi-byte sequence held in the decoder.
       stdoutBuf += stdoutDecoder.end();
@@ -395,6 +478,12 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         if (classified.kind === "sso_expired") {
           kind = "sso_expired";
           errorMsg = `SSO session expired for profile '${profile}'. Call aws_login_start with profile='${profile}' to re-authenticate.`;
+        } else if (classified.kind === "invalid_creds") {
+          // Distinct from no_creds on purpose: credentials WERE found and sent,
+          // and the service rejected them. "Check ~/.aws/credentials exists" is
+          // the wrong advice here.
+          kind = "invalid_creds";
+          errorMsg = `Credentials for profile '${profile}' were rejected by AWS (they resolved, but the service refused them). Common causes: the access key was deleted or rotated, the profile points at the wrong partition/account, or the machine clock has drifted enough to break request signing. Underlying error: ${truncateForErrorMsg(stderrBuf.trim())}`;
         } else if (classified.kind === "no_creds") {
           kind = "no_creds";
           errorMsg = `No credentials found for profile '${profile}'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${truncateForErrorMsg(stderrBuf.trim())}`;
@@ -427,9 +516,39 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         }
         try {
           settle({ ok: true, data: JSON.parse(trimmed), command: displayCommand, rawStdout: stdoutBuf });
-        } catch {
-          // Some operations emit plain strings even with --output json (e.g.
-          // --query expressions that extract scalars). Preserve the text.
+        } catch (err) {
+          // Two very different situations reach this catch, and collapsing them
+          // into one ok:true was hiding the bad one.
+          //
+          // (a) Legitimately non-JSON stdout: some operations emit a plain
+          //     scalar even under --output json (a --query expression that
+          //     extracts a string/number returns it unquoted). Preserve the
+          //     text -- that IS the successful result.
+          //
+          // (b) stdout that OPENS as a JSON object/array and fails to parse:
+          //     a truncated or corrupted payload. Reporting that as ok:true
+          //     hands the caller a string where the schema promises an object,
+          //     and the truncation disappears silently.
+          //
+          // The first character separates them: no scalar starts with { or [.
+          //
+          // (c) NDJSON, when the caller declared it: every line is its own JSON
+          //     document, so the blob opens with `{` and cannot parse as a
+          //     whole. That is the format working correctly, not a truncation,
+          //     so it takes the string branch and the caller splits the lines.
+          if (!opts.ndjson && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
+            const detail = err instanceof Error ? err.message : String(err);
+            settle({
+              ok: false,
+              kind: "malformed_json",
+              error: `aws CLI exited 0 but its stdout opens as JSON and failed to parse: ${detail}. The payload is most likely truncated. Retry, or narrow the response with --query / pagination. Raw stdout is preserved in rawStdout.`,
+              command: displayCommand,
+              exitCode: code,
+              rawStdout: stdoutBuf,
+              rawStderr: stderrBuf,
+            });
+            return;
+          }
           settle({ ok: true, data: trimmed, command: displayCommand, rawStdout: stdoutBuf });
         }
       } else {

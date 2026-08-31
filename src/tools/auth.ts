@@ -13,6 +13,68 @@ import type { Tool, ToolResult } from "./tool.js";
 // event loop on readFileSync.
 const MAX_SSO_CACHE_FILE_BYTES = 64 * 1024;
 
+/**
+ * Clock-skew cushion on the expiry check.
+ *
+ * Without one, a client clock even slightly fast makes `expiresAtMs <= now`
+ * true for a token the SSO endpoint would still honor, so the cached token is
+ * silently discarded and the caller is pushed through a pointless re-login.
+ * Deliberately small: it must not keep a genuinely dead token alive long
+ * enough that the NEXT CLI call fails with a confusing sso_expired. It only
+ * covers seconds-scale skew -- a clock minutes off still needs fixing at the
+ * OS level.
+ */
+const EXPIRY_SKEW_GRACE_MS = 60_000;
+
+/**
+ * Parse a cache file's `expiresAt` into epoch millis, or NaN.
+ *
+ * botocore's LEGACY SSO cache writer formats the field with strftime
+ * `%Y-%m-%dT%H:%M:%S%Z`, which renders as `2026-08-30T12:00:00UTC` -- not an
+ * ISO-8601 spelling, and `new Date()` returns NaN for it (with or without a
+ * space before `UTC`). The modern `sso-session` path writes `...Z` and parses
+ * fine, so this only bit profiles using the inline `sso_start_url` style:
+ * every cache file was skipped, findCachedSsoToken returned null, and
+ * aws_refresh_if_expiring_soon spawned a fresh login on every call while
+ * reporting "No cached SSO token found".
+ */
+function parseExpiresAt(raw: unknown): number {
+  if (typeof raw !== "string") return Number.NaN;
+  const direct = new Date(raw).getTime();
+  if (Number.isFinite(direct)) return direct;
+  // Rewrite only the trailing `UTC` designator; anything else is left alone so
+  // a genuinely malformed value still lands in the warn path below.
+  const normalized = raw.replace(/\s*UTC$/, "Z");
+  return normalized === raw ? Number.NaN : new Date(normalized).getTime();
+}
+
+/**
+ * Warn-once dedupe for cache files whose `expiresAt` will not parse. Keyed by
+ * file path plus raw value so a NEW bad file is still reported, while the
+ * common case (the same bad file re-read on every aws_whoami) warns exactly
+ * once. Mirrors the parseTestPrefixArgs dedupe in aws-cli.ts.
+ */
+const warnedUnparseableExpiry = new Set<string>();
+
+/** For tests -- drop the warn-once dedupe so the warning can be re-observed. */
+export function _resetUnparseableExpiryDedupe(): void {
+  warnedUnparseableExpiry.clear();
+}
+
+/**
+ * Surface an unparseable expiry instead of silently skipping the file. Goes to
+ * stderr (console.warn), never stdout -- stdout is the MCP protocol channel.
+ * The value is a timestamp, not credential material, so echoing it is safe.
+ */
+function warnUnparseableExpiry(path: string, raw: unknown): void {
+  const key = `${path} :: ${String(raw)}`;
+  if (warnedUnparseableExpiry.has(key)) return;
+  warnedUnparseableExpiry.add(key);
+  console.warn(
+    `[aws-mcp] SSO cache file ${path} has an expiresAt this server cannot parse (${JSON.stringify(raw)}); treating it as no cached token. Re-run 'aws sso login' to rewrite the cache.`,
+  );
+}
+
 // Test seam for the aws_login_start fresh-spawn branch. The handler calls
 // `_startSsoLoginImpl(useProfile)` rather than `startSsoLogin` directly so a
 // test can inject an implementation that supplies the fake-aws shim opts
@@ -33,7 +95,7 @@ export function _resetStartSsoLoginImpl(): void {
   _startSsoLoginImpl = (profile) => startSsoLogin(profile);
 }
 
-export interface FindTokenOptions {
+interface FindTokenOptions {
   /**
    * If set, only return tokens whose `startUrl` matches. Prevents the
    * multi-org misread where the first valid token in the cache belongs to a
@@ -67,8 +129,14 @@ export function findCachedSsoToken(
         const contents = JSON.parse(readFileSync(path, "utf-8"));
         if (!contents.accessToken || !contents.expiresAt) continue;
         if (opts.startUrl && contents.startUrl !== opts.startUrl) continue;
-        const expiresAtMs = new Date(contents.expiresAt).getTime();
-        if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) continue;
+        const expiresAtMs = parseExpiresAt(contents.expiresAt);
+        if (!Number.isFinite(expiresAtMs)) {
+          // Not a silent skip: an unreadable expiry looks exactly like an
+          // empty cache to every caller, so say so once on stderr.
+          warnUnparseableExpiry(path, contents.expiresAt);
+          continue;
+        }
+        if (expiresAtMs <= now - EXPIRY_SKEW_GRACE_MS) continue;
         if (!best || expiresAtMs > best.expiresAtMs) {
           best = { expiresAtIso: contents.expiresAt, expiresAtMs, startUrl: contents.startUrl };
         }
@@ -79,7 +147,11 @@ export function findCachedSsoToken(
     if (best) {
       return {
         expiresAt: best.expiresAtIso,
-        minutesLeft: Math.floor((best.expiresAtMs - now) / 60_000),
+        // Clamped at 0: with EXPIRY_SKEW_GRACE_MS a token accepted here can
+        // already be a few seconds past its stamped expiry, and a negative
+        // minutesLeft would be a new shape for every caller. 0 still trips
+        // every `minutesLeft < threshold` refresh check.
+        minutesLeft: Math.max(0, Math.floor((best.expiresAtMs - now) / 60_000)),
         startUrl: best.startUrl,
       };
     }
@@ -155,7 +227,11 @@ async function getCallerIdentity(
       ok: false,
       kind: result.kind,
       error: result.error,
-      rawBody: result.rawStderr ?? result.rawStdout,
+      // `||`, not `??`: on a non-zero exit with empty stderr, rawStderr is ""
+      // (present but useless), and `??` would hand back that empty string
+      // instead of falling through to whatever the CLI managed to print on
+      // stdout. Same reasoning as the `profile || getProfile()` sites below.
+      rawBody: result.rawStderr || result.rawStdout,
     };
   }
   const data = (result.data ?? {}) as { Account?: unknown; UserId?: unknown; Arn?: unknown };
@@ -339,7 +415,7 @@ export const authTools: readonly Tool[] = [
   {
     name: "aws_refresh_if_expiring_soon",
     description:
-      "Proactive SSO token check. If the cached token has fewer than `thresholdMinutes` left (default 10), this kicks off aws_login_start and returns the verification URL + code in one round-trip. If plenty of time remains, returns `status: 'ok'` with the minutes left. Use at the start of a multi-step AWS workflow to avoid mid-session expiry.",
+      "Proactive SSO token check. If the cached token has fewer than `thresholdMinutes` left (default 10), this kicks off aws_login_start and returns the verification URL + code in one round-trip. If plenty of time remains, returns `status: 'ok'` with the minutes left. Use at the start of a multi-step AWS workflow to avoid mid-session expiry. `status: 'ok'` is a point-in-time reading of the cache, not a lease: nothing re-checks afterwards, so a token that lapses mid-workflow still surfaces as an sso_expired error from the next aws_call / aws_whoami. Raise `thresholdMinutes` to cover the expected length of the workflow rather than treating 'ok' as a guarantee.",
     annotations: {
       title: "Refresh SSO token if it's expiring soon",
       readOnlyHint: false,

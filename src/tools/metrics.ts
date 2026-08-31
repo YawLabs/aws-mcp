@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
 import { getProfile, getRegion } from "../session.js";
+import { RELATIVE_TIME_RE, relativeTimeMs } from "./logs.js";
 import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolResult } from "./tool.js";
 
@@ -87,21 +88,25 @@ const QUERY_ID_RE = /^[a-z][A-Za-z0-9_]*$/;
 // before the API would reject it; 100 covers every realistic agent case.
 const MAX_QUERIES = 100;
 
-// CloudWatch caps a single GetMetricData response at ~100,800 datapoints per
-// request (1,440 points/day over 70 days). When a caller supplies an explicit
-// `period`, we validate datapoint-count upfront so an over-the-cap period+range
-// bounces with an actionable message instead of CloudWatch's less-specific
-// downstream ValidationError. The auto-pick path (pickAutoPeriodSeconds) is
-// already capped well under this by construction, so we only check explicit
-// periods. CloudWatch also requires `period` to be a positive multiple of 60.
+// CloudWatch caps a single GetMetricData response at ~100,800 datapoints PER
+// REQUEST (1,440 points/day over 70 days) -- not per query. We validate the
+// datapoint count upfront so an over-the-cap request bounces with an actionable
+// message instead of CloudWatch's less-specific downstream ValidationError, and
+// the check has to mirror the cap's shape: each query on its own AND the sum
+// across the batch, since 100 queries of 100,000 points each pass individually
+// and blow the request cap together. Both the explicit-period and the
+// auto-picked-period paths are checked (see pickAutoPeriodSeconds below for why
+// the auto-pick is not safe by construction). CloudWatch also requires `period`
+// to be a positive multiple of 60.
 const CLOUDWATCH_MAX_DATAPOINTS = 100_800;
 
 // Pick a sane period granularity scaled to the requested range so a wide
 // window doesn't default to a needlessly fine resolution: minutes for a few
-// hours, coarser steps as the range grows to days/weeks. The tiers stay well
-// short of CloudWatch's per-request datapoint ceiling -- they exist to give a
-// useful default shape (someone asking for 7 days almost never wants 1s
-// points), not to defend against that cap.
+// hours, coarser steps as the range grows to days/weeks. The tiers exist to
+// give a useful default shape (someone asking for 7 days almost never wants 1s
+// points), NOT to defend against the datapoint cap: the last tier floors at
+// 3600s, so any range beyond ~11.5 years crosses CLOUDWATCH_MAX_DATAPOINTS on
+// the auto-pick alone. The handler therefore checks the auto-picked period too.
 const PERIOD_3H_MS = 3 * 60 * 60 * 1000;
 const PERIOD_24H_MS = 24 * 60 * 60 * 1000;
 const PERIOD_15D_MS = 15 * 24 * 60 * 60 * 1000;
@@ -114,33 +119,47 @@ export function pickAutoPeriodSeconds(startMs: number, endMs: number): number {
   return 3600;
 }
 
-// Mirrors the relative-time vocab used by aws_logs_tail's `since` flag so
-// agents only learn it once. "5m" / "2h" / "1d" / "1w" relative to "now"
-// when used as startTime; endTime defaults to "now" if omitted.
-const RELATIVE_TIME_RE = /^\d+[smhdw]$/;
-const UNIT_MS: Record<string, number> = {
-  s: 1000,
-  m: 60 * 1000,
-  h: 60 * 60 * 1000,
-  d: 24 * 60 * 60 * 1000,
-  w: 7 * 24 * 60 * 60 * 1000,
-};
+// The relative-time vocab ("5m" / "2h" / "1d" / "1w", relative to "now") is
+// shared with aws_logs_tail's `since` flag so agents only learn it once, and is
+// IMPORTED from logs.ts rather than re-declared here -- the two copies were
+// byte-identical, which is the drift multi-region.ts already designed out by
+// centralizing its region regex in session.ts.
+
+// A bare number is the trap this rejects. "5" fails RELATIVE_TIME_RE (no unit)
+// and would fall through to `new Date("5")`, which V8 reads as 2001-05-01 -- a
+// dropped unit silently becomes a 25-year window with nothing rejecting it
+// locally. Neither reading ("5 minutes"? "the year 5"?) is safe to guess.
+const BARE_NUMBER_RE = /^\d+(?:\.\d+)?$/;
+
+// ISO 8601 shapes we accept, and why the offset is mandatory: `new Date()`
+// parses a DATE-ONLY string as UTC but a DATE-TIME without an offset as LOCAL
+// time. The handler then .toISOString()s the result into the CloudWatch
+// request, so "2026-05-16T10:00:00" -- which the tool description calls ISO
+// 8601 -- silently shifts the query window by the host's UTC offset, and the
+// same call means different things on a laptop and a container. Requiring an
+// explicit offset (Z or +/-HH:MM) makes the window host-independent; date-only
+// stays accepted because its UTC interpretation is unambiguous.
+const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[Zz]|[+-]\d{2}:?\d{2})$/;
 
 /**
- * Resolve a startTime / endTime input (ISO 8601 or relative like "1h") to
- * a Date. Relative values are interpreted as "ago" relative to `now`; ISO
- * values are parsed verbatim. Returns null on parse failure.
+ * Resolve a startTime / endTime input to a Date. Accepted forms:
+ *   - "now"
+ *   - relative shorthand ("15m", "1h", "1d", "1w"), interpreted as "ago"
+ *   - ISO 8601 date-only ("2026-05-16"), read as UTC midnight
+ *   - ISO 8601 date-time WITH an explicit offset ("2026-05-16T10:00:00Z",
+ *     "2026-05-16T10:00:00-04:00")
+ * Everything else -- an offset-less date-time, a bare number, free text --
+ * returns null rather than being handed to Date's permissive parser.
  */
 export function resolveTime(input: string, now: number): Date | null {
   if (input === "now") return new Date(now);
-  const rel = input.match(RELATIVE_TIME_RE);
-  if (rel) {
-    const num = Number(input.slice(0, -1));
-    const unit = input.slice(-1);
-    const ms = UNIT_MS[unit];
-    if (!ms || !Number.isFinite(num)) return null;
-    return new Date(now - num * ms);
+  if (RELATIVE_TIME_RE.test(input)) {
+    const ms = relativeTimeMs(input);
+    return ms === null ? null : new Date(now - ms);
   }
+  if (BARE_NUMBER_RE.test(input)) return null;
+  if (!ISO_DATE_ONLY_RE.test(input) && !ISO_DATE_TIME_RE.test(input)) return null;
   const t = new Date(input);
   if (Number.isNaN(t.getTime())) return null;
   return t;
@@ -149,7 +168,7 @@ export function resolveTime(input: string, now: number): Date | null {
 /** Per-query input from the MCP caller. PascalCase fields land in CloudWatch's
  * MetricDataQueries shape; we keep the wire schema camelCase to match every
  * other tool in this server. */
-export interface MetricsQueryInput {
+interface MetricsQueryInput {
   id: string;
   namespace?: string;
   metricName?: string;
@@ -243,7 +262,7 @@ export const metricsTools: readonly Tool[] = [
   {
     name: "aws_metrics_query",
     description:
-      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept ISO 8601 or relative shorthand ('15m', '1h', '1d', '1w'); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, period?, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. Each series' `period` is the effective granularity for that query (its explicit period, or the auto-pick it inherited); it is omitted for an expression query that didn't set one. The top-level `periodSeconds` is always the auto-pick. When CloudWatch truncates a large response, `hasMore` is true and `nextToken` carries the resume cursor -- call again with `nextToken` set to fetch the next page (rare for typical agent queries that stay within the per-request cap). Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
+      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept relative shorthand ('15m', '1h', '1d', '1w'), 'now', or ISO 8601 WITH an explicit offset ('2026-05-16T10:00:00Z' / '...-04:00' -- an offset-less date-time is rejected rather than silently read in the host's local zone; a date-only '2026-05-16' is read as UTC midnight); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, period?, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. Each series' `period` is the effective granularity for that query (its explicit period, or the auto-pick it inherited); it is omitted for an expression query that didn't set one. The top-level `periodSeconds` is always the auto-pick. When CloudWatch truncates a large response, `hasMore` is true and `nextToken` carries the resume cursor -- call again with `nextToken` set to fetch the next page (rare for typical agent queries that stay within the per-request cap). Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
     annotations: {
       title: "Query CloudWatch metrics (GetMetricData)",
       readOnlyHint: true,
@@ -312,8 +331,15 @@ export const metricsTools: readonly Tool[] = [
       startTime: z
         .string()
         .optional()
-        .describe("ISO 8601 timestamp or relative shorthand ('15m', '1h', '1d', '1w'). Default '1h' (one hour ago)."),
-      endTime: z.string().optional().describe("ISO 8601 timestamp or relative shorthand. Default 'now'."),
+        .describe(
+          "Relative shorthand ('15m', '1h', '1d', '1w'), 'now', or an ISO 8601 timestamp with an explicit offset ('2026-05-16T10:00:00Z', '2026-05-16T10:00:00-04:00'). A date-only '2026-05-16' is read as UTC midnight; an offset-less date-time is rejected (it would resolve in the server host's local zone). A bare number like '5' is rejected -- write '5m'. Default '1h' (one hour ago).",
+        ),
+      endTime: z
+        .string()
+        .optional()
+        .describe(
+          "Same forms as startTime: relative shorthand, 'now', or ISO 8601 with an explicit offset. Default 'now'.",
+        ),
       scanBy: z
         .enum(["TimestampAscending", "TimestampDescending"])
         .optional()
@@ -400,13 +426,13 @@ export const metricsTools: readonly Tool[] = [
       if (!startDate) {
         return {
           ok: false,
-          error: `Invalid startTime '${startStr}'. Use ISO 8601 (e.g. '2026-05-16T10:00:00Z') or relative shorthand (e.g. '1h', '15m', '1d').`,
+          error: `Invalid startTime '${startStr}'. Use relative shorthand ('15m', '1h', '1d', '1w'), 'now', or ISO 8601 WITH an explicit offset ('2026-05-16T10:00:00Z', '2026-05-16T10:00:00-04:00'); a date-only '2026-05-16' is read as UTC midnight. An offset-less date-time is rejected because it would be read in the host's local zone, and a bare number is rejected because Date reads it as a date, not a duration -- write '5m', not '5'.`,
         };
       }
       if (!endDate) {
         return {
           ok: false,
-          error: `Invalid endTime '${endStr}'. Use ISO 8601 or relative shorthand, or 'now' for the current moment.`,
+          error: `Invalid endTime '${endStr}'. Use 'now', relative shorthand ('15m', '1h', '1d', '1w'), or ISO 8601 WITH an explicit offset ('2026-05-16T10:00:00Z', '2026-05-16T10:00:00-04:00'); a date-only '2026-05-16' is read as UTC midnight. An offset-less date-time and a bare number are both rejected -- see startTime.`,
         };
       }
       if (endDate.getTime() <= startDate.getTime()) {
@@ -416,30 +442,45 @@ export const metricsTools: readonly Tool[] = [
         };
       }
 
-      // Validate any EXPLICITLY-supplied per-query period upfront so a bad
-      // period bounces with an actionable message instead of CloudWatch's
-      // less-specific downstream ValidationError. Only the explicit-period
-      // path is checked here; the auto-pick path (pickAutoPeriodSeconds) is
-      // capped safe by construction.
+      // Validate period + datapoint volume upfront so a bad request bounces
+      // with an actionable message instead of CloudWatch's less-specific
+      // downstream ValidationError. CLOUDWATCH_MAX_DATAPOINTS is a PER-REQUEST
+      // cap, so this checks each query AND the sum across the batch, and it
+      // checks the auto-picked period as well as explicit ones (the auto-pick
+      // floors at 3600s, so it is not safe by construction for very wide
+      // ranges).
       const rangeSeconds = (endDate.getTime() - startDate.getTime()) / 1000;
+      const periodSeconds = pickAutoPeriodSeconds(startDate.getTime(), endDate.getTime());
+      let totalDatapoints = 0;
       for (const q of i.queries) {
-        if (q.period === undefined) continue;
-        if (q.period <= 0 || q.period % 60 !== 0) {
+        if (q.period !== undefined && (q.period <= 0 || q.period % 60 !== 0)) {
           return {
             ok: false,
             error: `Query '${q.id}' has invalid period ${q.period}. CloudWatch requires period to be a positive multiple of 60 (seconds).`,
           };
         }
-        const datapoints = Math.ceil(rangeSeconds / q.period);
+        // returnData:false computes an intermediate value for an expression
+        // without returning a series, so it costs nothing against the cap.
+        if (q.returnData === false) continue;
+        const effectivePeriod = q.period ?? periodSeconds;
+        const datapoints = Math.ceil(rangeSeconds / effectivePeriod);
         if (datapoints > CLOUDWATCH_MAX_DATAPOINTS) {
+          const periodPhrase =
+            q.period !== undefined ? `period ${q.period}s` : `the auto-picked period ${effectivePeriod}s`;
           return {
             ok: false,
-            error: `Query '${q.id}' with period ${q.period}s over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period or narrow the time range.`,
+            error: `Query '${q.id}' with ${periodPhrase} over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period or narrow the time range.`,
           };
         }
+        totalDatapoints += datapoints;
+      }
+      if (totalDatapoints > CLOUDWATCH_MAX_DATAPOINTS) {
+        return {
+          ok: false,
+          error: `These ${i.queries.length} queries would request ${totalDatapoints} datapoints in a single GetMetricData call over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}), exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. The cap applies to the whole request, not to each query. Widen the periods, narrow the time range, or split the queries across calls.`,
+        };
       }
 
-      const periodSeconds = pickAutoPeriodSeconds(startDate.getTime(), endDate.getTime());
       const metricDataQueries = buildMetricDataQueries(i.queries, periodSeconds);
 
       const params: Record<string, unknown> = {
@@ -469,7 +510,9 @@ export const metricsTools: readonly Tool[] = [
       });
 
       if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
+        // `||`, not `??`: an empty-string rawStderr is not nullish, so `??`
+        // would hand back "" instead of falling back to stdout.
+        return { ok: false, error: result.error, rawBody: result.rawStderr || result.rawStdout };
       }
 
       const raw = (result.data ?? {}) as CloudWatchMetricDataResponse;

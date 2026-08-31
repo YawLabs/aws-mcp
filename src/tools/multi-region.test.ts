@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
-import { multiRegionTools, runWithConcurrency } from "./multi-region.js";
+import { capAggregateResults, multiRegionTools, type RegionResult, runWithConcurrency } from "./multi-region.js";
 
 const tool = multiRegionTools.find((t) => t.name === "aws_multi_region");
 if (!tool) throw new Error("multiRegionTools missing aws_multi_region");
@@ -317,6 +317,56 @@ describe("aws_multi_region input bounds (regression)", () => {
     const res = await tool.handler({ service: "s3api", operation: "list-buckets", regions, profile: "default" });
     assert.equal(res.ok, false, "handler must agree with the schema");
     assert.match(res.error ?? "", /Too many regions: 40 requested, max 32/);
+  });
+});
+
+describe("capAggregateResults -- aggregate response budget", () => {
+  // Per-CALL output is capped in aws-cli.ts (5MB of stdout kills the
+  // subprocess), but the BATCH had no ceiling: 32 regions x 5MB each is 160MB
+  // held in `results` and serialized into one MCP response.
+  const bigData = { blob: "x".repeat(4096) };
+  const okEntry = (region: string): RegionResult => ({ region, ok: true, command: `aws s3api ...`, data: bigData });
+
+  it("leaves a batch under the budget untouched", () => {
+    const input = [okEntry("us-east-1"), okEntry("us-west-2")];
+    const out = capAggregateResults(input, 1_000_000);
+    assert.deepEqual(out.truncatedRegions, []);
+    assert.deepEqual(out.results, input);
+  });
+
+  it("drops data from the entries past the budget and names them", () => {
+    const input = Array.from({ length: 8 }, (_, n) => okEntry(`us-east-${n + 1}`));
+    // Room for roughly the first two entries.
+    const out = capAggregateResults(input, 9_000);
+    assert.ok(out.truncatedRegions.length > 0, "some entries must be trimmed");
+    assert.ok(out.truncatedRegions.length < input.length, "the early entries must survive intact");
+    assert.equal(out.results[0].data, bigData, "the first entry keeps its payload");
+    for (const r of out.results) {
+      if (out.truncatedRegions.includes(r.region)) {
+        assert.equal(r.data, undefined, `${r.region} must lose its data`);
+        assert.equal(r.truncated, true, `${r.region} must be flagged truncated`);
+        assert.equal(r.ok, true, "truncation must not restate a successful call as a failure");
+        assert.equal(r.command, "aws s3api ...", "the command attempted is still surfaced");
+      } else {
+        assert.equal(r.truncated, undefined);
+      }
+    }
+    const total = Buffer.byteLength(JSON.stringify(out.results), "utf8");
+    assert.ok(total <= 9_000 + 512, `capped payload should be near the budget, got ${total}`);
+  });
+
+  it("never drops an error entry -- losing the reason a region failed is worse than the bytes", () => {
+    const input: RegionResult[] = [
+      okEntry("us-east-1"),
+      okEntry("us-east-2"),
+      { region: "eu-west-1", ok: false, error: "SSO session expired", errorKind: "sso_expired" },
+    ];
+    const out = capAggregateResults(input, 1);
+    const err = out.results.find((r) => r.region === "eu-west-1");
+    assert.equal(err?.error, "SSO session expired");
+    assert.equal(err?.errorKind, "sso_expired");
+    assert.equal(err?.truncated, undefined);
+    assert.deepEqual(out.truncatedRegions, ["us-east-1", "us-east-2"]);
   });
 });
 

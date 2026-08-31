@@ -6,7 +6,13 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { _clearSessions, findActiveSessionByProfile, startSsoLogin } from "../sso.js";
-import { _resetStartSsoLoginImpl, _setStartSsoLoginImpl, authTools, findCachedSsoToken } from "./auth.js";
+import {
+  _resetStartSsoLoginImpl,
+  _resetUnparseableExpiryDedupe,
+  _setStartSsoLoginImpl,
+  authTools,
+  findCachedSsoToken,
+} from "./auth.js";
 import { resolveProfileStartUrl } from "./profiles.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -829,5 +835,97 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
     assert.equal(r.data?.reused, undefined, "fresh spawn must not carry the reuse marker");
     assert.ok(r.data?.sessionId, "fresh spawn returns a sessionId");
     assert.match(r.data?.reason ?? "", /^Token has \d+ min left \(threshold 10\)\.$/);
+  });
+});
+
+describe("findCachedSsoToken — expiresAt parsing and clock-skew grace", () => {
+  let cacheDir: string;
+
+  beforeEach(() => {
+    cacheDir = mkdtempSync(join(tmpdir(), "aws-mcp-expiry-"));
+    _resetUnparseableExpiryDedupe();
+  });
+
+  afterEach(() => {
+    rmSync(cacheDir, { recursive: true, force: true });
+    _resetUnparseableExpiryDedupe();
+  });
+
+  // botocore's legacy SSO cache writer stamps expiresAt with strftime
+  // "%Y-%m-%dT%H:%M:%S%Z" -> "2026-08-30T12:00:00UTC", which new Date() reads
+  // as NaN. Every file was skipped, so a legacy inline-sso_start_url profile
+  // looked like an empty cache and aws_refresh_if_expiring_soon spawned a
+  // login on every single call.
+  for (const [label, suffix] of [
+    ["no space", "UTC"],
+    ["space-separated", " UTC"],
+  ] as const) {
+    it(`accepts the legacy botocore '${label}' UTC spelling`, () => {
+      const future = new Date(Date.now() + 3600_000);
+      const legacy = `${future.toISOString().slice(0, 19)}${suffix}`;
+      writeFileSync(join(cacheDir, "legacy.json"), JSON.stringify({ accessToken: "t", expiresAt: legacy }));
+      const result = findCachedSsoToken(cacheDir);
+      assert.ok(result, `expected the legacy spelling ${JSON.stringify(legacy)} to parse`);
+      assert.equal(result.expiresAt, legacy, "the raw stamped value is echoed back, not a normalized one");
+      assert.ok(result.minutesLeft >= 59 && result.minutesLeft <= 60, `got ${result.minutesLeft}`);
+    });
+  }
+
+  it("still treats the modern ...Z spelling as authoritative", () => {
+    const future = new Date(Date.now() + 1800_000).toISOString();
+    writeFileSync(join(cacheDir, "modern.json"), JSON.stringify({ accessToken: "t", expiresAt: future }));
+    const result = findCachedSsoToken(cacheDir);
+    assert.ok(result);
+    assert.equal(result.expiresAt, future);
+  });
+
+  it("keeps a token that just slipped past expiry, inside the skew grace", () => {
+    // A client clock a few seconds fast would otherwise discard a token the
+    // SSO endpoint still honors and force a pointless re-login.
+    const justPast = new Date(Date.now() - 20_000).toISOString();
+    writeFileSync(join(cacheDir, "skew.json"), JSON.stringify({ accessToken: "t", expiresAt: justPast }));
+    const result = findCachedSsoToken(cacheDir);
+    assert.ok(result, "a token 20s past expiry must survive the 60s skew grace");
+    assert.equal(result.minutesLeft, 0, "minutesLeft is clamped at 0, never negative");
+  });
+
+  it("still drops a token well past the skew grace", () => {
+    const wellPast = new Date(Date.now() - 5 * 60_000).toISOString();
+    writeFileSync(join(cacheDir, "dead.json"), JSON.stringify({ accessToken: "t", expiresAt: wellPast }));
+    assert.equal(findCachedSsoToken(cacheDir), null);
+  });
+
+  it("warns once per bad file for an expiresAt it cannot parse, instead of skipping silently", () => {
+    writeFileSync(join(cacheDir, "garbage.json"), JSON.stringify({ accessToken: "t", expiresAt: "not-a-date" }));
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      assert.equal(findCachedSsoToken(cacheDir), null);
+      assert.equal(findCachedSsoToken(cacheDir), null);
+      assert.equal(findCachedSsoToken(cacheDir), null);
+    } finally {
+      console.warn = realWarn;
+    }
+    assert.equal(warnings.length, 1, `expected exactly one warning, got ${warnings.length}: ${warnings.join(" | ")}`);
+    assert.match(warnings[0], /garbage\.json/);
+    assert.match(warnings[0], /not-a-date/);
+  });
+
+  it("does not warn for a file that lacks expiresAt entirely (already handled upstream)", () => {
+    writeFileSync(join(cacheDir, "partial.json"), JSON.stringify({ accessToken: "t" }));
+    const warnings: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      assert.equal(findCachedSsoToken(cacheDir), null);
+    } finally {
+      console.warn = realWarn;
+    }
+    assert.deepEqual(warnings, []);
   });
 });

@@ -6,6 +6,7 @@ import {
   redactDisplayArgs,
   runAwsCall,
   SAFE_NAME_RE,
+  shellQuoteArg,
   truncateForErrorMsg,
 } from "./aws-cli.js";
 
@@ -202,6 +203,76 @@ describe("redactDisplayArgs", () => {
     assert.equal(redacted[4], "--cli-input-json");
     assert.equal(redacted[6], "--profile");
     assert.equal(redacted[7], "prod");
+  });
+});
+
+describe("shellQuoteArg", () => {
+  // displayCommand is returned to the caller as `data.command`, and the caller
+  // is an LLM -- which will paste it into a shell far more readily than a
+  // human would. Joining raw argv on a space produced a string that either
+  // failed to run or, with a metacharacter-bearing value, ran something else.
+
+  it("leaves ordinary CLI tokens unquoted", () => {
+    for (const safe of [
+      "aws",
+      "s3api",
+      "list-buckets",
+      "--profile",
+      "--cli-input-json",
+      "us-east-1",
+      "org:account:role", // SSO profile names -- isValidProfileName permits ':'
+      "user@company.com", // and '@'
+      "/usr/local/bin/aws",
+      "a.b,c+d=e",
+    ]) {
+      assert.equal(shellQuoteArg(safe), safe, `expected '${safe}' to need no quoting`);
+    }
+  });
+
+  it("quotes values containing spaces", () => {
+    assert.equal(shellQuoteArg("two words"), "'two words'");
+    // The redaction stub itself has spaces and angle brackets.
+    assert.equal(shellQuoteArg("<redacted len=42>"), "'<redacted len=42>'");
+  });
+
+  it("quotes shell metacharacters so a pasted command cannot execute them", () => {
+    // The concrete hazard: --query takes arbitrary JMESPath and profile names
+    // are permissive, so these reach displayCommand.
+    assert.equal(shellQuoteArg("$(whoami)"), "'$(whoami)'");
+    assert.equal(shellQuoteArg("a;rm -rf /"), "'a;rm -rf /'");
+    assert.equal(shellQuoteArg("`id`"), "'`id`'");
+    assert.equal(shellQuoteArg("a|b"), "'a|b'");
+    assert.equal(shellQuoteArg("a&b"), "'a&b'");
+    assert.equal(shellQuoteArg("$HOME"), "'$HOME'");
+    assert.equal(shellQuoteArg("a>b"), "'a>b'");
+  });
+
+  it("quotes JMESPath expressions, which are full of shell-active characters", () => {
+    assert.equal(shellQuoteArg("Buckets[].Name"), "'Buckets[].Name'");
+    assert.equal(
+      shellQuoteArg("Reservations[*].Instances[*].[InstanceId]"),
+      "'Reservations[*].Instances[*].[InstanceId]'",
+    );
+  });
+
+  it("escapes an embedded single quote with the POSIX close-escape-reopen idiom", () => {
+    // Inside single quotes a POSIX shell expands nothing and there is no
+    // escape character, so the only way to include one is to close, emit an
+    // escaped quote, and reopen.
+    assert.equal(shellQuoteArg("it's"), `'it'\\''s'`);
+    assert.equal(shellQuoteArg("'"), `''\\'''`);
+  });
+
+  it("quotes an empty argv entry so it stays visible", () => {
+    // An empty string joined raw would vanish from the display command.
+    assert.equal(shellQuoteArg(""), "''");
+  });
+
+  it("quotes Windows paths (backslashes are shell-active on POSIX)", () => {
+    assert.equal(
+      shellQuoteArg("C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe"),
+      "'C:\\Program Files\\Amazon\\AWSCLIV2\\aws.exe'",
+    );
   });
 });
 

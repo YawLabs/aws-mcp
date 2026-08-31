@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { after, afterEach, before, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { assumeTools } from "./assume.js";
@@ -482,5 +482,97 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
       delete process.env.AWS_MCP_FAKE_SCENARIO;
       rmSync(isolatedHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe("aws_assume_role — credentials file location and overwrite warning", () => {
+  let scratchDir: string;
+  let savedSharedFile: string | undefined;
+
+  beforeEach(() => {
+    scratchDir = mkdtempSync(join(tmpdir(), "aws-mcp-assume-shared-"));
+    savedSharedFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
+  });
+
+  afterEach(() => {
+    if (savedSharedFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE;
+    else process.env.AWS_SHARED_CREDENTIALS_FILE = savedSharedFile;
+    rmSync(scratchDir, { recursive: true, force: true });
+  });
+
+  it("writes to AWS_SHARED_CREDENTIALS_FILE when it is set, not to ~/.aws/credentials", async () => {
+    // The handler previously hardcoded ~/.aws/credentials while its own EACCES
+    // message told the user to set this variable. A user who had it set got the
+    // profile written where the CLI never reads, so the returned hint named a
+    // profile that did not exist from the CLI's point of view.
+    const target = join(scratchDir, "custom-credentials");
+    process.env.AWS_SHARED_CREDENTIALS_FILE = target;
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "shared-file",
+    } as never);
+
+    assert.equal(r.ok, true);
+    const data = r.data as { credentialsPath: string; profile: string; warning?: string };
+    assert.equal(data.credentialsPath, target);
+    assert.equal(data.profile, "mcp-shared-file");
+    assert.match(readFileSync(target, "utf-8"), /\[mcp-shared-file\]/);
+    assert.equal(data.warning, undefined, "a freshly-created profile must not carry the overwrite warning");
+
+    // The default location must not have picked up this profile.
+    const defaultPath = join(fakeHome, ".aws", "credentials");
+    if (existsSync(defaultPath)) {
+      assert.doesNotMatch(readFileSync(defaultPath, "utf-8"), /\[mcp-shared-file\]/);
+    }
+  });
+
+  it("expands a leading ~ in AWS_SHARED_CREDENTIALS_FILE the way botocore does", async () => {
+    // A literal "~" directory next to the cwd would be exactly the
+    // write-here-read-there mismatch this change exists to remove.
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "~/tilde-credentials";
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "tilde",
+    } as never);
+
+    assert.equal(r.ok, true);
+    const expected = join(fakeHome, "tilde-credentials");
+    const data = r.data as { credentialsPath: string };
+    assert.equal(data.credentialsPath, expected);
+    assert.match(readFileSync(expected, "utf-8"), /\[mcp-tilde\]/);
+  });
+
+  it("warns on the second assume into the same profile, since the managed keys are overwritten in place", async () => {
+    // The 'mcp-' prefix is a naming convention, not a collision guard: the user
+    // may keep their own mcp-* profile, and re-assuming with the same
+    // sessionName lands on the same section either way.
+    const target = join(scratchDir, "credentials");
+    process.env.AWS_SHARED_CREDENTIALS_FILE = target;
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+
+    const first = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "dup",
+    } as never);
+    assert.equal(first.ok, true);
+    assert.equal((first.data as { warning?: string }).warning, undefined);
+
+    const second = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "dup",
+    } as never);
+    assert.equal(second.ok, true);
+    const warning = (second.data as { warning?: string }).warning ?? "";
+    assert.match(warning, /already existed/);
+    assert.match(warning, /mcp-dup/);
+    assert.match(warning, /overwritten/);
+
+    // Still exactly one section -- the warning describes an in-place update.
+    const text = readFileSync(target, "utf-8");
+    assert.equal((text.match(/\[mcp-dup\]/g) ?? []).length, 1);
   });
 });

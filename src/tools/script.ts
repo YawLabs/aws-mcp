@@ -18,33 +18,46 @@ import type { Tool, ToolResult } from "./tool.js";
  * doesn't have to ping-pong through N MCP tool calls and intermediate
  * context.
  *
- * Trust model: this is NOT a security sandbox. We strip the most obvious
- * filesystem / process escape hatches (no require, no process, no fs, no
- * fetch, codeGeneration disabled so eval/Function are off) so a misled
- * model can't trivially exfiltrate credentials, but node:vm is not a
- * hardened boundary. Treat aws_script the same way you treat anything else
- * the model can already call -- the threat surface is "model writes JS that
- * calls our tools," not "untrusted code from the internet."
+ * Trust model: this is NOT a security sandbox, and the vm context does NOT
+ * contain a determined script. `require`, `process`, `fs` and `fetch` are
+ * absent as bare globals, and `codeGeneration.strings: false` turns off the
+ * in-realm `eval` / `Function` -- enough to stop an ACCIDENTAL reach for them,
+ * and nothing more (see ESCAPE IS REACHABLE below). Treat aws_script exactly
+ * the way you treat anything else the model can already call -- the threat
+ * surface is "model writes JS that calls our tools," not "untrusted code from
+ * the internet" -- and rely on IAM, not on this file, for what any of it is
+ * permitted to do.
+ *
+ * ESCAPE IS REACHABLE (measured on Node 22, against the shipped build): the
+ * in-realm code-generation block is real but partial. `Function('return
+ * this')()` does throw EvalError -- that half holds. What it does not cover is
+ * the bridge: every function bound onto the context (aws.*, the console
+ * capture fns) is a HOST closure whose prototype chain never entered the
+ * sandbox, so `console.log.constructor` IS the HOST realm's `Function`, not
+ * the sandbox's. Compiling through it happens in the host realm, where
+ * `codeGeneration.strings` does not apply:
+ * `console.log.constructor('return process')()` returns the real host
+ * `process` object (the probe read back the host pid exactly), and from there
+ * `process.getBuiltinModule('fs')` and `('child_process')` are both reachable.
+ * Any aws.* helper is the same door. So: host process, fs and child_process
+ * ARE reachable from inside a script. The shadow entry and the codeGeneration
+ * flags raise the bar on the obvious paths; they are not a boundary, and
+ * nothing in this file is.
  *
  * RUNTIME CAVEAT (oam.js): `codeGeneration: { strings: false }` is honored by
  * Node but NOT by oam -- under oam, `eval` and `Function` still work inside the
  * context. Measured, not assumed, and re-measured against oam 0.9.0: still
  * divergent, so this is a standing difference rather than a bug awaiting a fix.
- * The containment that actually matters still holds there:
- * `Function('return this')()` yields a global whose `process` and `require` are
- * both undefined, and `Function('return require')` throws (ReferenceError on
- * oam where Node raises EvalError -- different error, same refusal), so a
- * script gains no capability it didn't already have by writing the same code
- * directly in its body. The practical effect is limited to dynamic code
- * construction. Do not treat the codeGeneration flag as a portable guarantee;
- * the shadow list below is the load-bearing defense.
+ * Given the bridge-constructor path above, that divergence changes how
+ * convenient an escape is, not whether one exists. Do not treat the
+ * codeGeneration flag as a portable guarantee.
  *
  * Sandbox surface (explicitly bound):
  *   aws.call({service, operation, params?, query?, profile?, region?,
  *             outputFormat?, timeoutMs?}) -> {command, result}
  *   aws.paginate({...}) -> {command, result, nextToken, hasMore}
  *   aws.paginateAll({...}) -> {items[], pages, count}  (auto-loops)
- *   aws.resource.{get,list,create,update,delete,status}({...})
+ *   aws.resource.{get,list,create,update,delete,status,diff}({...})
  *   aws.logsTail({...})
  *   aws.metricsQuery({...})
  *   aws.iamSimulate({...})
@@ -53,8 +66,10 @@ import type { Tool, ToolResult } from "./tool.js";
  *   aws.docs.{search,read}({...})
  *   console.log/info/warn/error/debug -> captured into a buffer, returned
  *                                        with the result
- *   Realm-fresh intrinsics: JSON, Math, Date, Promise, Array, Object,
- *     String, Number, Boolean, Error
+ *   Realm-local intrinsics (JSON, Math, Date, Promise, Array, Object, String,
+ *     Number, Boolean, Error, ...) come free with `createContext({})` -- the
+ *     fresh realm brings its own set, so a script that mutates
+ *     `Object.prototype` dirties only the sandbox's Object.
  *
  * Intentionally NOT bound (run as separate MCP tool calls):
  *   - aws_list_profiles, aws_whoami, aws_login_start, aws_login_complete,
@@ -65,30 +80,33 @@ import type { Tool, ToolResult } from "./tool.js";
  * aws_script self-recursion is also off the table for the same reason a
  * shell script doesn't embed a second copy of itself.
  *
- * Explicitly shadowed (made `undefined`):
- *   - I/O & process: require, process, fetch, Request, Response,
- *     Headers, AbortController, AbortSignal, BroadcastChannel
- *   - Event loop: setTimeout/Interval/Immediate, clearTimeout/Interval/
- *     Immediate, queueMicrotask
- *   - Realm/process handles: Buffer, global, globalThis
+ * Explicitly shadowed (made `undefined`): `globalThis`, and only that. It is
+ * an ECMAScript intrinsic, so it is present in every realm and would hand a
+ * script a live handle on its own global object; nothing else needs
+ * shadowing because nothing else is there. Probed on Node 22: a bare
+ * `vm.createContext({})` carries `globalThis`, `console`, `Intl`,
+ * `WebAssembly`, `Atomics`, `SharedArrayBuffer` and the ECMAScript
+ * intrinsics -- and nothing else. `Buffer`, `process`, `require`, the
+ * timer/clear functions, `queueMicrotask`, `global`, `fetch` / `Request` /
+ * `Response` / `Headers`, `AbortController` / `AbortSignal` and
+ * `BroadcastChannel` are all absent already, so the old entries for them
+ * were no-ops.
  *
- * Other Node-injected vm-context globals left available: `Intl`,
- * `WebAssembly` (with `compile`/`instantiate` blocked by
- * `codeGeneration.wasm: false`), `Atomics`, `SharedArrayBuffer`. All
- * pure-compute APIs with no filesystem/network/event-loop reach.
+ * Node-injected vm-context globals left available: `Intl`, `WebAssembly`
+ * (with `compile`/`instantiate` blocked by `codeGeneration.wasm: false`),
+ * `Atomics`, `SharedArrayBuffer`. All pure-compute APIs with no
+ * filesystem/network/event-loop reach.
  *
- * Globals NOT injected by `vm.createContext({})` on Node 22 (so neither
- * bound here nor in the shadow list): `URL`, `URLSearchParams`,
- * `TextEncoder`, `TextDecoder`, `crypto`, `structuredClone`, `EventTarget`,
- * `MessageChannel`, `performance`, `fs`. `import` is likewise unavailable --
- * a bare `import` statement is a syntax error in the non-module script body,
- * and dynamic `import()` is off because `codeGeneration` is disabled. None of
- * these are in the shadow list because they're absent-by-default (a
- * ReferenceError-by-absence), not actively set to `undefined`. A script that
- * uses any of them gets a ReferenceError today. If a future Node release starts injecting them, or
- * any other global with reach beyond compute (a `webcrypto.subtle`-style
- * key store, a thread spawner, ...), revisit the shadow list -- the list
- * is the contract, not the absence-from-list.
+ * Everything else -- `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
+ * `crypto`, `structuredClone`, `EventTarget`, `MessageChannel`,
+ * `performance`, `fs`, plus every name in the ex-shadow list above -- is
+ * absent by default, so a bare reference is a ReferenceError and `typeof`
+ * reports "undefined". `import` is likewise unavailable: a bare `import`
+ * statement is a syntax error in the non-module script body, and dynamic
+ * `import()` is off because `codeGeneration` is disabled. Re-run the probe if
+ * a future Node release starts injecting a global with reach beyond compute
+ * (a `webcrypto.subtle`-style key store, a thread spawner, ...) -- absence is
+ * the contract here, and it is a runtime fact, not a list this file owns.
  *
  * The script body is wrapped in `(async () => { ... })()` so callers use
  * `return <value>` to surface a result.
@@ -188,7 +206,7 @@ async function unwrap(tool: Tool, input: unknown): Promise<unknown> {
  * intentionally tracks the aws_paginate surface 1:1 to avoid silently
  * dropping a field a script author passed.
  */
-export interface PaginateAllInput {
+interface PaginateAllInput {
   service: string;
   operation: string;
   params?: Record<string, unknown>;
@@ -208,7 +226,12 @@ export interface PaginateAllInput {
  */
 export function buildPaginateAll(paginateTool: Tool) {
   return async (input: PaginateAllInput) => {
-    const maxPages = Math.min(input.maxPages ?? DEFAULT_MAX_PAGES, MAX_PAGES_HARD_CAP);
+    // Floor of 1, not just a ceiling: without it `maxPages: 0` (or a negative)
+    // skipped the loop entirely and returned {items: [], pages: 0} as a
+    // SUCCESS -- an empty result that reads like "the list is empty" rather
+    // than "you asked for zero pages". One page is the smallest request that
+    // can answer anything, so clamp up to it.
+    const maxPages = Math.max(1, Math.min(input.maxPages ?? DEFAULT_MAX_PAGES, MAX_PAGES_HARD_CAP));
     let token: string | undefined;
     const items: unknown[] = [];
     let pages = 0;
@@ -250,6 +273,7 @@ export interface ScriptHandlers {
     update: (input: unknown) => Promise<unknown>;
     delete: (input: unknown) => Promise<unknown>;
     status: (input: unknown) => Promise<unknown>;
+    diff: (input: unknown) => Promise<unknown>;
   };
   docs: {
     search: (input: unknown) => Promise<unknown>;
@@ -257,8 +281,8 @@ export interface ScriptHandlers {
   };
 }
 
-/** Build the production handler set from the real tool registries. Exposed so tests can substitute mocks via `runScript(opts, customHandlers)`. */
-export function defaultScriptHandlers(): ScriptHandlers {
+/** Build the production handler set from the real tool registries. Tests substitute mocks via `runScript(opts, customHandlers)` instead of calling this. */
+function defaultScriptHandlers(): ScriptHandlers {
   const callTool = findTool("aws_call", callTools);
   const paginateTool = findTool("aws_paginate", paginateTools);
   const logsTailTool = findTool("aws_logs_tail", logsTools);
@@ -274,6 +298,7 @@ export function defaultScriptHandlers(): ScriptHandlers {
   const resourceUpdate = findTool("aws_resource_update", resourceTools);
   const resourceDelete = findTool("aws_resource_delete", resourceTools);
   const resourceStatus = findTool("aws_resource_status", resourceTools);
+  const resourceDiff = findTool("aws_resource_diff", resourceTools);
   return {
     call: (input) => unwrap(callTool, input),
     paginate: (input) => unwrap(paginateTool, input),
@@ -290,6 +315,12 @@ export function defaultScriptHandlers(): ScriptHandlers {
       update: (input) => unwrap(resourceUpdate, input),
       delete: (input) => unwrap(resourceDelete, input),
       status: (input) => unwrap(resourceStatus, input),
+      // aws_resource_diff is the preview half of preview-then-update, which
+      // is exactly the composition a script is for: diff, inspect `changes`,
+      // then call aws.resource.update with the same patch only if it looks
+      // right. Leaving it unbound forced that round-trip back out to the MCP
+      // boundary.
+      diff: (input) => unwrap(resourceDiff, input),
     },
     docs: {
       search: (input) => unwrap(docsSearchTool, input),
@@ -298,16 +329,43 @@ export function defaultScriptHandlers(): ScriptHandlers {
   };
 }
 
-export interface RunScriptOptions {
+interface RunScriptOptions {
   code: string;
   timeoutMs?: number;
 }
 
-export interface ScriptRunResult {
+interface ScriptRunResult {
   data: unknown;
   logs: string[];
   truncatedLogs: boolean;
   durationMs: number;
+}
+
+/**
+ * An Error escaping `runScript` carries whatever the script logged before it
+ * died. A script that times out or throws is exactly when those lines matter
+ * most -- they're the only trace of how far it got -- so they ride out on the
+ * error rather than being dropped with the rejected promise.
+ */
+interface ScriptFailure extends Error {
+  logs?: string[];
+  truncatedLogs?: boolean;
+  durationMs?: number;
+  rawBody?: string;
+}
+
+/**
+ * Duck-type, not `instanceof Error` -- vm's own timeout error is built in
+ * another realm, so `instanceof` says false for it (measured: `e.name ===
+ * "Error"`, `e.message === "Script execution timed out after 200ms"`, and
+ * `e instanceof Error === false`). The exact error a timed-out script
+ * produces is the one whose logs matter most, so the check has to recognize
+ * it. A thrown string or a plain data object has no string `message` and is
+ * left alone, preserving the documented "non-Error throws pass through
+ * unchanged" contract.
+ */
+function isErrorLike(v: unknown): v is ScriptFailure {
+  return typeof v === "object" && v !== null && typeof (v as { message?: unknown }).message === "string";
 }
 
 export async function runScript(
@@ -349,11 +407,13 @@ export async function runScript(
   // Realm-isolated context: passing an empty object to createContext gives
   // the script its OWN set of intrinsics (Object, Array, Promise, Error, ...).
   // A script that does `Object.prototype.polluted = 1` mutates the sandbox
-  // realm's Object, not the host's -- the parent process stays clean. We then
-  // pull JSON / Math / Date / Promise / Array / Object / String / Number /
-  // Boolean / Error / console out of the FRESH context (via runInContext)
-  // and rebind them on the same context so a script that names them as
-  // globals gets the realm-local versions, not the host's.
+  // realm's Object, not the host's -- the parent process stays clean. That
+  // isolation is a property of the fresh realm alone; this file does not have
+  // to do anything to get it. (An earlier version read JSON / Math / Date /
+  // Promise / Array / Object / String / Number / Boolean out of the context
+  // and assigned them straight back onto it, which was credited with the
+  // isolation above. Probed: the values are identical before and after, so
+  // the round-trip was a no-op -- the realm was already local.)
   const ctx = createContext(
     {},
     {
@@ -362,20 +422,11 @@ export async function runScript(
     },
   );
 
-  // Grab the fresh realm's intrinsics. `runInContext` evaluates inside ctx,
-  // so the values returned here are the sandbox's own constructors.
-  const fresh = runInContext("({ JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error })", ctx) as {
-    JSON: typeof JSON;
-    Math: typeof Math;
-    Date: typeof Date;
-    Promise: typeof Promise;
-    Array: typeof Array;
-    Object: typeof Object;
-    String: typeof String;
-    Number: typeof Number;
-    Boolean: typeof Boolean;
-    Error: typeof Error;
-  };
+  // The one read that IS load-bearing: `wrapForRealm` below needs the
+  // sandbox's own Error constructor so a bridge failure arrives as something
+  // a script-side `e instanceof Error` recognizes. `runInContext` evaluates
+  // inside ctx, so this is the realm's constructor, not the host's.
+  const fresh = runInContext("({ Error })", ctx) as { Error: typeof Error };
 
   // Bridge handlers throw host-realm Error instances (created in `unwrap`
   // above, or anywhere else inside the bridge that uses `new Error(...)`).
@@ -424,6 +475,7 @@ export async function runScript(
       update: wrapForRealm(handlers.resource.update),
       delete: wrapForRealm(handlers.resource.delete),
       status: wrapForRealm(handlers.resource.status),
+      diff: wrapForRealm(handlers.resource.diff),
     },
     docs: {
       search: wrapForRealm(handlers.docs.search),
@@ -431,20 +483,10 @@ export async function runScript(
     },
   };
 
-  // Bind realm-local intrinsics + the AWS bridge + console + explicit
-  // shadows onto the context's global object.
+  // Bind the AWS bridge + the capturing console + the one real shadow onto
+  // the context's global object.
   Object.assign(ctx, {
     aws,
-    JSON: fresh.JSON,
-    Math: fresh.Math,
-    Date: fresh.Date,
-    Promise: fresh.Promise,
-    Array: fresh.Array,
-    Object: fresh.Object,
-    String: fresh.String,
-    Number: fresh.Number,
-    Boolean: fresh.Boolean,
-    Error: fresh.Error,
     console: {
       log: captureLog("log"),
       info: captureLog("info"),
@@ -452,53 +494,37 @@ export async function runScript(
       error: captureLog("error"),
       debug: captureLog("debug"),
     },
-    // Node injects a handful of host globals into every new vm context
-    // (Buffer, the timer APIs, queueMicrotask, AbortController, ...). The
-    // ones that hand out filesystem / event-loop / process / network access
-    // are explicitly shadowed here so `typeof Buffer === "undefined"` inside
-    // the script -- a model that asks for them gets a ReferenceError.
-    Buffer: undefined,
-    process: undefined,
-    require: undefined,
-    setTimeout: undefined,
-    setInterval: undefined,
-    setImmediate: undefined,
-    clearTimeout: undefined,
-    clearInterval: undefined,
-    clearImmediate: undefined,
-    queueMicrotask: undefined,
-    global: undefined,
+    // `globalThis` is an ECMAScript intrinsic, so it exists in every realm --
+    // this is the only entry here that shadows something actually present.
+    // The block used to carry 18 more (Buffer, process, require, the
+    // timer/clear family, queueMicrotask, global, fetch/Request/Response/
+    // Headers, AbortController/AbortSignal, BroadcastChannel). Probed on Node
+    // 22: `createContext({})` injects NONE of them -- a bare context has only
+    // globalThis, console, Intl, WebAssembly, Atomics, SharedArrayBuffer and
+    // the ECMAScript intrinsics -- so all 18 were assigning `undefined` over
+    // nothing. Absence already gives the same script-visible result (bare
+    // reference -> ReferenceError, `typeof` -> "undefined"), so they are gone
+    // rather than restated. If a future Node release starts injecting one,
+    // this is where it would go back.
     globalThis: undefined,
-    // README claims no network access. node:vm doesn't inject fetch by
-    // default, but Node's behaviour here has changed before -- shadow the
-    // whole fetch surface explicitly so the contract is enforced by code,
-    // not by a runtime default.
-    fetch: undefined,
-    Request: undefined,
-    Response: undefined,
-    Headers: undefined,
-    AbortController: undefined,
-    AbortSignal: undefined,
-    // BroadcastChannel can post messages to listeners in OTHER vm contexts
-    // or the parent process when a channel with the same name is open
-    // there. The aws-mcp parent doesn't subscribe to any channel, so the
-    // realistic reach is nil -- but a future plugin in the parent could,
-    // and the cost of shadowing is zero. Defense-in-depth.
-    BroadcastChannel: undefined,
   });
 
   const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
   const wrappedSource = `(async () => {\n${opts.code}\n})()`;
 
-  // Two-layer timeout: vm's `timeout` catches a synchronous infinite loop
-  // before the IIFE yields its first microtask; Promise.race covers async
-  // wall-clock once the IIFE has yielded. An async function that never
-  // yields (e.g. `while(true) {}` before any `await`) is caught by the
-  // first layer; an async function that yields then hangs is caught by the
-  // second. A script that yields and then re-enters a sync infinite loop
-  // between awaits is still possible to construct but requires arranging
-  // the loop to fall behind the timeout's setTimeout entry on the event
-  // loop -- documented limitation, not a security issue.
+  // Two-layer timeout, with a hole between the layers that nothing here
+  // closes. vm's `timeout` only measures SYNCHRONOUS evaluation: its window
+  // shuts the moment the IIFE yields at its first `await`. Promise.race then
+  // covers async wall-clock -- but only while the event loop is free to run
+  // the timer callback. So a synchronous loop placed AFTER any `await`
+  // escapes both: the vm window has already closed, and the timer cannot fire
+  // because the loop owns the thread. No arranging is required -- an `await`
+  // followed by a spin loop is enough, and it is the natural shape (fetch,
+  // then process). Measured: a spin loop after one await ran 4001ms against a
+  // 1000ms timeout, and `while (true) {}` after an await wedges the server
+  // permanently -- no timeout fires, and nothing short of a restart recovers
+  // it. A synchronous loop BEFORE the first await is still caught by the vm
+  // layer. Known hole; fixing it means moving execution off this thread.
   const started = Date.now();
   // Hoist the reject so setTimeout can be created OUTSIDE the Promise
   // executor. The previous shape (let timer; new Promise(() => { timer =
@@ -525,6 +551,23 @@ export async function runScript(
     }) as Promise<unknown>;
     const data = await Promise.race([evalResult, timeoutPromise]);
     return { data, logs, truncatedLogs, durationMs: Date.now() - started };
+  } catch (err) {
+    // Carry the captured output out with the failure. On a timeout the logs
+    // are the only record of how far the script got before it stalled, and
+    // they were previously discarded with the rejected promise. Non-Error
+    // throws pass through untouched -- scripts can throw primitives, and the
+    // documented contract is that those reach the caller unchanged.
+    if (isErrorLike(err)) {
+      try {
+        err.logs = logs;
+        err.truncatedLogs = truncatedLogs;
+        err.durationMs = Date.now() - started;
+      } catch {
+        // Frozen or sealed error object: nothing to attach to. The failure
+        // itself still propagates -- losing the logs beats losing the error.
+      }
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -551,7 +594,7 @@ export const scriptTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): require, process, fetch + family, BroadcastChannel, setTimeout/Interval, queueMicrotask, Buffer, global, globalThis. NOT available (ReferenceError if used): URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance, fs, import. eval/Function are disabled under Node (codeGeneration off); under the oam.js runtime they remain callable, but reach no process/require either way, so don't rely on either behavior. Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
+          "JavaScript snippet evaluated inside `(async () => { ... })()`. Use `return <value>` to surface a result. Bound globals: aws.call, aws.paginate, aws.paginateAll, aws.resource.{get,list,create,update,delete,status,diff}, aws.logsTail, aws.metricsQuery, aws.iamSimulate, aws.multiRegion, aws.assumeRole, aws.docs.{search,read}, console (capture), JSON, Math, Date, Promise, Array, Object, String, Number, Boolean, Error, Intl, Atomics, SharedArrayBuffer, WebAssembly (compile blocked). Intentionally NOT bound (call as sibling MCP tools instead): aws_list_profiles, the auth/session tools, and aws_script itself. Shadowed (undefined): globalThis. NOT available (ReferenceError if referenced, `typeof` reports 'undefined'): require, process, Buffer, global, fetch/Request/Response/Headers, AbortController/AbortSignal, BroadcastChannel, setTimeout/setInterval/setImmediate and their clear* pairs, queueMicrotask, URL, URLSearchParams, TextEncoder, TextDecoder, crypto, structuredClone, EventTarget, MessageChannel, performance, fs, import. The in-realm eval/Function are disabled under Node (codeGeneration off) and remain callable under the oam.js runtime; either way this is not a security boundary -- write scripts as if they run with the server's full authority, because they do. Tool helpers throw on failure -- wrap in try/catch when you want to handle errors per-call.",
         ),
       timeoutMs: z
         .number()
@@ -560,7 +603,7 @@ export const scriptTools: readonly Tool[] = [
         .max(MAX_TIMEOUT_MS)
         .optional()
         .describe(
-          `Wall-clock timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}; max ${MAX_TIMEOUT_MS}. Best-effort across evaluation plus awaited aws.* calls -- it fires on synchronous spin before the first await and on async wall-clock once the script has yielded, but a synchronous infinite loop BETWEEN awaits can outrun the timer and is not guaranteed to be interrupted. On timeout the script stops being awaited and the tool returns an error, but any aws.* call already in flight is NOT cancelled -- it continues until its own per-call timeout (default 60s). Plan retries accordingly: a script that timed out mid 'resource.delete' may have completed the delete; re-issuing the same script can double-mutate.`,
+          `Wall-clock timeout in milliseconds. Default ${DEFAULT_TIMEOUT_MS}; max ${MAX_TIMEOUT_MS}. Best-effort: it fires on synchronous spin BEFORE the first await, and on async wall-clock once the script has yielded. It does NOT fire on a synchronous loop placed after an await -- that loop holds the thread, so the timer never runs and the call hangs until the process is restarted. Keep post-await work non-blocking. On timeout the script stops being awaited and the tool returns an error (with the console lines captured so far), but any aws.* call already in flight is NOT cancelled -- it continues until its own per-call timeout (default 60s). Plan retries accordingly: a script that timed out mid 'resource.delete' may have completed the delete; re-issuing the same script can double-mutate.`,
         ),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
@@ -577,12 +620,28 @@ export const scriptTools: readonly Tool[] = [
           },
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const rawBody =
-          err instanceof Error && typeof (err as Error & { rawBody?: string }).rawBody === "string"
-            ? (err as Error & { rawBody?: string }).rawBody
-            : undefined;
-        return { ok: false, error: message, rawBody };
+        // isErrorLike, not instanceof: vm's cross-realm timeout error fails
+        // `instanceof Error` (see the note on isErrorLike), and `String(err)`
+        // on it prepends a redundant "Error: " to the message.
+        const failure = isErrorLike(err) ? err : undefined;
+        const message = failure ? failure.message : String(err);
+        const logs = failure?.logs ?? [];
+        const truncatedLogs = failure?.truncatedLogs ?? false;
+        // The captured lines go out on rawBody as well as on `data`: index.ts
+        // renders only `error` + `rawBody` for a failed ToolResult, so logs
+        // left in `data` alone would never reach the model -- and a timeout is
+        // exactly when it wants to see how far the script got.
+        const logBody = logs.length
+          ? `Captured console output before the failure (${logs.length} line(s)${truncatedLogs ? ", truncated" : ""}):\n${logs.join("\n")}`
+          : undefined;
+        const toolRawBody = typeof failure?.rawBody === "string" ? failure.rawBody : undefined;
+        const rawBody = [toolRawBody, logBody].filter((s): s is string => Boolean(s)).join("\n\n");
+        return {
+          ok: false,
+          error: message,
+          rawBody: rawBody || undefined,
+          data: { logs, truncatedLogs, durationMs: failure?.durationMs },
+        };
       }
     },
   },

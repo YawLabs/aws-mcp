@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-import { validateOpaqueToken } from "./resource.js";
+import { validateCursorToken } from "./resource.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 /**
@@ -98,10 +98,13 @@ export const paginateTools: readonly Tool[] = [
         timeoutMs?: number;
       };
       // startingToken lands in extraFlags as a bare --starting-token arg, so
-      // argv-safety it the same way resource.ts guards nextToken/clientToken:
-      // a leading-hyphen or over-length token would otherwise leak as a flag.
+      // argv-safety it the same way resource.ts guards its cursors: a
+      // leading-hyphen or absurdly long token would otherwise leak as a flag.
+      // Cursor bound (2048), NOT the 128-char RequestToken/ClientToken bound
+      // -- real resume cursors are base64 blobs that run well past 128, and
+      // the tighter cap rejected page 2 of every list.
       if (i.startingToken !== undefined) {
-        const stErr = validateOpaqueToken(i.startingToken, "startingToken");
+        const stErr = validateCursorToken(i.startingToken, "startingToken");
         if (stErr) return { ok: false, error: stErr };
       }
 
@@ -130,7 +133,11 @@ export const paginateTools: readonly Tool[] = [
       });
 
       if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
+        // Truthiness, not `??`: an empty-string stderr means "no stderr", and
+        // `??` would return that empty string and drop a stdout body that
+        // does carry the diagnostic. Same contract as call.ts:80 and
+        // resource.ts's rawBodyOf.
+        return { ok: false, error: result.error, rawBody: result.rawStderr ? result.rawStderr : result.rawStdout };
       }
 
       let resultBody: unknown;

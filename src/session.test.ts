@@ -7,6 +7,8 @@ import {
   getProfile,
   getRegion,
   getSessionState,
+  invalidProfileMessage,
+  invalidRegionMessage,
   isValidProfileName,
   isValidRegionName,
   setProfile,
@@ -19,6 +21,7 @@ const savedEnv = { ...process.env };
 beforeEach(() => {
   _resetSession();
   delete process.env.AWS_PROFILE;
+  delete process.env.AWS_DEFAULT_PROFILE;
   delete process.env.AWS_REGION;
   delete process.env.AWS_DEFAULT_REGION;
 });
@@ -70,6 +73,98 @@ describe("getRegion", () => {
     process.env.AWS_REGION = "us-west-2";
     setRegion("ap-southeast-1");
     assert.equal(getRegion(), "ap-southeast-1");
+  });
+});
+
+describe("empty-string env vars are ABSENT, not a value", () => {
+  // `??` treats "" as present, so an empty AWS_PROFILE / AWS_REGION used to
+  // stop the resolution chain dead and hand `aws --profile ''` to the CLI.
+  // This is routine in CI: `AWS_REGION: ${{ inputs.region }}` with nothing
+  // passed, a `.env` line with no value, `export AWS_PROFILE=` in a wrapper.
+  // The chains use `||` so empty falls through to the next link.
+
+  it("AWS_PROFILE='' falls through to the built-in default", () => {
+    process.env.AWS_PROFILE = "";
+    assert.equal(getProfile(), "default");
+  });
+
+  it("AWS_PROFILE='' falls through to AWS_DEFAULT_PROFILE when that is set", () => {
+    process.env.AWS_PROFILE = "";
+    process.env.AWS_DEFAULT_PROFILE = "legacy-prof";
+    assert.equal(getProfile(), "legacy-prof");
+  });
+
+  it("AWS_REGION='' falls through to AWS_DEFAULT_REGION", () => {
+    process.env.AWS_REGION = "";
+    process.env.AWS_DEFAULT_REGION = "eu-central-1";
+    assert.equal(getRegion(), "eu-central-1");
+  });
+
+  it("both region vars empty falls through to the built-in default", () => {
+    process.env.AWS_REGION = "";
+    process.env.AWS_DEFAULT_REGION = "";
+    assert.equal(getRegion(), "us-east-1");
+  });
+
+  it("an empty env var never reaches the argv validators", () => {
+    // The concrete consequence: "" fails isValidProfileName / isValidRegionName,
+    // so before this fix a CI job with an unset-but-exported var got a
+    // bad_input rejection from runAwsCall instead of the default profile.
+    process.env.AWS_PROFILE = "";
+    process.env.AWS_REGION = "";
+    assert.equal(isValidProfileName(getProfile()), true);
+    assert.equal(isValidRegionName(getRegion()), true);
+  });
+});
+
+describe("AWS_DEFAULT_PROFILE (the legacy spelling)", () => {
+  it("is honored when AWS_PROFILE is unset", () => {
+    process.env.AWS_DEFAULT_PROFILE = "legacy-prof";
+    assert.equal(getProfile(), "legacy-prof");
+  });
+
+  it("loses to AWS_PROFILE when both are set", () => {
+    // Mirrors the AWS_REGION / AWS_DEFAULT_REGION precedence already in place.
+    process.env.AWS_PROFILE = "modern-prof";
+    process.env.AWS_DEFAULT_PROFILE = "legacy-prof";
+    assert.equal(getProfile(), "modern-prof");
+  });
+
+  it("loses to a session override", () => {
+    process.env.AWS_DEFAULT_PROFILE = "legacy-prof";
+    setProfile("sess-prof");
+    assert.equal(getProfile(), "sess-prof");
+  });
+});
+
+describe("invalidProfileMessage / invalidRegionMessage", () => {
+  // Single-sourced so the three call sites (these setters, the pre-validation
+  // in tools/session.ts, and runAwsCall's post-resolution check) cannot drift
+  // apart again.
+
+  it("setProfile throws exactly the shared message", () => {
+    assert.throws(
+      () => setProfile("-evil"),
+      (err: Error) => err.message === invalidProfileMessage("-evil"),
+    );
+  });
+
+  it("setRegion throws exactly the shared message", () => {
+    assert.throws(
+      () => setRegion("US-EAST-1"),
+      (err: Error) => err.message === invalidRegionMessage("US-EAST-1"),
+    );
+  });
+
+  it("appends a call-site tail after the shared rule statement", () => {
+    const withTail = invalidProfileMessage("bad", "Check the 'profile' arg or AWS_PROFILE env var.");
+    assert.ok(withTail.startsWith(invalidProfileMessage("bad")), "tail form must extend the bare form");
+    assert.match(withTail, /Check the 'profile' arg or AWS_PROFILE env var\.$/);
+  });
+
+  it("omits the separator when no tail is given", () => {
+    assert.doesNotMatch(invalidRegionMessage("bad"), / $/);
+    assert.match(invalidRegionMessage("bad", "Extra."), /\)\. Extra\.$/);
   });
 });
 
@@ -198,6 +293,37 @@ describe("getSessionState", () => {
   it("reports AWS_DEFAULT_REGION as an 'env' source", () => {
     process.env.AWS_DEFAULT_REGION = "eu-central-1";
     assert.equal(getSessionState().regionSource, "env");
+  });
+
+  it("reports AWS_DEFAULT_PROFILE as an 'env' source", () => {
+    process.env.AWS_DEFAULT_PROFILE = "legacy-prof";
+    const state = getSessionState();
+    assert.equal(state.profile, "legacy-prof");
+    assert.equal(state.profileSource, "env");
+  });
+
+  it("the source label agrees with the value when env vars are empty strings", () => {
+    // The bug: getRegion used `??` (so "" WAS the answer) while regionSource
+    // used `||` (so it said "default"). The response claimed the built-in
+    // default was in play while reporting region:"" -- a state that reads as
+    // fine and then fails at the CLI. Both sides now use the same truthiness.
+    process.env.AWS_PROFILE = "";
+    process.env.AWS_REGION = "";
+    const state = getSessionState();
+    assert.equal(state.profile, "default");
+    assert.equal(state.profileSource, "default");
+    assert.equal(state.region, "us-east-1");
+    assert.equal(state.regionSource, "default");
+  });
+
+  it("labels 'env' only when the value actually came from the env", () => {
+    // Empty AWS_REGION with a real AWS_DEFAULT_REGION: the value IS from the
+    // env, just the other variable.
+    process.env.AWS_REGION = "";
+    process.env.AWS_DEFAULT_REGION = "eu-central-1";
+    const state = getSessionState();
+    assert.equal(state.region, "eu-central-1");
+    assert.equal(state.regionSource, "env");
   });
 });
 

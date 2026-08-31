@@ -10,11 +10,16 @@ import type { Tool, ToolResult } from "./tool.js";
  * before risking the call you ask aws_iam_simulate the same question and get
  * the same answer with the IAM statement that decided it.
  *
- * Maps to `aws iam simulate-principal-policy`. The response shape is flattened
- * to {action, resource, decision, matchedStatementIds, missingContextValues}
- * per EvaluationResult; the raw `evaluationResults` is preserved for callers
- * that need OrganizationsDecisionDetail / PermissionsBoundaryDecisionDetail
- * or the full MatchedStatements bodies.
+ * Maps to `aws iam simulate-principal-policy`. The response is flattened to
+ * {action, resource, decision, matchedStatementIds, missingContextValues,
+ * organizationsDecision, permissionsBoundaryDecision} per EvaluationResult.
+ * The raw EvaluationResults array is NOT echoed back alongside it: every field
+ * a caller was reaching into it for is promoted onto the flat shape, and
+ * returning both doubled the payload of every response for no consumer.
+ *
+ * IAM paginates this API (IsTruncated + Marker). The response surfaces
+ * `hasMore` + `marker`, and `marker` is accepted as an input to resume --
+ * matching the nextToken convention in metrics.ts / paginate.ts / resource.ts.
  *
  * Note: the caller (whoever's credentials this MCP server is using) needs
  * iam:SimulatePrincipalPolicy on the principal being simulated. The
@@ -57,7 +62,17 @@ const CONTEXT_KEY_TYPES = [
   "dateList",
 ] as const;
 
-export interface SimulationResult {
+// Caps on the request shape. The evaluated result count is actions x
+// resources, and every param travels in ONE argv entry (aws-cli.ts:317 pushes
+// `--cli-input-json <json>` as a single argument). Linux caps a single argv
+// entry at 128 KB and Windows caps the WHOLE command line at ~32 KB, so an
+// unbounded resource list doesn't fail validation -- it fails as an opaque
+// spawn error. MAX_RESOURCES mirrors the 50-entry actions cap; the byte guard
+// below it covers the other axis, since one ARN may be up to 2048 chars.
+const MAX_RESOURCES = 50;
+const MAX_ARGV_JSON_CHARS = 24_000;
+
+interface SimulationResult {
   action: string;
   resource: string;
   decision: string;
@@ -104,9 +119,9 @@ export function parseSimulationResults(raw: unknown): SimulationResult[] {
       // an ABSENT (or empty-string) SourcePolicyId but still carry
       // SourcePolicyType plus StartPosition.{Line,Column}. Synthesize an id
       // so the flat matchedStatementIds field doesn't silently drop the
-      // match (the raw evaluationResults is still preserved for callers that
-      // want the full body). Decision/summary counts are unaffected -- they
-      // read EvalDecision, not these IDs.
+      // match -- it is the only place the attribution surfaces now that the
+      // raw EvaluationResults array is no longer echoed back. Decision/summary
+      // counts are unaffected -- they read EvalDecision, not these IDs.
       const sourceType = ms.SourcePolicyType;
       if (typeof sourceType !== "string") continue;
       const startPos = ms.StartPosition;
@@ -151,7 +166,7 @@ export const iamSimulateTools: readonly Tool[] = [
   {
     name: "aws_iam_simulate",
     description:
-      "Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny / unknown -- unknown is the malformed-response fallback when EvalDecision is missing or unrecognised), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide -- common for tag-based policies). Use this BEFORE a risky operation to avoid a 403; pairs with the post-failure Suggestion you get from aws_call. Requires iam:SimulatePrincipalPolicy on the caller.",
+      "Simulate IAM permissions for a principal: can principal X do actions Y on resources Z? Wraps `iam simulate-principal-policy`. Returns one entry per (action, resource) pair with `decision` (allowed / explicitDeny / implicitDeny / unknown -- unknown is the malformed-response fallback when EvalDecision is missing or unrecognised), `matchedStatementIds` (which IAM statements decided), and `missingContextValues` (context keys the policy needed but you didn't provide -- common for tag-based policies). IAM paginates large batches: when it truncates, `hasMore` is true and `marker` carries the resume cursor -- call again with `marker` set to get the rest, and treat `summary` as covering only the page you have. Use this BEFORE a risky operation to avoid a 403; pairs with the post-failure Suggestion you get from aws_call. Requires iam:SimulatePrincipalPolicy on the caller.",
     annotations: {
       title: "Simulate IAM permissions for a principal",
       readOnlyHint: true,
@@ -175,9 +190,10 @@ export const iamSimulateTools: readonly Tool[] = [
         ),
       resources: z
         .array(z.string().min(1))
+        .max(MAX_RESOURCES)
         .optional()
         .describe(
-          "Resource ARNs to test against, e.g. ['arn:aws:s3:::my-bucket/*']. When omitted, AWS applies its own default of ['*'] server-side (best-case 'is this action ever allowed?') -- this tool does not inject a ['*'] itself.",
+          `Resource ARNs to test against, e.g. ['arn:aws:s3:::my-bucket/*']. Up to ${MAX_RESOURCES} entries -- the simulator evaluates actions x resources, and the whole request travels as a single argv entry, so a larger batch dies as an opaque spawn error rather than a result. Split bigger batches across calls. When omitted, AWS applies its own default of ['*'] server-side (best-case 'is this action ever allowed?') -- this tool does not inject a ['*'] itself.`,
         ),
       contextEntries: z
         .array(
@@ -190,6 +206,14 @@ export const iamSimulateTools: readonly Tool[] = [
         .optional()
         .describe(
           "Context keys for policies that depend on request context -- 'aws:RequestTag/Project' = 'foo', etc. Provide when the policy you're testing references condition keys; the response's `missingContextValues` will tell you which ones it wanted.",
+        ),
+      marker: z
+        .string()
+        .min(1)
+        .max(1024)
+        .optional()
+        .describe(
+          "Resume cursor from a previous call's `marker`. Omit for the first page. Forwarded as IAM's Marker; only meaningful when a prior call returned `hasMore: true`.",
         ),
       profile: z.string().optional().describe("Override session profile for this call."),
       region: z
@@ -204,6 +228,7 @@ export const iamSimulateTools: readonly Tool[] = [
         actions: string[];
         resources?: string[];
         contextEntries?: { contextKeyName: string; contextKeyType: string; contextKeyValues: string[] }[];
+        marker?: string;
         profile?: string;
         region?: string;
         timeoutMs?: number;
@@ -224,6 +249,12 @@ export const iamSimulateTools: readonly Tool[] = [
         }
       }
       if (i.resources) {
+        if (i.resources.length > MAX_RESOURCES) {
+          return {
+            ok: false,
+            error: `Too many resources: ${i.resources.length} requested, max ${MAX_RESOURCES}. The simulator evaluates actions x resources and the request travels as one argv entry; split the batch across calls.`,
+          };
+        }
         for (const r of i.resources) {
           // Permissive resource shape: an ARN, '*', or a placeholder string
           // the agent passes through. AWS validates server-side. We only
@@ -251,6 +282,22 @@ export const iamSimulateTools: readonly Tool[] = [
           ContextKeyValues: c.contextKeyValues,
         }));
       }
+      if (i.marker !== undefined) {
+        params.Marker = i.marker;
+      }
+
+      // The count caps above bound the LISTS; this bounds the BYTES they
+      // serialize to. 50 resources at the 2048-char ceiling is ~100 KB in one
+      // argv entry -- past both the Linux per-entry limit and the Windows
+      // whole-command-line limit. Catch it here so the caller gets a reason
+      // instead of a spawn failure with no useful message.
+      const payloadChars = JSON.stringify(params).length;
+      if (payloadChars > MAX_ARGV_JSON_CHARS) {
+        return {
+          ok: false,
+          error: `Request too large: the simulation parameters serialize to ${payloadChars} characters, over the ${MAX_ARGV_JSON_CHARS} limit. They travel as a single argv entry (--cli-input-json), which the OS caps well below this. Use shorter/fewer resource ARNs, fewer actions, or split the batch across calls.`,
+        };
+      }
 
       const result = await runAwsCall({
         service: "iam",
@@ -262,11 +309,19 @@ export const iamSimulateTools: readonly Tool[] = [
         outputFormat: "json",
       });
       if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
+        // `||`, not `??`: an empty-string rawStderr is not nullish, so `??`
+        // would hand back "" instead of falling back to stdout.
+        return { ok: false, error: result.error, rawBody: result.rawStderr || result.rawStdout };
       }
 
-      const raw = result.data as { EvaluationResults?: unknown[] } | null;
+      const raw = result.data as { EvaluationResults?: unknown[]; IsTruncated?: unknown; Marker?: unknown } | null;
       const results = parseSimulationResults(raw?.EvaluationResults);
+      // IAM paginates: a batch of actions x resources can come back truncated
+      // with a Marker to resume from. Reading only EvaluationResults reported
+      // `summary.total` as if it were the whole answer -- a silent undercount
+      // on exactly the large batches a caller is least able to eyeball.
+      const marker = typeof raw?.Marker === "string" && raw.Marker.length > 0 ? raw.Marker : null;
+      const hasMore = raw?.IsTruncated === true || marker !== null;
       const allowed = results.filter((r) => r.decision === "allowed").length;
       // Count unknown separately so it isn't silently folded into denied.
       // unknown is the malformed-response fallback (EvalDecision missing or
@@ -281,7 +336,8 @@ export const iamSimulateTools: readonly Tool[] = [
           principalArn: i.principalArn,
           summary: { allowed, denied, unknown, total: results.length },
           results,
-          evaluationResults: raw?.EvaluationResults ?? [],
+          marker,
+          hasMore,
         },
       };
     },

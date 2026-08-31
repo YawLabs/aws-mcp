@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
+import { type AwsCallFailure, type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
 import { getProfile } from "../session.js";
 import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolResult } from "./tool.js";
@@ -48,8 +48,14 @@ export function isValidIdentifier(id: string): boolean {
 }
 
 /**
- * Opaque-token validator for RequestToken and ClientToken. AWS docs cap both
- * at 128 chars. Only enforce argv-safety + bounded length.
+ * Opaque-token validator for RequestToken and ClientToken -- and ONLY those
+ * two. AWS docs cap both at 128 chars. Only enforce argv-safety + bounded
+ * length.
+ *
+ * Explicitly not for pagination cursors. A CCAPI NextToken is a different
+ * thing that happens to be another opaque string: AWS documents ListResources
+ * NextToken at up to 2048 chars, and real ones are base64 blobs well past 128.
+ * Cursors go through `validateCursorToken` below.
  */
 export function isValidOpaqueToken(token: string): boolean {
   if (token.length === 0 || token.length > 128) return false;
@@ -107,6 +113,21 @@ export function validateOpaqueToken(token: string, fieldName: string): string | 
 }
 
 /**
+ * Argv-safety guard for PAGINATION cursors (CCAPI `nextToken`, the CLI's
+ * `--starting-token`). Same leading-hyphen / control-char defense as
+ * `validateOpaqueToken`, but bounded at 2048 rather than 128: these carry a
+ * base64 continuation blob, not a request id. The 128 cap was borrowed from
+ * the RequestToken/ClientToken limit and rejected page 2 of every list -- an
+ * entirely expected input failing loudly.
+ */
+export function validateCursorToken(token: string, fieldName: string): string | null {
+  if (!isValidIdentifier(token)) {
+    return `Invalid ${fieldName}. Must be 1-2048 chars, not start with '-', and contain no control characters.`;
+  }
+  return null;
+}
+
+/**
  * CCAPI ProgressEvent terminal states. Anything else (PENDING, IN_PROGRESS,
  * CANCEL_IN_PROGRESS) is still in flight.
  */
@@ -119,7 +140,7 @@ const MAX_POLL_INTERVAL_MS = 30_000;
 const MIN_MAX_WAIT_MS = 1_000;
 const MAX_MAX_WAIT_MS = 30 * 60_000;
 
-export interface ProgressFields {
+interface ProgressFields {
   requestToken: string | null;
   operationStatus: string | null;
   identifier: string | null;
@@ -148,6 +169,87 @@ export function extractProgressFields(progressEvent: unknown): ProgressFields {
   };
 }
 
+/**
+ * Pick the diagnostic body off a failed CLI call. Truthiness, not `??`: an
+ * EMPTY-STRING stderr is "no stderr", and `??` would hand back that empty
+ * string and drop a stdout body that does carry the diagnostic. Some `aws`
+ * invocations route their message to stdout on a nonzero exit (a wrapper
+ * swallowing stderr, stderr closed). Same rule aws_call documents at
+ * call.ts:80.
+ */
+function rawBodyOf(result: AwsCallFailure): string | undefined {
+  return result.rawStderr ? result.rawStderr : result.rawStdout;
+}
+
+/**
+ * Every verb in this file shells the same way -- service "cloudcontrol", JSON
+ * output, session profile/region/timeout passed through. One helper so a new
+ * verb can't drift from the others, and so the failure shape below is written
+ * once instead of seven times.
+ */
+async function ccapiCall(
+  operation: string,
+  extraFlags: string[],
+  i: { profile?: string; region?: string; timeoutMs?: number },
+): Promise<AwsCallResult> {
+  return runAwsCall({
+    service: "cloudcontrol",
+    operation,
+    profile: i.profile,
+    region: i.region,
+    timeoutMs: i.timeoutMs,
+    outputFormat: "json",
+    extraFlags,
+  });
+}
+
+/** The one failure shape for a failed `ccapiCall`. Typed on the failure arm, so callers must narrow first. */
+function ccapiFailure(result: AwsCallFailure): ToolResult {
+  return { ok: false, error: result.error, rawBody: rawBodyOf(result) };
+}
+
+/**
+ * Shared handler preamble: argv-safety on the free-text fields every CCAPI
+ * verb shares. Returns the first error message, or null when the input is
+ * clean. `identifier` and `clientToken` are checked only when present, so the
+ * verbs that don't take them can call this unchanged.
+ */
+function validateCommonFields(i: { typeName: string; identifier?: string; clientToken?: string }): string | null {
+  const tnErr = validateTypeName(i.typeName);
+  if (tnErr) return tnErr;
+  if (i.identifier !== undefined) {
+    const idErr = validateIdentifier(i.identifier);
+    if (idErr) return idErr;
+  }
+  if (i.clientToken !== undefined) {
+    const ctErr = validateOpaqueToken(i.clientToken, "clientToken");
+    if (ctErr) return ctErr;
+  }
+  return null;
+}
+
+/** Pull the ProgressEvent out of a CCAPI mutation/status response body. */
+function unwrapProgressEvent(data: unknown): Record<string, unknown> | null {
+  const raw = data as { ProgressEvent?: Record<string, unknown> } | null;
+  return raw?.ProgressEvent ?? null;
+}
+
+/**
+ * The shared success shape for anything that returns a ProgressEvent: the
+ * command, the flat-promoted fields, and the raw event. `extra` carries the
+ * extra keys the awaited path adds.
+ */
+function progressResponse(
+  command: string,
+  progressEvent: Record<string, unknown> | null,
+  extra?: Record<string, unknown>,
+): ToolResult {
+  return {
+    ok: true,
+    data: { command, ...extractProgressFields(progressEvent), progressEvent, ...extra },
+  };
+}
+
 interface PollResult {
   ok: boolean;
   progressEvent: Record<string, unknown> | null;
@@ -164,7 +266,14 @@ interface PollResult {
   rawBody?: string;
 }
 
-type AwsCaller = typeof runAwsCall | ((opts: Parameters<typeof runAwsCall>[0]) => Promise<AwsCallResult>);
+/**
+ * The shape `pollUntilTerminal` needs from its caller: `runAwsCall` itself, or
+ * a test double with the same signature. This used to be a union of
+ * `typeof runAwsCall` and this signature, but the second member subsumes the
+ * first -- `runAwsCall` already satisfies it -- so the union was one type
+ * written twice.
+ */
+type AwsCaller = (opts: Parameters<typeof runAwsCall>[0]) => Promise<AwsCallResult>;
 
 /**
  * Loop `cloudcontrol get-resource-request-status` until the operation reaches
@@ -173,8 +282,14 @@ type AwsCaller = typeof runAwsCall | ((opts: Parameters<typeof runAwsCall>[0]) =
  * `pollIntervalMs`. Always caps the wait at the remaining maxWaitMs budget so
  * we don't overshoot.
  *
- * One-shot guarantee: the first AWS call always fires before the timeout check,
- * so the loop never returns without making at least one request. A
+ * Budget is checked BEFORE each call rather than after it. The old order
+ * (sleep to the remaining budget, then call at the loop top, then check
+ * elapsed) always spent one extra AWS call past maxWaitMs: the final sleep
+ * lands exactly on the budget, and the loop then re-entered and called
+ * anyway.
+ *
+ * One-shot guarantee, preserved: the check is skipped on the first pass, so
+ * the loop never returns without making at least one request. A
  * maxWaitMs <= elapsed (notably maxWaitMs of 0, which a direct internal caller
  * can pass -- the tool path's Zod floor of MIN_MAX_WAIT_MS only guards the
  * public surface) returns ok:false after exactly one call, surfacing whatever
@@ -199,7 +314,23 @@ export async function pollUntilTerminal(
   let attempts = 0;
   let lastEvent: Record<string, unknown> | null = null;
   let lastCommand = "";
+  let lastStatus: string | null = null;
+  const outOfBudget = (): PollResult => {
+    const elapsed = Date.now() - start;
+    return {
+      ok: false,
+      progressEvent: lastEvent,
+      command: lastCommand,
+      attempts,
+      elapsedMs: elapsed,
+      error: `Polled for ${Math.round(elapsed / 1000)}s without reaching a terminal state (last status: ${lastStatus ?? "unknown"}). Increase maxWaitMs, or call aws_resource_status with requestToken='${opts.requestToken}' to keep checking.`,
+    };
+  };
   while (true) {
+    // Budget first, call second -- `attempts > 0` keeps the one-shot
+    // guarantee for the first pass. Checking after the call meant the loop
+    // always burned one request past maxWaitMs.
+    if (attempts > 0 && Date.now() - start >= opts.maxWaitMs) return outOfBudget();
     attempts++;
     const result = await awsCall({
       service: "cloudcontrol",
@@ -219,28 +350,17 @@ export async function pollUntilTerminal(
         elapsedMs: Date.now() - start,
         error: result.error,
         kind: result.kind,
-        rawBody: result.rawStderr ?? result.rawStdout,
+        rawBody: rawBodyOf(result),
       };
     }
     lastCommand = result.command;
-    const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
-    lastEvent = raw?.ProgressEvent ?? null;
-    const status =
+    lastEvent = unwrapProgressEvent(result.data);
+    lastStatus =
       lastEvent && typeof lastEvent.OperationStatus === "string" ? (lastEvent.OperationStatus as string) : null;
-    if (status && TERMINAL_STATUSES.has(status)) {
+    if (lastStatus && TERMINAL_STATUSES.has(lastStatus)) {
       return { ok: true, progressEvent: lastEvent, command: lastCommand, attempts, elapsedMs: Date.now() - start };
     }
     const elapsed = Date.now() - start;
-    if (elapsed >= opts.maxWaitMs) {
-      return {
-        ok: false,
-        progressEvent: lastEvent,
-        command: lastCommand,
-        attempts,
-        elapsedMs: elapsed,
-        error: `Polled for ${Math.round(elapsed / 1000)}s without reaching a terminal state (last status: ${status ?? "unknown"}). Increase maxWaitMs, or call aws_resource_status with requestToken='${opts.requestToken}' to keep checking.`,
-      };
-    }
     let waitMs = opts.pollIntervalMs;
     const retryAfterRaw =
       lastEvent && typeof lastEvent.RetryAfter === "string" ? (lastEvent.RetryAfter as string) : null;
@@ -273,8 +393,7 @@ async function buildMutationResponse(
     maxWaitMs?: number;
   },
 ): Promise<ToolResult> {
-  const raw = initial.data as { ProgressEvent?: Record<string, unknown> } | null;
-  const progressEvent = raw?.ProgressEvent ?? null;
+  const progressEvent = unwrapProgressEvent(initial.data);
   const fields = extractProgressFields(progressEvent);
   const initialStatus = fields.operationStatus ?? "";
   const alreadyTerminal = TERMINAL_STATUSES.has(initialStatus);
@@ -304,22 +423,25 @@ async function buildMutationResponse(
       }
       return { ok: false, error: polled.error ?? "Poll failed", rawBody: polled.rawBody };
     }
-    const finalFields = extractProgressFields(polled.progressEvent);
-    return {
-      ok: true,
-      data: {
-        command: polled.command,
-        ...finalFields,
-        progressEvent: polled.progressEvent,
-        awaited: { attempts: polled.attempts, elapsedMs: polled.elapsedMs },
-      },
-    };
+    return progressResponse(polled.command, polled.progressEvent, {
+      awaited: { attempts: polled.attempts, elapsedMs: polled.elapsedMs },
+    });
   }
 
-  return {
-    ok: true,
-    data: { command: initial.command, ...fields, progressEvent },
-  };
+  // Not-awaited shape. When the caller ASKED to await and we got here anyway,
+  // say why: awaitCompletion with no RequestToken in the response used to
+  // return this shape silently, so the caller saw an IN_PROGRESS event and no
+  // hint that the wait it requested never happened. (An already-terminal
+  // response needs no signal -- there was nothing left to wait for.)
+  const awaitSkipped =
+    i.awaitCompletion && !fields.requestToken && !alreadyTerminal
+      ? {
+          awaitSkipped:
+            "awaitCompletion was requested but the response carried no requestToken, so there was nothing to poll. The operation may still be in flight -- re-read the resource, or re-issue with a clientToken to make the retry idempotent.",
+        }
+      : undefined;
+
+  return progressResponse(initial.command, progressEvent, awaitSkipped);
 }
 
 const baseFields = {
@@ -327,6 +449,19 @@ const baseFields = {
   region: z.string().optional().describe("Override session region for this call."),
   timeoutMs: z.number().int().positive().optional().describe("Timeout in milliseconds. Default 60000."),
 };
+
+/**
+ * RFC 6902 defines `add` and `replace` as carrying a value; only `remove`
+ * doesn't. `value: z.unknown().optional()` accepted an op without one, and
+ * `{op: 'add', path: '/X'}` then produced `X: undefined` -- which disappears
+ * on the next JSON serialization, so the "change" silently evaporated (sent
+ * to CCAPI as a value-less patch on the update path, and dropped from the
+ * simulated `after` document on the diff path). Reject it at the schema so
+ * the model gets a field-level error instead of a no-op.
+ */
+const patchOpHasValue = (op: { op: string; value?: unknown }): boolean =>
+  !(op.op === "add" || op.op === "replace") || op.value !== undefined;
+const PATCH_VALUE_REQUIRED = "ops 'add' and 'replace' require a 'value' field (use 'remove' to delete a path).";
 
 const awaitFields = {
   awaitCompletion: z
@@ -385,24 +520,11 @@ export const resourceTools: readonly Tool[] = [
         region?: string;
         timeoutMs?: number;
       };
-      const tnErr = validateTypeName(i.typeName);
-      if (tnErr) return { ok: false, error: tnErr };
-      const idErr = validateIdentifier(i.identifier);
-      if (idErr) return { ok: false, error: idErr };
+      const vErr = validateCommonFields(i);
+      if (vErr) return { ok: false, error: vErr };
 
-      const result = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "get-resource",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags: ["--type-name", i.typeName, "--identifier", i.identifier],
-      });
-
-      if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
-      }
+      const result = await ccapiCall("get-resource", ["--type-name", i.typeName, "--identifier", i.identifier], i);
+      if (!result.ok) return ccapiFailure(result);
 
       const raw = result.data as { TypeName?: string; ResourceDescription?: unknown } | null;
       const parsed = parseResourceProperties(raw?.ResourceDescription);
@@ -453,12 +575,9 @@ export const resourceTools: readonly Tool[] = [
         region?: string;
         timeoutMs?: number;
       };
-      const tnErr = validateTypeName(i.typeName);
-      if (tnErr) return { ok: false, error: tnErr };
-      if (i.nextToken !== undefined) {
-        const ntErr = validateOpaqueToken(i.nextToken, "nextToken");
-        if (ntErr) return { ok: false, error: ntErr };
-      }
+      const cursorErr = i.nextToken !== undefined ? validateCursorToken(i.nextToken, "nextToken") : null;
+      const vErr = validateCommonFields(i) ?? cursorErr;
+      if (vErr) return { ok: false, error: vErr };
 
       const extraFlags: string[] = ["--type-name", i.typeName, "--max-results", String(i.maxResults ?? 100)];
       if (i.nextToken) extraFlags.push("--next-token", i.nextToken);
@@ -466,25 +585,22 @@ export const resourceTools: readonly Tool[] = [
         extraFlags.push("--resource-model", JSON.stringify(i.resourceModel));
       }
 
-      const result = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "list-resources",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags,
-      });
-
-      if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
-      }
+      const result = await ccapiCall("list-resources", extraFlags, i);
+      if (!result.ok) return ccapiFailure(result);
 
       const raw = result.data as { ResourceDescriptions?: unknown[]; NextToken?: string } | null;
       const descriptions = Array.isArray(raw?.ResourceDescriptions) ? raw.ResourceDescriptions : [];
       const resources = descriptions.map((d) => {
         const p = parseResourceProperties(d);
-        return { identifier: p.Identifier, properties: p.Properties };
+        // propertiesRaw rides along on an unparseable Properties string, the
+        // same as aws_resource_get -- it is the only diagnosable thing left
+        // when the parse failed, and dropping it here made the two verbs
+        // disagree about the shape of the same resource.
+        return {
+          identifier: p.Identifier,
+          properties: p.Properties,
+          ...(p.propertiesRaw ? { propertiesRaw: p.propertiesRaw } : {}),
+        };
       });
       const nextToken = extractNextToken(raw);
       return {
@@ -537,29 +653,14 @@ export const resourceTools: readonly Tool[] = [
         pollIntervalMs?: number;
         maxWaitMs?: number;
       };
-      const tnErr = validateTypeName(i.typeName);
-      if (tnErr) return { ok: false, error: tnErr };
-      if (i.clientToken !== undefined) {
-        const ctErr = validateOpaqueToken(i.clientToken, "clientToken");
-        if (ctErr) return { ok: false, error: ctErr };
-      }
+      const vErr = validateCommonFields(i);
+      if (vErr) return { ok: false, error: vErr };
 
       const extraFlags: string[] = ["--type-name", i.typeName, "--desired-state", JSON.stringify(i.desiredState)];
       if (i.clientToken) extraFlags.push("--client-token", i.clientToken);
 
-      const result = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "create-resource",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags,
-      });
-
-      if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
-      }
+      const result = await ccapiCall("create-resource", extraFlags, i);
+      if (!result.ok) return ccapiFailure(result);
 
       return buildMutationResponse({ command: result.command, data: result.data }, i);
     },
@@ -581,15 +682,19 @@ export const resourceTools: readonly Tool[] = [
       identifier: z.string().min(1).describe("Primary identifier for the resource."),
       patchDocument: z
         .array(
-          z.object({
-            op: z.enum(["add", "remove", "replace", "move", "copy", "test"]),
-            path: z.string(),
-            value: z.unknown().optional(),
-            from: z.string().optional(),
-          }),
+          z
+            .object({
+              op: z.enum(["add", "remove", "replace", "move", "copy", "test"]),
+              path: z.string(),
+              value: z.unknown().optional(),
+              from: z.string().optional(),
+            })
+            .refine(patchOpHasValue, { message: PATCH_VALUE_REQUIRED, path: ["value"] }),
         )
         .min(1)
-        .describe("RFC 6902 JSON Patch document (array of operations). At least one entry."),
+        .describe(
+          "RFC 6902 JSON Patch document (array of operations). At least one entry. 'add' and 'replace' must carry a `value`.",
+        ),
       clientToken: z.string().optional().describe("Idempotency token (max 128 chars)."),
       ...baseFields,
       ...awaitFields,
@@ -607,14 +712,8 @@ export const resourceTools: readonly Tool[] = [
         pollIntervalMs?: number;
         maxWaitMs?: number;
       };
-      const tnErr = validateTypeName(i.typeName);
-      if (tnErr) return { ok: false, error: tnErr };
-      const idErr = validateIdentifier(i.identifier);
-      if (idErr) return { ok: false, error: idErr };
-      if (i.clientToken !== undefined) {
-        const ctErr = validateOpaqueToken(i.clientToken, "clientToken");
-        if (ctErr) return { ok: false, error: ctErr };
-      }
+      const vErr = validateCommonFields(i);
+      if (vErr) return { ok: false, error: vErr };
 
       const extraFlags: string[] = [
         "--type-name",
@@ -626,19 +725,8 @@ export const resourceTools: readonly Tool[] = [
       ];
       if (i.clientToken) extraFlags.push("--client-token", i.clientToken);
 
-      const result = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "update-resource",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags,
-      });
-
-      if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
-      }
+      const result = await ccapiCall("update-resource", extraFlags, i);
+      if (!result.ok) return ccapiFailure(result);
 
       return buildMutationResponse({ command: result.command, data: result.data }, i);
     },
@@ -674,31 +762,14 @@ export const resourceTools: readonly Tool[] = [
         pollIntervalMs?: number;
         maxWaitMs?: number;
       };
-      const tnErr = validateTypeName(i.typeName);
-      if (tnErr) return { ok: false, error: tnErr };
-      const idErr = validateIdentifier(i.identifier);
-      if (idErr) return { ok: false, error: idErr };
-      if (i.clientToken !== undefined) {
-        const ctErr = validateOpaqueToken(i.clientToken, "clientToken");
-        if (ctErr) return { ok: false, error: ctErr };
-      }
+      const vErr = validateCommonFields(i);
+      if (vErr) return { ok: false, error: vErr };
 
       const extraFlags: string[] = ["--type-name", i.typeName, "--identifier", i.identifier];
       if (i.clientToken) extraFlags.push("--client-token", i.clientToken);
 
-      const result = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "delete-resource",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags,
-      });
-
-      if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
-      }
+      const result = await ccapiCall("delete-resource", extraFlags, i);
+      if (!result.ok) return ccapiFailure(result);
 
       return buildMutationResponse({ command: result.command, data: result.data }, i);
     },
@@ -724,27 +795,10 @@ export const resourceTools: readonly Tool[] = [
       const rtErr = validateOpaqueToken(i.requestToken, "requestToken");
       if (rtErr) return { ok: false, error: rtErr };
 
-      const result = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "get-resource-request-status",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags: ["--request-token", i.requestToken],
-      });
+      const result = await ccapiCall("get-resource-request-status", ["--request-token", i.requestToken], i);
+      if (!result.ok) return ccapiFailure(result);
 
-      if (!result.ok) {
-        return { ok: false, error: result.error, rawBody: result.rawStderr ?? result.rawStdout };
-      }
-
-      const raw = result.data as { ProgressEvent?: Record<string, unknown> } | null;
-      const progressEvent = raw?.ProgressEvent ?? null;
-      const fields = extractProgressFields(progressEvent);
-      return {
-        ok: true,
-        data: { command: result.command, ...fields, progressEvent },
-      };
+      return progressResponse(result.command, unwrapProgressEvent(result.data));
     },
   },
 
@@ -764,23 +818,25 @@ export const resourceTools: readonly Tool[] = [
       identifier: z.string().min(1).describe("Primary identifier for the resource."),
       patchDocument: z
         .array(
-          z.object({
-            // Diff simulates patches locally via applyJsonPatch; only the
-            // add/remove/replace subset is implemented. Reject the other
-            // three RFC 6902 ops here so the model gets schema-validation
-            // feedback instead of a runtime "not implemented" error
-            // surfaced as a generic "Patch application failed". The
-            // sibling aws_resource_update tool accepts the full op set
-            // because CCAPI does -- only this preview tool is restricted.
-            op: z.enum(["add", "remove", "replace"]),
-            path: z.string(),
-            value: z.unknown().optional(),
-            from: z.string().optional(),
-          }),
+          z
+            .object({
+              // Diff simulates patches locally via applyJsonPatch; only the
+              // add/remove/replace subset is implemented. Reject the other
+              // three RFC 6902 ops here so the model gets schema-validation
+              // feedback instead of a runtime "not implemented" error
+              // surfaced as a generic "Patch application failed". The
+              // sibling aws_resource_update tool accepts the full op set
+              // because CCAPI does -- only this preview tool is restricted.
+              op: z.enum(["add", "remove", "replace"]),
+              path: z.string(),
+              value: z.unknown().optional(),
+              from: z.string().optional(),
+            })
+            .refine(patchOpHasValue, { message: PATCH_VALUE_REQUIRED, path: ["value"] }),
         )
         .min(1)
         .describe(
-          "RFC 6902 JSON Patch (add/remove/replace subset). For move/copy/test, use aws_resource_update directly.",
+          "RFC 6902 JSON Patch (add/remove/replace subset); 'add' and 'replace' must carry a `value`. For move/copy/test, use aws_resource_update directly.",
         ),
       ...baseFields,
     }),
@@ -793,23 +849,12 @@ export const resourceTools: readonly Tool[] = [
         region?: string;
         timeoutMs?: number;
       };
-      const tnErr = validateTypeName(i.typeName);
-      if (tnErr) return { ok: false, error: tnErr };
-      const idErr = validateIdentifier(i.identifier);
-      if (idErr) return { ok: false, error: idErr };
+      const vErr = validateCommonFields(i);
+      if (vErr) return { ok: false, error: vErr };
 
-      const getResult = await runAwsCall({
-        service: "cloudcontrol",
-        operation: "get-resource",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        extraFlags: ["--type-name", i.typeName, "--identifier", i.identifier],
-      });
-      if (!getResult.ok) {
-        return { ok: false, error: getResult.error, rawBody: getResult.rawStderr ?? getResult.rawStdout };
-      }
+      const getResult = await ccapiCall("get-resource", ["--type-name", i.typeName, "--identifier", i.identifier], i);
+      if (!getResult.ok) return ccapiFailure(getResult);
+
       const raw = getResult.data as { ResourceDescription?: unknown } | null;
       const parsed = parseResourceProperties(raw?.ResourceDescription);
       const before = parsed.Properties;
@@ -851,6 +896,10 @@ export const resourceTools: readonly Tool[] = [
  * type-unrepresentable rather than relying on a runtime throw alone. The
  * runtime throw in _applyJsonPatchInPlace stays as defense for any caller
  * that widens to JsonPatchOp.
+ *
+ * Kept exported deliberately: resource-diff.test.ts imports it to construct
+ * the move/copy/test ops that pin that runtime throw. Narrowing it to a local
+ * type would leave the throw with no way to be exercised.
  */
 export interface JsonPatchOp {
   op: "add" | "remove" | "replace" | "move" | "copy" | "test";
@@ -1084,14 +1133,14 @@ export function summarizePatch(ops: readonly SimulatedJsonPatchOp[], before: unk
   // The in-place replay is O(N + D). Correctness still holds because each
   // op's `after` snapshot is taken right after its single op mutates the
   // working copy, before the next op runs.
-  let working: unknown;
+  //
+  // No try/catch around this clone: `before` is JSON.parse output from
+  // parseResourceProperties, so it is acyclic and round-trippable by
+  // construction. The guard could only ever have fired for a hand-built
+  // cyclic document from a direct caller, and it answered that by silently
+  // degrading the entire replay -- a throw is the more useful signal.
+  let working: unknown = clone(before);
   let replayOk = true;
-  try {
-    working = clone(before);
-  } catch {
-    replayOk = false;
-    working = undefined;
-  }
 
   const out: PatchChange[] = [];
   for (const op of ops) {

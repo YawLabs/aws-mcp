@@ -13,6 +13,7 @@ import {
   resourceTools,
   TERMINAL_STATUSES,
   TYPE_NAME_RE,
+  validateCursorToken,
 } from "./resource.js";
 
 const getTool = (name: string) => {
@@ -27,6 +28,7 @@ const createResource = getTool("aws_resource_create");
 const updateResource = getTool("aws_resource_update");
 const deleteResource = getTool("aws_resource_delete");
 const statusResource = getTool("aws_resource_status");
+const diffResource = getTool("aws_resource_diff");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
@@ -122,6 +124,28 @@ describe("isValidOpaqueToken", () => {
   });
 });
 
+describe("validateCursorToken", () => {
+  // Pagination cursors are NOT RequestToken/ClientToken: AWS documents
+  // ListResources NextToken at up to 2048 chars, and real ones are base64
+  // blobs well past 128. Validating them with the 128-char opaque-token
+  // guard rejected page 2 of every list on entirely expected input.
+  it("accepts a cursor longer than the 128-char opaque-token cap", () => {
+    assert.equal(validateCursorToken("a".repeat(600), "nextToken"), null);
+    assert.equal(validateCursorToken("a".repeat(2048), "nextToken"), null);
+  });
+
+  it("still rejects over-2048, empty, leading-hyphen, and control chars", () => {
+    assert.match(validateCursorToken("a".repeat(2049), "nextToken") ?? "", /Invalid nextToken/);
+    assert.match(validateCursorToken("", "nextToken") ?? "", /Invalid nextToken/);
+    assert.match(validateCursorToken("-bad", "nextToken") ?? "", /Invalid nextToken/);
+    assert.match(validateCursorToken("bad\x01", "nextToken") ?? "", /Invalid nextToken/);
+  });
+
+  it("names the field it was given", () => {
+    assert.match(validateCursorToken("-bad", "startingToken") ?? "", /Invalid startingToken/);
+  });
+});
+
 describe("parseResourceProperties", () => {
   it("parses JSON-encoded Properties into an object", () => {
     const result = parseResourceProperties({
@@ -212,6 +236,41 @@ describe("schemas", () => {
       }).success,
       false,
     );
+  });
+
+  it("requires a value on 'add' / 'replace' ops, not on 'remove'", () => {
+    // `{op:'add', path:'/X'}` used to parse clean and then produce
+    // `X: undefined`, which vanishes on serialization -- the "change" was a
+    // silent no-op. RFC 6902 defines add/replace as carrying a value.
+    for (const t of [updateResource, diffResource]) {
+      for (const op of ["add", "replace"] as const) {
+        const r = t.inputSchema.safeParse({
+          typeName: "AWS::Lambda::Function",
+          identifier: "my-fn",
+          patchDocument: [{ op, path: "/MemorySize" }],
+        });
+        assert.equal(r.success, false, `${t.name} must reject a value-less '${op}'`);
+      }
+      // remove needs no value, and an explicit null IS a value.
+      assert.equal(
+        t.inputSchema.safeParse({
+          typeName: "AWS::Lambda::Function",
+          identifier: "my-fn",
+          patchDocument: [{ op: "remove", path: "/MemorySize" }],
+        }).success,
+        true,
+        `${t.name} must still accept a value-less 'remove'`,
+      );
+      assert.equal(
+        t.inputSchema.safeParse({
+          typeName: "AWS::Lambda::Function",
+          identifier: "my-fn",
+          patchDocument: [{ op: "replace", path: "/MemorySize", value: null }],
+        }).success,
+        true,
+        `${t.name} must accept an explicit null value`,
+      );
+    }
   });
 
   it("aws_resource_status requires requestToken", () => {
@@ -448,6 +507,27 @@ describe("pollUntilTerminal", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /without reaching a terminal state/);
     assert.equal((r.progressEvent as Record<string, unknown>)?.OperationStatus, "IN_PROGRESS");
+  });
+
+  it("never issues an AWS call once the budget is spent", async () => {
+    // The budget check used to run AFTER the call: the final sleep clamps to
+    // land exactly on maxWaitMs, the loop re-entered, and one more request
+    // went out past the deadline the caller set. Uses the real sleep so
+    // elapsed time is real; asserts the property (every call starts inside
+    // the budget) rather than an exact call count, which is timing-sensitive.
+    const start = Date.now();
+    const offsets: number[] = [];
+    const awsCall = async (): Promise<AwsCallResult> => {
+      offsets.push(Date.now() - start);
+      return progressResponse({ OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" });
+    };
+    const maxWaitMs = 120;
+    const r = await pollUntilTerminal({ requestToken: "tok-1", pollIntervalMs: 20, maxWaitMs }, awsCall);
+    assert.equal(r.ok, false);
+    assert.ok(offsets.length >= 2, `expected several polls, got ${offsets.length}`);
+    for (const off of offsets) {
+      assert.ok(off < maxWaitMs, `a poll started at ${off}ms, past the ${maxWaitMs}ms budget: ${offsets.join(",")}`);
+    }
   });
 
   it("propagates an error from the underlying CLI call", async () => {

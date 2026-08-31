@@ -31,7 +31,24 @@ import { isValidProfileName } from "./session.js";
 // stderr. 5 MB is ample for any legit sso login session.
 const MAX_STDERR_BYTES = 5 * 1024 * 1024;
 
-export interface LoginStartResult {
+/**
+ * Cap on the raw `aws sso login` output echoed back through `rawOutput` (and
+ * from there into model-visible text by tools/auth.ts). Clean output is a URL
+ * and a six-character code, so this never trims a healthy login -- it bounds
+ * the unfiltered-CLI-output channel a misbehaving or chatty `aws` opens into
+ * the model's context. MAX_STDERR_BYTES already bounds MEMORY; this bounds
+ * what we forward.
+ */
+const MAX_RAW_OUTPUT_CHARS = 4_000;
+
+function clampRawOutput(text: string): string {
+  if (text.length <= MAX_RAW_OUTPUT_CHARS) return text;
+  // Keep the head: the URL + code banner and the CLI's own error preamble both
+  // land at the top, and a runaway tail is exactly what we are cutting.
+  return `${text.slice(0, MAX_RAW_OUTPUT_CHARS)}\n... [truncated ${text.length - MAX_RAW_OUTPUT_CHARS} chars of 'aws sso login' output]`;
+}
+
+interface LoginStartResult {
   ok: true;
   sessionId: string;
   verificationUrl: string;
@@ -39,13 +56,13 @@ export interface LoginStartResult {
   profile: string;
 }
 
-export interface LoginStartError {
+interface LoginStartError {
   ok: false;
   error: string;
   rawOutput?: string;
 }
 
-export interface LoginWaitResult {
+interface LoginWaitResult {
   ok: boolean;
   exitCode: number | null;
   error?: string;
@@ -202,15 +219,15 @@ export function supportsDeviceCodeFlag(v: CliVersion | null): boolean {
 /**
  * Build the argv tail for `aws sso login` (everything after any test prefix).
  *
- * The empty-profile guard is vestigial — startSsoLogin rejects an empty
- * profile at the isValidProfileName gate (PROFILE_NAME_RE requires >=1 char),
- * so `profile` is always non-empty by the time this runs. Kept because the
- * `profile || "default"` fallback at the resolve site mirrors it.
+ * `profile` is always non-empty here: startSsoLogin rejects an empty profile at
+ * the isValidProfileName gate (PROFILE_NAME_RE requires >=1 char) before this
+ * runs, so `--profile` is unconditional. It stays ahead of the profile value
+ * and after `--use-device-code` so the value can never be read as a flag.
  */
 export function _buildLoginArgs(profile: string, useDeviceCode: boolean): string[] {
   const args = ["sso", "login", "--no-browser"];
   if (useDeviceCode) args.push("--use-device-code");
-  if (profile) args.push("--profile", profile);
+  args.push("--profile", profile);
   return args;
 }
 
@@ -340,7 +357,7 @@ export function _ttlKillswitchTick(
  * timeout cases don't take 15 seconds, and shrink `sessionTtlMs` so the
  * TTL killswitch can fire deterministically.
  */
-export interface SsoLoginOptions {
+interface SsoLoginOptions {
   command?: string;
   prefixArgs?: string[];
   urlWaitMs?: number;
@@ -481,7 +498,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         resolve({
           ok: false,
           error: `Timed out after ${urlWaitMs / 1000}s waiting for 'aws sso login' to print a verification URL. The AWS CLI may be misconfigured, or the profile '${profile}' may not be set up for SSO.`,
-          rawOutput: stdoutBuf + stderrBuf,
+          rawOutput: clampRawOutput(stdoutBuf + stderrBuf),
         });
       }
     }, urlWaitMs);
@@ -508,7 +525,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
             ? "aws-mcp passed --use-device-code and this AWS CLI did not honor it."
             : "aws-mcp omitted --use-device-code because this AWS CLI reported a version older than 2.22.0."
         } Upgrade the AWS CLI to 2.22.0 or newer, or run 'aws sso login --use-device-code --profile ${profile}' in a terminal and retry.`,
-        rawOutput: stdoutBuf + stderrBuf,
+        rawOutput: clampRawOutput(stdoutBuf + stderrBuf),
       });
       return true;
     };
@@ -528,6 +545,13 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         settled = true;
         clearTimeout(urlTimeout);
         const sessionId = randomUUID();
+        // Deliberate handoff: the TTL killswitch is armed HERE, at the same
+        // moment the urlWaitMs timeout is cleared, so the subprocess is under
+        // exactly one deadline at all times. Before this point a hung `aws`
+        // (spawned but never printing) is bounded by urlTimeout, which kills
+        // the proc and settles the start Promise; after it, by this timer.
+        // The coupling is why arming late is safe -- move either half and a
+        // subprocess can end up with no deadline at all.
         const ttlTimer = setTimeout(() => _ttlKillswitchTick(sessions.get(sessionId), proc), sessionTtlMs);
         ttlTimer.unref();
         const session: LoginSession = {
@@ -552,9 +576,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
           sessionId,
           verificationUrl: urlSeen,
           userCode: codeSeen,
-          // `|| "default"` is vestigial -- see the empty-profile note above;
-          // `profile` is always non-empty here (startSsoLogin rejects "").
-          profile: profile || "default",
+          profile,
         });
       }
     });
@@ -575,7 +597,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
       const ttlExpired = registeredSession?.ttlExpired === true;
       const ttlMs = registeredSession?.ttlMs ?? SESSION_TTL_MS;
       finalizeSession();
-      const rawOutput = stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : "");
+      const rawOutput = clampRawOutput(stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : ""));
       let result: LoginWaitResult;
       if (ttlExpired && code !== 0) {
         // TTL killswitch fired and the subprocess exited non-zero (or via
@@ -603,7 +625,10 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         result = {
           ok: false,
           exitCode: code,
-          error: `aws sso login exited with code ${code}${stderrBuf ? `: ${stderrBuf.trim()}` : ""}`,
+          // Clamped for the same reason as rawOutput: this string is forwarded
+          // to the model as `error`, and stderrBuf is bounded only by the 5 MB
+          // memory cap.
+          error: `aws sso login exited with code ${code}${stderrBuf ? `: ${clampRawOutput(stderrBuf.trim())}` : ""}`,
           rawOutput,
         };
       }
@@ -646,7 +671,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         ok: false,
         exitCode: null,
         error: errorMsg,
-        rawOutput: stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : ""),
+        rawOutput: clampRawOutput(stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : "")),
       });
       if (!settled) {
         settled = true;
@@ -660,7 +685,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
   });
 }
 
-export interface ActiveSession {
+interface ActiveSession {
   sessionId: string;
   profile: string;
   verificationUrl: string;

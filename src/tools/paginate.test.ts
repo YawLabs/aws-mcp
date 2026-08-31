@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { runAwsCall } from "../aws-cli.js";
 import { _resetSession } from "../session.js";
 import { extractNextToken, paginateTools, wrapQueryForPagination } from "./paginate.js";
+import { validateCursorToken } from "./resource.js";
 
 const tool = paginateTools.find((t) => t.name === "aws_paginate");
 if (!tool) throw new Error("paginateTools missing aws_paginate");
@@ -92,11 +93,20 @@ describe("aws_paginate handler — startingToken validation (no spawn)", () => {
     assert.match(r.error ?? "", /Invalid startingToken/);
   });
 
-  it("rejects an over-length (>128 char) startingToken", async () => {
+  it("accepts a long (>128 char) startingToken -- real cursors are base64 blobs", () => {
+    // The bound is the 2048-char cursor bound, NOT the 128-char
+    // RequestToken/ClientToken one. AWS documents ListResources NextToken at
+    // up to 2048; the old 128 cap rejected page 2 of a normal list. Asserted
+    // against the validator rather than the handler so the test doesn't have
+    // to spawn a CLI just to get past the guard.
+    assert.equal(validateCursorToken("a".repeat(600), "startingToken"), null);
+  });
+
+  it("rejects an over-length (>2048 char) startingToken", async () => {
     const r = (await tool.handler({
       service: "s3api",
       operation: "list-buckets",
-      startingToken: "a".repeat(129),
+      startingToken: "a".repeat(2049),
     })) as { ok: boolean; error?: string };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid startingToken/);

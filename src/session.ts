@@ -51,12 +51,42 @@ export function isValidRegionName(name: string): boolean {
   return REGION_NAME_RE.test(name);
 }
 
+/**
+ * Single source for the "that profile name is not usable" text. Three call
+ * sites need it -- setProfile below, the pre-mutation validation in
+ * tools/session.ts, and runAwsCall's post-resolution check in aws-cli.ts --
+ * and they carried three hand-maintained near-copies that had already drifted
+ * apart. `tail` is the call-site-specific hint appended after the shared rule
+ * statement; omit it for the bare form.
+ */
+export function invalidProfileMessage(name: string, tail?: string): string {
+  const base = `Invalid profile name '${name}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`;
+  return tail ? `${base} ${tail}` : base;
+}
+
+/** Region counterpart to {@link invalidProfileMessage}. */
+export function invalidRegionMessage(name: string, tail?: string): string {
+  const base = `Invalid region '${name}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1', 'eu-west-3').`;
+  return tail ? `${base} ${tail}` : base;
+}
+
+// `||`, not `??`, on every env link below. An env var set to the EMPTY STRING
+// is routine in CI (`AWS_PROFILE: ${{ inputs.profile }}` with nothing passed,
+// a `.env` line with no value, `export AWS_REGION=` in a wrapper script), and
+// `??` treats "" as PRESENT -- so the chain would stop dead on it and hand
+// `aws --profile ''` to the CLI instead of falling through to the next link.
+// Empty means absent here.
+//
+// AWS_DEFAULT_PROFILE is the legacy spelling of AWS_PROFILE; botocore honors
+// both, so a config that only sets the old name still resolves. AWS_PROFILE
+// wins when both are set, mirroring the AWS_REGION / AWS_DEFAULT_REGION
+// precedence already used below.
 export function getProfile(): string {
-  return sessionProfile ?? process.env.AWS_PROFILE ?? "default";
+  return sessionProfile || process.env.AWS_PROFILE || process.env.AWS_DEFAULT_PROFILE || "default";
 }
 
 export function getRegion(): string {
-  return sessionRegion ?? process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION ?? "us-east-1";
+  return sessionRegion || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
 }
 
 export function setProfile(name: string): void {
@@ -65,9 +95,7 @@ export function setProfile(name: string): void {
   }
   const trimmed = name.trim();
   if (!isValidProfileName(trimmed)) {
-    throw new Error(
-      `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`,
-    );
+    throw new Error(invalidProfileMessage(trimmed));
   }
   sessionProfile = trimmed;
 }
@@ -78,9 +106,7 @@ export function setRegion(name: string): void {
   }
   const trimmed = name.trim();
   if (!isValidRegionName(trimmed)) {
-    throw new Error(
-      `Invalid region '${trimmed}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1', 'eu-west-3').`,
-    );
+    throw new Error(invalidRegionMessage(trimmed));
   }
   sessionRegion = trimmed;
 }
@@ -93,9 +119,12 @@ export function clearRegion(): void {
   sessionRegion = undefined;
 }
 
-export type SessionSource = "session" | "env" | "default";
+// Neither type is exported: getSessionState's return value is consumed
+// structurally (tools/session.ts hands it straight to the MCP envelope), and
+// no .d.ts ships, so there is no caller that needs to name them.
+type SessionSource = "session" | "env" | "default";
 
-export interface SessionState {
+interface SessionState {
   profile: string;
   region: string;
   profileSource: SessionSource;
@@ -106,7 +135,15 @@ export function getSessionState(): SessionState {
   return {
     profile: getProfile(),
     region: getRegion(),
-    profileSource: sessionProfile ? "session" : process.env.AWS_PROFILE ? "env" : "default",
+    // Truthiness, matching the `||` chains in getProfile / getRegion exactly:
+    // an empty-string env var is skipped by the getter, so labelling it "env"
+    // here would report a source the returned VALUE didn't actually come from
+    // (the pre-fix pairing was region:"" with regionSource:"default").
+    profileSource: sessionProfile
+      ? "session"
+      : process.env.AWS_PROFILE || process.env.AWS_DEFAULT_PROFILE
+        ? "env"
+        : "default",
     regionSource: sessionRegion
       ? "session"
       : process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION

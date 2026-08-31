@@ -26,7 +26,17 @@ if (!tool) throw new Error("scriptTools missing aws_script");
  * handler get a default that throws -- catching scripts that reach for tools
  * the test didn't intend to mock.
  */
-function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
+// Partial one level deeper than `Partial<ScriptHandlers>` for the nested
+// groups: a plain Partial leaves `resource` / `docs` all-or-nothing, so every
+// test stubbing one resource verb had to spell out the other five -- and
+// adding a verb to the bridge then broke each of those literals. The merge
+// below already treats each key independently.
+type MockOverrides = Partial<Omit<ScriptHandlers, "resource" | "docs">> & {
+  resource?: Partial<ScriptHandlers["resource"]>;
+  docs?: Partial<ScriptHandlers["docs"]>;
+};
+
+function makeMockHandlers(overrides: MockOverrides = {}): {
   handlers: ScriptHandlers;
   calls: { method: string; input: unknown }[];
 } {
@@ -54,6 +64,7 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
       update: notImpl("resource.update"),
       delete: notImpl("resource.delete"),
       status: notImpl("resource.status"),
+      diff: notImpl("resource.diff"),
     },
     docs: {
       search: notImpl("docs.search"),
@@ -89,6 +100,7 @@ function makeMockHandlers(overrides: Partial<ScriptHandlers> = {}): {
       status: overrides.resource?.status
         ? record("resource.status", overrides.resource.status)
         : defaults.resource.status,
+      diff: overrides.resource?.diff ? record("resource.diff", overrides.resource.diff) : defaults.resource.diff,
     },
     docs: {
       search: overrides.docs?.search ? record("docs.search", overrides.docs.search) : defaults.docs.search,
@@ -613,6 +625,35 @@ describe("runScript paginateAll", () => {
     assert.equal(r.data, 1000, "maxPages above the hard cap must clamp to 1000");
     assert.equal(paginateCalls, 1000);
   });
+
+  it("floors maxPages at 1 so maxPages:0 still fetches a page", async () => {
+    // The clamp used to be ceiling-only, so `maxPages: 0` skipped the loop
+    // and returned {items: [], pages: 0} as a SUCCESS -- indistinguishable
+    // from "the list is empty".
+    let paginateCalls = 0;
+    const fakePaginateTool: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+      handler: async () => {
+        paginateCalls++;
+        return { ok: true, data: { result: ["a"], nextToken: null, hasMore: false } };
+      },
+    };
+    const { handlers } = makeMockHandlers();
+    const customHandlers: ScriptHandlers = { ...handlers, paginateAll: buildPaginateAll(fakePaginateTool) };
+    const r = await runScript(
+      {
+        code: `
+          return await aws.paginateAll({ service: "s3api", operation: "list-objects-v2", maxPages: 0 });
+        `,
+      },
+      customHandlers,
+    );
+    assert.deepEqual(plain(r.data), { items: ["a"], pages: 1, count: 1 });
+    assert.equal(paginateCalls, 1);
+  });
 });
 
 describe("runScript cross-realm error bridging", () => {
@@ -884,6 +925,39 @@ describe("runScript log capture limits", () => {
 });
 
 describe("runScript additional aws.* bindings", () => {
+  it("invokes aws.resource.diff -- the preview half of preview-then-update", async () => {
+    // aws_resource_diff was registered as an MCP tool but never bound into
+    // the script bridge, so the one composition it exists for (diff, inspect
+    // the changes, then update with the same patch) had to leave the script.
+    const { handlers, calls } = makeMockHandlers({
+      resource: {
+        diff: async () => ({
+          before: { MemorySize: 256 },
+          after: { MemorySize: 512 },
+          changes: [{ op: "replace", path: "/MemorySize", before: 256, after: 512 }],
+          changeCount: 1,
+        }),
+      },
+    });
+    const r = await runScript(
+      {
+        code: `
+          const d = await aws.resource.diff({
+            typeName: "AWS::Lambda::Function",
+            identifier: "my-fn",
+            patchDocument: [{ op: "replace", path: "/MemorySize", value: 512 }],
+          });
+          return { count: d.changeCount, path: d.changes[0].path };
+        `,
+      },
+      handlers,
+    );
+    assert.deepEqual(plain(r.data), { count: 1, path: "/MemorySize" });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "resource.diff");
+    assert.equal((calls[0].input as { identifier: string }).identifier, "my-fn");
+  });
+
   it("invokes aws.metricsQuery with the script's input", async () => {
     const { handlers, calls } = makeMockHandlers({
       metricsQuery: async () => ({
@@ -1141,6 +1215,25 @@ describe("runScript timeouts", () => {
     // after Ns". Either path is acceptable -- we just need ok:false with a
     // non-empty message.
     assert.ok(handlerResult.error && handlerResult.error.length > 0);
+  });
+
+  it("returns the console lines captured before the timeout", async () => {
+    // The captured output is the only record of how far a stalled script
+    // got, and it is wanted most at exactly this moment -- it used to be
+    // discarded along with the rejected promise.
+    const handlerResult = await tool.handler({
+      code: `console.log("reached step 1"); while (true) { /* stall */ }`,
+      timeoutMs: 200,
+    });
+    assert.equal(handlerResult.ok, false);
+    const data = handlerResult.data as { logs?: string[]; truncatedLogs?: boolean };
+    assert.ok(
+      data?.logs?.some((l) => l.includes("reached step 1")),
+      `expected the pre-timeout log line in data.logs, got ${JSON.stringify(data?.logs)}`,
+    );
+    // index.ts renders only `error` + `rawBody` for a failed ToolResult, so
+    // logs left in `data` alone would never reach the model.
+    assert.match(handlerResult.rawBody ?? "", /reached step 1/);
   });
 });
 

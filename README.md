@@ -315,8 +315,13 @@ directory -- already in `.gitignore`.
 |----------|---------|---------|
 | `AWS_PROFILE` | `default` | Profile used when a tool call omits `profile`. |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | Region used when a tool call omits `region`. `AWS_REGION` wins if both are set. |
+| `AWS_SHARED_CREDENTIALS_FILE` | `~/.aws/credentials` | Where `aws_assume_role` writes the profile it creates. Honored (with `~` expansion, like botocore) so the write lands in the same file the CLI later reads. |
 
-If you authenticate via SAML (Okta / Azure AD / ADFS) or a custom `credential_process`, set `AWS_PROFILE` to that profile. The server passes `--profile` through to the AWS CLI, so the CLI's standard credential chain -- `credential_process`, SSO sessions, role chaining, static keys, IMDS -- resolves as usual.
+If you authenticate via SAML (Okta / Azure AD / ADFS) or a custom `credential_process`, set `AWS_PROFILE` to that profile.
+
+Every call resolves a profile name first -- **explicit tool `profile` argument -> the session profile set by `aws_session_set` -> `$AWS_PROFILE` -> the literal `default`** -- and then passes it to the CLI as `--profile <name>`. That flag is always present; there is no "no profile" mode. Inside the chosen profile the CLI's own chain resolves as usual: `credential_process`, SSO sessions (both `sso_session` blocks and inline `sso_start_url`), role chaining via `source_profile` / `role_arn`, static keys stored in `~/.aws/credentials`, container credentials, and IMDS.
+
+**Exception -- static keys in your environment are not used.** Because a profile is always passed explicitly, botocore drops the environment credential provider from the chain, so `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` exported in your shell are never consulted. (Container credentials and IMDS are unaffected -- they sit later in the chain and are not profile-gated.) To use static keys, put them in a profile section of `~/.aws/credentials` and point `AWS_PROFILE` at it, rather than exporting them.
 
 If neither `AWS_PROFILE` is set nor `aws_session_set` has been called and there's no `[default]` section in `~/.aws/config`, tools will fail with `ProfileNotFound`. Set `AWS_PROFILE` in your MCP config to your usual working profile.
 
@@ -352,26 +357,26 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 - **Success envelope shape per tool** -- the `data` object on `{ok: true, data}` responses, specifically:
   - `aws_call` -> `{command, result}`
   - `aws_paginate` -> `{command, result, nextToken, hasMore}`
-  - `aws_multi_region` -> `{service, operation, regionCount, okCount, errorCount, results: [{region, ok, data?, command?, error?, errorKind?}]}`
+  - `aws_multi_region` -> `{service, operation, regionCount, okCount, errorCount, results: [{region, ok, data?, command?, error?, errorKind?, truncated?}]}` (the aggregate response is capped; entries past the budget keep their `region`/`ok` but drop `data` and are flagged `truncated: true`. Error entries are never dropped, and `okCount`/`errorCount` are computed before capping, so they always describe what the calls did rather than what survived the cap.)
   - `aws_whoami` -> `{account, userId, arn, profile, region, ssoToken: {expiresAt, minutesLeft, startUrl?} | null}` (`startUrl` is omitted when the cached token didn't record one)
   - `aws_login_start` -> `{sessionId, profile, verificationUrl, userCode, instructions, reused?}` (`reused: true` when re-surfacing an in-flight login for the same profile)
   - `aws_login_complete` -> `{loggedIn, account, userId, arn, profile, region, ssoToken}` (same `ssoToken` shape as `aws_whoami`, including the optional `startUrl`)
   - `aws_refresh_if_expiring_soon` -> **one of two shapes by branch:** `{status: "ok", minutesLeft, expiresAt, profile}` when the cached token has more than `thresholdMinutes` left, or `{status: "refreshing", reason, sessionId, profile, verificationUrl, userCode, reused?, instructions}` when a refresh is in flight. Discriminate on `status`.
-  - `aws_assume_role` -> `{profile, credentialsPath, expiration, assumedRoleArn, assumedRoleId, sourceProfile, hint}`
+  - `aws_assume_role` -> `{profile, credentialsPath, expiration, assumedRoleArn, assumedRoleId, sourceProfile, hint, warning?}` (`warning` is present only when the target profile already existed and its three credential keys were overwritten in place; `credentialsPath` follows `AWS_SHARED_CREDENTIALS_FILE` when that is set)
   - `aws_list_profiles` -> `{configPath, profiles: [{name, region?, ssoStartUrl?, ssoRegion?, ssoSession?, isSso}]}`
   - `aws_session_get` / `aws_session_set` / `aws_session_clear` -> `{profile, region, profileSource, regionSource}` where `*Source` is `"session" | "env" | "default"`. All three return the same shape (set/clear return the post-mutation state).
   - `aws_resource_get` -> `{command, typeName, identifier, properties, propertiesRaw?}`
-  - `aws_resource_list` -> `{command, typeName, resources: [{identifier, properties}], nextToken, hasMore}`
-  - `aws_resource_create` / `_update` / `_delete` / `_status` -> flat-promoted `{command, requestToken, operationStatus, identifier, errorCode, statusMessage, retryAfter, progressEvent}` plus an `awaited: {attempts, elapsedMs}` block when `awaitCompletion: true` was passed
+  - `aws_resource_list` -> `{command, typeName, resources: [{identifier, properties, propertiesRaw?}], nextToken, hasMore}` (`propertiesRaw` rides along on an entry whose `Properties` string didn't parse, matching `aws_resource_get`)
+  - `aws_resource_create` / `_update` / `_delete` / `_status` -> flat-promoted `{command, requestToken, operationStatus, identifier, errorCode, statusMessage, retryAfter, progressEvent}` plus an `awaited: {attempts, elapsedMs}` block when `awaitCompletion: true` was passed, or an `awaitSkipped` string when `awaitCompletion: true` was passed but no request token came back to poll on
   - `aws_resource_diff` -> `{command, typeName, identifier, before, after, changes, changeCount}`
   - `aws_logs_tail` -> `{command, logGroupName, since, eventCount, events}`
   - `aws_metrics_query` -> `{command, profile, region, startTime, endTime, periodSeconds, series: [{id, label?, timestamps, values, period?, statusCode?}], nextToken, hasMore, messages?: [{code?, value?}]}` (`messages` is omitted when empty; per-series `label` / `period` / `statusCode` are present when CloudWatch returns them or the query specifies/inherits a period; `nextToken` is null and `hasMore` false unless CloudWatch truncated the response)
-  - `aws_iam_simulate` -> `{command, principalArn, summary: {allowed, denied, total}, results, evaluationResults}`
+  - `aws_iam_simulate` -> `{command, principalArn, summary: {allowed, denied, unknown, total}, results, marker, hasMore}` (`summary` describes only the page in hand; when `hasMore` is true, pass `marker` back to fetch the rest. `unknown` counts results whose `EvalDecision` was missing or unrecognized, so a malformed response can't be silently folded into `denied`.)
   - `aws_script` -> `{result, logs, truncatedLogs, durationMs}` where `result` is whatever the script `return`ed (any JSON-serializable value, including `undefined`)
   - `aws_docs_search` -> `{query, count, results: [{title, url, summary?, excerpt?}]}` (`summary` / `excerpt` are present only when the upstream search backend returns them)
   - `aws_docs_read` -> `{url, cached, content, startIndex, endIndex, totalLength, hasMore, nextStartIndex}`
 - **Error envelope** -- `{ok: false, error: string, rawBody?: string}`. The `error` string is human-readable; its *wording* is best-effort (see below).
-- **`errorKind` enum on `aws_multi_region`** -- `"sso_expired" | "no_creds" | "bad_input" | "spawn_failure" | "timeout" | "output_too_large" | "nonzero_exit"`. New variants may be added (additive); existing ones won't be renamed or repurposed.
+- **`errorKind` enum on `aws_multi_region`** -- `"sso_expired" | "no_creds" | "invalid_creds" | "bad_input" | "spawn_failure" | "timeout" | "output_too_large" | "malformed_json" | "nonzero_exit"`. New variants may be added (additive); existing ones won't be renamed or repurposed. (`invalid_creds` means credentials resolved but AWS rejected them -- distinct from `no_creds`, where none were found. `malformed_json` means stdout opened with `{` or `[` and failed to parse, i.e. a truncated response rather than the scalar output a `--query` can legitimately produce.)
 
 **Best-effort (may change in a minor or patch):**
 

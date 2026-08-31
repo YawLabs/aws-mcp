@@ -45,12 +45,13 @@ describe("procHasExited", () => {
 
 // Minimal child-process-like double for killProc: an EventEmitter (killProc
 // itself doesn't emit, but the real ChildProcess is one and tests may want it)
-// carrying the exact fields killProc's escalation guard reads -- `killed` and
-// `exitCode` -- plus a `kill` spy that records every signal it was sent. The
-// guard does NOT consult signalCode, so we don't model it flipping here; the
-// real OS sets `killed` true on a successful kill() call, which is what the
-// guard checks. `onTerm` lets a test simulate "SIGTERM was delivered and the
-// proc died" so we can assert SIGKILL is then skipped.
+// carrying the fields the escalation guard reads -- `exitCode` and
+// `signalCode`, via procHasExited -- plus `killed` (which the guard
+// deliberately does NOT consult) and a `kill` spy that records every signal it
+// was sent. `killed` is modeled the way Node sets it: true as soon as a signal
+// has been DISPATCHED, whether or not the child honored it. `onTerm` lets a
+// test simulate "SIGTERM was delivered and the proc died" so we can assert
+// SIGKILL is then skipped.
 class FakeProc extends EventEmitter {
   killed = false;
   exitCode: number | null = null;
@@ -83,15 +84,11 @@ describe("killProc", () => {
     mock.timers.enable({ apis: ["setTimeout"] });
     try {
       const proc = makeFakeProc();
-      // Model a proc that ignores SIGTERM (the Windows / stubborn-daemon case
-      // killProc exists for): kill() records the signal but the proc never
-      // exits, so `killed` stays as kill() set it and exitCode stays null.
-      // Reset `killed` to false after SIGTERM so the guard (`!killed`) passes;
-      // this simulates a kill() impl that didn't latch killed, isolating the
-      // exitCode===null branch that actually drives escalation.
-      proc.onTerm = () => {
-        proc.killed = false;
-      };
+      // Model a proc that ignores SIGTERM (the stubborn-daemon case killProc
+      // exists for): kill() records the signal and Node latches `killed`, but
+      // the child never exits, so exitCode / signalCode stay null. No fixup of
+      // `killed` here -- the guard is procHasExited, so the latched `killed`
+      // must not suppress the escalation.
       killProc(proc as unknown as ChildProcess);
       assert.deepEqual(proc.signals, ["SIGTERM"]);
 
@@ -113,15 +110,16 @@ describe("killProc", () => {
     try {
       const proc = makeFakeProc();
       // SIGTERM worked: the proc exited cleanly, so libuv populated exitCode.
+      // `killed` stays latched true, as Node leaves it -- exitCode is what the
+      // guard trips on.
       proc.onTerm = () => {
-        proc.killed = false; // not the field the guard trips on here
-        proc.exitCode = 0; // this is -- exitCode !== null short-circuits SIGKILL
+        proc.exitCode = 0;
       };
       killProc(proc as unknown as ChildProcess);
       assert.deepEqual(proc.signals, ["SIGTERM"]);
 
       mock.timers.tick(KILL_ESCALATION_MS);
-      // Escalation timer ran but the `exitCode === null` guard was false.
+      // Escalation timer ran but procHasExited was true.
       assert.deepEqual(proc.signals, ["SIGTERM"]);
       assert.equal(proc.kill.mock.callCount(), 1);
     } finally {
@@ -129,19 +127,42 @@ describe("killProc", () => {
     }
   });
 
-  it("does NOT send SIGKILL when the proc reports killed after the window", () => {
+  it("does NOT send SIGKILL when the proc was reaped via signalCode alone", () => {
+    // procHasExited reads BOTH fields. A child killed by a signal reports
+    // signalCode with exitCode still null, so an exitCode-only guard would
+    // escalate against an already-dead proc.
     mock.timers.enable({ apis: ["setTimeout"] });
     try {
       const proc = makeFakeProc();
-      // The default FakeProc.kill leaves `killed` true after SIGTERM (the
-      // normal case: the signal was delivered). The guard's `!proc.killed`
-      // arm then short-circuits SIGKILL.
+      proc.onTerm = () => {
+        proc.signalCode = "SIGTERM";
+      };
       killProc(proc as unknown as ChildProcess);
-      assert.equal(proc.killed, true);
 
       mock.timers.tick(KILL_ESCALATION_MS);
       assert.deepEqual(proc.signals, ["SIGTERM"]);
       assert.equal(proc.kill.mock.callCount(), 1);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it("STILL escalates when proc.killed is true but the child never exited", () => {
+    // Regression guard for the bug this replaced: the guard used to be
+    // `!proc.killed && proc.exitCode === null`. Node sets `killed` when the
+    // signal is DISPATCHED, so it is always true here and the SIGKILL branch
+    // was unreachable on every platform -- the comment blamed Windows, but a
+    // stubborn Unix daemon never got its SIGKILL either.
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const proc = makeFakeProc();
+      killProc(proc as unknown as ChildProcess);
+      assert.equal(proc.killed, true, "Node latches killed on dispatch, before the child dies");
+      assert.equal(proc.exitCode, null, "the child ignored SIGTERM -- still alive");
+
+      mock.timers.tick(KILL_ESCALATION_MS);
+      assert.deepEqual(proc.signals, ["SIGTERM", "SIGKILL"]);
+      assert.equal(proc.kill.mock.callCount(), 2);
     } finally {
       mock.timers.reset();
     }
@@ -161,8 +182,8 @@ describe("killProc", () => {
         proc.killed = true;
         return true;
       });
-      // exitCode stays null and killed stays false, so the post-window guard
-      // passes and SIGKILL is attempted despite the SIGTERM throw.
+      // exitCode / signalCode stay null, so procHasExited is false and SIGKILL
+      // is still attempted despite the SIGTERM throw.
       assert.doesNotThrow(() => killProc(proc as unknown as ChildProcess));
       mock.timers.tick(KILL_ESCALATION_MS);
       assert.deepEqual(proc.signals, ["SIGTERM", "SIGKILL"]);

@@ -416,6 +416,73 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
   });
 });
 
+describe("aws_iam_simulate request bounds", () => {
+  // Results are actions x resources and the whole request travels in ONE argv
+  // entry (--cli-input-json). Without a cap, a plausible 300-ARN batch died as
+  // an opaque spawn error instead of a validation message.
+  it("rejects more than 50 resources at both the schema and the handler", async () => {
+    const resources = Array.from({ length: 51 }, (_, n) => `arn:aws:s3:::bucket-${n}/*`);
+    assert.equal(
+      tool.inputSchema.safeParse({
+        principalArn: "arn:aws:iam::123456789012:user/jeff",
+        actions: ["s3:GetObject"],
+        resources,
+      }).success,
+      false,
+      "precondition: the schema rejects 51 resources",
+    );
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject"],
+      resources,
+    } as never);
+    assert.equal(r.ok, false, "handler must agree with the schema");
+    assert.match(r.error ?? "", /Too many resources: 51 requested, max 50/);
+  });
+
+  it("rejects a payload that would overflow the single argv entry, even within the count caps", async () => {
+    // 50 resources is legal by count, but at ~2000 chars each the serialized
+    // --cli-input-json is ~100 KB -- past the Linux per-entry limit and far
+    // past the Windows whole-command-line limit. Each ARN is under the
+    // per-resource 2048-char cap, so only the byte guard can catch this.
+    const resources = Array.from({ length: 50 }, (_, n) => `arn:aws:s3:::bucket-${n}/${"a".repeat(1980)}`);
+    for (const r of resources) assert.ok(r.length <= 2048, "precondition: each ARN is under the per-resource cap");
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject"],
+      resources,
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Request too large/);
+    assert.match(r.error ?? "", /single argv entry/);
+  });
+});
+
+describe("aws_iam_simulate response shape", () => {
+  it("surfaces pagination state and drops the duplicated raw evaluationResults", async () => {
+    // IsTruncated/Marker were read by nobody, so `summary.total` was reported
+    // as if it were the complete answer. hasMore/marker now say otherwise on a
+    // truncated page; on a complete one they are false/null.
+    // `evaluationResults` used to echo the entire raw array next to the flat
+    // `results` derived from it -- double payload, no consumer.
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject", "lambda:InvokeFunction", "ec2:TerminateInstances"],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as Record<string, unknown>;
+    assert.equal(data.hasMore, false, "a complete page reports hasMore:false");
+    assert.equal(data.marker, null, "a complete page carries no resume cursor");
+    assert.equal(
+      Object.hasOwn(data, "evaluationResults"),
+      false,
+      "the raw EvaluationResults array must not be echoed alongside `results`",
+    );
+    assert.ok(Array.isArray(data.results), "the flat results array is still the payload");
+  });
+});
+
 describe("parseSimulationResults -- inline-policy matches (no SourcePolicyId)", () => {
   // Inline policies (and certain implicit sources) come back from IAM with
   // SourcePolicyType + StartPosition but no SourcePolicyId. Without a

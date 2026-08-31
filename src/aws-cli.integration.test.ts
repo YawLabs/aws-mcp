@@ -54,6 +54,9 @@ describe("runAwsCall — success paths", () => {
   });
 
   it("returns raw string when stdout isn't valid JSON (outputFormat=json)", async () => {
+    // A --query expression extracting a scalar returns it unquoted even under
+    // --output json. That IS the successful result, so the string fallback
+    // stays -- see the malformed-JSON cases below for the half that doesn't.
     const r = await runAwsCall({
       service: "s3api",
       operation: "list-buckets",
@@ -74,6 +77,81 @@ describe("runAwsCall — success paths", () => {
     assert.equal(r.ok, true);
     if (!r.ok) return;
     assert.match(r.data as string, /some-plain-string/);
+  });
+});
+
+describe("runAwsCall — truncated JSON is a FAILURE, not a success", () => {
+  // The bug: JSON.parse failure settled {ok:true, data: trimmed} for every
+  // input, so a truncated payload was reported as a successful call carrying a
+  // broken string. The scalar rationale is real, but it only covers stdout
+  // that isn't JSON at all -- text that OPENS with '{' or '[' and fails to
+  // parse is a truncation, and silently downgrading it to a string is how a
+  // partial result gets treated as the whole result.
+
+  it("settles kind='malformed_json' when stdout opens with '{' and fails to parse", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_truncated_json"),
+    });
+    assert.equal(r.ok, false, "a truncated payload must not be reported as a successful call");
+    if (r.ok) return;
+    assert.equal(r.kind, "malformed_json");
+    assert.match(r.error, /failed to parse/i);
+    assert.match(r.error, /truncated/i);
+    // Exit code was 0 -- the CLI itself thought it succeeded. That is exactly
+    // why this needs its own kind rather than nonzero_exit.
+    assert.equal(r.exitCode, 0);
+    // The bytes that did arrive are preserved for diagnosis.
+    assert.match(r.rawStdout ?? "", /bucket-1/);
+  });
+
+  it("detects the '[' container too", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_truncated_json_array"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "malformed_json");
+  });
+
+  it("does NOT fire for a scalar --query result", async () => {
+    // The guard against over-correcting: plain text must still be ok:true.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_nonjson_success"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.data, "some-plain-string");
+  });
+
+  it("does NOT fire for empty stdout", async () => {
+    // Empty is a legitimate success shape (tag-role, put-*) and never reaches
+    // the parse at all.
+    const r = await runAwsCall({
+      service: "iam",
+      operation: "tag-role",
+      ...fakeOpts("call_empty_success"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.data, null);
+  });
+
+  it("does NOT fire for outputFormat != json (nothing is parsed)", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      outputFormat: "text",
+      ...fakeOpts("call_truncated_json"),
+    });
+    assert.equal(r.ok, true, "text/table/yaml output is passed through unparsed");
+    if (!r.ok) return;
+    assert.match(r.data as string, /bucket-1/);
   });
 });
 
@@ -250,6 +328,28 @@ describe("runAwsCall — argv construction", () => {
     assert.ok(!r.command.includes("hunter2-secret"), "secret leaked in displayCommand");
     assert.match(r.command, /<redacted len=\d+>/);
   });
+
+  it("shell-quotes the displayed command so it survives a paste", async () => {
+    // data.command goes to a model, which pastes far more readily than a human
+    // does. The redaction stub contains spaces and angle brackets and a --query
+    // expression contains brackets and dots, so an unquoted join produced a
+    // string that either failed to run or ran something else.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query: "Buckets[].Name",
+      params: { Prefix: "x" },
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    // Both hazardous entries appear quoted...
+    assert.match(r.command, /'Buckets\[\]\.Name'/);
+    assert.match(r.command, /'<redacted len=\d+>'/);
+    // ...and the ordinary tokens are left alone, so the string stays readable.
+    assert.match(r.command, /(^|\s)s3api\s/);
+    assert.match(r.command, /\s--query\s/);
+  });
 });
 
 describe("runAwsCall — failure paths", () => {
@@ -358,20 +458,25 @@ describe("runAwsCall — failure paths", () => {
   });
 
   it("preserves partial stdout when a timeout kills a subprocess mid-stream", async () => {
-    // call_partial_then_hang flushes a JSON fragment, lets the parent drain it,
-    // then hangs past our timeoutMs. The timeout branch (aws-cli.ts:311)
-    // attaches the partial rawStdout to the failure so the bytes that DID arrive
-    // before the kill aren't lost. The fragment is not valid JSON on its own --
-    // the timeout path never parses stdout, it just preserves the raw bytes.
+    // call_partial_then_hang flushes a JSON fragment, then hangs past our
+    // timeoutMs. The timeout branch attaches the partial rawStdout to the
+    // failure so the bytes that DID arrive before the kill aren't lost. The
+    // fragment is not valid JSON on its own -- the timeout path never parses
+    // stdout, it just preserves the raw bytes, so this does NOT go down the
+    // malformed_json path above.
     //
-    // timeoutMs is deliberately roomy, and must NOT be tuned back down. This is
-    // the one timeout in this file that races the WRONG way: every other case
-    // only needs the timeout to beat a sleeping fake, whereas this one needs the
-    // fragment to ARRIVE FIRST -- which means the budget has to cover Node's
-    // cold start, module load, and the first stdout drain. At 200ms that failed
-    // roughly 1 run in 6 under a parallel full-suite run (`node --test` runs
-    // files across all cores), surfacing as an empty rawStdout. Anything
-    // comfortably between startup+50ms and the fake's 10s hang works.
+    // runAwsCall now settles on 'close' rather than 'exit', which strengthens
+    // this case: 'close' fires only once the pipes are drained, so a fragment
+    // still sitting in the pipe when the child is reaped can no longer be lost
+    // to a settle that beat the read.
+    //
+    // timeoutMs is still deliberately roomy and must NOT be tuned back down.
+    // The remaining requirement is unchanged: the fake has to get its write
+    // out before our timeout kills it, so the budget has to cover Node's cold
+    // start and module load. At 200ms that failed roughly 1 run in 6 under a
+    // parallel full-suite run (`node --test` runs files across all cores),
+    // surfacing as an empty rawStdout. Anything comfortably between
+    // startup+50ms and the fake's 10s hang works.
     const r = await runAwsCall({
       service: "s3api",
       operation: "list-buckets",

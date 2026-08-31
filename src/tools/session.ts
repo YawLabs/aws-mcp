@@ -3,6 +3,8 @@ import {
   clearProfile,
   clearRegion,
   getSessionState,
+  invalidProfileMessage,
+  invalidRegionMessage,
   isValidProfileName,
   isValidRegionName,
   setProfile,
@@ -50,10 +52,9 @@ export const sessionTools: readonly Tool[] = [
           return { ok: false, error: "Profile name cannot be empty" };
         }
         if (!isValidProfileName(trimmed)) {
-          return {
-            ok: false,
-            error: `Invalid profile name '${trimmed}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`,
-          };
+          // Same text setProfile would have thrown -- shared so the two can't
+          // drift, since this path exists purely to validate ahead of it.
+          return { ok: false, error: invalidProfileMessage(trimmed) };
         }
       }
       if (region !== undefined) {
@@ -62,10 +63,7 @@ export const sessionTools: readonly Tool[] = [
           return { ok: false, error: "Region cannot be empty" };
         }
         if (!isValidRegionName(trimmed)) {
-          return {
-            ok: false,
-            error: `Invalid region '${trimmed}'. Must match /^[a-z][a-z0-9-]{2,30}$/ (e.g. 'us-east-1', 'eu-west-3').`,
-          };
+          return { ok: false, error: invalidRegionMessage(trimmed) };
         }
       }
       // Both inputs valid -- now apply. setProfile/setRegion re-trim, so the

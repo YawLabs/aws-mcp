@@ -23,6 +23,16 @@ const DEFAULT_CONCURRENCY = 8;
 const MAX_CONCURRENCY = 32;
 const MAX_REGIONS = 32;
 
+// Per-CALL output is capped (aws-cli.ts kills a subprocess whose stdout passes
+// 5 MB), but the BATCH had no ceiling of its own: 32 regions x 5 MB each is
+// 160 MB held in `results` and then JSON-serialized into a single MCP response.
+// Cap the aggregate at the same 5 MB one call is allowed. Entries are kept in
+// order and counted until the budget is spent; past it, an entry's `data` is
+// DROPPED (not string-truncated, which would emit unparseable JSON) and the
+// entry is flagged `truncated: true` so the caller can see exactly which
+// regions to re-run on their own or narrow with `query` / `params`.
+const MAX_TOTAL_RESULT_BYTES = 5 * 1024 * 1024;
+
 // Region validation comes from session.ts (REGION_NAME_RE / isValidRegionName)
 // so the argv-safety contract for region IDs is defined in one place. Previously
 // this file carried a duplicate regex with the identical pattern -- harmless
@@ -35,6 +45,46 @@ export interface RegionResult {
   command?: string;
   error?: string;
   errorKind?: string;
+  /**
+   * True when this region's call finished but its `data` was dropped to keep
+   * the aggregate response under MAX_TOTAL_RESULT_BYTES. `ok` still reports
+   * what the CALL did -- an ok:true entry with truncated:true succeeded and
+   * its payload didn't fit, which is a different thing from a failure.
+   */
+  truncated?: boolean;
+}
+
+/**
+ * Enforce the aggregate response budget across per-region results.
+ *
+ * Walks entries in order, charging each one its serialized size, and once the
+ * budget is spent drops `data` from any entry that carries one. Error entries
+ * are left intact: their text is already bounded (aws-cli.ts truncates error
+ * messages at 8 KB) and losing the reason a region failed is worse than the
+ * bytes it costs. Returns the regions whose data was dropped so the handler
+ * can surface them.
+ */
+export function capAggregateResults(
+  results: readonly RegionResult[],
+  maxBytes: number,
+): { results: RegionResult[]; truncatedRegions: string[] } {
+  const truncatedRegions: string[] = [];
+  let used = 0;
+  const out = results.map((r) => {
+    const size = Buffer.byteLength(JSON.stringify(r), "utf8");
+    if (used + size <= maxBytes || r.data === undefined) {
+      used += size;
+      return r;
+    }
+    const trimmed: RegionResult = { region: r.region, ok: r.ok, truncated: true };
+    if (r.command !== undefined) trimmed.command = r.command;
+    if (r.error !== undefined) trimmed.error = r.error;
+    if (r.errorKind !== undefined) trimmed.errorKind = r.errorKind;
+    truncatedRegions.push(r.region);
+    used += Buffer.byteLength(JSON.stringify(trimmed), "utf8");
+    return trimmed;
+  });
+  return { results: out, truncatedRegions };
 }
 
 /**
@@ -95,7 +145,7 @@ export const multiRegionTools: readonly Tool[] = [
   {
     name: "aws_multi_region",
     description:
-      "Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes `regions: string[]` instead of `region`. Returns an array of `{region, ok, data?, command?, error?, errorKind?}` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so `results.length` may be less than `regions.length`; use the returned `regionCount` for the actual count run. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.",
+      "Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes `regions: string[]` instead of `region`. Returns an array of `{region, ok, data?, command?, error?, errorKind?}` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so `results.length` may be less than `regions.length`; use the returned `regionCount` for the actual count run. The whole batch is capped at 5 MB of results: if it would exceed that, later entries keep their status but lose `data` and are flagged `truncated: true`, with the affected regions listed in a top-level `truncatedRegions` -- re-run those regions individually or narrow with `query`/`params`. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.",
     annotations: {
       title: "Run an AWS operation across multiple regions in parallel",
       // The operation can be anything -- we conservatively annotate as not
@@ -224,8 +274,12 @@ export const multiRegionTools: readonly Tool[] = [
         }
       });
 
+      // Counted BEFORE the aggregate cap runs: okCount/errorCount describe what
+      // the CALLS did, which is unchanged by whether a payload fit in the
+      // response budget.
       const okCount = results.filter((r) => r.ok).length;
       const errCount = results.length - okCount;
+      const capped = capAggregateResults(results, MAX_TOTAL_RESULT_BYTES);
 
       return {
         ok: true,
@@ -235,7 +289,14 @@ export const multiRegionTools: readonly Tool[] = [
           regionCount: regions.length,
           okCount,
           errorCount: errCount,
-          results,
+          ...(capped.truncatedRegions.length > 0
+            ? {
+                truncated: true,
+                truncatedRegions: capped.truncatedRegions,
+                maxTotalResultBytes: MAX_TOTAL_RESULT_BYTES,
+              }
+            : {}),
+          results: capped.results,
         },
       };
     },

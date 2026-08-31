@@ -25,15 +25,47 @@ function fakeResponse(opts: {
   json?: unknown;
   text?: string;
   contentType?: string;
+  contentLength?: string;
   textThrows?: boolean;
+  url?: string;
+  bodyChunks?: Array<string | Uint8Array>;
 }): Response {
   const contentType = opts.contentType ?? "text/html; charset=utf-8";
   return {
     ok: opts.ok ?? true,
     status: opts.status ?? 200,
     statusText: opts.statusText ?? "OK",
+    // Absent unless a case opts in, so the existing fixtures keep exercising
+    // the "no redirect information" fallback to the requested URL.
+    ...(opts.url !== undefined ? { url: opts.url } : {}),
+    // A streaming body only when a case asks for one; otherwise the handler
+    // takes the text() path, like every pre-existing fixture here.
+    ...(opts.bodyChunks !== undefined
+      ? {
+          body: {
+            getReader: () => {
+              const encoder = new TextEncoder();
+              const chunks = opts.bodyChunks as Array<string | Uint8Array>;
+              let n = 0;
+              return {
+                read: async () => {
+                  if (n >= chunks.length) return { done: true, value: undefined };
+                  const chunk = chunks[n++];
+                  return { done: false, value: typeof chunk === "string" ? encoder.encode(chunk) : chunk };
+                },
+                cancel: async () => {},
+              };
+            },
+          },
+        }
+      : {}),
     headers: {
-      get: (name: string) => (name.toLowerCase() === "content-type" ? contentType : null),
+      get: (name: string) => {
+        const key = name.toLowerCase();
+        if (key === "content-type") return contentType;
+        if (key === "content-length") return opts.contentLength ?? null;
+        return null;
+      },
     },
     json: async () => {
       if (opts.json === undefined) throw new Error("no json body");
@@ -427,6 +459,97 @@ describe("aws_docs_read handler", () => {
     assert.equal(fetchCount, 1);
     // The second window is a real slice, not a repeat of the first.
     assert.notEqual((first.data as { content: string }).content, (second.data as { content: string }).content);
+  });
+
+  it("rejects an over-size page from Content-Length without downloading it", async () => {
+    // The 30s fetch timeout bounds LATENCY, not SIZE. A declared length over
+    // the 5MB cap must bounce before any body read happens -- `textThrows`
+    // makes that provable: if the handler touched the body we would get the
+    // body-read error instead of the size one.
+    const fetchImpl = (async () =>
+      fakeResponse({ contentLength: String(6 * 1024 * 1024), textThrows: true })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/huge.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /more than 5 MB of HTML/);
+    assert.match(r.error ?? "", /content-length 6291456 bytes/);
+    assert.doesNotMatch(r.error ?? "", /response body/, "must not read a body it already knows is too large");
+  });
+
+  it("stops a streaming body once it crosses the cap", async () => {
+    // No Content-Length (chunked): the cap has to be enforced mid-stream, and
+    // the bytes past it are never buffered or converted.
+    const oneMb = "y".repeat(1024 * 1024);
+    const fetchImpl = (async () =>
+      fakeResponse({ bodyChunks: Array.from({ length: 8 }, () => oneMb) })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/streamed.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /more than 5 MB of HTML/);
+    assert.doesNotMatch(r.error ?? "", /content-length/, "size learned mid-stream, not from a header");
+  });
+
+  it("reads a normal page through the streaming path unchanged", async () => {
+    // The cap must not disturb the ordinary case: chunked HTML, split so a
+    // multi-byte character straddles a chunk boundary, still converts.
+    const utf8 = new TextEncoder().encode("<html><body><main><h1>Café</h1><p>ok</p></main></body></html>");
+    const splitAt = utf8.indexOf(0xc3) + 1; // mid-sequence: 'é' is 0xC3 0xA9
+    const fetchImpl = (async () =>
+      fakeResponse({ bodyChunks: [utf8.subarray(0, splitAt), utf8.subarray(splitAt)] })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/small.html" });
+    assert.equal(r.ok, true);
+    assert.match((r.data as { content: string }).content, /# Café/, "split multi-byte sequence must not become U+FFFD");
+  });
+
+  it("re-checks the allowlist against the FINAL url after redirects", async () => {
+    // isValidDocsUrl gates the REQUEST url, but fetch follows redirects -- so
+    // an allowlisted docs URL that 302s off-domain was fetched and converted
+    // with only the content-type gate behind it.
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://evil.example.com/landing.html",
+        text: "<html><body><main><p>not aws docs</p></main></body></html>",
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/redirector.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /redirected to 'https:\/\/evil\.example\.com\/landing\.html'/);
+  });
+
+  it("allows a redirect that stays inside the docs allowlist", async () => {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://docs.aws.amazon.com/en_us/lambda/latest/dg/welcome.html",
+        text: "<html><body><main><p>localized</p></main></body></html>",
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html" });
+    assert.equal(r.ok, true);
+    assert.match((r.data as { content: string }).content, /localized/);
+  });
+
+  it("serves but does not cache a conversion larger than the per-entry bound", async () => {
+    // The cache header comment's footprint math (64 entries x 1MB) is only true
+    // if an over-size conversion stays out of the cache. The page is still
+    // served in full -- it just costs a fetch per window.
+    let fetchCount = 0;
+    const html = `<html><body><main><p>${"z".repeat(1_100_000)}</p></main></body></html>`;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ text: html });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const url = "https://docs.aws.amazon.com/enormous.html";
+
+    const first = await read.handler({ url, maxLength: 50 });
+    assert.equal(first.ok, true);
+    assert.ok((first.data as { totalLength: number }).totalLength > 1_000_000, "precondition: over MAX_MAX_LENGTH");
+
+    const second = await read.handler({ url, startIndex: 50, maxLength: 50 });
+    assert.equal(second.ok, true);
+    assert.equal((second.data as { cached: boolean }).cached, false, "an over-size page must not be cached");
+    assert.equal(fetchCount, 2, "the second window re-fetches instead of blowing the cache bound");
   });
 
   it("scopes the cache per buildDocsTools instance", async () => {

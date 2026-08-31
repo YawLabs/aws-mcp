@@ -238,6 +238,30 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "call_truncated_json": {
+      // Exit 0 with stdout that OPENS as a JSON object and is cut off partway
+      // -- what a killed upload, a full disk, or a proxy dropping the response
+      // body actually produces. The sibling of call_nonjson_success, and the
+      // pair is the whole point: both fail JSON.parse, and runAwsCall must
+      // treat them completely differently. The scalar is a legitimate success;
+      // this one is a truncated payload and settles as kind:"malformed_json".
+      //
+      // Before that split, a truncated response came back as {ok:true, data:
+      // "<the broken text>"} -- the caller was told the call SUCCEEDED and
+      // handed a string where the schema promises an object.
+      process.stdout.write('{"Buckets":[{"Name":"bucket-1"},{"Na');
+      process.exit(0);
+      return;
+    }
+
+    case "call_truncated_json_array": {
+      // Same as above but opening with '[', the other JSON container. Pins
+      // that the detection is not '{'-only.
+      process.stdout.write('[{"Name":"bucket-1"},{"Nam');
+      process.exit(0);
+      return;
+    }
+
     case "call_access_denied": {
       process.stderr.write("An error occurred (AccessDenied) when calling the ListBuckets operation: Access Denied\n");
       process.exit(255);
@@ -279,13 +303,26 @@ async function main(): Promise<void> {
       // call_slow (which hangs before emitting anything), this exercises the
       // timeout-PRESERVES-partial-output path: runAwsCall's timeout branch
       // attaches rawStdout to the AwsCallFailure, so a test can assert the
-      // partial bytes survived the kill. We flush a fragment immediately, give
-      // the parent's stdout.on('data') a tick to drain it, then sleep well past
-      // any reasonable test timeoutMs so the parent's timeout fires and kills
-      // us. The fragment is intentionally NOT valid JSON on its own -- the
-      // timeout path never parses stdout, it just preserves the raw bytes.
+      // partial bytes survived the kill. The fragment is intentionally NOT
+      // valid JSON on its own -- the timeout path never parses stdout, it just
+      // preserves the raw bytes.
+      //
+      // Behavior is unchanged now that runAwsCall settles on 'close' instead of
+      // 'exit', but the reason it holds is stronger. Under 'exit' the parent
+      // could settle the moment we were reaped, with our fragment still sitting
+      // unread in the pipe -- so the sleep below was load-bearing, buying the
+      // parent's stdout.on('data') a chance to drain first. 'close' fires only
+      // after the pipes are drained and closed, so the fragment is now
+      // guaranteed to be in rawStdout however the scheduling falls. The sleep
+      // stays because it keeps the two-chunk write shape this scenario is
+      // named for; it is no longer what makes the assertion pass.
+      //
+      // What DOES still matter is ordering: we must get this write out before
+      // the parent's timeout kills us, so the test's timeoutMs has to clear
+      // Node's cold start. See the note on the caller in
+      // aws-cli.integration.test.ts.
       process.stdout.write('{"partial":"this-arrived-before-the-timeout"');
-      await sleep(50); // let the parent drain the first chunk before we hang
+      await sleep(50); // keeps the write split across two chunks
       await sleep(10_000); // hang well past the test's timeoutMs
       process.stdout.write("}\n");
       process.exit(0);

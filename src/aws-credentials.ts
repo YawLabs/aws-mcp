@@ -14,7 +14,12 @@
  *
  * We write to a .tmp file first and rename on top of the original so a
  * crash mid-write can't leave the user with a truncated credentials file.
- * On Unix we chmod 0o600 to match the AWS CLI's own behavior.
+ * The tmp file is opened with mode 0o600 (a no-op on Windows), so the
+ * credentials file inherits those permissions through the rename -- matching
+ * the AWS CLI's own behavior. If anything between the open and the rename
+ * throws, the tmp file is unlinked: it holds all three plaintext credentials
+ * under a name (`<path>.tmp-<pid>-<uuid>`) that no other cleanup path and no
+ * human would ever think to look for.
  *
  * Concurrent writers are serialized via a sidecar lock file (`<path>.lock`).
  * Without the lock, two upsertProfile calls landing at the same instant for
@@ -25,22 +30,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import {
-  chmodSync,
-  closeSync,
-  existsSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  type Stats,
-  statSync,
-  unlinkSync,
-  writeSync,
-} from "node:fs";
-import { platform } from "node:os";
+import { closeSync, existsSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 
-export interface AssumedCredentials {
+interface AssumedCredentials {
   aws_access_key_id: string;
   aws_secret_access_key: string;
   aws_session_token: string;
@@ -99,12 +92,15 @@ function splitSections(text: string): Section[] {
  * left the stale credentials sitting in the first one. `[mcp-dev]\t` failed the
  * same way; `[ mcp-dev ]` and CRLF files happened to work, which is why this
  * hid for so long.
+ *
+ * Callers only ever pass lines splitSections stored, which by construction
+ * matched SECTION_HEADER_RE -- so the exec always matches. The `?? ""` is a
+ * type-level floor, not a second parsing path (a second path is exactly what
+ * produced the bug above); "" matches no profile name, all of which are
+ * non-empty.
  */
 function sectionName(header: string): string {
-  const m = SECTION_HEADER_RE.exec(header);
-  // Fall back to the old slice only for a line that isn't in header shape at
-  // all -- unreachable via splitSections, which only stores matching lines.
-  return (m ? m[1] : header.slice(1, -1)).trim();
+  return (SECTION_HEADER_RE.exec(header)?.[1] ?? "").trim();
 }
 
 function buildProfileBody(creds: AssumedCredentials): string {
@@ -183,6 +179,19 @@ export function upsertProfileIntoText(text: string, profile: string, creds: Assu
     .map((s) => (s.header === null ? s.body : `${s.header}\n${s.body}`))
     .join("")
     .replace(/\n*$/, "\n");
+}
+
+/**
+ * Does `text` already contain a section for `profile`?
+ *
+ * Uses the same matcher as upsertProfileIntoText (the `sectionName` compare
+ * subsumes the raw-header compare, since sectionName("[x]") === "x"), so the
+ * answer is exactly "would the upsert OVERWRITE rather than APPEND". Callers
+ * use it to warn that a pre-existing profile's managed keys are about to be
+ * replaced in place.
+ */
+export function profileExistsInText(text: string, profile: string): boolean {
+  return splitSections(text).some((s) => s.header !== null && sectionName(s.header) === profile);
 }
 
 /** Max wall-clock spent trying to acquire the lock before giving up. */
@@ -308,16 +317,27 @@ function releaseLock(lockPath: string): void {
 
 /**
  * Read, modify, and atomically rewrite a credentials file. Creates the file
- * if it doesn't exist. Applies 0o600 permissions on Unix.
+ * if it doesn't exist. The tmp file is opened 0o600, and renameSync replaces
+ * the destination inode, so the resulting credentials file is 0o600 on Unix
+ * without a follow-up chmod (open's mode is only ever narrowed by umask, never
+ * widened).
+ *
+ * Returns `{ existed: true }` when the profile was already present and its
+ * managed keys were overwritten in place, so callers can warn about it.
  *
  * Concurrent callers (multi-process or async) are serialized via a sidecar
  * lock file -- see `acquireLock` for the protocol.
  */
-export async function upsertProfile(path: string, profile: string, creds: AssumedCredentials): Promise<void> {
+export async function upsertProfile(
+  path: string,
+  profile: string,
+  creds: AssumedCredentials,
+): Promise<{ existed: boolean }> {
   const lockPath = `${path}.lock`;
   await acquireLock(lockPath);
   try {
     const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
+    const existed = profileExistsInText(existing, profile);
     const nextText = upsertProfileIntoText(existing, profile, creds);
     // randomUUID suffix prevents two same-process callers from clobbering
     // each other's in-flight tmp writes; the lock above prevents cross-
@@ -325,24 +345,30 @@ export async function upsertProfile(path: string, profile: string, creds: Assume
     const tmpPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
     const fd = openSync(tmpPath, "w", 0o600);
     try {
-      writeSync(fd, nextText);
-    } finally {
-      closeSync(fd);
+      try {
+        writeSync(fd, nextText);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmpPath, path);
+    } catch (err) {
+      // The tmp file holds all three plaintext credentials. A failed
+      // writeSync / closeSync / renameSync would otherwise strand it at
+      // `<path>.tmp-<pid>-<uuid>` forever -- no cleanup path looks for that
+      // name, and the caller (see tools/assume.ts) reports only "the write
+      // failed". Unlink is best-effort and must not mask the real error, so
+      // its own failure is swallowed and `err` is rethrown untouched.
+      //
+      // Only reachable BEFORE a successful rename: once renameSync returns,
+      // tmpPath no longer exists and nothing after it can throw.
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // best-effort
+      }
+      throw err;
     }
-    renameSync(tmpPath, path);
-    if (platform() !== "win32") {
-      // Post-rename the file always exists -- statSync directly, no existsSync
-      // guard needed. The chmod only fires when the file was more permissive
-      // than 0o600, so a freshly-opened-with-0o600 tmp file is a no-op.
-      const st: Stats = statSync(path);
-      const existingMode = st.mode & 0o777;
-      // unreachable in practice: the tmp file is opened 0600 before rename, and
-      // renameSync replaces the destination inode (discarding any looser perms
-      // that existed at `path`), so post-rename mode is always 0600 and the
-      // group/other bits are already clear. Kept as a defensive belt for
-      // hypothetical platforms whose open(mode) is advisory.
-      if ((existingMode & 0o077) !== 0) chmodSync(path, 0o600);
-    }
+    return { existed };
   } finally {
     releaseLock(lockPath);
   }

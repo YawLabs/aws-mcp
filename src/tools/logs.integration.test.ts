@@ -101,6 +101,10 @@ describe("aws_logs_tail — NDJSON output end-to-end", () => {
       service: "logs",
       operation: "tail",
       extraFlags: ["/aws/lambda/my-fn", "--format", "json"],
+      // Mirrors the real call in logs.ts. NDJSON opens with `{` and cannot
+      // parse as one document, which is indistinguishable from a truncated
+      // payload unless the caller says so -- hence the explicit flag.
+      ndjson: true,
       ...fakeOpts("logs_tail_ndjson"),
     });
     assert.equal(r.ok, true);
@@ -112,6 +116,24 @@ describe("aws_logs_tail — NDJSON output end-to-end", () => {
     assert.equal(events.length, 3);
     assert.equal((events[0] as { message: string }).message, "hello");
     assert.equal((events[2] as { logStreamName: string }).logStreamName, "s2");
+  });
+
+  it("treats the same bytes as a truncated payload when ndjson is NOT declared", async () => {
+    // The other half of the contract above. runAwsCall cannot tell complete
+    // NDJSON from a truncated JSON document by inspection -- both open with
+    // `{` and fail a whole-blob parse -- so an undeclared caller gets the
+    // conservative answer. This is why the flag exists rather than the check
+    // simply special-casing newlines.
+    const r = await runAwsCall({
+      service: "logs",
+      operation: "tail",
+      extraFlags: ["/aws/lambda/my-fn", "--format", "json"],
+      ...fakeOpts("logs_tail_ndjson"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "malformed_json");
+    assert.match(r.rawStdout ?? "", /hello/, "raw stdout is preserved for diagnosis");
   });
 
   it("returns an empty array when the window produced no events", async () => {

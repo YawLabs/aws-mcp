@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdtempSync,
@@ -16,7 +17,7 @@ import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { upsertProfile, upsertProfileIntoText } from "./aws-credentials.js";
+import { profileExistsInText, upsertProfile, upsertProfileIntoText } from "./aws-credentials.js";
 
 const CREDS = {
   aws_access_key_id: "AKIA-NEW-1",
@@ -316,6 +317,36 @@ describe("upsertProfile — lock subsystem", () => {
     const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
     assert.deepEqual(leftovers, [], `no .tmp-* files should remain, found: ${leftovers.join(", ")}`);
   });
+
+  it("leaves no .tmp-* file behind when the rename FAILS (Windows-only; read-only destination)", async () => {
+    // The tmp file holds all three credentials in plaintext under a name
+    // (`credentials.tmp-<pid>-<uuid>`) nothing else ever looks at, so a failed
+    // rename must not strand it. Windows-only because this is the one portable-
+    // ish way to make renameSync fail with the tmp file already written: on
+    // Windows a destination carrying FILE_ATTRIBUTE_READONLY (what chmod 0444
+    // sets) makes MoveFileEx(MOVEFILE_REPLACE_EXISTING) return EPERM. On POSIX
+    // rename only consults the PARENT directory's permissions, and a parent we
+    // could make unwritable would fail earlier, at the lock. The cleanup code
+    // itself is platform-agnostic.
+    if (platform() !== "win32") return;
+    writeFileSync(path, "[other]\naws_access_key_id = KEEP\n");
+    chmodSync(path, 0o444);
+    try {
+      await assert.rejects(upsertProfile(path, "mcp-dev", CREDS), (err: NodeJS.ErrnoException) => {
+        // The original error must reach the caller unchanged -- the cleanup is
+        // best-effort and must never mask it.
+        assert.equal(err.code, "EPERM", `expected the rename EPERM to propagate, got ${err.code}`);
+        return true;
+      });
+      const leftovers = readdirSync(dir).filter((name) => name.includes(".tmp-"));
+      assert.deepEqual(leftovers, [], `the tmp credentials file must be unlinked, found: ${leftovers.join(", ")}`);
+      // The original file is untouched, and the lock was still released.
+      assert.match(readFileSync(path, "utf-8"), /KEEP/);
+      assert.ok(!existsSync(`${path}.lock`), "the lock must be released even when the write fails");
+    } finally {
+      chmodSync(path, 0o644);
+    }
+  });
 });
 
 /**
@@ -408,9 +439,7 @@ describe("upsertProfile — concurrent cross-process writers are serialized", ()
           // child's own exit code instead. A late exit after res() is a no-op
           // on an already-settled promise, which is the normal path: these
           // children are expected to exit once the race has been signalled.
-          child.once("exit", (code) =>
-            rej(new Error(`race child exited (code ${code}) before signalling ready`)),
-          );
+          child.once("exit", (code) => rej(new Error(`race child exited (code ${code}) before signalling ready`)));
         });
         resolve({ child, ready });
       });
@@ -621,4 +650,60 @@ aws_session_token = stale-token
       assert.deepEqual(strays, [], `unexpected leftover files: ${strays.join(", ")}`);
     });
   }
+});
+
+describe("profileExistsInText / upsertProfile 'existed' flag", () => {
+  const body = "aws_access_key_id = OLD\naws_secret_access_key = OLD\naws_session_token = OLD\n";
+
+  it("reports false for an absent profile and true for a present one", () => {
+    assert.equal(profileExistsInText("", "mcp-dev"), false);
+    assert.equal(profileExistsInText(`[other]\n${body}`, "mcp-dev"), false);
+    assert.equal(profileExistsInText(`[mcp-dev]\n${body}`, "mcp-dev"), true);
+  });
+
+  it("uses the same matcher as the upsert, so odd headers count as present", () => {
+    // If these disagreed, the caller would be told the profile was new while
+    // upsertProfileIntoText overwrote an existing section (or vice versa).
+    for (const header of ["[ mcp-dev ]", "[mcp-dev]  ", "[mcp-dev]\t"]) {
+      assert.equal(profileExistsInText(`${header}\n${body}`, "mcp-dev"), true, `header ${JSON.stringify(header)}`);
+    }
+  });
+
+  it("does not treat the preamble (comments before the first section) as a profile", () => {
+    assert.equal(profileExistsInText("# just a comment\n", "mcp-dev"), false);
+  });
+});
+
+describe("upsertProfile — existed flag through the real file path", () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "aws-mcp-creds-existed-"));
+    path = join(dir, "credentials");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns existed:false on first write and existed:true on the overwrite", async () => {
+    const first = await upsertProfile(path, "mcp-dev", CREDS);
+    assert.equal(first.existed, false);
+    const second = await upsertProfile(path, "mcp-dev", {
+      aws_access_key_id: "AKIA-V2",
+      aws_secret_access_key: "secret-v2",
+      aws_session_token: "token-v2",
+    });
+    assert.equal(second.existed, true);
+    const text = readFileSync(path, "utf-8");
+    assert.match(text, /AKIA-V2/);
+    assert.ok(!text.includes("AKIA-NEW-1"), "the overwrite must replace the managed keys in place");
+  });
+
+  it("returns existed:false when a DIFFERENT profile is already in the file", async () => {
+    writeFileSync(path, "[other]\naws_access_key_id = SOMETHING\n");
+    const r = await upsertProfile(path, "mcp-dev", CREDS);
+    assert.equal(r.existed, false);
+  });
 });

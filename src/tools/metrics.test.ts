@@ -71,6 +71,34 @@ describe("resolveTime", () => {
     assert.equal(resolveTime("5x", NOW), null); // unknown unit
     assert.equal(resolveTime("h", NOW), null); // missing number
   });
+
+  it("rejects a bare number instead of letting Date read it as a date", () => {
+    // '5' fails the relative-time pattern (no unit) and used to fall through to
+    // `new Date("5")`, which V8 parses as 2001-05-01 -- a dropped unit turned
+    // into a 25-year window with nothing rejecting it locally.
+    for (const bad of ["5", "0", "2026", "15.5"]) {
+      assert.equal(resolveTime(bad, NOW), null, `expected bare number '${bad}' to be rejected`);
+    }
+  });
+
+  it("rejects an offset-less date-time (it would resolve in the host's local zone)", () => {
+    // `new Date()` reads a date-time WITHOUT an offset as LOCAL time, and the
+    // handler .toISOString()s the result into the request -- so the same input
+    // meant different windows on different hosts.
+    for (const bad of ["2026-05-16T10:00:00", "2026-05-16T10:00", "2026-05-16T10:00:00.500"]) {
+      assert.equal(resolveTime(bad, NOW), null, `expected offset-less '${bad}' to be rejected`);
+    }
+  });
+
+  it("accepts explicit offsets and resolves them to the same instant", () => {
+    assert.equal(resolveTime("2026-05-16T10:00:00Z", NOW)?.toISOString(), "2026-05-16T10:00:00.000Z");
+    assert.equal(resolveTime("2026-05-16T06:00:00-04:00", NOW)?.toISOString(), "2026-05-16T10:00:00.000Z");
+    assert.equal(resolveTime("2026-05-16T12:00:00+02:00", NOW)?.toISOString(), "2026-05-16T10:00:00.000Z");
+  });
+
+  it("accepts a date-only value as UTC midnight (unambiguous, so no offset needed)", () => {
+    assert.equal(resolveTime("2026-05-16", NOW)?.toISOString(), "2026-05-16T00:00:00.000Z");
+  });
 });
 
 describe("pickAutoPeriodSeconds", () => {
@@ -205,7 +233,9 @@ describe("buildMetricDataQueries", () => {
 
   it("omits Dimensions when none are given", () => {
     const out = buildMetricDataQueries([{ id: "x", namespace: "AWS/SQS", metricName: "NumberOfMessagesReceived" }], 60);
-    assert.equal((out[0].MetricStat?.Metric as { Dimensions?: unknown }).Dimensions, undefined);
+    const metric = out[0].MetricStat?.Metric as { Dimensions?: unknown } | undefined;
+    assert.ok(metric, "MetricStat.Metric should be present");
+    assert.equal(metric.Dimensions, undefined);
   });
 
   it("omits Dimensions when q.dimensions is an empty object (was a CloudWatch ValidationError)", () => {
@@ -217,7 +247,9 @@ describe("buildMetricDataQueries", () => {
       [{ id: "x", namespace: "AWS/SQS", metricName: "NumberOfMessagesReceived", dimensions: {} }],
       60,
     );
-    assert.equal((out[0].MetricStat?.Metric as { Dimensions?: unknown }).Dimensions, undefined);
+    const metric = out[0].MetricStat?.Metric as { Dimensions?: unknown } | undefined;
+    assert.ok(metric, "MetricStat.Metric should be present");
+    assert.equal(metric.Dimensions, undefined);
   });
 });
 
@@ -504,6 +536,62 @@ describe("aws_metrics_query handler validation", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /exceeding CloudWatch's per-request cap/);
     assert.match(r.error ?? "", /Widen the period or narrow the time range/);
+  });
+
+  it("rejects a batch whose datapoints only exceed the cap in AGGREGATE", async () => {
+    // CloudWatch's ~100,800 ceiling is per REQUEST, not per query. 100 queries
+    // at 60s over 7 days is 10,080 points each -- every one passes on its own,
+    // and together they are 1,008,000. The per-query-only check passed this
+    // locally and let CloudWatch bounce it with the vaguer error the check
+    // exists to prevent.
+    const queries = Array.from({ length: 100 }, (_, n) => ({
+      id: `q${n}`,
+      namespace: "AWS/EC2",
+      metricName: "CPUUtilization",
+      period: 60,
+    }));
+    const r = await tool.handler({
+      queries,
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-01-08T00:00:00Z",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /These 100 queries would request 1008000 datapoints/);
+    assert.match(r.error ?? "", /applies to the whole request, not to each query/);
+  });
+
+  it("rejects an AUTO-PICKED period that exceeds the cap on a very wide range", async () => {
+    // The auto-pick was documented as 'capped safe by construction'. It floors
+    // at 3600s, so a range past ~11.5 years crosses the cap with no explicit
+    // period anywhere in the input.
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      startTime: "2001-01-01T00:00:00Z",
+      endTime: "2026-01-01T00:00:00Z",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /the auto-picked period 3600s/);
+    assert.match(r.error ?? "", /exceeding CloudWatch's per-request cap/);
+  });
+
+  it("does not count returnData:false queries against the cap", async () => {
+    // They compute an intermediate value for an expression without returning a
+    // series, so they cost nothing against the response cap. Same 100 x 10,080
+    // shape as the aggregate-rejection case above, which must therefore run.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    const queries = Array.from({ length: 100 }, (_, n) => ({
+      id: `q${n}`,
+      namespace: "AWS/EC2",
+      metricName: "CPUUtilization",
+      period: 60,
+      returnData: false,
+    }));
+    const r = await tool.handler({
+      queries,
+      startTime: "2026-01-01T00:00:00Z",
+      endTime: "2026-01-08T00:00:00Z",
+    } as never);
+    assert.equal(r.ok, true);
   });
 
   it("accepts a valid explicit period (multiple of 60, under the datapoint cap)", async () => {

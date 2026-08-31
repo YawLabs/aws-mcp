@@ -1,18 +1,23 @@
 /**
- * Classify an unknown error from the AWS SDK or the aws CLI subprocess into
- * one of a small set of actionable kinds, so callers can surface the right
- * fix-it message (re-login / fix creds / show raw error).
+ * Classify an error from the aws CLI subprocess into one of a small set of
+ * actionable kinds, so callers can surface the right fix-it message (re-login
+ * / fix creds / show raw error).
  *
- * Both the SDK and the CLI get routed through here — the regexes cover both
- * sources. Patterns:
- *   - SDK throws Error subclasses named SSOTokenProviderFailure,
- *     ExpiredTokenException, CredentialsProviderError.
- *   - CLI prints stderr strings like "Error loading SSO Token: ...",
- *     "Unable to locate credentials", etc. We wrap CLI stderr in `new Error()`
- *     before calling classify, so it arrives as a plain Error.
+ * TEXT ONLY -- there is no SDK side. This package ships zero runtime
+ * dependencies and does not depend on @aws-sdk at all; every AWS call is a
+ * subprocess to the `aws` binary. The single production caller is
+ * aws-cli.ts's exit handler, which does `classifyAuthError(new Error(stderr))`
+ * -- so `err.name` is always the literal "Error", and matching on SDK class
+ * names (SSOTokenProviderFailure / ExpiredTokenException /
+ * CredentialsProviderError) classified nothing that ever reached here. Those
+ * branches are gone; the anchored stderr patterns below are the whole
+ * classifier.
+ *
+ * Add new patterns as CLI stderr text, anchored tightly enough that ordinary
+ * prose can't trip them.
  */
 
-export type AuthErrorKind = "sso_expired" | "no_creds" | "other";
+export type AuthErrorKind = "sso_expired" | "no_creds" | "invalid_creds" | "other";
 
 // Anchor on the exact strings botocore/aws-cli emit so we don't false-positive
 // on stderr that mentions "SSO", "session", and "expired" in unrelated
@@ -31,9 +36,10 @@ export type AuthErrorKind = "sso_expired" | "no_creds" | "other";
 //     where {provider}="sso" and {error_msg}="Token has expired and refresh
 //     failed" comes from DeferredRefreshableToken._protected_refresh in
 //     botocore/tokens.py when a mandatory refresh fails on an expired token.
-//
-// The SDK throws an Error subclass named SSOTokenProviderFailure for the
-// same family; we match that by name above the regex check.
+//   - the service-side expiry, which does NOT come from botocore at all: STS
+//     and friends reject an expired session token with the standard wrapper
+//     "An error occurred (ExpiredToken) when calling the X operation: The
+//     security token included in the request is expired".
 const SSO_EXPIRED_PATTERNS: RegExp[] = [
   // "Error loading SSO Token: ..." -- the prefix is the load() failure;
   // the rest is variable (profile name, expiry phrasing) but the prefix is
@@ -47,6 +53,33 @@ const SSO_EXPIRED_PATTERNS: RegExp[] = [
   // "Error when retrieving token from sso: Token has expired and refresh
   // failed". The trailing fragment alone is specific enough.
   /Token has expired and refresh failed/,
+  // The most common expiry shape in practice, and the one this classifier
+  // used to miss entirely: the service rejects the request rather than
+  // botocore failing to load a token, so it arrives in the standard wrapper.
+  // Anchored on "An error occurred (" + the code so the bare word can't match
+  // prose. Covers both the STS spelling (ExpiredToken) and the
+  // service-exception spelling (ExpiredTokenException).
+  //
+  // parseAwsError below already attached "Re-authenticate with
+  // aws_login_start." to this code; until now classifyAuthError disagreed and
+  // called it "other", so the same stderr got a re-login suggestion appended
+  // to a generic nonzero_exit error instead of the sso_expired treatment.
+  /An error occurred \(ExpiredToken(?:Exception)?\)/,
+];
+
+// Credentials that EXIST but the service refuses. Distinct from no_creds
+// (nothing resolved at all): the fix is different -- rotate / re-issue the key
+// or fix the clock, not "configure a profile".
+//
+// Canonical shapes, all via the standard wrapper:
+//   - UnrecognizedClientException: "The security token included in the request
+//     is invalid" (a deleted/rotated access key, or a token for another
+//     partition).
+//   - InvalidClientTokenId: same family, the STS/IAM spelling.
+//   - SignatureDoesNotMatch: the secret key is wrong, or -- the classic -- the
+//     machine's clock has drifted far enough to invalidate SigV4.
+const INVALID_CREDS_PATTERNS: RegExp[] = [
+  /An error occurred \((?:UnrecognizedClientException|InvalidClientTokenId|SignatureDoesNotMatch)\)/,
 ];
 // Same treatment as SSO_EXPIRED_PATTERNS -- anchor on the exact strings
 // botocore emits so we don't false-positive on stderr that happens to mention
@@ -60,9 +93,6 @@ const SSO_EXPIRED_PATTERNS: RegExp[] = [
 //   - CredentialRetrievalError.fmt =
 //       "Error when retrieving credentials from {provider}: {error_msg}"
 //   - ProfileNotFound.fmt = "The config profile ({profile}) could not be found"
-//
-// The JS SDK throws Error subclasses named CredentialsProviderError for the
-// same family; we match that by name above the regex check.
 const NO_CREDS_PATTERNS: RegExp[] = [
   /Unable to locate credentials/,
   /Unable to locate authorization token/,
@@ -72,18 +102,18 @@ const NO_CREDS_PATTERNS: RegExp[] = [
 ];
 
 export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message: string } {
+  // Message text only. `err.name` is not consulted: the sole production caller
+  // constructs `new Error(stderrBuf)`, so it is always "Error". See the file
+  // header.
   const message = err instanceof Error ? err.message : String(err);
-  const name = err instanceof Error ? err.name : "";
-  const blob = `${name}: ${message}`;
 
-  if (
-    name === "SSOTokenProviderFailure" ||
-    name === "ExpiredTokenException" ||
-    SSO_EXPIRED_PATTERNS.some((re) => re.test(blob))
-  ) {
+  if (SSO_EXPIRED_PATTERNS.some((re) => re.test(message))) {
     return { kind: "sso_expired", message };
   }
-  if (name === "CredentialsProviderError" || NO_CREDS_PATTERNS.some((re) => re.test(blob))) {
+  if (INVALID_CREDS_PATTERNS.some((re) => re.test(message))) {
+    return { kind: "invalid_creds", message };
+  }
+  if (NO_CREDS_PATTERNS.some((re) => re.test(message))) {
     return { kind: "no_creds", message };
   }
   return { kind: "other", message };
@@ -95,7 +125,9 @@ export function classifyAuthError(err: unknown): { kind: AuthErrorKind; message:
  * to retry, escalate to IAM, or fix the request -- raw stderr is preserved
  * separately for diagnosis.
  */
-export interface ParsedAwsError {
+// Not exported: parseAwsError's callers use the returned object's fields
+// directly and no .d.ts ships, so nothing needs to name the type.
+interface ParsedAwsError {
   code?: string;
   operation?: string;
   message?: string;
@@ -135,7 +167,18 @@ export function parseAwsError(stderr: string): ParsedAwsError {
       out.suggestion = `Check IAM permissions: principal ${naMatch[1]} lacks ${naMatch[2]}.`;
     } else if (code === "AccessDenied" || code === "AccessDeniedException" || code === "UnauthorizedOperation") {
       out.suggestion = "Check IAM permissions for this operation.";
-    } else if (code === "ThrottlingException" || code === "Throttling" || code === "RequestLimitExceeded") {
+    } else if (
+      // Every service spells rate-limiting differently: ThrottlingException is
+      // the common one, but S3 says SlowDown, API Gateway / Lambda say
+      // TooManyRequestsException, and DynamoDB says
+      // ProvisionedThroughputExceededException. Same remedy for all of them.
+      code === "ThrottlingException" ||
+      code === "Throttling" ||
+      code === "RequestLimitExceeded" ||
+      code === "TooManyRequestsException" ||
+      code === "SlowDown" ||
+      code === "ProvisionedThroughputExceededException"
+    ) {
       out.suggestion = "Reduce request rate or retry with backoff.";
     } else if (
       code === "ResourceNotFoundException" ||
@@ -160,6 +203,20 @@ export function parseAwsError(stderr: string): ParsedAwsError {
         "Resource state conflicts with the requested operation; check current state with aws_resource_get.";
     }
     return out;
+  }
+
+  // Not-authorized text OUTSIDE the standard wrapper. Above, NOT_AUTHORIZED_RE
+  // only ever runs against m[3] -- the message captured inside "An error
+  // occurred (...) when calling ...". The same sentence also shows up bare:
+  // CCAPI / cloudcontrol surface it without the wrapper, as do several
+  // higher-level `aws` customizations. Without this the most actionable
+  // stderr the CLI produces fell through to message-only, no suggestion.
+  const bareNotAuthorized = NOT_AUTHORIZED_RE.exec(trimmed);
+  if (bareNotAuthorized) {
+    return {
+      message: trimmed,
+      suggestion: `Check IAM permissions: principal ${bareNotAuthorized[1]} lacks ${bareNotAuthorized[2]}.`,
+    };
   }
 
   const endpointMatch = BAD_ENDPOINT_RE.exec(trimmed);

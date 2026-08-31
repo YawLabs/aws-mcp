@@ -13,7 +13,7 @@ export interface ToolResult {
   rawBody?: string;
 }
 
-export interface ToolAnnotations {
+interface ToolAnnotations {
   title?: string;
   readOnlyHint?: boolean;
   destructiveHint?: boolean;

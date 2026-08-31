@@ -38,6 +38,14 @@ const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
 const FETCH_TIMEOUT_MS = 30_000;
 
+// Hard ceiling on the HTML we will pull down for one page. FETCH_TIMEOUT_MS
+// bounds LATENCY, not SIZE -- a steady multi-hundred-MB body streams in well
+// under 30s, buffers entirely in memory, and then blocks the event loop of
+// this single-threaded stdio server inside turndown's synchronous conversion.
+// 5 MB mirrors aws-cli.ts's per-stream stdout cap so both ingress paths into
+// this process carry the same ceiling; real AWS doc pages are 10-800 KB.
+const MAX_DOC_HTML_BYTES = 5 * 1024 * 1024;
+
 // aws_docs_read is paginated: an agent reading a long page calls it N times
 // with different startIndex windows. Without a cache that's N full fetches +
 // N full HTML->markdown conversions of the same document. Cache the
@@ -49,10 +57,15 @@ const FETCH_TIMEOUT_MS = 30_000;
 // in one session) without unbounded memory growth. Each entry is bounded
 // by MAX_MAX_LENGTH (1MB) of converted markdown, so worst-case footprint
 // is ~64MB; typical doc pages are 10-100 KB after chrome stripping.
+//
+// Two things make that bound real rather than aspirational: the body read is
+// capped at MAX_DOC_HTML_BYTES, and the handler only caches a conversion whose
+// markdown fits MAX_MAX_LENGTH (an over-size page is still served in full via
+// pagination -- it just re-fetches per window instead of blowing the bound).
 export const DOC_CACHE_MAX_ENTRIES = 64;
 const DOC_CACHE_TTL_MS = 5 * 60_000;
 
-export interface DocsSearchResult {
+interface DocsSearchResult {
   title: string;
   url: string;
   summary?: string;
@@ -222,7 +235,7 @@ export function htmlToMarkdown(html: string): string {
   return md.replace(/\n{3,}/g, "\n\n").trim();
 }
 
-export interface PaginatedContent {
+interface PaginatedContent {
   content: string;
   startIndex: number;
   endIndex: number;
@@ -253,7 +266,7 @@ export function paginateContent(markdown: string, startIndex: number, maxLength:
 }
 
 /** Fetch with an AbortController-backed timeout. Injectable for tests. */
-export type FetchImpl = typeof fetch;
+type FetchImpl = typeof fetch;
 
 async function fetchWithTimeout(
   fetchImpl: FetchImpl,
@@ -280,12 +293,77 @@ function isAbortError(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { name?: unknown }).name === "AbortError";
 }
 
+/**
+ * Outcome of a capped body read. `too_large` carries the observed byte count
+ * when we learned it from Content-Length (i.e. before downloading anything)
+ * and null when we hit the cap mid-stream and stopped counting.
+ */
+type BodyReadOutcome =
+  | { kind: "ok"; html: string }
+  | { kind: "too_large"; bytes: number | null }
+  | { kind: "error"; message: string };
+
+/**
+ * Read a response body with a hard byte ceiling.
+ *
+ * Three layers, cheapest first:
+ *   1. A Content-Length over the cap rejects before a single byte is pulled.
+ *   2. A streaming body is read chunk-by-chunk and cancelled the moment the
+ *      running total crosses the cap -- the bytes past it are never buffered.
+ *   3. A Response-like object with no stream body (test doubles, a fetch impl
+ *      that only implements text()) is buffered and then measured, which
+ *      still enforces the same ceiling on what reaches turndown.
+ */
+async function readBodyWithCap(response: Response, maxBytes: number): Promise<BodyReadOutcome> {
+  const declaredHeader = response.headers.get("content-length");
+  if (declaredHeader !== null) {
+    const declared = Number(declaredHeader);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      return { kind: "too_large", bytes: declared };
+    }
+  }
+
+  try {
+    const body = (response as { body?: ReadableStream<Uint8Array> | null }).body;
+    if (body && typeof body.getReader === "function") {
+      const reader = body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let bytes = 0;
+      let html = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        bytes += value.byteLength;
+        if (bytes > maxBytes) {
+          // Stop the transfer; we already have more than we are willing to
+          // convert. cancel() can reject on an already-errored stream, and
+          // that is not the failure we want to report.
+          await reader.cancel().catch(() => {});
+          return { kind: "too_large", bytes: null };
+        }
+        // stream: true so a multi-byte UTF-8 sequence split across chunks
+        // doesn't decode to U+FFFD.
+        html += decoder.decode(value, { stream: true });
+      }
+      html += decoder.decode();
+      return { kind: "ok", html };
+    }
+    const html = await response.text();
+    const bytes = Buffer.byteLength(html, "utf8");
+    if (bytes > maxBytes) return { kind: "too_large", bytes };
+    return { kind: "ok", html };
+  } catch (err) {
+    return { kind: "error", message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 interface DocCacheEntry {
   markdown: string;
   storedAt: number;
 }
 
-export interface DocCache {
+interface DocCache {
   get(url: string): string | undefined;
   set(url: string, markdown: string): void;
 }
@@ -357,9 +435,11 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
       }),
       handler: async (input: unknown): Promise<ToolResult> => {
         const i = input as { query: string; limit?: number };
-        // Defense-in-depth: clamp limit into the valid range so direct
-        // (non-MCP) callers that bypass schema validation can't send an
-        // out-of-range value to parseSearchResults.
+        // Clamp limit into the valid range. No caller currently reaches this
+        // handler unvalidated -- index.ts registers inputSchema at the MCP
+        // boundary and the aws_script bridge runs inputSchema.parse first
+        // (script.ts:158-161) -- so this is a local invariant kept next to the
+        // code that depends on it, not a live guard against a known caller.
         const limit = Math.min(Math.max(1, i.limit ?? DEFAULT_SEARCH_LIMIT), MAX_SEARCH_LIMIT);
         let response: Response;
         try {
@@ -462,9 +542,11 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
           };
         }
         const startIndex = Math.max(0, i.startIndex ?? 0);
-        // Defense-in-depth: clamp maxLength into the valid range so direct
-        // (non-MCP) callers that bypass schema validation can't pass an
-        // out-of-range value to paginateContent.
+        // Clamp maxLength into the valid range. Same status as the limit clamp
+        // in aws_docs_search above: every entry point parses the schema first
+        // (MCP boundary in index.ts, inputSchema.parse in script.ts:158-161),
+        // so this keeps the invariant local rather than covering a caller that
+        // actually bypasses validation.
         const maxLength = Math.min(Math.max(1, i.maxLength ?? DEFAULT_MAX_LENGTH), MAX_MAX_LENGTH);
 
         // Paginated reads of the same page hit the cache -- one fetch +
@@ -491,6 +573,21 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
           if (!response.ok) {
             return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
           }
+          // fetch FOLLOWS redirects, so the isValidDocsUrl check on i.url above
+          // only vouches for the first hop. Re-check where we actually landed:
+          // without this, an allowlisted docs URL that 302s off-domain gets
+          // fetched and converted with nothing but the content-type gate
+          // between us and arbitrary third-party HTML.
+          // `response.url` is absent/empty on a Response-like object that
+          // doesn't set it (test doubles); that means "no redirect
+          // information", so fall back to the URL we already validated.
+          const finalUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : i.url;
+          if (!isValidDocsUrl(finalUrl)) {
+            return {
+              ok: false,
+              error: `${i.url} redirected to '${finalUrl}', which is not an 'https://docs.aws.amazon.com/...html' page. aws_docs_read only follows redirects that stay inside the AWS documentation allowlist.`,
+            };
+          }
           // A 200 doesn't guarantee HTML -- a docs URL can redirect to a
           // login wall, an error page, or an asset. Feeding non-HTML to the
           // parser produces junk markdown; reject it with a clear message
@@ -502,15 +599,24 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
               error: `${i.url} returned content-type '${contentType || "unknown"}', not text/html -- the URL may have redirected to a non-documentation page (login wall, error page, or asset). aws_docs_read only handles AWS documentation HTML pages.`,
             };
           }
-          let html: string;
-          try {
-            html = await response.text();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return { ok: false, error: `Failed to read the response body from ${i.url}: ${msg}.` };
+          const body = await readBodyWithCap(response, MAX_DOC_HTML_BYTES);
+          if (body.kind === "error") {
+            return { ok: false, error: `Failed to read the response body from ${i.url}: ${body.message}.` };
           }
-          markdown = htmlToMarkdown(html);
-          docCache.set(i.url, markdown);
+          if (body.kind === "too_large") {
+            const observed = body.bytes !== null ? ` (content-length ${body.bytes} bytes)` : "";
+            return {
+              ok: false,
+              error: `${i.url} returned more than ${MAX_DOC_HTML_BYTES / 1024 / 1024} MB of HTML${observed} -- too large to convert. AWS documentation pages are far smaller than this, so the URL is likely a generated dump or a non-documentation asset.`,
+            };
+          }
+          markdown = htmlToMarkdown(body.html);
+          // Only cache what the DOC_CACHE_MAX_ENTRIES footprint math assumes:
+          // at most MAX_MAX_LENGTH of markdown per entry. An over-size page is
+          // still served in full (paginateContent slices the whole string
+          // below) -- it just costs a fetch + convert per window instead of
+          // silently breaking the cache bound.
+          if (markdown.length <= MAX_MAX_LENGTH) docCache.set(i.url, markdown);
         }
 
         const page = paginateContent(markdown, startIndex, maxLength);
