@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.0.1] — 2026-08-31
 
 ### Fixed
 - **`aws_call`, `aws_multi_region` and `aws_resource_update` now declare `destructiveHint: true`.** MCP hosts gate their "are you sure?" confirmation on this annotation -- a server cannot prompt on its own, so the annotation *is* the confirmation mechanism. Per the MCP spec the field defaults to `true`, and `false` positively asserts "performs only additive updates". All three asserted that while being able to do the opposite: `aws_call` reaches the entire AWS API (`ec2 terminate-instances`, `s3api delete-bucket`, `iam delete-user`), `aws_multi_region` runs that same arbitrary operation across up to 32 regions at once, and a Cloud Control update patching a replacement-forcing property makes the provider delete and re-create the resource. `aws_call`'s comment already said to "annotate conservatively since we can't introspect" -- the value was the least conservative one available. Read-only tools (`aws_paginate`, `aws_docs_*`, `aws_whoami`) are unchanged. Expect hosts to prompt on these three where they previously did not; that is the point.
