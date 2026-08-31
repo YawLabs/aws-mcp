@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.1.0] — 2026-08-31
 
 ### Added
 - **Progress reporting on long-running tools.** A stdio server that says nothing for minutes is indistinguishable from one that has hung, and three tools could run that long in silence. `aws_resource_*` with `awaitCompletion` now emits one MCP progress notification per poll attempt naming the elapsed time and the observed `OperationStatus` (no `total` -- the operation ends when AWS says so, so there is no honest denominator); `aws_multi_region` reports `(completed, total)` as each region settles, using the deduped region count; `aws_assume_role` emits a single starting notification naming the role and resolved timeout rather than manufacturing fake intermediate steps. Progress is opt-in per the MCP spec -- nothing is sent unless the client supplied a `progressToken`, so this is invisible to clients that do not ask for it.
