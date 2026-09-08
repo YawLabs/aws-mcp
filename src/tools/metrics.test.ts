@@ -341,6 +341,11 @@ describe("aws_metrics_query handler validation", () => {
     } as never);
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /invalid statistic/);
+    // NEGATIVE contract: this guard returns before runAwsCall, so nothing
+    // classified the failure. An ABSENT errorKind means "unclassified" --
+    // never "nonzero_exit", and never a manufactured "bad_input".
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
   });
 
   it("accepts extended percentile statistics (p99, p99.9, tm95)", async () => {
@@ -850,6 +855,33 @@ describe("aws_metrics_query handler (fake-aws integration)", () => {
     } as never);
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /ValidationError/);
+    // metrics.ts's single CLI-failure return forwards both new fields. A
+    // ValidationError is the shape a model most often causes here (a bad
+    // namespace, a missing member), and it takes parseAwsError's
+    // parameter-schema branch rather than the IAM one.
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, "Check the operation parameters against the API schema.");
+    // Carried structurally AND left in the message: toMcpResult does not
+    // re-render `suggestion`, so removing it from `error` would drop the
+    // remedy from what the model reads.
+    assert.ok(
+      (r.error ?? "").endsWith("\n\nSuggestion: Check the operation parameters against the API schema."),
+      `error must still end with the suggestion sentence, got: ${r.error}`,
+    );
+  });
+
+  it("forwards the auth-class kind with no suggestion beside it", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_no_creds";
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      profile: "my-profile",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "no_creds");
+    // The auth branches build their own profile-aware remedy into `error`, so
+    // parseAwsError never runs -- the two fields are independent.
+    assert.equal(r.suggestion, undefined);
+    assert.match(r.error ?? "", /No credentials found/);
   });
 
   it("sends MetricDataQueries via --cli-input-json with PascalCase keys", async () => {

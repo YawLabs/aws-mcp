@@ -688,7 +688,7 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
         awaitCompletion: true,
         pollIntervalMs: 500,
         maxWaitMs: 2000,
-      })) as { ok: boolean; error?: string };
+      })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
       assert.equal(r.ok, false);
       assert.match(r.error ?? "", /SSO session expired/);
       assert.match(r.error ?? "", /aws_login_start/);
@@ -698,6 +698,12 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
       // create-side one -- pins that the hint pulls from THIS handler's
       // ProgressEvent rather than a hardcoded constant.
       assert.match(r.error ?? "", /req-tok-upd/);
+      // The recovery sentence is BUILT here, so its wording no longer matches
+      // what any other tool emits. PollResult.kind rides along so a caller can
+      // still branch on WHICH credential failure interrupted the wait instead
+      // of parsing the sentence.
+      assert.equal(r.errorKind, "sso_expired");
+      assert.equal(r.suggestion, undefined);
     } finally {
       afterEachEnv();
     }
@@ -714,13 +720,15 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
         awaitCompletion: true,
         pollIntervalMs: 500,
         maxWaitMs: 2000,
-      })) as { ok: boolean; error?: string };
+      })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
       assert.equal(r.ok, false);
       assert.match(r.error ?? "", /SSO session expired/);
       assert.match(r.error ?? "", /aws_login_start/);
       assert.match(r.error ?? "", /tester/);
       assert.match(r.error ?? "", /aws_resource_status/);
       assert.match(r.error ?? "", /req-tok-del/);
+      assert.equal(r.errorKind, "sso_expired");
+      assert.equal(r.suggestion, undefined);
     } finally {
       afterEachEnv();
     }
@@ -741,7 +749,7 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
         awaitCompletion: true,
         pollIntervalMs: 500,
         maxWaitMs: 2000,
-      })) as { ok: boolean; error?: string };
+      })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
       assert.equal(r.ok, false);
       assert.match(r.error ?? "", /No credentials available/);
       assert.match(r.error ?? "", /fixing credentials/);
@@ -752,6 +760,10 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
       // mixing them would mislead the caller about how to recover.
       assert.doesNotMatch(r.error ?? "", /SSO session expired/);
       assert.doesNotMatch(r.error ?? "", /aws_login_start/);
+      // The structural half of that same distinction: the two hints differ in
+      // prose AND in kind, so a caller need not tell them apart by wording.
+      assert.equal(r.errorKind, "no_creds");
+      assert.equal(r.suggestion, undefined);
     } finally {
       afterEachEnv();
     }
@@ -790,8 +802,10 @@ describe("buildMutationResponse auth-recovery — expired_creds and invalid_cred
         awaitCompletion: true,
         pollIntervalMs: 500,
         maxWaitMs: 2000,
-      })) as { ok: boolean; error?: string };
+      })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
       assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "expired_creds");
+      assert.equal(r.suggestion, undefined);
       assert.match(r.error ?? "", /Temporary credentials for profile 'tester' expired while awaiting completion/);
       assert.match(r.error ?? "", /re-run the assume/);
       // The whole point of the arm: the recovery path survives the failure.
@@ -826,12 +840,14 @@ describe("buildMutationResponse auth-recovery — expired_creds and invalid_cred
         awaitCompletion: true,
         pollIntervalMs: 500,
         maxWaitMs: 2000,
-      })) as { ok: boolean; error?: string };
+      })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
       assert.equal(r.ok, false);
       // These two are the load-bearing assertions: the bare poll error (what
       // the un-fixed code returned) carries neither.
       assert.match(r.error ?? "", /aws_resource_status/);
       assert.match(r.error ?? "", /req-tok-inv/);
+      assert.equal(r.errorKind, "invalid_creds");
+      assert.equal(r.suggestion, undefined);
       assert.match(r.error ?? "", /Fix the credentials for this profile/);
       assert.match(r.error ?? "", /tester/);
       assert.match(r.error ?? "", /Underlying error:/);

@@ -548,6 +548,11 @@ describe("resource verbs -- initial ccapiCall failure (ccapiFailure + rawBodyOf)
       },
     },
     { name: "aws_resource_delete", tool: deleteRes, input: { typeName: "AWS::S3::Bucket", identifier: "my-bucket" } },
+    // The seventh ccapiFailure caller. It was missing from this list because
+    // its input is a requestToken rather than a typeName, but it shares the
+    // exact `if (!result.ok) return ccapiFailure(result)` line -- so including
+    // it makes this one loop pin the whole shared failure envelope.
+    { name: "aws_resource_status", tool: statusRes, input: { requestToken: "req-tok-abc" } },
     {
       name: "aws_resource_diff",
       tool: diffRes,
@@ -569,6 +574,19 @@ describe("resource verbs -- initial ccapiCall failure (ccapiFailure + rawBodyOf)
         assert.equal(r.data, undefined, `${verb.name} must not return data on a failed call`);
         // rawBodyOf's first half: a populated stderr IS the diagnostic body.
         assert.match(r.rawBody ?? "", /not authorized to perform: cloudformation:GetResource/);
+        // ccapiFailure forwards runAwsCall's classification and remedy for
+        // every verb at once. AccessDeniedException with no "User: <arn>"
+        // prefix falls to parseAwsError's code-based branch, so the suggestion
+        // is the generic one rather than the principal-naming variant.
+        assert.equal(r.errorKind, "nonzero_exit", `${verb.name} must forward the classified kind`);
+        assert.equal(r.suggestion, "Check IAM permissions for this operation.", verb.name);
+        // Carried structurally AND left in the message -- toMcpResult does not
+        // re-render `suggestion`, so removing it from `error` would drop the
+        // remedy from what the model reads.
+        assert.ok(
+          (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+          `${verb.name}: error must still end with the suggestion sentence, got: ${r.error}`,
+        );
       } finally {
         clearFakeAws();
       }
@@ -589,9 +607,27 @@ describe("resource verbs -- initial ccapiCall failure (ccapiFailure + rawBodyOf)
       assert.match(r.error ?? "", /exited with code 1 and no stderr/);
       assert.equal(typeof r.rawBody, "string", "rawBody must not be dropped when the diagnostic is on stdout");
       assert.match(r.rawBody ?? "", /ccapi-diagnostic-on-stdout-only/);
+      // The kind still arrives -- the exit code alone classifies it -- but
+      // parseAwsError got an EMPTY stderr and had nothing to recognize, so the
+      // two fields part company here. This is the case that proves errorKind
+      // and suggestion are independent rather than one implying the other.
+      assert.equal(r.errorKind, "nonzero_exit");
+      assert.equal(r.suggestion, undefined, "parseAwsError('') yields nothing");
     } finally {
       clearFakeAws();
     }
+  });
+
+  it("leaves errorKind UNSET when aws_resource_status rejects its own requestToken", async () => {
+    // NEGATIVE contract, on the verb that was just added to the loop above:
+    // validateOpaqueToken returns before ccapiCall, so no runAwsCall ever ran
+    // and nothing classified the failure. An ABSENT errorKind means
+    // "unclassified" -- it must never be back-filled with "nonzero_exit".
+    const r = await statusRes.handler({ requestToken: "-evil" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid requestToken/);
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
   });
 });
 
