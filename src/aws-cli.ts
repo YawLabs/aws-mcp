@@ -170,7 +170,45 @@ interface AwsCallOptions {
   // Test-injection knobs, mirrored from startSsoLogin. Not exposed via MCP.
   command?: string;
   prefixArgs?: string[];
+  /**
+   * Environment for the child process.
+   *
+   * REPLACES the parent environment rather than merging into it -- that is
+   * node's spawn semantics, not a choice made here -- so a caller that only
+   * wants to ADD a variable has to spread `process.env` itself. Every existing
+   * caller does.
+   *
+   * Started life as a test-injection knob alongside command/prefixArgs (the
+   * suites use it to point one spawn at a fake-aws scenario). It is now also a
+   * production path: aws_multi_account hands each per-account spawn its own
+   * assumed-role credentials this way, so the credentials live for the lifetime
+   * of one subprocess instead of being written into the shared credentials
+   * file.
+   */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Leave `--profile` off argv entirely. For callers that supply credentials
+   * through `env` rather than by naming a profile.
+   *
+   * Load-bearing, not cosmetic. botocore drops the ENVIRONMENT credential
+   * provider from its resolution chain the moment a profile is set as a session
+   * INSTANCE variable, and the CLI's `--profile` flag is exactly that
+   * (create_credential_resolver: `disable_env_vars =
+   * session.instance_variables().get('profile') is not None`, then
+   * `providers.remove(env_provider)`). The AWS_PROFILE env var does NOT trip it,
+   * because it resolves through the config chain rather than as an instance
+   * variable -- so the flag is the specific thing that has to go. Passing both
+   * `env` credentials and `--profile` does not error: it silently ignores the
+   * credentials and runs as the profile, which for a cross-account fan-out means
+   * every "account" in the batch quietly answering from the operator's own.
+   *
+   * Caveat for any future caller: the auth-class failure messages further down
+   * still name the profile this function RESOLVED, and an omitProfile call never
+   * used it. Rewrite those to name the identity you actually supplied
+   * (aws_multi_account names the account) or the reader gets sent to
+   * re-authenticate something unrelated to the failure.
+   */
+  omitProfile?: boolean;
 }
 
 // AuthErrorKind MINUS "other". classifyAuthError returns "other" for anything
@@ -304,7 +342,12 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   // Argv-safety: the resolved values land in `aws --profile X --region Y`.
   // Validate AFTER resolution so this catches both explicit opts overrides
   // AND env-var fallback (AWS_PROFILE / AWS_REGION bypass setProfile/setRegion).
-  if (!isValidProfileName(profile)) {
+  //
+  // Skipped for omitProfile callers because the value never reaches argv for
+  // them, and the check exists only to keep it from posing as a flag. Running
+  // it anyway would fail a call that uses no profile at all whenever the
+  // operator's shell happens to carry a malformed AWS_PROFILE.
+  if (!opts.omitProfile && !isValidProfileName(profile)) {
     return Promise.resolve({
       ok: false,
       kind: "bad_input",
@@ -343,8 +386,12 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     ...(opts.extraFlags ?? []),
     "--output",
     outputFormat,
-    "--profile",
-    profile,
+    // Conditional so the flag is ABSENT, not empty, for omitProfile callers --
+    // see AwsCallOptions.omitProfile for why its mere presence would discard
+    // the credentials such a caller passed in `env`. The default path keeps the
+    // exact `--output F --profile P --region R` order the fake-aws scenarios
+    // index into (several read the token after `--region`).
+    ...(opts.omitProfile ? [] : ["--profile", profile]),
     "--region",
     region,
   ];

@@ -90,6 +90,193 @@ interface AssumeRoleCliResponse {
   };
 }
 
+/**
+ * Default deadline for one sts:AssumeRole round-trip.
+ *
+ * SAML / credential_process flows can exceed runAwsCall's 60s default on cold
+ * start (federated IdP round-trip, MFA prompt forwarding). 120s is the
+ * assume-role-specific floor; callers can override. Exported so a second caller
+ * (aws_multi_account) states the same number in its schema description instead
+ * of hard-coding a copy that can drift.
+ */
+export const DEFAULT_ASSUME_TIMEOUT_MS = 120_000;
+
+/**
+ * One set of temporary credentials, in memory.
+ *
+ * Field names are lowerCamel rather than the CLI's PascalCase because this is
+ * our shape, not AWS's -- the caller decides what to do with it (write a
+ * profile section, hand it to one subprocess, drop it), and nothing here is a
+ * pass-through of the wire format.
+ */
+export interface AssumedRoleCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  /** ISO 8601 as `--output json` emits it. Absent when STS omitted it. */
+  expiration?: string;
+  assumedRoleArn?: string;
+  assumedRoleId?: string;
+}
+
+/**
+ * Result of {@link assumeRoleCredentials}.
+ *
+ * The failure arm carries a fully-built ToolResult rather than the raw pieces
+ * (message + kind + stderr) on purpose. aws_assume_role returns it verbatim, so
+ * the extraction cannot change that tool's failure envelope by accident -- key
+ * presence included, which `assert.deepStrictEqual` in the suite would notice.
+ * A caller that wants to re-word a failure (aws_multi_account rewrites the
+ * profile-naming auth messages to name an account) reads `failure.error` /
+ * `failure.errorKind` off it.
+ */
+export type AssumeRoleOutcome =
+  | { ok: true; credentials: AssumedRoleCredentials }
+  | { ok: false; failure: ToolResult };
+
+/**
+ * Call sts:AssumeRole and RETURN the credentials instead of persisting them.
+ *
+ * This is the seam between "get a session for a role" and "what to do with the
+ * session". aws_assume_role writes it to the shared credentials file;
+ * aws_multi_account hands it to a single subprocess through the environment and
+ * lets it die with that process. Anything org-wide that needs a session per
+ * account goes through here rather than growing a second copy of the STS call.
+ *
+ * Precondition: `roleArn` and `sourceProfile` are expected pre-validated by the
+ * caller, which is where a good error message can name the ARGUMENT that was
+ * wrong ('sourceProfile', 'accounts[3]'). This is a message-quality contract,
+ * not a safety one -- runAwsCall re-validates the profile and region before
+ * either reaches argv, so a caller that skips its own checks gets a worse
+ * message, never an unsafe spawn.
+ */
+export async function assumeRoleCredentials(opts: {
+  roleArn: string;
+  sessionName: string;
+  sourceProfile: string;
+  region: string;
+  durationSeconds?: number;
+  externalId?: string;
+  timeoutMs?: number;
+}): Promise<AssumeRoleOutcome> {
+  const { sourceProfile } = opts;
+
+  // Shell out to `aws sts assume-role` rather than using the in-process
+  // SDK. The SDK's fromNodeProviderChain occasionally diverges from the
+  // CLI for profiles that use `credential_process` (the standard SAML
+  // escape hatch) or non-Identity-Center SSO -- mirroring how every
+  // other tool in this server reaches AWS keeps the "SAML works because
+  // we shell out" story consistent. Inputs are sent via --cli-input-json
+  // (no argv positionals), so RoleArn / RoleSessionName / ExternalId
+  // can't pose as flags.
+  const params: Record<string, unknown> = {
+    RoleArn: opts.roleArn,
+    RoleSessionName: opts.sessionName,
+    DurationSeconds: opts.durationSeconds ?? 3600,
+  };
+  if (opts.externalId !== undefined) {
+    params.ExternalId = opts.externalId;
+  }
+
+  const result = await runAwsCall({
+    service: "sts",
+    operation: "assume-role",
+    params,
+    profile: sourceProfile,
+    region: opts.region,
+    outputFormat: "json",
+    timeoutMs: opts.timeoutMs ?? DEFAULT_ASSUME_TIMEOUT_MS,
+  });
+
+  if (!result.ok) {
+    // runAwsCall already classified auth-class failures; rewrite the
+    // sso_expired hint to name the source profile (the CLI's stderr
+    // mentions whichever profile it failed to load, but the caller
+    // cares about the assuming identity specifically).
+    if (result.kind === "sso_expired") {
+      return {
+        ok: false,
+        failure: {
+          ok: false,
+          error: `SSO session expired for source profile '${sourceProfile}'. Call aws_login_start with profile='${sourceProfile}' before assuming.`,
+          errorKind: result.kind,
+        },
+      };
+    }
+    // expired_creds reaches here when the SOURCE profile is itself a
+    // temporary session (role chaining, or a profile fed by an earlier
+    // assume). runAwsCall's message already names both remedies and keeps
+    // the underlying stderr; this arm exists only to name the source
+    // profile, which the CLI's stderr does not reliably identify.
+    if (result.kind === "expired_creds") {
+      return {
+        ok: false,
+        failure: {
+          ok: false,
+          error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${underlyingOf(result)}`,
+          errorKind: result.kind,
+        },
+      };
+    }
+    // invalid_creds is NOT an expiry and NOT a missing profile: the source
+    // profile's credentials resolved and STS REJECTED them (a rotated or
+    // deleted access key, a key for the wrong partition, or a drifted
+    // clock breaking SigV4). Refreshing a session cannot fix that, so this
+    // arm must not say "re-authenticate" the way the two above do, nor
+    // "no credentials found" -- the remedy is to fix the credentials that
+    // profile resolves to. Like its siblings, this arm exists only to name
+    // the SOURCE profile, which the CLI's stderr does not reliably do.
+    if (result.kind === "invalid_creds") {
+      return {
+        ok: false,
+        failure: {
+          ok: false,
+          error: `Credentials for source profile '${sourceProfile}' were rejected by AWS (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition/account, or a drifted machine clock). Fix the credentials for that profile before assuming. Underlying error: ${underlyingOf(result)}`,
+          errorKind: result.kind,
+        },
+      };
+    }
+    // `aws sts assume-role --output json` writes the credential blob to
+    // STDOUT on success. On a non-zero exit the CLI still may have flushed
+    // a partial JSON fragment to stdout before failing; surfacing it as
+    // rawBody risks leaking secret material into error envelopes. Stick
+    // to stderr for this op specifically; if stderr is empty the upstream
+    // error string ("aws CLI exited with code X and no stderr") already
+    // carries enough signal for the caller.
+    return {
+      ok: false,
+      failure: {
+        ok: false,
+        error: result.error,
+        errorKind: result.kind,
+        suggestion: result.suggestion,
+        rawBody: result.rawStderr,
+      },
+    };
+  }
+
+  const data = (result.data ?? {}) as AssumeRoleCliResponse;
+  const creds = data.Credentials;
+  if (!creds?.AccessKeyId || !creds.SecretAccessKey || !creds.SessionToken) {
+    return {
+      ok: false,
+      failure: { ok: false, error: "STS AssumeRole succeeded but returned incomplete credentials." },
+    };
+  }
+
+  return {
+    ok: true,
+    credentials: {
+      accessKeyId: creds.AccessKeyId,
+      secretAccessKey: creds.SecretAccessKey,
+      sessionToken: creds.SessionToken,
+      expiration: creds.Expiration,
+      assumedRoleArn: data.AssumedRoleUser?.Arn,
+      assumedRoleId: data.AssumedRoleUser?.AssumedRoleId,
+    },
+  };
+}
+
 export const assumeTools: readonly Tool[] = [
   {
     name: "aws_assume_role",
@@ -202,24 +389,7 @@ export const assumeTools: readonly Tool[] = [
         };
       }
 
-      // Shell out to `aws sts assume-role` rather than using the in-process
-      // SDK. The SDK's fromNodeProviderChain occasionally diverges from the
-      // CLI for profiles that use `credential_process` (the standard SAML
-      // escape hatch) or non-Identity-Center SSO -- mirroring how every
-      // other tool in this server reaches AWS keeps the "SAML works because
-      // we shell out" story consistent. Inputs are sent via --cli-input-json
-      // (no argv positionals), so RoleArn / RoleSessionName / ExternalId
-      // can't pose as flags.
-      const params: Record<string, unknown> = {
-        RoleArn: i.roleArn,
-        RoleSessionName: i.sessionName,
-        DurationSeconds: i.durationSeconds ?? 3600,
-      };
-      if (i.externalId !== undefined) {
-        params.ExternalId = i.externalId;
-      }
-
-      const timeoutMs = i.timeoutMs ?? 120_000;
+      const timeoutMs = i.timeoutMs ?? DEFAULT_ASSUME_TIMEOUT_MS;
       // ONE report, and only one. The work here is a single STS round-trip
       // that either returns or times out -- there is no second step to
       // observe, so any "step 2 of 3" would be invented. What the caller
@@ -235,88 +405,31 @@ export const assumeTools: readonly Tool[] = [
         `Calling sts:AssumeRole for ${i.roleArn} as source profile '${sourceProfile}' (timeout ${Math.round(timeoutMs / 1000)}s)`,
       );
 
-      const result = await runAwsCall({
-        service: "sts",
-        operation: "assume-role",
-        params,
-        profile: sourceProfile,
+      // The STS round-trip and its failure envelopes live in
+      // assumeRoleCredentials so aws_multi_account can mint a session per
+      // account without a second copy of this call. Everything below --
+      // resolving the credentials FILE and writing the profile section into it
+      // -- is what makes this tool specifically aws_assume_role.
+      const outcome = await assumeRoleCredentials({
+        roleArn: i.roleArn,
+        sessionName: i.sessionName,
+        sourceProfile,
         region: useRegion,
-        outputFormat: "json",
-        // SAML / credential_process flows can exceed runAwsCall's 60s default
-        // on cold start (federated IdP round-trip, MFA prompt forwarding).
-        // 120s is the assume-role-specific floor; callers can override.
+        durationSeconds: i.durationSeconds,
+        externalId: i.externalId,
         // Resolved above so the progress message quotes the same number.
         timeoutMs,
       });
-
-      if (!result.ok) {
-        // runAwsCall already classified auth-class failures; rewrite the
-        // sso_expired hint to name the source profile (the CLI's stderr
-        // mentions whichever profile it failed to load, but the caller
-        // cares about the assuming identity specifically).
-        if (result.kind === "sso_expired") {
-          return {
-            ok: false,
-            error: `SSO session expired for source profile '${sourceProfile}'. Call aws_login_start with profile='${sourceProfile}' before assuming.`,
-            errorKind: result.kind,
-          };
-        }
-        // expired_creds reaches here when the SOURCE profile is itself a
-        // temporary session (role chaining, or a profile fed by an earlier
-        // assume). runAwsCall's message already names both remedies and keeps
-        // the underlying stderr; this arm exists only to name the source
-        // profile, which the CLI's stderr does not reliably identify.
-        if (result.kind === "expired_creds") {
-          return {
-            ok: false,
-            error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${underlyingOf(result)}`,
-            errorKind: result.kind,
-          };
-        }
-        // invalid_creds is NOT an expiry and NOT a missing profile: the source
-        // profile's credentials resolved and STS REJECTED them (a rotated or
-        // deleted access key, a key for the wrong partition, or a drifted
-        // clock breaking SigV4). Refreshing a session cannot fix that, so this
-        // arm must not say "re-authenticate" the way the two above do, nor
-        // "no credentials found" -- the remedy is to fix the credentials that
-        // profile resolves to. Like its siblings, this arm exists only to name
-        // the SOURCE profile, which the CLI's stderr does not reliably do.
-        if (result.kind === "invalid_creds") {
-          return {
-            ok: false,
-            error: `Credentials for source profile '${sourceProfile}' were rejected by AWS (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition/account, or a drifted machine clock). Fix the credentials for that profile before assuming. Underlying error: ${underlyingOf(result)}`,
-            errorKind: result.kind,
-          };
-        }
-        // `aws sts assume-role --output json` writes the credential blob to
-        // STDOUT on success. On a non-zero exit the CLI still may have flushed
-        // a partial JSON fragment to stdout before failing; surfacing it as
-        // rawBody risks leaking secret material into error envelopes. Stick
-        // to stderr for this op specifically; if stderr is empty the upstream
-        // error string ("aws CLI exited with code X and no stderr") already
-        // carries enough signal for the caller.
-        return {
-          ok: false,
-          error: result.error,
-          errorKind: result.kind,
-          suggestion: result.suggestion,
-          rawBody: result.rawStderr,
-        };
-      }
-
-      const data = (result.data ?? {}) as AssumeRoleCliResponse;
-      const creds = data.Credentials;
-      if (!creds?.AccessKeyId || !creds.SecretAccessKey || !creds.SessionToken) {
-        return { ok: false, error: "STS AssumeRole succeeded but returned incomplete credentials." };
-      }
+      if (!outcome.ok) return outcome.failure;
+      const creds = outcome.credentials;
 
       const credentialsPath = resolveCredentialsPath();
       let existed = false;
       try {
         ({ existed } = await upsertProfile(credentialsPath, targetProfile, {
-          aws_access_key_id: creds.AccessKeyId,
-          aws_secret_access_key: creds.SecretAccessKey,
-          aws_session_token: creds.SessionToken,
+          aws_access_key_id: creds.accessKeyId,
+          aws_secret_access_key: creds.secretAccessKey,
+          aws_session_token: creds.sessionToken,
         }));
       } catch (err) {
         // acquireLock / openSync inside upsertProfile can throw a raw NodeJS
@@ -339,15 +452,15 @@ export const assumeTools: readonly Tool[] = [
         throw err;
       }
 
-      const expiration = creds.Expiration;
+      const expiration = creds.expiration;
       return {
         ok: true,
         data: {
           profile: targetProfile,
           credentialsPath,
           expiration,
-          assumedRoleArn: data.AssumedRoleUser?.Arn,
-          assumedRoleId: data.AssumedRoleUser?.AssumedRoleId,
+          assumedRoleArn: creds.assumedRoleArn,
+          assumedRoleId: creds.assumedRoleId,
           sourceProfile,
           // Only present when we overwrote a section that was already there.
           // The 'mcp-' prefix makes collisions unlikely, not impossible -- the

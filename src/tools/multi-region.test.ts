@@ -330,20 +330,20 @@ describe("capAggregateResults -- aggregate response budget", () => {
 
   it("leaves a batch under the budget untouched", () => {
     const input = [okEntry("us-east-1"), okEntry("us-west-2")];
-    const out = capAggregateResults(input, 1_000_000);
-    assert.deepEqual(out.truncatedRegions, []);
+    const out = capAggregateResults(input, 1_000_000, (r) => r.region);
+    assert.deepEqual(out.truncatedIds, []);
     assert.deepEqual(out.results, input);
   });
 
   it("drops data from the entries past the budget and names them", () => {
     const input = Array.from({ length: 8 }, (_, n) => okEntry(`us-east-${n + 1}`));
     // Room for roughly the first two entries.
-    const out = capAggregateResults(input, 9_000);
-    assert.ok(out.truncatedRegions.length > 0, "some entries must be trimmed");
-    assert.ok(out.truncatedRegions.length < input.length, "the early entries must survive intact");
+    const out = capAggregateResults(input, 9_000, (r) => r.region);
+    assert.ok(out.truncatedIds.length > 0, "some entries must be trimmed");
+    assert.ok(out.truncatedIds.length < input.length, "the early entries must survive intact");
     assert.equal(out.results[0].data, bigData, "the first entry keeps its payload");
     for (const r of out.results) {
-      if (out.truncatedRegions.includes(r.region)) {
+      if (out.truncatedIds.includes(r.region)) {
         assert.equal(r.data, undefined, `${r.region} must lose its data`);
         assert.equal(r.truncated, true, `${r.region} must be flagged truncated`);
         assert.equal(r.ok, true, "truncation must not restate a successful call as a failure");
@@ -365,14 +365,14 @@ describe("capAggregateResults -- aggregate response budget", () => {
     const b = okEntry("us-west-2");
     const exactFit = Buffer.byteLength(JSON.stringify(a), "utf8") + Buffer.byteLength(JSON.stringify(b), "utf8");
 
-    const fits = capAggregateResults([a, b], exactFit);
-    assert.deepEqual(fits.truncatedRegions, [], "an exact fit must not truncate anything");
+    const fits = capAggregateResults([a, b], exactFit, (r) => r.region);
+    assert.deepEqual(fits.truncatedIds, [], "an exact fit must not truncate anything");
     assert.equal(fits.results[0].data, bigData);
     assert.equal(fits.results[1].data, bigData, "the entry landing exactly on the budget must keep its payload");
     assert.equal(fits.results[1].truncated, undefined);
 
-    const oneByteShort = capAggregateResults([a, b], exactFit - 1);
-    assert.deepEqual(oneByteShort.truncatedRegions, ["us-west-2"], "one byte short drops exactly the last entry");
+    const oneByteShort = capAggregateResults([a, b], exactFit - 1, (r) => r.region);
+    assert.deepEqual(oneByteShort.truncatedIds, ["us-west-2"], "one byte short drops exactly the last entry");
     assert.equal(oneByteShort.results[0].data, bigData, "the first entry still fits");
     assert.equal(oneByteShort.results[1].data, undefined);
     assert.equal(oneByteShort.results[1].truncated, true);
@@ -384,12 +384,12 @@ describe("capAggregateResults -- aggregate response budget", () => {
       okEntry("us-east-2"),
       { region: "eu-west-1", ok: false, error: "SSO session expired", errorKind: "sso_expired" },
     ];
-    const out = capAggregateResults(input, 1);
+    const out = capAggregateResults(input, 1, (r) => r.region);
     const err = out.results.find((r) => r.region === "eu-west-1");
     assert.equal(err?.error, "SSO session expired");
     assert.equal(err?.errorKind, "sso_expired");
     assert.equal(err?.truncated, undefined);
-    assert.deepEqual(out.truncatedRegions, ["us-east-1", "us-east-2"]);
+    assert.deepEqual(out.truncatedIds, ["us-east-1", "us-east-2"]);
   });
 });
 

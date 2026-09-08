@@ -1818,6 +1818,114 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "macct_success":
+    case "macct_partial_failure":
+    case "macct_leaky_stderr":
+    case "macct_big_payload": {
+      // The four aws_multi_account scenarios share one block because every one
+      // of them needs the same two-PHASE behaviour, and duplicating the phase
+      // split four times is how the copies drift apart. Each account drives two
+      // spawns:
+      //
+      //   phase 1, `sts assume-role`: mint credentials whose values ENCODE the
+      //     account they were minted for, so phase 2 can prove which session it
+      //     was actually handed. The account comes out of the RoleArn inside
+      //     --cli-input-json, which is where the handler puts it.
+      //   phase 2, the caller's operation: the credentials arrive through the
+      //     ENVIRONMENT (aws_multi_account passes them via runAwsCall's `env`),
+      //     so this side reads AWS_ACCESS_KEY_ID rather than argv.
+      //
+      // Phase 2 also reports whether `--profile` was on argv. That is not
+      // decoration: botocore drops the environment credential provider entirely
+      // once a profile is explicitly set, so a regression that put the flag back
+      // would make every account silently answer as the operator's own -- a
+      // wrong ANSWER, not an error, which is the kind of bug no failure assertion
+      // catches.
+      const argv = process.argv.slice(2);
+      const isAssume = argv[0] === "sts" && argv[1] === "assume-role";
+
+      if (isAssume) {
+        const inputIdx = argv.indexOf("--cli-input-json");
+        const payload = inputIdx >= 0 ? (JSON.parse(argv[inputIdx + 1]) as { RoleArn?: string }) : {};
+        const account = /:([0-9]{12}):role\//.exec(payload.RoleArn ?? "")?.[1] ?? "unknown";
+        if (scenario === "macct_partial_failure" && account === "222222222222") {
+          // One account whose ASSUME fails, so the batch proves an account can
+          // drop out before its operation ever runs.
+          process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+          process.exit(255);
+          return;
+        }
+        process.stdout.write(
+          `${JSON.stringify({
+            Credentials: {
+              AccessKeyId: `ASIAFAKE${account}`,
+              SecretAccessKey: `fake-secret-${account}`,
+              SessionToken: `fake-token-${account}`,
+              Expiration: "2099-12-31T23:59:59+00:00",
+            },
+            AssumedRoleUser: {
+              AssumedRoleId: `AROAFAKE${account}:macct`,
+              Arn: `arn:aws:sts::${account}:assumed-role/Fake/macct`,
+            },
+            PackedPolicySize: 6,
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+
+      const accessKeyId = process.env.AWS_ACCESS_KEY_ID ?? "";
+      const account = accessKeyId.startsWith("ASIAFAKE") ? accessKeyId.slice("ASIAFAKE".length) : "unknown";
+      const sawProfileFlag = argv.includes("--profile");
+
+      if (scenario === "macct_leaky_stderr") {
+        // Adversarial: a subprocess that dumps the credentials it was handed to
+        // BOTH streams and then fails. Nothing real does this -- the point is
+        // that aws_multi_account's response must not contain them even when the
+        // text it is forwarding does. Deliberately worded so classifyAuthError
+        // does NOT recognize it: an auth-class kind would take the handler's
+        // rewrite path and drop the leaked text on the floor, and the test would
+        // pass without ever exercising the scrub.
+        const dump = `AWS_ACCESS_KEY_ID=${accessKeyId} AWS_SECRET_ACCESS_KEY=${process.env.AWS_SECRET_ACCESS_KEY} AWS_SESSION_TOKEN=${process.env.AWS_SESSION_TOKEN}`;
+        process.stdout.write(`partial output before failing: ${dump}\n`);
+        process.stderr.write(`An error occurred (InternalError) when calling the operation: debug dump ${dump}\n`);
+        process.exit(254);
+        return;
+      }
+
+      if (scenario === "macct_partial_failure" && account === "333333333333") {
+        // A second account that assumed fine and then failed the OPERATION, so
+        // the batch carries both failure stages plus a success at once.
+        process.stderr.write(
+          "An error occurred (AccessDenied) when calling the operation: not authorized in this account\n",
+        );
+        process.exit(254);
+        return;
+      }
+
+      if (scenario === "macct_big_payload") {
+        // ~2.75 MB per account: under the 5 MB PER-CALL stdout cap in
+        // aws-cli.ts, but two of them cross the 5 MB AGGREGATE budget.
+        process.stdout.write(`${JSON.stringify({ Account: account, Blob: "x".repeat(2_750_000) })}\n`);
+        process.exit(0);
+        return;
+      }
+
+      process.stdout.write(
+        `${JSON.stringify({
+          Account: account,
+          SawProfileFlag: sawProfileFlag,
+          // A BOOLEAN, not the token: this scenario's job is to prove the exact
+          // session reached the right subprocess, and echoing the value would
+          // put credential-shaped text in a payload the leak test then has to
+          // special-case.
+          SessionTokenMatches: process.env.AWS_SESSION_TOKEN === `fake-token-${account}`,
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     case "obs2_mr_big_payload": {
       // Drives aws_multi_region's AGGREGATE byte cap (5 MB across the batch)
       // through the real handler. Region-branching like mr_partial_failure:

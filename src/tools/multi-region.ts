@@ -38,37 +38,57 @@ const MAX_TOTAL_RESULT_BYTES = 5 * 1024 * 1024;
 // this file carried a duplicate regex with the identical pattern -- harmless
 // today, drift risk tomorrow.
 
-export interface RegionResult {
-  region: string;
+/**
+ * The part of a fan-out entry {@link capAggregateResults} needs to reason about:
+ * whether the call succeeded, and whether it carries a payload big enough to be
+ * worth dropping.
+ *
+ * Everything that identifies the entry -- `region` here, `accountId` in
+ * aws_multi_account -- is deliberately NOT in this shape. The cap function
+ * reads the identifier through the `idOf` accessor its caller passes and
+ * otherwise copies the entry wholesale, so it stays honest about entries whose
+ * key it has never heard of.
+ */
+export interface CappableResult {
   ok: boolean;
   data?: unknown;
   command?: string;
   error?: string;
   errorKind?: string;
   /**
-   * True when this region's call finished but its `data` was dropped to keep
-   * the aggregate response under MAX_TOTAL_RESULT_BYTES. `ok` still reports
-   * what the CALL did -- an ok:true entry with truncated:true succeeded and
-   * its payload didn't fit, which is a different thing from a failure.
+   * True when this entry's call finished but its `data` was dropped to keep the
+   * aggregate response under the byte budget. `ok` still reports what the CALL
+   * did -- an ok:true entry with truncated:true succeeded and its payload
+   * didn't fit, which is a different thing from a failure.
    */
   truncated?: boolean;
 }
 
+export interface RegionResult extends CappableResult {
+  region: string;
+}
+
 /**
- * Enforce the aggregate response budget across per-region results.
+ * Enforce the aggregate response budget across a batch of per-item results.
  *
  * Walks entries in order, charging each one its serialized size, and once the
  * budget is spent drops `data` from any entry that carries one. Error entries
  * are left intact: their text is already bounded (aws-cli.ts truncates error
- * messages at 8 KB) and losing the reason a region failed is worse than the
- * bytes it costs. Returns the regions whose data was dropped so the handler
- * can surface them.
+ * messages at 8 KB) and losing the reason an item failed is worse than the
+ * bytes it costs. Returns the ids whose data was dropped so the handler can
+ * surface them.
+ *
+ * `idOf` is required rather than defaulted because this function is shared by
+ * fan-outs keyed on different fields (aws_multi_region on `region`,
+ * aws_multi_account on `accountId`); a default would silently name the wrong
+ * thing -- or nothing -- for the next one.
  */
-export function capAggregateResults(
-  results: readonly RegionResult[],
+export function capAggregateResults<T extends CappableResult>(
+  results: readonly T[],
   maxBytes: number,
-): { results: RegionResult[]; truncatedRegions: string[] } {
-  const truncatedRegions: string[] = [];
+  idOf: (entry: T) => string,
+): { results: T[]; truncatedIds: string[] } {
+  const truncatedIds: string[] = [];
   let used = 0;
   const out = results.map((r) => {
     const size = Buffer.byteLength(JSON.stringify(r), "utf8");
@@ -76,15 +96,18 @@ export function capAggregateResults(
       used += size;
       return r;
     }
-    const trimmed: RegionResult = { region: r.region, ok: r.ok, truncated: true };
-    if (r.command !== undefined) trimmed.command = r.command;
-    if (r.error !== undefined) trimmed.error = r.error;
-    if (r.errorKind !== undefined) trimmed.errorKind = r.errorKind;
-    truncatedRegions.push(r.region);
+    // Copy-minus-`data`, not a hand-written field list. A literal would have to
+    // name every key worth keeping, and the identifier key differs per caller --
+    // so the entry the caller got back would be one it could not match to its
+    // own input. The rest-destructure also means a field added to an entry type
+    // later survives truncation without anyone remembering to update this.
+    const { data: _dropped, ...withoutData } = r;
+    const trimmed = { ...withoutData, truncated: true } as T;
+    truncatedIds.push(idOf(r));
     used += Buffer.byteLength(JSON.stringify(trimmed), "utf8");
     return trimmed;
   });
-  return { results: out, truncatedRegions };
+  return { results: out, truncatedIds };
 }
 
 /**
@@ -102,11 +125,11 @@ export function capAggregateResults(
  * contract, instead of surfacing an opaque error from an anonymous worker with
  * no indication of which input caused it.
  *
- * The current sole caller (aws_multi_region) is safe because its `fn` wraps
- * each region in a try/catch and runAwsCall is itself resolve-only -- it
- * returns an `{ok: false, ...}` result on failure instead of rejecting. Any
- * NEW caller must uphold the same discipline: catch inside `fn` and return a
- * result, never let `fn` reject.
+ * Both current callers (aws_multi_region, aws_multi_account) are safe because
+ * their `fn` wraps each item in a try/catch and runAwsCall is itself
+ * resolve-only -- it returns an `{ok: false, ...}` result on failure instead of
+ * rejecting. Any NEW caller must uphold the same discipline: catch inside `fn`
+ * and return a result, never let `fn` reject.
  *
  * `concurrency` is floored at 1: a zero or negative value would spawn zero
  * workers, so `Promise.all([])` resolves instantly and every slot of `results`
@@ -312,7 +335,7 @@ export const multiRegionTools: readonly Tool[] = [
       // response budget.
       const okCount = results.filter((r) => r.ok).length;
       const errCount = results.length - okCount;
-      const capped = capAggregateResults(results, MAX_TOTAL_RESULT_BYTES);
+      const capped = capAggregateResults(results, MAX_TOTAL_RESULT_BYTES, (r) => r.region);
 
       return {
         ok: true,
@@ -322,10 +345,13 @@ export const multiRegionTools: readonly Tool[] = [
           regionCount: regions.length,
           okCount,
           errorCount: errCount,
-          ...(capped.truncatedRegions.length > 0
+          // The envelope field stays `truncatedRegions` even though the shared
+          // helper now returns the neutral `truncatedIds`: it is a published
+          // response field this tool's callers already read.
+          ...(capped.truncatedIds.length > 0
             ? {
                 truncated: true,
-                truncatedRegions: capped.truncatedRegions,
+                truncatedRegions: capped.truncatedIds,
                 maxTotalResultBytes: MAX_TOTAL_RESULT_BYTES,
               }
             : {}),
