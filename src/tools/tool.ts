@@ -11,6 +11,40 @@ export interface ToolResult {
   data?: unknown;
   error?: string;
   rawBody?: string;
+  /**
+   * Machine-readable classification of a failure, so a caller can branch on the
+   * failure CLASS instead of regex-matching `error` prose -- which is what the
+   * README "Stability" section already tells integrators to do, and what only
+   * aws_multi_region could actually support before this field existed.
+   *
+   * Typed `string` rather than AwsCallFailureKind on purpose. It matches
+   * RegionResult.errorKind in tools/multi-region.ts (the field this one
+   * generalizes), and not every value comes from a CLI call: multi-region emits
+   * "bad_input" for a region name it rejected locally and "unexpected" for a
+   * worker that threw. Importing the union would also point this module at
+   * aws-cli.ts, which nothing else here needs.
+   *
+   * Set ONLY where the handler already holds a classified kind. A handler that
+   * fails its own input validation leaves this unset rather than inventing a
+   * value, so an ABSENT errorKind means "unclassified" -- never "nonzero_exit".
+   */
+  errorKind?: string;
+  /**
+   * The one-line remedy parseAwsError (src/errors.ts) derives from a recognized
+   * AWS error code, carried structurally so a caller does not have to split it
+   * back out of `error`.
+   *
+   * NOT rendered by toMcpResult, deliberately. Its only producer -- runAwsCall's
+   * nonzero_exit branch -- already appends "\n\nSuggestion: <text>" to the
+   * message it builds, so rendering the field too would print the same sentence
+   * twice: the defect v2.0.1 fixed for rawBody. Its consumers are in-process
+   * ones -- the aws_script bridge attaches it to the Error it throws, so a
+   * script can branch on it. A future handler that sets `suggestion` WITHOUT
+   * also putting it in `error` would not surface it to the model at all; put it
+   * in the message as well, or teach toMcpResult to append it when the text does
+   * not already contain it.
+   */
+  suggestion?: string;
 }
 
 interface ToolAnnotations {

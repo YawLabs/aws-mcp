@@ -123,8 +123,35 @@ export function toMcpResult(response: ToolResult): McpResult {
     const rawTrimmed = response.rawBody?.trim();
     const alreadyInSummary = !!rawTrimmed && baseError.includes(rawTrimmed);
     const errorText = rawTrimmed && !alreadyInSummary ? `${baseError}\n\n${response.rawBody}` : baseError;
+    // Deliver the classification as a leading `errorKind: <kind>` line.
+    //
+    // The text content block is the only path guaranteed to reach every host
+    // today. structuredContent needs a declared outputSchema, and the SDK only
+    // accepts one through registerTool -- the `server.tool(name, description,
+    // shape, annotations, cb)` overload the registration loop below uses has no
+    // slot for it. An ok:false result also never renders `data`: this branch
+    // returns before the parts assembly below ever sees it. So the wire format
+    // is prose, and this line is its machine-readable part.
+    //
+    // LEADING, not trailing, and spelled with the literal field name. The README
+    // tells integrators to anchor on `errorKind` rather than regex the `error`
+    // wording, so the token has to BE `errorKind` and has to survive a host that
+    // clips a long body -- and rawBody, which runs to 8 KB, is what gets clipped.
+    //
+    // ONE newline, not two. The blank line is this function's section separator
+    // in both branches ("summary, blank line, raw blob"), so the kind rides in
+    // the same block as the summary instead of announcing itself as a section --
+    // and a result with no rawBody still contains no "\n\n".
+    //
+    // Composed AFTER errorText so the anti-doubling guard above still compares
+    // rawBody against the SUMMARY alone. Folding the kind into `baseError` would
+    // put text the CLI never emitted inside the string that containment check
+    // reads.
+    //
+    // `suggestion` is deliberately not rendered here: see ToolResult.
+    const kindLine = response.errorKind ? `errorKind: ${response.errorKind}\n` : "";
     return {
-      content: [{ type: "text" as const, text: errorText }],
+      content: [{ type: "text" as const, text: `${kindLine}${errorText}` }],
       isError: true,
     };
   }

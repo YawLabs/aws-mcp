@@ -211,6 +211,22 @@ export interface AwsCallFailure {
   ok: false;
   kind: AwsCallFailureKind;
   error: string;
+  /**
+   * The one-line remedy parseAwsError derived from a recognized AWS error code,
+   * when it recognized one. Present on the `nonzero_exit` branch only: the
+   * auth-class branches above it build their own remedy into `error` and name
+   * the profile (which parseAwsError cannot), so a second, differently worded
+   * suggestion beside it would be two instructions for one failure -- the defect
+   * v2.0.1 fixed in aws_assume_role and aws_resource_*.
+   *
+   * Still embedded in `error` as well, and that duplication is deliberate rather
+   * than an oversight to tidy up: aws_multi_region carries only per-region
+   * `error` TEXT (RegionResult has no suggestion field), so moving the sentence
+   * out of the message would silently drop the remedy from every multi-region
+   * failure. Read this field instead of splitting the string; toMcpResult does
+   * not re-render it.
+   */
+  suggestion?: string;
   command?: string;
   exitCode?: number | null;
   rawStdout?: string;
@@ -454,6 +470,10 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         const classified = classifyAuthError(new Error(stderrBuf));
         let errorMsg: string;
         let kind: AwsCallFailureKind;
+        // Only the nonzero_exit branch below assigns this -- the auth-class
+        // branches build their own profile-aware remedy into errorMsg instead.
+        // See AwsCallFailure.suggestion.
+        let suggestion: string | undefined;
         if (classified.kind === "sso_expired") {
           kind = "sso_expired";
           errorMsg = `SSO session expired for profile '${profile}'. Call aws_login_start with profile='${profile}' to re-authenticate.`;
@@ -482,11 +502,17 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           // we recognize a common AWS error shape. The raw stderr stays in
           // baseMsg untouched so the agent can still see the original text.
           const parsed = parseAwsError(stderrBuf);
+          suggestion = parsed.suggestion;
           errorMsg = parsed.suggestion ? `${baseMsg}\n\nSuggestion: ${parsed.suggestion}` : baseMsg;
         }
         settle({
           ok: false,
           kind,
+          // Conditional spread, the same form the spawn call above uses for
+          // `...(opts.env ? { env: opts.env } : {})`: omit the key entirely
+          // rather than emitting `suggestion: undefined` on the auth-class
+          // branches, which have no suggestion to give.
+          ...(suggestion !== undefined ? { suggestion } : {}),
           error: errorMsg,
           command: displayCommand,
           exitCode: code,

@@ -87,6 +87,10 @@ export const callTools: readonly Tool[] = [
         return {
           ok: false,
           error: result.error,
+          // runAwsCall already classified this failure; forwarding the kind is
+          // what lets a caller branch on it without regexing the message.
+          errorKind: result.kind,
+          suggestion: result.suggestion,
           // Treat an empty-string rawStderr as "no stderr" so a nonzero exit
           // that wrote its diagnostic to stdout (rare but observed: some
           // `aws` operations route through stdout when stderr is closed or

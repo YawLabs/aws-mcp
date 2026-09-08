@@ -258,6 +258,7 @@ export const assumeTools: readonly Tool[] = [
           return {
             ok: false,
             error: `SSO session expired for source profile '${sourceProfile}'. Call aws_login_start with profile='${sourceProfile}' before assuming.`,
+            errorKind: result.kind,
           };
         }
         // expired_creds reaches here when the SOURCE profile is itself a
@@ -269,6 +270,7 @@ export const assumeTools: readonly Tool[] = [
           return {
             ok: false,
             error: `Temporary credentials for source profile '${sourceProfile}' have expired. Refresh that profile (aws_login_start if it is SSO-backed, otherwise re-run its assume) before assuming. Underlying error: ${underlyingOf(result)}`,
+            errorKind: result.kind,
           };
         }
         // invalid_creds is NOT an expiry and NOT a missing profile: the source
@@ -283,6 +285,7 @@ export const assumeTools: readonly Tool[] = [
           return {
             ok: false,
             error: `Credentials for source profile '${sourceProfile}' were rejected by AWS (they resolved, but the service refused them -- a rotated or deleted access key, the wrong partition/account, or a drifted machine clock). Fix the credentials for that profile before assuming. Underlying error: ${underlyingOf(result)}`,
+            errorKind: result.kind,
           };
         }
         // `aws sts assume-role --output json` writes the credential blob to
@@ -292,7 +295,13 @@ export const assumeTools: readonly Tool[] = [
         // to stderr for this op specifically; if stderr is empty the upstream
         // error string ("aws CLI exited with code X and no stderr") already
         // carries enough signal for the caller.
-        return { ok: false, error: result.error, rawBody: result.rawStderr };
+        return {
+          ok: false,
+          error: result.error,
+          errorKind: result.kind,
+          suggestion: result.suggestion,
+          rawBody: result.rawStderr,
+        };
       }
 
       const data = (result.data ?? {}) as AssumeRoleCliResponse;

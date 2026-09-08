@@ -158,6 +158,62 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     assert.match(r.rawBody ?? "", /partial-output-on-stdout/);
   });
 
+  // --- errorKind / suggestion forwarding ---
+
+  it("forwards the classified errorKind on the auth-class failures, with no suggestion", async () => {
+    // The auth branches build their own profile-aware remedy into `error`, so
+    // parseAwsError never runs for them and `suggestion` stays absent -- the
+    // two new fields are independent.
+    for (const [scenario, kind] of [
+      ["call_sso_expired", "sso_expired"],
+      ["call_no_creds", "no_creds"],
+    ] as const) {
+      process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+      const r = (await tool.handler({ service: "s3api", operation: "list-buckets", profile: "my-profile" })) as {
+        ok: boolean;
+        errorKind?: string;
+        suggestion?: string;
+      };
+      assert.equal(r.ok, false, scenario);
+      assert.equal(r.errorKind, kind, scenario);
+      assert.equal(r.suggestion, undefined, scenario);
+    }
+  });
+
+  it("forwards nonzero_exit plus the parsed suggestion, which stays embedded in error too", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
+    const r = (await tool.handler({ service: "s3api", operation: "list-buckets" })) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, "Check IAM permissions for this operation.");
+    // The field DUPLICATES the message rather than replacing it: aws_multi_region
+    // carries only per-region `error` text, so moving it out would drop the
+    // remedy there.
+    assert.ok(
+      (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+      `error must still end with the suggestion sentence, got: ${r.error}`,
+    );
+  });
+
+  it("classifies a nonzero exit with empty stderr but has no suggestion to give", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_fail_stdout_only";
+    const r = (await tool.handler({ service: "s3api", operation: "list-buckets" })) as {
+      ok: boolean;
+      errorKind?: string;
+      suggestion?: string;
+      rawBody?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, undefined, "parseAwsError('') yields nothing");
+    assert.match(r.rawBody ?? "", /partial-output-on-stdout/);
+  });
+
   // --- bad_input short-circuit (runAwsCall returns before spawning) ---
 
   it("returns ok:false with undefined rawBody when validation fails before any subprocess", async () => {
@@ -173,5 +229,8 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid service/);
     assert.equal(r.rawBody, undefined);
+    // runAwsCall classified it before returning, so the kind survives even
+    // though no subprocess ever ran.
+    assert.equal((r as { errorKind?: string }).errorKind, "bad_input");
   });
 });

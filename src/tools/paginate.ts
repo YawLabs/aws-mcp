@@ -135,9 +135,15 @@ export const paginateTools: readonly Tool[] = [
       if (!result.ok) {
         // Truthiness, not `??`: an empty-string stderr means "no stderr", and
         // `??` would return that empty string and drop a stdout body that
-        // does carry the diagnostic. Same contract as call.ts:80 and
+        // does carry the diagnostic. Same contract as call.ts and
         // resource.ts's rawBodyOf.
-        return { ok: false, error: result.error, rawBody: result.rawStderr ? result.rawStderr : result.rawStdout };
+        return {
+          ok: false,
+          error: result.error,
+          errorKind: result.kind,
+          suggestion: result.suggestion,
+          rawBody: result.rawStderr ? result.rawStderr : result.rawStdout,
+        };
       }
 
       let resultBody: unknown;

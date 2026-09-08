@@ -95,6 +95,64 @@ describe("toMcpResult — ok:false (error) branches", () => {
   });
 });
 
+describe("toMcpResult — errorKind delivery", () => {
+  it("prefixes an `errorKind: <kind>` line ahead of the error summary", () => {
+    const r = toMcpResult({ ok: false, error: "AccessDenied", errorKind: "nonzero_exit" });
+    assert.deepEqual(r, {
+      content: [{ type: "text", text: "errorKind: nonzero_exit\nError: AccessDenied" }],
+      isError: true,
+    });
+    // ONE newline: the blank line stays reserved for "rawBody follows", so a
+    // result with no rawBody still contains no "\n\n".
+    assert.equal(r.content[0].text.includes("\n\n"), false);
+  });
+
+  it("omits the line entirely when errorKind is absent (legacy shape pinned)", () => {
+    // The regression pin that makes the feature additive: an unclassified
+    // failure must not gain a header. Byte-identical to the pre-change output.
+    const r = toMcpResult({ ok: false, error: "AccessDenied", rawBody: "stderr blob" });
+    assert.deepEqual(r, {
+      content: [{ type: "text", text: "Error: AccessDenied\n\nstderr blob" }],
+      isError: true,
+    });
+  });
+
+  it("composes kind line + summary + rawBody in that order", () => {
+    const r = toMcpResult({ ok: false, error: "boom", errorKind: "timeout", rawBody: "raw" });
+    assert.equal(r.content[0].text, "errorKind: timeout\nError: boom\n\nraw");
+  });
+
+  it("does not regress the rawBody doubling guard", () => {
+    // The v2.0.1 fix compares rawBody against the SUMMARY alone. The kind line
+    // is composed after that check, so adding it must not make the containment
+    // test miss and re-append the stderr.
+    const stderr = "aws: [ERROR]: The config profile (nope) could not be found";
+    const r = toMcpResult({
+      ok: false,
+      error: `No credentials found for profile 'nope'. Check ~/.aws/config and ~/.aws/credentials. Underlying error: ${stderr}`,
+      errorKind: "no_creds",
+      rawBody: `${stderr}\r\n`,
+    });
+    const text = r.content[0].text;
+    assert.equal(text.split("could not be found").length - 1, 1, `stderr must appear exactly once: ${text}`);
+    assert.equal(text.startsWith("errorKind: no_creds\nError: No credentials found"), true);
+    assert.equal(text.includes("\n\n"), false, "nothing appended, so no separator");
+  });
+
+  it("never renders `suggestion`, which its producer already embeds in `error`", () => {
+    // The guard against reintroducing the v2.0.1 doubling defect on a second
+    // field: runAwsCall puts the sentence in `error` AND on the field.
+    const suggestion = "Check IAM permissions for this operation.";
+    const r = toMcpResult({
+      ok: false,
+      error: `boom\n\nSuggestion: ${suggestion}`,
+      errorKind: "nonzero_exit",
+      suggestion,
+    });
+    assert.equal(r.content[0].text.split("Suggestion:").length - 1, 1);
+  });
+});
+
 describe("toMcpResult — ok:true (success) branches", () => {
   it("serializes data as pretty JSON (2-space indent) when present", () => {
     const data = { Buckets: [{ Name: "b1" }], Owner: { ID: "abc" } };
@@ -253,8 +311,8 @@ void _typePin;
  * loop at the bottom of the test will name both indexes.
  */
 describe("tool registry snapshot", () => {
-  it("allTools has 25 entries, every individual array contributes, every name is unique", () => {
-    // The per-array imports mirror the spread order in src/index.ts:100-118
+  it("allTools has 26 entries, every individual array contributes, every name is unique", () => {
+    // The per-array imports mirror the spread order in src/index.ts
     // exactly. A typo in either place is caught at module load (spread) or
     // at the corresponding import (tsc).
     const groups: ReadonlyArray<readonly [string, readonly Tool[]]> = [
@@ -282,7 +340,7 @@ describe("tool registry snapshot", () => {
 
     // Total: pinned. Update this number whenever a tool is added or removed.
     const sumOfGroups = groups.reduce((n, [, arr]) => n + arr.length, 0);
-    assert.equal(sumOfGroups, 25, "sum of per-group tool counts drifted from the pinned total");
+    assert.equal(sumOfGroups, 26, "sum of per-group tool counts drifted from the pinned total");
 
     // allTools (the actual export consumed by the MCP registration loop) must
     // equal the per-group sum. A typo in src/index.ts referencing a wrong

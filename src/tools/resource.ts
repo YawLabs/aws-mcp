@@ -205,7 +205,13 @@ async function ccapiCall(
 
 /** The one failure shape for a failed `ccapiCall`. Typed on the failure arm, so callers must narrow first. */
 function ccapiFailure(result: AwsCallFailure): ToolResult {
-  return { ok: false, error: result.error, rawBody: rawBodyOf(result) };
+  return {
+    ok: false,
+    error: result.error,
+    errorKind: result.kind,
+    suggestion: result.suggestion,
+    rawBody: rawBodyOf(result),
+  };
 }
 
 /**
@@ -300,7 +306,7 @@ type AwsCaller = (opts: Parameters<typeof runAwsCall>[0]) => Promise<AwsCallResu
  * `signal` is optional so the scripted `(ms) => void` doubles the tests inject
  * still satisfy the parameter type.
  */
-function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+export function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve) => {
     if (signal?.aborted) {
       resolve();
@@ -539,7 +545,11 @@ async function buildMutationResponse(
         } else {
           reLoginHint = `No credentials available while awaiting completion. After fixing credentials for profile '${useProfile}', ${recovery} Underlying error: ${underlying}`;
         }
-        return { ok: false, error: reLoginHint, rawBody: polled.rawBody };
+        // PollResult.kind mirrors AwsCallFailureKind (see its docblock), and the
+        // guard above narrowed it to the four auth kinds, so the caller can
+        // branch on WHICH credential failure interrupted the wait rather than
+        // parsing the recovery sentence we just built.
+        return { ok: false, error: reLoginHint, errorKind: polled.kind, rawBody: polled.rawBody };
       }
       // Also the client-cancelled arm (`polled.cancelled`): it carries no
       // AwsCallFailureKind, so it lands here and surfaces pollUntilTerminal's
@@ -547,7 +557,11 @@ async function buildMutationResponse(
       // requestToken to resume with. Deliberately not reported as ok:true --
       // the operation had not reached a terminal state when we stopped
       // watching, and saying otherwise would be a fake success.
-      return { ok: false, error: polled.error ?? "Poll failed", rawBody: polled.rawBody };
+      // `polled.kind` is undefined on the two non-CLI arms -- the budget
+      // exhaustion and the client-cancelled result -- and that is the correct
+      // answer for both: nothing classified them, so the field is absent rather
+      // than being given a manufactured value.
+      return { ok: false, error: polled.error ?? "Poll failed", errorKind: polled.kind, rawBody: polled.rawBody };
     }
     return progressResponse(polled.command, polled.progressEvent, {
       awaited: { attempts: polled.attempts, elapsedMs: polled.elapsedMs },

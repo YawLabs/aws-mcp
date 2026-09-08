@@ -324,7 +324,13 @@ export const iamSimulateTools: readonly Tool[] = [
       if (!result.ok) {
         // `||`, not `??`: an empty-string rawStderr is not nullish, so `??`
         // would hand back "" instead of falling back to stdout.
-        return { ok: false, error: result.error, rawBody: result.rawStderr || result.rawStdout };
+        return {
+          ok: false,
+          error: result.error,
+          errorKind: result.kind,
+          suggestion: result.suggestion,
+          rawBody: result.rawStderr || result.rawStdout,
+        };
       }
 
       const raw = result.data as { EvaluationResults?: unknown[]; IsTruncated?: unknown; Marker?: unknown } | null;

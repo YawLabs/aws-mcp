@@ -213,7 +213,7 @@ async function getCallerIdentity(
   region: string,
 ): Promise<
   | { ok: true; account?: string; userId?: string; arn?: string }
-  | { ok: false; kind: string; error: string; rawBody?: string }
+  | { ok: false; kind: string; error: string; suggestion?: string; rawBody?: string }
 > {
   const result = await runAwsCall({
     service: "sts",
@@ -227,6 +227,7 @@ async function getCallerIdentity(
       ok: false,
       kind: result.kind,
       error: result.error,
+      suggestion: result.suggestion,
       // `||`, not `??`: on a non-zero exit with empty stderr, rawStderr is ""
       // (present but useless), and `??` would hand back that empty string
       // instead of falling through to whatever the CLI managed to print on
@@ -274,7 +275,13 @@ export const authTools: readonly Tool[] = [
         // runAwsCall already shaped the error text for sso_expired / no_creds
         // (matching what aws_call surfaces). Pass it through so this tool's
         // hints stay consistent with every other tool's hints.
-        return { ok: false, error: identity.error, rawBody: identity.rawBody };
+        return {
+          ok: false,
+          error: identity.error,
+          errorKind: identity.kind,
+          suggestion: identity.suggestion,
+          rawBody: identity.rawBody,
+        };
       }
       // startUrlForProfile returns undefined for non-SSO profiles (no
       // sso_start_url in ~/.aws/config). When that happens, the startUrl
@@ -394,6 +401,8 @@ export const authTools: readonly Tool[] = [
         return {
           ok: false,
           error: `Login subprocess succeeded but identity check failed: ${identity.error}`,
+          errorKind: identity.kind,
+          suggestion: identity.suggestion,
           rawBody: identity.rawBody,
         };
       }

@@ -188,9 +188,17 @@ async function unwrap(tool: Tool, input: unknown): Promise<unknown> {
   if (!r.ok) {
     const e = new Error(r.error || `Tool '${tool.name}' failed`) as Error & {
       rawBody?: string;
+      errorKind?: string;
+      suggestion?: string;
       toolName?: string;
     };
     if (r.rawBody) e.rawBody = r.rawBody;
+    // Guarded, like rawBody above and unlike toolName below: wrapForRealm
+    // copies every enumerable own key onto the realm-fresh error, so an
+    // unconditional assignment would put `errorKind: undefined` on the error
+    // object of every script-visible failure that has no classification.
+    if (r.errorKind) e.errorKind = r.errorKind;
+    if (r.suggestion) e.suggestion = r.suggestion;
     e.toolName = tool.name;
     throw e;
   }
@@ -352,6 +360,10 @@ interface ScriptFailure extends Error {
   truncatedLogs?: boolean;
   durationMs?: number;
   rawBody?: string;
+  // Set by `unwrap` when an aws.* bridge call failed with a classified kind,
+  // and copied across the realm boundary by wrapForRealm. Absent when the
+  // script threw on its own (a TypeError, an explicit throw, the vm timeout).
+  errorKind?: string;
 }
 
 /**
@@ -640,9 +652,10 @@ export const scriptTools: readonly Tool[] = [
         const logs = failure?.logs ?? [];
         const truncatedLogs = failure?.truncatedLogs ?? false;
         // The captured lines go out on rawBody as well as on `data`: index.ts
-        // renders only `error` + `rawBody` for a failed ToolResult, so logs
-        // left in `data` alone would never reach the model -- and a timeout is
-        // exactly when it wants to see how far the script got.
+        // never renders `data` for a failed ToolResult (only `error`, `rawBody`,
+        // and the `errorKind` line), so logs left in `data` alone would never
+        // reach the model -- and a timeout is exactly when it wants to see how
+        // far the script got.
         const logBody = logs.length
           ? `Captured console output before the failure (${logs.length} line(s)${truncatedLogs ? ", truncated" : ""}):\n${logs.join("\n")}`
           : undefined;
@@ -651,6 +664,10 @@ export const scriptTools: readonly Tool[] = [
         return {
           ok: false,
           error: message,
+          // Duck-typed exactly like toolRawBody above: a script is free to catch
+          // a bridge error and throw something else entirely, so this is present
+          // only when the escaping error really is one `unwrap` built.
+          errorKind: typeof failure?.errorKind === "string" ? failure.errorKind : undefined,
           rawBody: rawBody || undefined,
           data: { logs, truncatedLogs, durationMs: failure?.durationMs },
         };

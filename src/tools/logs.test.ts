@@ -2,13 +2,22 @@ import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import type { runAwsCall } from "../aws-cli.js";
 import {
+  DEFAULT_MAX_EVENTS,
+  DEFAULT_QUERY_LIMIT,
+  flattenQueryRows,
   isValidLogStreamName,
+  isValidQueryId,
   LOG_GROUP_RE,
   LOG_STREAM_NAME_RE,
   logsTools,
+  MAX_MAX_EVENTS,
+  MAX_QUERY_LIMIT,
+  MAX_QUERY_LOG_GROUPS,
   MAX_SINCE_MS,
   parseLogsJsonOutput,
+  pollQueryUntilTerminal,
   RELATIVE_TIME_RE,
   relativeTimeMs,
   resolveLogGroupName,
@@ -248,6 +257,28 @@ describe("aws_logs_tail schema", () => {
     assert.equal(tool.inputSchema.safeParse({ logGroupName: "/aws/lambda/my-fn" }).success, true);
   });
 
+  it("accepts maxEvents across its documented range", () => {
+    for (const maxEvents of [1, 10, DEFAULT_MAX_EVENTS, MAX_MAX_EVENTS]) {
+      assert.equal(
+        tool.inputSchema.safeParse({ logGroupName: "/aws/lambda/my-fn", maxEvents }).success,
+        true,
+        `expected maxEvents=${maxEvents} to parse`,
+      );
+    }
+  });
+
+  it("rejects maxEvents outside 1..MAX_MAX_EVENTS and non-integers", () => {
+    // Both sides of the ceiling in one test, so a future `.max()` edit fails
+    // here rather than at runtime.
+    for (const maxEvents of [0, -1, 1.5, MAX_MAX_EVENTS + 1, "500"]) {
+      assert.equal(
+        tool.inputSchema.safeParse({ logGroupName: "/aws/lambda/my-fn", maxEvents }).success,
+        false,
+        `expected maxEvents=${JSON.stringify(maxEvents)} to be rejected`,
+      );
+    }
+  });
+
   it("accepts typical since values", () => {
     for (const since of ["5m", "30s", "2h", "1d", "1w"]) {
       assert.equal(
@@ -443,5 +474,292 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /filterPattern/);
     assert.match(r.error ?? "", /must not start with '-'/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// aws_logs_query
+// ---------------------------------------------------------------------------
+
+const queryTool = logsTools.find((t) => t.name === "aws_logs_query");
+if (!queryTool) throw new Error("logsTools missing aws_logs_query");
+
+const okQuery = (over: Record<string, unknown> = {}) => ({
+  logGroupNames: ["/aws/lambda/my-fn"],
+  queryString: "fields @timestamp, @message",
+  ...over,
+});
+
+describe("aws_logs_query schema", () => {
+  it("requires logGroupNames (1..MAX_QUERY_LOG_GROUPS) and a non-empty queryString", () => {
+    assert.equal(queryTool.inputSchema.safeParse({}).success, false);
+    assert.equal(queryTool.inputSchema.safeParse(okQuery({ logGroupNames: [] })).success, false);
+    assert.equal(queryTool.inputSchema.safeParse(okQuery({ queryString: "" })).success, false);
+    assert.equal(queryTool.inputSchema.safeParse(okQuery()).success, true);
+
+    const names = (n: number) => Array.from({ length: n }, (_, i) => `/g/${i}`);
+    assert.equal(
+      queryTool.inputSchema.safeParse(okQuery({ logGroupNames: names(MAX_QUERY_LOG_GROUPS) })).success,
+      true,
+    );
+    assert.equal(
+      queryTool.inputSchema.safeParse(okQuery({ logGroupNames: names(MAX_QUERY_LOG_GROUPS + 1) })).success,
+      false,
+    );
+  });
+
+  it("restricts queryLanguage to CWLI | PPL -- SQL names its log groups inside the query string", () => {
+    // AWS: "The exception is queries using the OpenSearch Service SQL query
+    // language, where you specify the log group names inside the querystring
+    // instead of here." This tool always sends logGroupNames, so SQL is routed
+    // to aws_call rather than silently conflicting.
+    for (const queryLanguage of ["CWLI", "PPL"]) {
+      assert.equal(queryTool.inputSchema.safeParse(okQuery({ queryLanguage })).success, true, queryLanguage);
+    }
+    assert.equal(queryTool.inputSchema.safeParse(okQuery({ queryLanguage: "SQL" })).success, false);
+  });
+
+  it("bounds limit at MAX_QUERY_LIMIT, which is GetQueryResults' single-call ceiling", () => {
+    // NOT StartQuery's documented 100,000: one GetQueryResults call returns at
+    // most 10,000 rows, and the remainder is only reachable through pagination
+    // members the installed CLI's model does not carry.
+    for (const limit of [1, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT]) {
+      assert.equal(queryTool.inputSchema.safeParse(okQuery({ limit })).success, true, String(limit));
+    }
+    for (const limit of [0, -1, 1.5, MAX_QUERY_LIMIT + 1]) {
+      assert.equal(queryTool.inputSchema.safeParse(okQuery({ limit })).success, false, String(limit));
+    }
+  });
+
+  it("declares read-only, non-destructive annotations", () => {
+    assert.deepEqual(queryTool.annotations, {
+      title: "Run a CloudWatch Logs Insights query and wait for results",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+  });
+});
+
+describe("isValidQueryId", () => {
+  it("accepts a bounded, argv-safe id and rejects the rest", () => {
+    assert.equal(isValidQueryId("f1e2d3c4-1234-5678-9abc-def012345678"), true);
+    assert.equal(isValidQueryId("a".repeat(256)), true);
+    assert.equal(isValidQueryId(""), false);
+    assert.equal(isValidQueryId("a".repeat(257)), false);
+    assert.equal(isValidQueryId("-x"), false, "leading hyphen could masquerade as a flag");
+    assert.equal(isValidQueryId("a\nb"), false, "control characters are rejected");
+    // A SPACE is allowed, matching isValidIdentifier / isValidOpaqueToken in
+    // resource.ts: the value goes into a single argv entry and never through a
+    // shell, so an embedded space cannot split it into a second argument. Only
+    // control characters (< 0x20) and a leading hyphen are dangerous there.
+    assert.equal(isValidQueryId("a b"), true);
+  });
+});
+
+describe("flattenQueryRows", () => {
+  it("flattens {field,value} pairs into objects and collects fields in first-seen order", () => {
+    const { rows, fields } = flattenQueryRows([
+      [
+        { field: "@message", value: "a" },
+        { field: "@ptr", value: "p" },
+      ],
+      [{ field: "@message", value: "b" }],
+    ]);
+    assert.deepEqual(fields, ["@message", "@ptr"]);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0]["@message"], "a");
+    assert.equal(rows[0]["@ptr"], "p");
+    assert.equal(rows[1]["@message"], "b");
+  });
+
+  it("skips a non-string field name and nulls a non-string value", () => {
+    const { rows, fields } = flattenQueryRows([
+      [
+        { field: 42, value: "x" },
+        { field: "@m", value: { nested: true } },
+      ],
+    ]);
+    assert.deepEqual(fields, ["@m"]);
+    assert.equal(rows[0]["@m"], null);
+  });
+
+  it("a literal __proto__ field becomes an OWN property and does not poison Object.prototype", () => {
+    // Field names come from the caller's own log data -- Insights discovers JSON
+    // keys automatically -- so "__proto__" is reachable input, not a hypothetical.
+    const { rows } = flattenQueryRows([[{ field: "__proto__", value: "pwned" }]]);
+    assert.deepEqual(Object.keys(rows[0]), ["__proto__"]);
+    assert.equal(JSON.parse(JSON.stringify(rows[0]))["__proto__"], "pwned");
+    assert.equal(Object.getPrototypeOf({}), Object.prototype);
+    assert.equal(({} as Record<string, unknown>).__proto__, Object.prototype);
+  });
+
+  it("returns empty rows and fields for non-array input", () => {
+    assert.deepEqual(flattenQueryRows(null), { rows: [], fields: [] });
+    assert.deepEqual(flattenQueryRows("nope"), { rows: [], fields: [] });
+  });
+});
+
+describe("pollQueryUntilTerminal", () => {
+  // A scripted GetQueryResults caller: one response per call, in order.
+  const scriptedCaller = (statuses: Array<string | null>, results: unknown[][] = []) => {
+    const calls: Array<Parameters<typeof runAwsCall>[0]> = [];
+    let n = 0;
+    const call = async (opts: Parameters<typeof runAwsCall>[0]) => {
+      calls.push(opts);
+      const status = statuses[Math.min(n, statuses.length - 1)];
+      const rows = results[Math.min(n, results.length - 1)] ?? [];
+      n++;
+      return {
+        ok: true as const,
+        data: { ...(status === null ? {} : { status }), results: rows, statistics: {} },
+        command: "aws logs get-query-results",
+        rawStdout: "",
+      };
+    };
+    return { call, calls };
+  };
+
+  it("keeps polling through Scheduled and Running, and returns on Complete", async () => {
+    const { call, calls } = scriptedCaller(["Scheduled", "Running", "Complete"]);
+    const slept: number[] = [];
+    const r = await pollQueryUntilTerminal(
+      { queryId: "q1", pollIntervalMs: 1234, maxWaitMs: 60_000 },
+      call,
+      async (ms: number) => {
+        slept.push(ms);
+      },
+    );
+    assert.equal(r.reason, "terminal");
+    assert.equal(r.status, "Complete");
+    assert.equal(r.attempts, 3);
+    assert.deepEqual(slept, [1234, 1234], "one sleep BETWEEN polls, none before the first or after the last");
+    for (const c of calls) {
+      assert.equal(c.service, "logs");
+      assert.equal(c.operation, "get-query-results");
+      assert.deepEqual(c.extraFlags, ["--query-id", "q1"]);
+    }
+  });
+
+  it("treats every non-in-flight status as terminal, including unrecognized and missing", async () => {
+    // The allowlist is Scheduled/Running: anything else stops. A status AWS adds
+    // after this release lands here rather than spinning to the budget.
+    for (const status of ["Failed", "Timeout", "Cancelled", "Frobnicated", null]) {
+      const { call } = scriptedCaller([status]);
+      const r = await pollQueryUntilTerminal(
+        { queryId: "q1", pollIntervalMs: 10, maxWaitMs: 60_000 },
+        call,
+        async () => {},
+      );
+      assert.equal(r.reason, "terminal", String(status));
+      assert.equal(r.attempts, 1, String(status));
+      assert.equal(r.status, status, String(status));
+    }
+  });
+
+  it("stops at the budget without making a call past maxWaitMs, and names the queryId", async () => {
+    const { call, calls } = scriptedCaller(["Running"]);
+    let now = 0;
+    const r = await pollQueryUntilTerminal(
+      { queryId: "q-budget", pollIntervalMs: 20, maxWaitMs: 100 },
+      call,
+      async (ms: number) => {
+        now += ms;
+      },
+    );
+    assert.equal(r.reason, "budget");
+    assert.equal(calls.length, r.attempts, "no AWS call after the budget expired");
+    assert.match(r.error ?? "", /q-budget/);
+    assert.match(r.error ?? "", /maxWaitMs/);
+    assert.match(r.error ?? "", /7 days/, "the resume hint must survive onto the budget arm");
+    assert.ok(now >= 0);
+  });
+
+  it("makes ZERO AWS calls when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let called = 0;
+    const r = await pollQueryUntilTerminal(
+      {
+        queryId: "q-cancel",
+        pollIntervalMs: 10,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: () => {}, signal: controller.signal },
+      },
+      async () => {
+        called++;
+        throw new Error("must not be called");
+      },
+      async () => {},
+    );
+    assert.equal(r.reason, "cancelled");
+    assert.equal(r.attempts, 0);
+    assert.equal(called, 0, "the signal is checked BEFORE the first pass, not after it");
+    // Never a fake success, and honest about what was and was not cancelled.
+    assert.match(r.error ?? "", /NOT cancelled/);
+    assert.match(r.error ?? "", /q-cancel/);
+  });
+
+  it("wakes immediately when cancellation arrives mid-sleep", async () => {
+    // The real abortable sleep, with an interval far longer than the test can
+    // wait: if the sleep were not abortable this would run for 30s.
+    const controller = new AbortController();
+    const { call } = scriptedCaller(["Running"]);
+    setTimeout(() => controller.abort(), 20);
+    const started = Date.now();
+    const r = await pollQueryUntilTerminal(
+      {
+        queryId: "q-midsleep",
+        pollIntervalMs: 30_000,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: () => {}, signal: controller.signal },
+      },
+      call,
+    );
+    assert.equal(r.reason, "cancelled");
+    assert.ok(Date.now() - started < 5_000, "must wake on abort, not wait out the 30s interval");
+    assert.match(r.error ?? "", /NOT cancelled/);
+    assert.match(r.error ?? "", /q-midsleep/);
+  });
+
+  it("reports one progress update per attempt, monotonic, with no total", async () => {
+    // No honest denominator exists -- the query ends when AWS says so -- so the
+    // v2.1.0 rule applies: omit `total` rather than manufacture one.
+    const { call } = scriptedCaller(["Scheduled", "Running", "Complete"]);
+    const seen: Array<{ progress: number; total?: number; message?: string }> = [];
+    const r = await pollQueryUntilTerminal(
+      {
+        queryId: "q1",
+        pollIntervalMs: 1,
+        maxWaitMs: 60_000,
+        ctx: {
+          reportProgress: (progress: number, total?: number, message?: string) =>
+            seen.push({ progress, total, message }),
+        },
+      },
+      call,
+      async () => {},
+    );
+    assert.equal(r.attempts, 3);
+    assert.equal(seen.length, 3);
+    assert.deepEqual(
+      seen.map((s) => s.progress),
+      [1, 2, 3],
+    );
+    for (const s of seen) assert.equal(s.total, undefined, "no fabricated denominator");
+    assert.match(seen[0].message ?? "", /Scheduled/);
+    assert.match(seen[2].message ?? "", /Complete/);
+  });
+
+  it("behaves identically with no ctx at all", async () => {
+    const { call } = scriptedCaller(["Complete"]);
+    const r = await pollQueryUntilTerminal(
+      { queryId: "q1", pollIntervalMs: 1, maxWaitMs: 60_000 },
+      call,
+      async () => {},
+    );
+    assert.equal(r.reason, "terminal");
+    assert.equal(r.attempts, 1);
   });
 });

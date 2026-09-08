@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
 import { getProfile, getRegion } from "../session.js";
-import { RELATIVE_TIME_RE, relativeTimeMs } from "./logs.js";
+import { resolveTime } from "./logs.js";
 import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolResult } from "./tool.js";
 
@@ -128,51 +128,14 @@ export function pickAutoPeriodSeconds(startMs: number, endMs: number): number {
   return 3600;
 }
 
-// The relative-time vocab ("5m" / "2h" / "1d" / "1w", relative to "now") is
-// shared with aws_logs_tail's `since` flag so agents only learn it once, and is
-// IMPORTED from logs.ts rather than re-declared here -- the two copies were
-// byte-identical, which is the drift multi-region.ts already designed out by
-// centralizing its region regex in session.ts.
-
-// A bare number is the trap this rejects. "5" fails RELATIVE_TIME_RE (no unit)
-// and would fall through to `new Date("5")`, which V8 reads as 2001-05-01 -- a
-// dropped unit silently becomes a 25-year window with nothing rejecting it
-// locally. Neither reading ("5 minutes"? "the year 5"?) is safe to guess.
-const BARE_NUMBER_RE = /^\d+(?:\.\d+)?$/;
-
-// ISO 8601 shapes we accept, and why the offset is mandatory: `new Date()`
-// parses a DATE-ONLY string as UTC but a DATE-TIME without an offset as LOCAL
-// time. The handler then .toISOString()s the result into the CloudWatch
-// request, so "2026-05-16T10:00:00" -- which the tool description calls ISO
-// 8601 -- silently shifts the query window by the host's UTC offset, and the
-// same call means different things on a laptop and a container. Requiring an
-// explicit offset (Z or +/-HH:MM) makes the window host-independent; date-only
-// stays accepted because its UTC interpretation is unambiguous.
-const ISO_DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:[Zz]|[+-]\d{2}:?\d{2})$/;
-
-/**
- * Resolve a startTime / endTime input to a Date. Accepted forms:
- *   - "now"
- *   - relative shorthand ("15m", "1h", "1d", "1w"), interpreted as "ago"
- *   - ISO 8601 date-only ("2026-05-16"), read as UTC midnight
- *   - ISO 8601 date-time WITH an explicit offset ("2026-05-16T10:00:00Z",
- *     "2026-05-16T10:00:00-04:00")
- * Everything else -- an offset-less date-time, a bare number, free text --
- * returns null rather than being handed to Date's permissive parser.
- */
-export function resolveTime(input: string, now: number): Date | null {
-  if (input === "now") return new Date(now);
-  if (RELATIVE_TIME_RE.test(input)) {
-    const ms = relativeTimeMs(input);
-    return ms === null ? null : new Date(now - ms);
-  }
-  if (BARE_NUMBER_RE.test(input)) return null;
-  if (!ISO_DATE_ONLY_RE.test(input) && !ISO_DATE_TIME_RE.test(input)) return null;
-  const t = new Date(input);
-  if (Number.isNaN(t.getTime())) return null;
-  return t;
-}
+// The window parser (`resolveTime`) and the relative-time vocab it extends now
+// both live in logs.ts, beside `aws_logs_tail`'s `since` and `aws_logs_query`'s
+// start/end. It moved out of this file when aws_logs_query needed the same
+// parser: logs.ts importing it back from here would close a module cycle
+// (logs -> metrics -> logs), and one-directional sharing is what the vocab
+// already did. Re-exported because metrics.test.ts imports it from this module,
+// and because the offset-mandatory rule it encodes was written for this tool.
+export { resolveTime };
 
 /** Per-query input from the MCP caller. PascalCase fields land in CloudWatch's
  * MetricDataQueries shape; we keep the wire schema camelCase to match every
@@ -536,7 +499,13 @@ export const metricsTools: readonly Tool[] = [
       if (!result.ok) {
         // `||`, not `??`: an empty-string rawStderr is not nullish, so `??`
         // would hand back "" instead of falling back to stdout.
-        return { ok: false, error: result.error, rawBody: result.rawStderr || result.rawStdout };
+        return {
+          ok: false,
+          error: result.error,
+          errorKind: result.kind,
+          suggestion: result.suggestion,
+          rawBody: result.rawStderr || result.rawStdout,
+        };
       }
 
       const raw = (result.data ?? {}) as CloudWatchMetricDataResponse;

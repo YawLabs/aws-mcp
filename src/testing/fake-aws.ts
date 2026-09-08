@@ -939,6 +939,178 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "logs_tail_ndjson_bulk": {
+      // A busy window: more events than aws_logs_tail's default maxEvents cap,
+      // emitted OLDEST-FIRST the way `aws logs tail` does. Each message carries
+      // its index so a test can assert WHICH end of the window survived the cap
+      // -- "keep the newest" is the tool's contract, and first-N vs last-N is
+      // indistinguishable unless the events are individually identifiable.
+      // ~1200 events is ~110 KB in one write, far below the 5 MB stdout cap.
+      const bulkLines: string[] = [];
+      for (let i = 0; i < 1200; i++) {
+        bulkLines.push(
+          JSON.stringify({
+            timestamp: new Date(Date.UTC(2026, 3, 21, 0, 0, 0) + i * 1000).toISOString(),
+            logStreamName: "s1",
+            message: `event-${i}`,
+          }),
+        );
+      }
+      process.stdout.write(`${bulkLines.join("\n")}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "logs_query_complete": {
+      // aws_logs_query happy path across the two CLI calls one handler run
+      // makes: `logs start-query` -> a queryId, then `logs get-query-results`
+      // -> Complete on the FIRST poll, so attempts === 1. Argv-branching, so
+      // it carries no cross-process state. Sibling to
+      // logs_query_running_then_complete, which is this flow with the in-flight
+      // statuses in front of it.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        process.stdout.write(`${JSON.stringify({ queryId: "q-complete-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-query-results")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            queryLanguage: "CWLI",
+            status: "Complete",
+            results: [
+              [
+                { field: "@timestamp", value: "2026-04-21 00:00:00.000" },
+                { field: "@message", value: "ERROR boom" },
+                { field: "@ptr", value: "ptr-1" },
+              ],
+              [
+                { field: "@timestamp", value: "2026-04-21 00:00:01.000" },
+                { field: "@message", value: "ERROR again" },
+                { field: "@ptr", value: "ptr-2" },
+              ],
+            ],
+            statistics: { recordsMatched: 2, recordsScanned: 1000, bytesScanned: 4096, logGroupsScanned: 1 },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: logs_query_complete hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "logs_query_running_then_complete": {
+      // Stateful ACROSS PROCESSES: each fake-aws invocation is a fresh process,
+      // so the poll progression lives in a counter FILE the parent names with
+      // AWS_MCP_FAKE_QUERY_COUNT_OUT -- one byte appended per get-query-results
+      // call, so the file's SIZE is the call number. Same side-channel shape as
+      // AWS_MCP_FAKE_VERSION_COUNT_OUT above; append, not overwrite, because
+      // counting the repeats is the whole point.
+      //
+      // Scheduled -> Running -> Complete. Both in-flight statuses appear, which
+      // is what proves the loop keeps polling instead of treating the first
+      // non-Complete answer as terminal, and the Running call returns PARTIAL
+      // results the handler must not return early with.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        process.stdout.write(`${JSON.stringify({ queryId: "q-progress-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-query-results")) {
+        const fs = await import("node:fs");
+        const countPath = process.env.AWS_MCP_FAKE_QUERY_COUNT_OUT;
+        let call = 3;
+        if (countPath) {
+          fs.appendFileSync(countPath, "1");
+          call = fs.statSync(countPath).size;
+        }
+        const status = call === 1 ? "Scheduled" : call === 2 ? "Running" : "Complete";
+        process.stdout.write(
+          `${JSON.stringify({
+            status,
+            results:
+              status === "Complete"
+                ? [[{ field: "@message", value: "done" }]]
+                : status === "Running"
+                  ? [[{ field: "@message", value: "partial-do-not-return-me" }]]
+                  : [],
+            statistics: { recordsMatched: status === "Complete" ? 1 : 0, recordsScanned: 10, bytesScanned: 100 },
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: logs_query_running_then_complete hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "logs_query_echo_args": {
+      // Capture-and-echo for aws_logs_query: write the START-QUERY argv as JSON
+      // to AWS_MCP_FAKE_ARGV_OUT (side channel -- the handler keeps only the
+      // queryId from that call), then answer the poll with a trivial Complete so
+      // the handler reaches ok:true and the test can read the file. Lets a test
+      // assert the two facts most easily got wrong: that --cli-input-json is
+      // camelCase (logGroupNames/startTime, NOT LogGroupNames/StartTime) and
+      // that the window is epoch SECONDS, not the milliseconds `aws logs tail`
+      // uses. Modeled on assume_role_echo_args.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
+        if (outPath) {
+          const fs = await import("node:fs");
+          fs.writeFileSync(outPath, JSON.stringify(argv));
+        }
+        process.stdout.write(`${JSON.stringify({ queryId: "q-echo-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-query-results")) {
+        process.stdout.write(`${JSON.stringify({ status: "Complete", results: [], statistics: {} })}\n`);
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: logs_query_echo_args hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "logs_query_failed": {
+      // A query that reaches the terminal Failed status. GetQueryResults carries
+      // no reason for it -- only the status -- which is exactly the shape the
+      // handler's message has to cope with.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        process.stdout.write(`${JSON.stringify({ queryId: "q-failed-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-query-results")) {
+        process.stdout.write(`${JSON.stringify({ status: "Failed", results: [], statistics: {} })}\n`);
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: logs_query_failed hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "logs_query_start_malformed": {
+      // `logs start-query` rejects the query before any polling can begin.
+      // Proves the handler surfaces the start-query failure directly instead of
+      // falling through to poll on a queryId it never got. The get-query-results
+      // branch is absent on purpose: reaching it would be the bug.
+      process.stderr.write(
+        "An error occurred (MalformedQueryException) when calling the StartQuery operation: Query string parse error\n",
+      );
+      process.exit(255);
+      return;
+    }
+
     case "sts_caller_identity_success": {
       // Mimics `aws sts get-caller-identity --output json`.
       process.stdout.write(
