@@ -88,17 +88,42 @@ assert_changelog_promoted() {
 }
 
 # SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
-# no-ops. Workaround for the MINGW64-ARM64 npm-run-script wrapper that
-# segfaults on exit-cleanup (platform-windows.md). Apply only when the
-# lint runner is broken on the host; CI catches lint regressions anyway.
+# no-ops.
+#
+# THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
+# regressed. `npm run lint` routes through scripts/lint.mjs, which picks a
+# biome binary that works on the host -- including Windows ARM64, where the
+# native arm64 build segfaults and the wrapper provisions the x64 build to run
+# under emulation instead. Verified: `npm run lint` exits 0 on that host.
+#
+# The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper" and
+# justified skipping with "CI catches lint regressions anyway". Both were wrong.
+# `npm run` is fine on that host (a plain node script through the same wrapper
+# exits 0); the SIGSEGV comes from `@biomejs/cli-win32-arm64/biome.exe` itself,
+# reproducible by invoking that binary directly with no npm in the picture. And
+# this repo ships NO CI by design, so nothing downstream re-checks formatting --
+# skipping the lint step means the release is published unlinted, full stop.
+#
+# So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
+# and treat that as a bug to fix rather than a step to routinely skip.
 #
 # SKIP_TEST=1 is the parallel escape hatch for `npm test` / `npm run test*`.
 # Apply only when local tests are unreliable due to PLATFORM issues -- not
 # code issues. The known case: Windows ARM64 subprocess-timing flakes in
 # aws-cli.integration / sso.integration / auth.test that race on event-loop
-# scheduling under sustained laptop load. CI on standard runners
-# (ubuntu / windows-x64 / macos) is the authoritative test check; setting
-# SKIP_TEST=1 here trusts that signal instead of a flaky local one.
+# scheduling under sustained laptop load.
+#
+# Same correction as above applies: this text used to say "CI on standard
+# runners is the authoritative test check", and there is no CI. Skipping the
+# tests means publishing untested, with nothing downstream to catch it.
+#
+# A timing flake is also worth diagnosing rather than skipping past, because
+# green-when-serialized is a specific and cheap signal:
+#   node --test --test-concurrency=1 "dist/**/*.test.js"
+# Green serialized + red parallel means a fixed-duration assumption is racing
+# `node --test`'s parallel file execution -- find that assertion and widen or
+# re-anchor it. Judge by failure RATE over several runs; one red run proves as
+# little as one green one.
 if [ "${SKIP_LINT:-}" = "1" ] || [ "${SKIP_TEST:-}" = "1" ]; then
   npm() {
     if [ "${SKIP_LINT:-}" = "1" ] && [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
