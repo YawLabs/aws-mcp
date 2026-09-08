@@ -6,8 +6,10 @@ import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
 import { docsTools } from "./tools/docs.js";
 import { iamSimulateTools } from "./tools/iam-simulate.js";
+import { lambdaTools } from "./tools/lambda.js";
 import { logsTools } from "./tools/logs.js";
 import { metricsTools } from "./tools/metrics.js";
+import { multiAccountTools } from "./tools/multi-account.js";
 import { multiRegionTools } from "./tools/multi-region.js";
 import { paginateTools } from "./tools/paginate.js";
 import { profilesTools } from "./tools/profiles.js";
@@ -311,7 +313,7 @@ void _typePin;
  * loop at the bottom of the test will name both indexes.
  */
 describe("tool registry snapshot", () => {
-  it("allTools has 26 entries, every individual array contributes, every name is unique", () => {
+  it("allTools has 28 entries, every individual array contributes, every name is unique", () => {
     // The per-array imports mirror the spread order in src/index.ts
     // exactly. A typo in either place is caught at module load (spread) or
     // at the corresponding import (tsc).
@@ -326,7 +328,9 @@ describe("tool registry snapshot", () => {
       ["metricsTools", metricsTools],
       ["resourceTools", resourceTools],
       ["multiRegionTools", multiRegionTools],
+      ["multiAccountTools", multiAccountTools],
       ["iamSimulateTools", iamSimulateTools],
+      ["lambdaTools", lambdaTools],
       ["docsTools", docsTools],
       ["scriptTools", scriptTools],
     ];
@@ -340,7 +344,7 @@ describe("tool registry snapshot", () => {
 
     // Total: pinned. Update this number whenever a tool is added or removed.
     const sumOfGroups = groups.reduce((n, [, arr]) => n + arr.length, 0);
-    assert.equal(sumOfGroups, 26, "sum of per-group tool counts drifted from the pinned total");
+    assert.equal(sumOfGroups, 28, "sum of per-group tool counts drifted from the pinned total");
 
     // allTools (the actual export consumed by the MCP registration loop) must
     // equal the per-group sum. A typo in src/index.ts referencing a wrong

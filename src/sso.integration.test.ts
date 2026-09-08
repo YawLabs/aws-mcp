@@ -700,7 +700,19 @@ describe("startSsoLogin — CLI version probe", () => {
       // pins that it is a SHORT timeout, with generous headroom because this
       // file runs inside a loaded parallel test run.
       assert.ok(elapsed >= 2000, `released before the probe timeout could fire (${elapsed}ms)`);
-      assert.ok(elapsed < 8000, `probe timeout is far longer than intended (${elapsed}ms)`);
+      // The upper bound is deliberately loose. `elapsed` is spawn latency PLUS
+      // the probe timeout, and only the second term is the thing under test:
+      // spawning the fake costs 700-4200ms on a loaded Windows ARM64 runner
+      // (measured), so a bound sized against the timeout alone fails on machine
+      // speed rather than on a real regression. Observed doing exactly that at
+      // 8000ms, roughly one full-suite run in five.
+      //
+      // What this still catches is the regression that matters -- someone
+      // raising the probe timeout to a user-visible duration -- because the
+      // probe sits IN FRONT of the URL wait, and 30s is far past anything a
+      // caller would tolerate. Sharpening it back down means bounding spawn
+      // latency separately, not tightening this number.
+      assert.ok(elapsed < 30_000, `probe timeout is far longer than intended (${elapsed}ms)`);
       const wait = await waitForLogin(start.sessionId);
       assert.match(wait.rawOutput ?? "", /ARGV:sso login --no-browser --use-device-code/);
     } finally {

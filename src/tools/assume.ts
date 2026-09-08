@@ -130,9 +130,7 @@ export interface AssumedRoleCredentials {
  * profile-naming auth messages to name an account) reads `failure.error` /
  * `failure.errorKind` off it.
  */
-export type AssumeRoleOutcome =
-  | { ok: true; credentials: AssumedRoleCredentials }
-  | { ok: false; failure: ToolResult };
+export type AssumeRoleOutcome = { ok: true; credentials: AssumedRoleCredentials } | { ok: false; failure: ToolResult };
 
 /**
  * Call sts:AssumeRole and RETURN the credentials instead of persisting them.

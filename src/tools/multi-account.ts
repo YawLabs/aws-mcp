@@ -2,7 +2,7 @@ import { z } from "zod";
 import { runAwsCall, truncateForErrorMsg } from "../aws-cli.js";
 import { getProfile, getRegion, invalidRegionMessage, isValidProfileName, isValidRegionName } from "../session.js";
 import { type AssumedRoleCredentials, assumeRoleCredentials, DEFAULT_ASSUME_TIMEOUT_MS } from "./assume.js";
-import { capAggregateResults, type CappableResult, runWithConcurrency } from "./multi-region.js";
+import { type CappableResult, capAggregateResults, runWithConcurrency } from "./multi-region.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
