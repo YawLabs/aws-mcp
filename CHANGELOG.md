@@ -961,7 +961,7 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v1.8.1...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.2.0...HEAD
 [1.8.1]: https://github.com/YawLabs/aws-mcp/compare/v1.8.0...v1.8.1
 [1.5.3]: https://github.com/YawLabs/aws-mcp/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/YawLabs/aws-mcp/compare/v1.5.1...v1.5.2
