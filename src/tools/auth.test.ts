@@ -217,6 +217,52 @@ describe("aws_whoami handler — error path consistency with aws_call (fake-aws)
     assert.match(r.error ?? "", /No credentials found/);
     assert.match(r.error ?? "", /tester/);
   });
+
+  // --- errorKind / suggestion forwarding (auth.ts's aws_whoami failure return) ---
+
+  it("forwards the classified errorKind through getCallerIdentity's own failure shape", async () => {
+    // aws_whoami does NOT call runAwsCall directly -- getCallerIdentity
+    // (auth.ts) re-wraps the failure into its own { ok:false, kind, error,
+    // suggestion, rawBody } record, and the handler forwards `kind` from THAT.
+    // A regression that dropped `kind` from the intermediate shape would be
+    // invisible to aws_call's tests, so both auth kinds are pinned here.
+    for (const [scenario, kind] of [
+      ["call_sso_expired", "sso_expired"],
+      ["call_no_creds", "no_creds"],
+    ] as const) {
+      process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+      const r = (await tool.handler({ profile: "tester" })) as {
+        ok: boolean;
+        errorKind?: string;
+        suggestion?: string;
+      };
+      assert.equal(r.ok, false, scenario);
+      assert.equal(r.errorKind, kind, scenario);
+      // Auth-class failures build their own profile-aware remedy into `error`;
+      // parseAwsError never runs for them, so there is no suggestion to carry.
+      assert.equal(r.suggestion, undefined, scenario);
+    }
+  });
+
+  it("forwards nonzero_exit plus the suggestion across the getCallerIdentity hop", async () => {
+    // The suggestion field has to survive TWO hops for aws_whoami: runAwsCall
+    // -> getCallerIdentity's re-wrap -> the handler's return. This is the only
+    // tool in the repo where that intermediate record exists.
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
+    const r = (await tool.handler({ profile: "tester" })) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, "Check IAM permissions for this operation.");
+    assert.ok(
+      (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+      `error must still end with the suggestion sentence, got: ${r.error}`,
+    );
+  });
 });
 
 describe("startUrlForProfile unknown-profile fallback", () => {
@@ -577,11 +623,19 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
       ok: boolean;
       error?: string;
       rawBody?: string;
+      errorKind?: string;
+      suggestion?: string;
     };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /exited with code 1/);
     assert.equal(typeof r.rawBody, "string");
     assert.ok((r.rawBody ?? "").length > 0, "expected the subprocess rawOutput to be surfaced as rawBody");
+    // NEGATIVE contract: this arm is the `aws sso login` SUBPROCESS failing, not
+    // a runAwsCall -- nothing classified it, so errorKind stays absent rather
+    // than being handed a manufactured "nonzero_exit". The sibling arm below
+    // (identity check) is the one that carries a kind.
+    assert.equal(r.errorKind, undefined, "a waitForLogin failure is unclassified, not nonzero_exit");
+    assert.equal(r.suggestion, undefined);
   });
 
   it("returns the identity-check-failed shape when login succeeds but get-caller-identity fails", async () => {
@@ -597,12 +651,19 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
       ok: boolean;
       error?: string;
       rawBody?: string;
+      errorKind?: string;
+      suggestion?: string;
     };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /^Login subprocess succeeded but identity check failed: /);
     // The wrapped identity error is the same SSO-expiry hint aws_call surfaces.
     assert.match(r.error ?? "", /SSO session expired/);
     assert.equal(typeof r.rawBody, "string");
+    // The handler PREFIXES the message, so the prose no longer matches what any
+    // other tool emits -- errorKind is what lets a caller still recognize this
+    // as the same failure class without parsing around the prefix.
+    assert.equal(r.errorKind, "sso_expired");
+    assert.equal(r.suggestion, undefined, "auth-class failures carry their remedy in `error`, not `suggestion`");
   });
 
   it("returns loggedIn + identity + profile/region + projected ssoToken on full success", async () => {

@@ -122,6 +122,11 @@ describe("aws_iam_simulate handler validation", () => {
     } as never);
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid action/);
+    // NEGATIVE contract: this guard returns before runAwsCall, so nothing
+    // classified the failure. An ABSENT errorKind means "unclassified" --
+    // never "nonzero_exit", and never a manufactured "bad_input".
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
   });
 
   it("rejects resources with leading hyphen (argv-injection defense)", async () => {
@@ -264,6 +269,42 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     assert.equal(data.summary.denied, 1);
     assert.equal(data.results[0].decision, "implicitDeny");
     assert.equal(data.results[0].matchedStatementIds, undefined);
+  });
+
+  // --- errorKind / suggestion forwarding (iam-simulate.ts's CLI-failure return) ---
+
+  it("forwards errorKind + suggestion on the single CLI-failure return", async () => {
+    // call_access_denied is argv-independent, so simulate-principal-policy's
+    // own --action-names / --policy-source-arn argv reaches the same fake
+    // branch aws_call does. AccessDenied on iam:SimulatePrincipalPolicy is the
+    // common real-world failure for this tool -- the caller is asking about
+    // permissions from a principal that lacks permission to ask.
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["lambda:CreateFunction"],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, "Check IAM permissions for this operation.");
+    assert.ok(
+      (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+      `error must still end with the suggestion sentence, got: ${r.error}`,
+    );
+    assert.match(r.rawBody ?? "", /AccessDenied/);
+  });
+
+  it("forwards the auth-class kind with no suggestion beside it", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_sso_expired";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["lambda:CreateFunction"],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "sso_expired");
+    // The auth branches build their own profile-aware remedy into `error`, so
+    // parseAwsError never runs -- the two fields are independent.
+    assert.equal(r.suggestion, undefined);
   });
 
   it("advisory fields + SourcePolicyId filtering through the handler (Phase-1 scenario)", async () => {

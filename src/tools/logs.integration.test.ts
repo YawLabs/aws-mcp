@@ -425,3 +425,37 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
     }
   });
 });
+
+describe("aws_logs_tail handler -- errorKind / suggestion forwarding", () => {
+  // logs.ts has exactly ONE errorKind-forwarding return: aws_logs_tail's CLI
+  // failure arm. Both scenarios below are argv-independent, so `aws logs tail`'s
+  // positional-group-name argv reaches the same fake branch aws_call does --
+  // this pins the FORWARDING, not the classifier.
+
+  it("forwards nonzero_exit plus the parsed suggestion, which stays embedded in error too", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
+    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn" });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, "Check IAM permissions for this operation.");
+    // Carried structurally AND left in the message: toMcpResult does not
+    // re-render `suggestion`, so removing it from `error` would drop the
+    // remedy from what the model reads.
+    assert.ok(
+      (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+      `error must still end with the suggestion sentence, got: ${r.error}`,
+    );
+    assert.match(r.rawBody ?? "", /AccessDenied/);
+  });
+
+  it("forwards the auth-class kind with no suggestion beside it", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_sso_expired";
+    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", profile: "my-profile" });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "sso_expired");
+    // The auth branches build their own profile-aware remedy into `error`, so
+    // parseAwsError never runs -- the two fields are independent.
+    assert.equal(r.suggestion, undefined);
+    assert.match(r.error ?? "", /SSO session expired/);
+  });
+});

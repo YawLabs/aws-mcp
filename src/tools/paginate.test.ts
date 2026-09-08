@@ -360,4 +360,74 @@ describe("aws_paginate handler — end-to-end via AWS_MCP_TEST_AWS_* env overrid
       afterEachEnv();
     }
   });
+
+  // --- errorKind / suggestion forwarding (paginate.ts's failure return) ---
+
+  it("forwards nonzero_exit plus the parsed suggestion, which stays embedded in error too", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
+      const r = (await tool.handler({ service: "s3api", operation: "list-buckets", maxItems: 2 })) as {
+        ok: boolean;
+        error?: string;
+        errorKind?: string;
+        suggestion?: string;
+      };
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "nonzero_exit");
+      assert.equal(r.suggestion, "Check IAM permissions for this operation.");
+      // Carried structurally AND left in the message: toMcpResult deliberately
+      // does not re-render `suggestion`, so dropping it from `error` would
+      // remove the remedy from what the model actually reads.
+      assert.ok(
+        (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+        `error must still end with the suggestion sentence, got: ${r.error}`,
+      );
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("forwards the auth-class kind through the extra pagination argv, with no suggestion", async () => {
+    // call_no_creds is argv-independent, so aws_paginate's added
+    // --max-items / --starting-token reach the same fake branch aws_call does
+    // -- this pins the FORWARDING, not the classifier. The auth branches build
+    // their own profile-aware remedy into `error`, so parseAwsError never runs
+    // and `suggestion` stays absent: the two fields are independent.
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "call_no_creds";
+      const r = (await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        maxItems: 2,
+        startingToken: "eyJuZXh0IjoiYWJjIn0=",
+        profile: "my-profile",
+      })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "no_creds");
+      assert.equal(r.suggestion, undefined);
+      assert.match(r.error ?? "", /No credentials found/);
+      assert.match(r.error ?? "", /my-profile/);
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("leaves errorKind UNSET when the handler's own startingToken guard rejects before any CLI call", async () => {
+    // The NEGATIVE half of the contract, and the reason ToolResult.errorKind is
+    // optional rather than defaulted: this guard returns before runAwsCall, so
+    // nothing classified the failure. An ABSENT errorKind means "unclassified"
+    // -- stamping "bad_input" here would make it indistinguishable from
+    // runAwsCall's own bad_input, which aws_call DOES surface.
+    const r = (await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      startingToken: "-evil",
+    })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startingToken/);
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
 });

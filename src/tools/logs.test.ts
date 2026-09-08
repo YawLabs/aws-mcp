@@ -328,9 +328,20 @@ describe("aws_logs_tail schema", () => {
 
 describe("aws_logs_tail handler — input validation (no spawn)", () => {
   it("rejects logGroupName with a leading hyphen", async () => {
-    const r = (await tool.handler({ logGroupName: "--force" })) as { ok: boolean; error?: string };
+    const r = (await tool.handler({ logGroupName: "--force" })) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid logGroupName/);
+    // NEGATIVE contract: this guard returns before runAwsCall (the describe
+    // name says "no spawn"), so nothing classified the failure. An ABSENT
+    // errorKind means "unclassified" -- never "nonzero_exit", and never a
+    // manufactured "bad_input".
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
   });
 
   it("rejects logGroupName with shell metachars", async () => {

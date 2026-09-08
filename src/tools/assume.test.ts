@@ -324,6 +324,78 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.doesNotMatch(r.error ?? "", /No credentials found/);
   });
 
+  // --- errorKind / suggestion forwarding (assume.ts's four failure returns) ---
+
+  it("forwards the classified kind on all three rewritten credential arms", async () => {
+    // These three arms REPLACE runAwsCall's message with a source-profile-aware
+    // one and drop rawBody entirely (the assume-role stdout can carry secret
+    // material). errorKind is therefore the ONLY surviving machine-readable
+    // trace of what actually failed -- for aws_assume_role specifically, a
+    // caller that wants to branch on the failure class has nothing else to read.
+    for (const [scenario, kind] of [
+      ["call_sso_expired", "sso_expired"],
+      ["awscli_expired_token", "expired_creds"],
+      ["res2_invalid_creds_stderr", "invalid_creds"],
+    ] as const) {
+      process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+      const r = (await tool.handler({
+        roleArn: "arn:aws:iam::123456789012:role/A",
+        sessionName: "sess",
+        sourceProfile: "my-source",
+      } as never)) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string; rawBody?: string };
+      assert.equal(r.ok, false, scenario);
+      assert.equal(r.errorKind, kind, scenario);
+      // Auth-class kinds never carry a suggestion: the arm's own prose IS the
+      // remedy, and parseAwsError only runs on the nonzero_exit branch.
+      assert.equal(r.suggestion, undefined, scenario);
+      // Deliberately dropped on these arms -- pinned so a future "helpfully
+      // restore rawBody" change has to be a conscious one.
+      assert.equal(r.rawBody, undefined, scenario);
+      assert.match(r.error ?? "", /source profile 'my-source'/, scenario);
+    }
+  });
+
+  it("forwards nonzero_exit plus the parsed suggestion on the generic CLI-failure arm", async () => {
+    // The fourth arm, the only one that passes runAwsCall's own message
+    // through -- so it is also the only one that has a suggestion to carry.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_access_denied";
+    const r = (await tool.handler({
+      roleArn: "arn:aws:iam::999999999999:role/NoSuchRole",
+      sessionName: "sess",
+    } as never)) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string; rawBody?: string };
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    // parseAwsError's NOT_AUTHORIZED branch, which names the principal and the
+    // action -- more specific than the bare AccessDenied remedy.
+    assert.equal(
+      r.suggestion,
+      "Check IAM permissions: principal arn:aws:iam::123456789012:user/jeff lacks sts:AssumeRole.",
+    );
+    assert.ok(
+      (r.error ?? "").endsWith(`\n\nSuggestion: ${r.suggestion}`),
+      `error must still end with the suggestion sentence, got: ${r.error}`,
+    );
+    // This arm DOES keep stderr (never stdout -- that is where the credential
+    // blob lands).
+    assert.match(r.rawBody ?? "", /AccessDenied/);
+  });
+
+  it("leaves errorKind UNSET when the handler rejects a malformed roleArn before any CLI call", async () => {
+    // NEGATIVE contract: the handler's own validation never reaches runAwsCall,
+    // so nothing classified this. Absent means "unclassified" -- never
+    // "nonzero_exit", and never a manufactured "bad_input".
+    const r = (await tool.handler({ roleArn: "not-an-arn", sessionName: "sess" } as never)) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid roleArn/);
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+
   it("guards against an incomplete Credentials block in CLI stdout", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_incomplete";
     const r = await tool.handler({
