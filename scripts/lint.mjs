@@ -33,7 +33,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -73,20 +73,74 @@ function nativeBinary() {
 }
 
 /**
- * Provision (once) and return the emulated x64 binary. Installs into
- * node_modules/.cache, which is already gitignored via node_modules/ and is
- * wiped by `npm ci` -- the next run simply re-installs it.
+ * Resolve npm's own CLI entry point so the install below can be spawned through
+ * `node` with NO shell.
+ *
+ * Both halves of that matter on Windows. `npm` on PATH is `npm.cmd`, and
+ * spawning a `.cmd` with `shell: false` throws EINVAL on Node 22 -- but turning
+ * the shell ON makes cmd.exe re-split the argv on whitespace, so a repo path
+ * containing a space arrives as two arguments and the second is read as a
+ * package name. (Measured: `--prefix "C:\a b\c"` becomes
+ * `["--prefix","C:a","bc"]`.) Spawning node with npm-cli.js sidesteps both.
+ */
+function npmCliPath() {
+  const candidates = [
+    join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+    join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+  ];
+  return candidates.find((p) => existsSync(p)) ?? null;
+}
+
+/**
+ * Provision (once per version) and return the emulated x64 binary. Installs
+ * into node_modules/.cache, which is already gitignored via node_modules/ and
+ * is wiped by `npm ci` -- the next run simply re-installs it.
+ *
+ * The version is part of the DIRECTORY NAME, not just the install argument.
+ * Keying the cache on presence alone would silently reuse a stale binary after
+ * a biome bump -- defeating the whole point of sourcing the version from
+ * biome.json, since the config would validate against one version while the
+ * checking was done by another. A version-stamped path also means an install
+ * interrupted midway leaves a directory that the NEXT bump abandons rather than
+ * trusts; the explicit re-verify below covers the same-version case.
  */
 function emulatedX64Binary(version) {
-  const prefix = join(repoRoot, "node_modules", ".cache", "biome-x64");
+  const prefix = join(repoRoot, "node_modules", ".cache", `biome-x64-${version}`);
   const bin = join(prefix, "node_modules", "@biomejs", "cli-win32-x64", "biome.exe");
-  if (existsSync(bin)) return bin;
+
+  // Presence is not validity: an install killed partway through leaves a
+  // truncated .exe that would otherwise be cached forever. Confirm the binary
+  // actually runs and reports the version we asked for before trusting it.
+  if (existsSync(bin)) {
+    const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
+    if (probe.status === 0 && String(probe.stdout).includes(version)) return bin;
+    // DISCARD the tree rather than reinstalling over it. `npm i` treats an
+    // already-present package as satisfied -- even with --force -- so installing
+    // on top of a truncated binary is a silent no-op that leaves the corruption
+    // in place and re-runs npm on every subsequent invocation. Measured: a
+    // 7-byte biome.exe survived the reinstall and lint kept failing.
+    //
+    // Bounded on purpose: `prefix` is a version-stamped directory this script
+    // created under the repo's own node_modules/.cache, never a user-supplied
+    // or shared path.
+    console.error(`[lint] cached biome at ${bin} is unusable or not ${version}; discarding and re-provisioning`);
+    rmSync(prefix, { recursive: true, force: true });
+  }
+
+  const npmCli = npmCliPath();
+  if (!npmCli) {
+    throw new Error(
+      "Could not locate npm-cli.js next to this node install, so the x64 biome cannot be\n" +
+        "provisioned without a shell (see npmCliPath). Set AWS_MCP_BIOME_BIN=<path to a\n" +
+        "working biome> instead.",
+    );
+  }
 
   console.error(`[lint] the win32-arm64 biome binary segfaults on this host; provisioning x64 ${version} under emulation`);
   const install = spawnSync(
-    "npm",
-    ["i", "--no-save", "--force", "--prefix", prefix, `@biomejs/cli-win32-x64@${version}`],
-    { stdio: "inherit", shell: isWindows },
+    process.execPath,
+    [npmCli, "i", "--no-save", "--force", "--prefix", prefix, `@biomejs/cli-win32-x64@${version}`],
+    { stdio: "inherit", shell: false },
   );
   if (install.status !== 0 || !existsSync(bin)) {
     throw new Error(
@@ -121,16 +175,29 @@ try {
 
 // Exit with biome's own status so `npm run lint` stays a usable gate, and so a
 // non-zero result is a real finding rather than this wrapper's opinion.
-const run = spawnSync(binary, process.argv.slice(2), { stdio: "inherit", shell: false });
+//
+// `shell` is enabled ONLY for a .cmd/.bat target: spawning one with shell:false
+// throws EINVAL on Node 22 (the `.bin/biome.cmd` shim fallback, and any
+// AWS_MCP_BIOME_BIN pointing at a batch file). Everything else -- including
+// every normal .exe path -- stays shell-free so arguments are passed verbatim.
+const needsShell = /\.(cmd|bat)$/i.test(binary);
+const run = spawnSync(binary, process.argv.slice(2), { stdio: "inherit", shell: needsShell });
 if (run.error) {
   console.error(`[lint] could not execute ${binary}: ${run.error.message}`);
   process.exit(1);
 }
-if (run.signal) {
+// A native crash surfaces differently by platform: POSIX reports a signal,
+// while Windows reports an NTSTATUS as the exit CODE and leaves signal null
+// (measured: the arm64 biome access violation is status 3221225477 / 0xC0000005,
+// signal null). Checking only `signal` meant this diagnostic could never fire on
+// the one host it was written for.
+const crashed = run.signal !== null || (run.status ?? 0) >= 0xc0000000;
+if (crashed) {
+  const how = run.signal ? `killed by ${run.signal}` : `crashed with 0x${(run.status >>> 0).toString(16)}`;
   console.error(
-    `[lint] biome was killed by ${run.signal} (${binary}).\n` +
+    `[lint] biome ${how} (${binary}).\n` +
       "On Windows ARM64 that is the known native-binary crash; this script normally\n" +
-      "routes around it, so check AWS_MCP_BIOME_BIN / AWS_MCP_BIOME_NATIVE overrides.",
+      "routes around it, so check the AWS_MCP_BIOME_BIN / AWS_MCP_BIOME_NATIVE overrides.",
   );
   process.exit(1);
 }

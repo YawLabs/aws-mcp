@@ -391,6 +391,8 @@ interface QueryPollResult {
   error?: string;
   /** Set on "call_failed" only, mirroring AwsCallFailure.kind. */
   kind?: AwsCallFailureKind;
+  /** Set on "call_failed" only, mirroring AwsCallFailure.suggestion. */
+  suggestion?: string;
   rawBody?: string;
 }
 
@@ -501,6 +503,12 @@ export async function pollQueryUntilTerminal(
         elapsedMs: Date.now() - start,
         error: result.error,
         kind: result.kind,
+        // Carried because the handler's call_failed arm REBUILDS the message
+        // around the queryId and quotes the raw diagnostic rather than
+        // `result.error` -- so a recognized error code's "Suggestion: ..." line,
+        // which runAwsCall appends to `error` and nowhere else, would otherwise
+        // be dropped from both the message and the envelope.
+        suggestion: result.suggestion,
         // `||`, not `??`: rawStderr is "" (not nullish) on a nonzero exit with
         // empty stderr, and `??` would return that "" instead of falling back
         // to stdout. Same fix as aws_logs_tail's failure return above.
@@ -998,7 +1006,10 @@ export const logsTools: readonly Tool[] = [
           ok: false,
           error: started.error,
           errorKind: started.kind,
-          suggestion: started.suggestion,
+          // Conditional spread rather than `suggestion: started.suggestion`, so
+          // the key is absent instead of explicitly undefined when there is none
+          // -- matching how aws-cli.ts builds this same field.
+          ...(started.suggestion !== undefined ? { suggestion: started.suggestion } : {}),
           rawBody: started.rawStderr || started.rawStdout,
         };
       }
@@ -1056,15 +1067,23 @@ export const logsTools: readonly Tool[] = [
         // the whole reason this arm exists. Falls back to the summary when there
         // is no raw body, so the clause is never empty.
         const underlying = polled.rawBody?.trim() || polled.error || "unknown";
+        // Re-append the remedy runAwsCall derived from a recognized error code.
+        // It normally rides at the end of `result.error`, but `underlying` above
+        // deliberately prefers the RAW stderr over that message -- so without
+        // this the sentence is lost from the text AND from the envelope, while
+        // README's Stability section promises `suggestion` is duplicated in
+        // `error`. Guarded on containment so a rawBody that already quotes it
+        // does not print it twice (the defect v2.0.1 fixed for rawBody itself).
+        const remedy =
+          polled.suggestion && !underlying.includes(polled.suggestion) ? `\n\nSuggestion: ${polled.suggestion}` : "";
         return {
           ok: false,
-          error: `${prefix} ${queryResumeHint(queryId)} Underlying error: ${underlying}`,
+          error: `${prefix} ${queryResumeHint(queryId)} Underlying error: ${underlying}${remedy}`,
           // The kind is already in hand -- `isAuthKind` above reads it -- and the
           // arm rewrites `error` wholesale, so without forwarding it the caller's
-          // only classification signal is the prose we just replaced. No
-          // `suggestion`: QueryPollResult carries none, and runAwsCall embeds
-          // that sentence in the message it built.
+          // only classification signal is the prose we just replaced.
           errorKind: polled.kind,
+          ...(polled.suggestion !== undefined ? { suggestion: polled.suggestion } : {}),
           rawBody: polled.rawBody,
         };
       }
