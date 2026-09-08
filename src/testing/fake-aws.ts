@@ -106,6 +106,32 @@ async function handleVersionProbe(): Promise<boolean> {
   return true;
 }
 
+/**
+ * Locate the positional outfile in an `aws lambda invoke` argv.
+ *
+ * runAwsCall appends `--output <fmt> --profile <p> --region <r>` immediately
+ * after the caller's extraFlags, and tools/lambda.ts puts the outfile last in
+ * extraFlags -- so the outfile is always the entry directly before `--output`.
+ * Anchoring on that boundary rather than "the last token that isn't a flag"
+ * keeps this from mistaking a flag VALUE (the qualifier, the function name) for
+ * the path.
+ */
+function lambdaOutfileFromArgv(): string | undefined {
+  const idx = process.argv.indexOf("--output");
+  if (idx <= 0) return undefined;
+  return process.argv[idx - 1];
+}
+
+/**
+ * Execution-log text the lambda_* scenarios base64 into LogResult. Shared so
+ * the happy path and the FunctionError path decode to the identical string and
+ * a test can assert the decode without pinning two separate literals.
+ */
+const LAMBDA_FAKE_LOG_TEXT =
+  "START RequestId: 8f3a1c2e-0000-4000-8000-abcdefabcdef Version: $LATEST\n" +
+  "hello from the handler\n" +
+  "END RequestId: 8f3a1c2e-0000-4000-8000-abcdefabcdef\n";
+
 async function main(): Promise<void> {
   if (await handleVersionProbe()) return;
   switch (scenario) {
@@ -1567,6 +1593,142 @@ async function main(): Promise<void> {
           ],
         })}\n`,
       );
+      process.exit(0);
+      return;
+    }
+
+    // --- aws_lambda_invoke (tools/lambda.ts) ---
+    //
+    // The real `aws lambda invoke` splits its answer across two channels: the
+    // response BODY goes to the positional outfile, and a metadata envelope
+    // (StatusCode / FunctionError / LogResult / ExecutedVersion) goes to
+    // stdout. Every scenario below reproduces that split, because a fake that
+    // only wrote stdout would let a broken outfile read pass unnoticed. The
+    // shapes here were taken from a real aws-cli/2.34.3 run against a stubbed
+    // Lambda endpoint, not from the API reference.
+
+    case "lambda_invoke_success": {
+      const fs = await import("node:fs");
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, JSON.stringify({ ok: true, greeting: "hello" }));
+      process.stdout.write(
+        `${JSON.stringify({
+          StatusCode: 200,
+          LogResult: Buffer.from(LAMBDA_FAKE_LOG_TEXT, "utf8").toString("base64"),
+          ExecutedVersion: "$LATEST",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "lambda_invoke_function_error": {
+      // The handler threw. EXIT CODE 0 is the point of this scenario and is not
+      // a simplification: the real CLI treats a FunctionError as a successful
+      // invocation (verified -- exit 0, empty stderr, the thrown error written
+      // to the outfile as the response body). That is what makes the tool's
+      // ok:true-with-functionError decision the one consistent with the layer
+      // underneath it.
+      const fs = await import("node:fs");
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) {
+        fs.writeFileSync(
+          outFile,
+          JSON.stringify({
+            errorMessage: "boom",
+            errorType: "Error",
+            stackTrace: ["    at handler (/var/task/index.js:3:9)"],
+          }),
+        );
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          StatusCode: 200,
+          FunctionError: "Unhandled",
+          LogResult: Buffer.from(LAMBDA_FAKE_LOG_TEXT, "utf8").toString("base64"),
+          ExecutedVersion: "$LATEST",
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "lambda_invoke_not_found": {
+      // Service-level failure: nonzero exit with the diagnostic on stderr, and
+      // deliberately NO outfile write -- the real CLI leaves the file untouched
+      // when the call never reaches the function, which is why the handler must
+      // not assume a readable body on the failure branch.
+      process.stderr.write(
+        "\nAn error occurred (ResourceNotFoundException) when calling the Invoke operation: Function not found: arn:aws:lambda:us-east-1:123456789012:function:missing-fn\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "lambda_invoke_echo_argv": {
+      // Capture-and-echo: dumps the argv AND the bytes the handler wrote to the
+      // fileb:// payload file to AWS_MCP_FAKE_ARGV_OUT, so a test can prove the
+      // payload actually round-tripped through the temp file instead of only
+      // asserting that a --payload flag was present. Modeled on
+      // metrics_echo_argv.
+      const fs = await import("node:fs");
+      const argv = process.argv.slice(2);
+      const payloadIdx = argv.indexOf("--payload");
+      let payloadFile: string | null = null;
+      if (payloadIdx >= 0) {
+        const ref = argv[payloadIdx + 1] ?? "";
+        if (ref.startsWith("fileb://")) {
+          payloadFile = fs.readFileSync(ref.slice("fileb://".length), "utf8");
+        }
+      }
+      const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
+      if (outPath) fs.writeFileSync(outPath, JSON.stringify({ argv, payloadFile }));
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, JSON.stringify({ ok: true }));
+      process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "lambda_invoke_empty_response": {
+      // A handler that returns nothing leaves a 0-byte outfile.
+      const fs = await import("node:fs");
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, "");
+      process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "lambda_invoke_nonjson_response": {
+      // A Lambda response body is not required to be JSON.
+      const fs = await import("node:fs");
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, "plain text, not JSON");
+      process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "lambda_invoke_large_response": {
+      // Larger than the handler's 256 KB response cap. Valid JSON on the wire,
+      // so a test can tell "clipped by our cap" (payloadTruncated, string body)
+      // apart from "the function returned garbage".
+      const fs = await import("node:fs");
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, JSON.stringify({ blob: "a".repeat(300_000) }));
+      process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "lambda_invoke_hang": {
+      // Never writes the outfile and never exits, so the parent's timeoutMs has
+      // to fire. Exists to prove the handler's finally-block cleanup runs on the
+      // TIMEOUT path, not just the happy one. The parent kills it, so the sleep
+      // never actually elapses -- same "stay alive until reaped" floor as
+      // happy_hold.
+      await sleep(10 * 60_000);
       process.exit(0);
       return;
     }
