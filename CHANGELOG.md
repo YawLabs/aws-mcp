@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.2.0] — 2026-09-08
 
 ### Added
 - **`aws_lambda_invoke` closes the one gap this README routed to a Python server.** `aws_call` is sold as covering the full AWS API, and for Lambda invokes that was false: `aws lambda invoke` takes the response body as a required POSITIONAL outfile, `SAFE_NAME_RE` rejects `operation: "invoke out.json"` before a process ever spawns, and `--cli-input-json` cannot supply an outfile because it is a CLI construct rather than an API member. The documented escape hatch was a `uvx`/Python awslabs server -- the exact thing this package's Node-only positioning exists to avoid. The new tool mints a 0600 temp file, passes it as a bare positional (the mechanism `aws_logs_tail` already uses for its log-group argument, so `aws-cli.ts` is untouched), and unlinks it in a `finally` that also covers the timeout and spawn-error paths. The returned `logTail` is the function's own `LogResult` already base64-DECODED, which collapses the usual invoke -> find the log group -> tail it -> hope the window caught it loop into one call; the official AWS server hands that back still encoded. A non-empty `functionError` is deliberately `ok: true` -- the invocation succeeded and the function's handler threw -- so a caller can tell "your code raised" apart from "the call never landed". `destructiveHint: true`, because invoking arbitrary Lambda code can do anything the function's own role permits, the same reasoning v2.0.1 applied to `aws_call`. Async invocation, DryRun and the `aws_script` binding are deferred.
