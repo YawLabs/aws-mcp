@@ -123,9 +123,18 @@ export interface AssumedRoleCredentials {
  * Result of {@link assumeRoleCredentials}.
  *
  * The failure arm carries a fully-built ToolResult rather than the raw pieces
- * (message + kind + stderr) on purpose. aws_assume_role returns it verbatim, so
- * the extraction cannot change that tool's failure envelope by accident -- key
- * presence included, which `assert.deepStrictEqual` in the suite would notice.
+ * (message + kind + stderr) on purpose: aws_assume_role returns it verbatim, so
+ * there is exactly one place a failure envelope is constructed and the
+ * extraction cannot make the two callers diverge.
+ *
+ * That is a STRUCTURAL guarantee, not a tested one -- nothing in the suite pins
+ * the key SET of this envelope, so adding or dropping a field here changes
+ * aws_assume_role's failure shape silently. (This comment previously claimed an
+ * `assert.deepStrictEqual` would catch that; no such assertion exists, and the
+ * release that added `errorKind` to these arms went unremarked by any test.)
+ * If the envelope's exact keys ever become load-bearing for a consumer, pin
+ * them with a real assertion rather than relying on this note.
+ *
  * A caller that wants to re-word a failure (aws_multi_account rewrites the
  * profile-naming auth messages to name an account) reads `failure.error` /
  * `failure.errorKind` off it.

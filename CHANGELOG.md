@@ -26,7 +26,7 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 - `resolveTime` — the `startTime`/`endTime` parser that makes an explicit UTC offset mandatory — moved from `metrics.ts` to `logs.ts`, beside the relative-time vocabulary it extends, and is re-exported from `metrics.ts` so nothing importing it has to change. `aws_logs_query` needs the same parser, and importing it the other way would have closed a `logs -> metrics -> logs` module cycle. `sleepUnlessAborted` is likewise exported from `resource.ts` and shared rather than copied into the second poll loop.
 
 ### Fixed
-- **The documented `errorKind` enum was missing `unexpected`.** `aws_multi_region` has emitted it since the tool shipped, for a region whose worker threw rather than returning a result, but the README's enum listed only the ten `AwsCallFailureKind` members -- so an integrator writing an exhaustive switch over the documented values had a hole. Documentation only; no behavior change.
+- **The documented `errorKind` enum was missing `unexpected`.** The fan-out tools have emitted it since `aws_multi_region` shipped, for an entry whose worker threw rather than returning a result, but the README's enum listed only the ten `AwsCallFailureKind` members -- so an integrator writing an exhaustive switch over the documented values had a hole. The Stability section now also separates the two surfaces the field appears on, because they follow different rules: a top-level envelope OMITS `errorKind` when the failure never reached the CLI, while a fan-out `results` entry always carries one -- including `bad_input` for an entry the tool rejected itself. Documentation only; no behavior change.
 
 ## [2.1.0] — 2026-08-31
 

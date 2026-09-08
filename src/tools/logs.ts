@@ -822,8 +822,8 @@ export const logsTools: readonly Tool[] = [
       // destructiveHint. destructiveHint means "may perform destructive or
       // irreversible UPDATES" -- hosts gate delete-confirmation prompts on it,
       // and repurposing it as "expensive" would make it mean two different
-      // things across this server's 26 tools and misfire on exactly the calls
-      // it exists to guard. The cost risk is handled where a caller can act on
+      // things across this server's tool surface and misfire on exactly the
+      // calls it exists to guard. The cost risk is handled where a caller can act on
       // it: the 90-day range cap, the 1000-row default limit, and an explicit
       // sentence in the description above.
     },
@@ -989,7 +989,18 @@ export const logsTools: readonly Tool[] = [
         params,
       });
       if (!started.ok) {
-        return { ok: false, error: started.error, rawBody: started.rawStderr || started.rawStdout };
+        // Forward the classification runAwsCall already made. Without this the
+        // README's errorKind contract -- which names aws_logs_query explicitly --
+        // is false for this tool, and a caller cannot tell an expired session
+        // (re-authenticate) from a MalformedQueryException (fix the query)
+        // without regex-matching prose the README tells them not to match.
+        return {
+          ok: false,
+          error: started.error,
+          errorKind: started.kind,
+          suggestion: started.suggestion,
+          rawBody: started.rawStderr || started.rawStdout,
+        };
       }
       const rawQueryId = (started.data as { queryId?: unknown } | null)?.queryId;
       if (typeof rawQueryId !== "string" || !isValidQueryId(rawQueryId)) {
@@ -1048,6 +1059,12 @@ export const logsTools: readonly Tool[] = [
         return {
           ok: false,
           error: `${prefix} ${queryResumeHint(queryId)} Underlying error: ${underlying}`,
+          // The kind is already in hand -- `isAuthKind` above reads it -- and the
+          // arm rewrites `error` wholesale, so without forwarding it the caller's
+          // only classification signal is the prose we just replaced. No
+          // `suggestion`: QueryPollResult carries none, and runAwsCall embeds
+          // that sentence in the message it built.
+          errorKind: polled.kind,
           rawBody: polled.rawBody,
         };
       }

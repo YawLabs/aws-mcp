@@ -1125,6 +1125,23 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "logs_query_poll_sso_expired": {
+      // start-query succeeds, then the SSO session lapses before the first poll
+      // lands. Reaches aws_logs_query's `call_failed` poll arm, which rewrites
+      // `error` wholesale to lead with the recovery hint -- so the forwarded
+      // errorKind is the caller's only remaining classification signal, and the
+      // one thing that distinguishes "re-authenticate" from "the poll broke".
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        process.stdout.write(`${JSON.stringify({ queryId: "q-poll-expired-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+      process.exit(255);
+      return;
+    }
+
     case "logs_query_start_malformed": {
       // `logs start-query` rejects the query before any polling can begin.
       // Proves the handler surfaces the start-query failure directly instead of

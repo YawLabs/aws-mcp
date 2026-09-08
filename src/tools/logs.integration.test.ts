@@ -377,6 +377,33 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
     // The scenario has no get-query-results branch; its fall-through exits 2
     // with a distinctive string, so its absence proves no poll was attempted.
     assert.equal(`${r.error ?? ""}${r.rawBody ?? ""}`.includes("unexpected argv"), false);
+    // The README's errorKind contract names aws_logs_query explicitly, so both
+    // of its CLI-failure arms have to carry the classification. This one shipped
+    // without it once already: the arm returned error + rawBody and dropped the
+    // kind runAwsCall had already computed.
+    assert.equal(r.errorKind, "nonzero_exit");
+  });
+
+  it("forwards the classified errorKind from a start-query auth failure", async () => {
+    // call_sso_expired is argv-independent -- stderr + exit 255 whatever the
+    // command -- so it reaches the start-query arm unchanged.
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_sso_expired";
+    const r = await queryTool.handler({ ...baseInput, profile: "my-profile", pollIntervalMs: 500 });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "sso_expired", "a caller must be able to tell re-auth from a bad query");
+    assert.match(r.error ?? "", /SSO session expired/);
+  });
+
+  it("forwards the classified errorKind when credentials lapse mid-poll", async () => {
+    // The poll arm rewrites `error` wholesale to lead with the recovery hint, so
+    // errorKind is the only classification the caller has left.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_poll_sso_expired";
+    const r = await queryTool.handler({ ...baseInput, profile: "my-profile", pollIntervalMs: 500 });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "sso_expired");
+    // The queryId still has to reach the caller: the query is unaffected by a
+    // poll-side credential failure and its results stay retrievable.
+    assert.match(r.error ?? "", /q-poll-expired-1/);
   });
 
   it("sends camelCase --cli-input-json with epoch-SECONDS times, and resolves an ARN to a bare name", async () => {
