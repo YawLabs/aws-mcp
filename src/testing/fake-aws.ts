@@ -1154,6 +1154,78 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "lq2_poll_access_denied": {
+      // start-query succeeds; every get-query-results call is denied. Reaches
+      // aws_logs_query's `call_failed` poll arm on a NON-auth kind, which is the
+      // half logs_query_poll_sso_expired cannot reach -- that scenario takes the
+      // isAuthKind branch, so the plain "Polling the query failed." prefix and
+      // the re-appended "Suggestion:" sentence (v2.2.1: `underlying` prefers the
+      // RAW stderr over runAwsCall's already-suffixed message, so the remedy has
+      // to be added back) have no other exercise. call_access_denied itself is
+      // argv-independent and would fail START-query instead, landing in the arm
+      // that is already covered.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        process.stdout.write(`${JSON.stringify({ queryId: "q-poll-denied-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(
+        "An error occurred (AccessDenied) when calling the GetQueryResults operation: Access Denied\n",
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "lq2_terminal_status": {
+      // Drives terminalQueryFailure's per-status message arms through the real
+      // handler: start-query hands back a fixed queryId and get-query-results
+      // answers with whatever AWS_MCP_FAKE_QUERY_STATUS names. The var UNSET
+      // omits the `status` member entirely, which is the malformed-response arm
+      // -- the same env side-channel shape as AWS_MCP_FAKE_QUERY_COUNT_OUT
+      // above. Every status here is outside Scheduled/Running, so the poll loop
+      // returns on the first attempt and the handler builds the message.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        process.stdout.write(`${JSON.stringify({ queryId: "q-term-1" })}\n`);
+        process.exit(0);
+        return;
+      }
+      if (argv.includes("get-query-results")) {
+        const status = process.env.AWS_MCP_FAKE_QUERY_STATUS;
+        process.stdout.write(`${JSON.stringify({ ...(status ? { status } : {}), results: [], statistics: {} })}\n`);
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: lq2_terminal_status hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
+    case "lq2_start_bad_query_id": {
+      // start-query EXITS 0 but its body carries no usable queryId, so the
+      // handler has to bail before polling rather than hand `--query-id
+      // undefined` to the CLI once per attempt for the whole wait budget.
+      // AWS_MCP_FAKE_QUERY_ID_SHAPE picks which half of
+      // `typeof rawQueryId !== "string" || !isValidQueryId(rawQueryId)` runs:
+      // unset (or "missing") omits the member, "number" sends 42, "hyphen"
+      // sends a string the argv guard rejects. No get-query-results branch on
+      // purpose -- the fall-through's "unexpected argv" string is absent from
+      // the response only if no poll was attempted, the same negative proof
+      // logs_query_start_malformed relies on.
+      const argv = process.argv.slice(2);
+      if (argv.includes("start-query")) {
+        const shape = process.env.AWS_MCP_FAKE_QUERY_ID_SHAPE;
+        const body = shape === "number" ? { queryId: 42 } : shape === "hyphen" ? { queryId: "-x" } : {};
+        process.stdout.write(`${JSON.stringify(body)}\n`);
+        process.exit(0);
+        return;
+      }
+      process.stderr.write(`fake-aws: lq2_start_bad_query_id hit unexpected argv: ${argv.join(" ")}\n`);
+      process.exit(2);
+      return;
+    }
+
     case "sts_caller_identity_success": {
       // Mimics `aws sts get-caller-identity --output json`.
       process.stdout.write(

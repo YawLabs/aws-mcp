@@ -259,6 +259,36 @@ describe("aws_logs_tail handler — maxEvents cap", () => {
     assert.equal(highData.eventCount, 1200, `clamps down to ${MAX_MAX_EVENTS}, which exceeds the window`);
     assert.equal(highData.truncated, false);
   });
+
+  it("treats EXACTLY maxEvents as a complete window and flips one below it (1200 in, 1199 out)", async () => {
+    // The cases above straddle the boundary widely (3 vs 500, 1200 vs 10000,
+    // 1200 vs 500 and vs 10), so an off-by-one flip to `>=` survives all of
+    // them: it would report truncated:true on a window that came back complete
+    // -- telling the caller to narrow a `since` that did not need narrowing --
+    // and slice(-1200) is a no-op that hides it from the event assertions.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
+    const exact = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 1200 });
+    assert.equal(exact.ok, true);
+    const exactData = exact.data as {
+      eventCount: number;
+      totalEvents: number;
+      truncated: boolean;
+      events: unknown[];
+    };
+    assert.equal(exactData.eventCount, 1200);
+    assert.equal(exactData.totalEvents, 1200);
+    assert.equal(exactData.truncated, false, "1200 of 1200 is a COMPLETE window");
+    assert.equal(msg(exactData.events[0]), "event-0", "nothing was sliced off the head");
+
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
+    const one = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 1199 });
+    assert.equal(one.ok, true);
+    const oneData = one.data as { eventCount: number; totalEvents: number; truncated: boolean; events: unknown[] };
+    assert.equal(oneData.eventCount, 1199);
+    assert.equal(oneData.totalEvents, 1200);
+    assert.equal(oneData.truncated, true);
+    assert.equal(msg(oneData.events[0]), "event-1", "the single OLDEST event is the one dropped");
+  });
 });
 
 describe("aws_logs_tail handler — log-group ARN end to end", () => {
@@ -449,6 +479,185 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
     } finally {
       delete process.env.AWS_MCP_FAKE_ARGV_OUT;
       rmSync(argvFile, { force: true });
+    }
+  });
+
+  it("brackets the truncated >= boundary: landing exactly ON the limit counts as truncated", async () => {
+    // The tool's own description tells callers to check `truncated` to decide
+    // whether more matched than came back, so a `>=` -> `>` regression makes a
+    // clipped result set report truncated:false and the agent draws a
+    // conclusion from a silently partial answer. logs_query_complete branches
+    // on argv and always returns its 2 rows regardless of the
+    // --cli-input-json payload, so `limit` is free to vary.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_complete";
+    const atLimit = await queryTool.handler({ ...baseInput, limit: 2, pollIntervalMs: 500 });
+    assert.equal(atLimit.ok, true, `expected ok, got: ${JSON.stringify(atLimit)}`);
+    const atLimitData = atLimit.data as { rowCount: number; truncated: boolean };
+    assert.equal(atLimitData.rowCount, 2);
+    assert.equal(atLimitData.truncated, true, "rows.length === limit is truncated");
+
+    const underLimit = await queryTool.handler({ ...baseInput, limit: 3, pollIntervalMs: 500 });
+    assert.equal(underLimit.ok, true);
+    const underLimitData = underLimit.data as { rowCount: number; truncated: boolean };
+    assert.equal(underLimitData.rowCount, 2);
+    assert.equal(underLimitData.truncated, false, "one under the limit is not");
+  });
+
+  it("fills the documented statistics keys with null and lets newer members ride through", async () => {
+    // The contract is "the documented keys are always present": an agent
+    // reading statistics.recordsMatched to decide whether `truncated` mattered
+    // would get undefined instead of null if the defaults-fill regressed, and a
+    // hand-written reshape (what the spread deliberately replaced) would drop
+    // members AWS adds later.
+    //
+    // logs_query_echo_args answers the poll with statistics:{} and no
+    // queryLanguage -- the older-model shape.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_echo_args";
+    const sparse = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
+    assert.equal(sparse.ok, true, `expected ok, got: ${JSON.stringify(sparse)}`);
+    const sparseData = sparse.data as { statistics: Record<string, unknown>; queryLanguage: unknown };
+    assert.deepEqual(sparseData.statistics, { recordsMatched: null, recordsScanned: null, bytesScanned: null });
+    assert.equal(sparseData.queryLanguage, null, "null, never undefined, when the response omits the member");
+
+    // logs_query_complete carries all three PLUS logGroupsScanned, which the
+    // reshape does not name.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_complete";
+    const full = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
+    assert.equal(full.ok, true);
+    const fullData = full.data as {
+      statistics: Record<string, unknown>;
+      queryLanguage: unknown;
+      startTime: string;
+      endTime: string;
+    };
+    assert.equal(fullData.statistics.logGroupsScanned, 1, "a member the reshape does not name must survive");
+    assert.equal(fullData.queryLanguage, "CWLI");
+    assert.match(fullData.startTime, /^\d{4}-\d{2}-\d{2}T.*Z$/);
+    assert.match(fullData.endTime, /^\d{4}-\d{2}-\d{2}T.*Z$/);
+  });
+
+  it("copies queryLanguage onto the wire verbatim, and omits the key when unset", async () => {
+    // Only the Zod enum was tested -- that CWLI/PPL parse and SQL does not.
+    // A dropped assignment means every PPL query silently runs as CWLI and
+    // fails with a parse error the caller cannot explain from this tool's own
+    // output.
+    const argvFile = join(tmpdir(), `aws-mcp-qlang-${process.pid}-${counter++}`);
+    const payloadFrom = (): Record<string, unknown> => {
+      const argv = JSON.parse(readFileSync(argvFile, "utf8")) as string[];
+      const jsonIdx = argv.indexOf("--cli-input-json");
+      assert.ok(jsonIdx >= 0, `--cli-input-json missing from argv: ${argv.join(" ")}`);
+      return JSON.parse(argv[jsonIdx + 1]) as Record<string, unknown>;
+    };
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvFile;
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_echo_args";
+    try {
+      const withLang = await queryTool.handler({ ...baseInput, queryLanguage: "PPL", pollIntervalMs: 500 });
+      assert.equal(withLang.ok, true, `expected ok, got: ${JSON.stringify(withLang)}`);
+      assert.equal(payloadFrom().queryLanguage, "PPL");
+
+      const withoutLang = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
+      assert.equal(withoutLang.ok, true);
+      // ABSENT, not null: an emitted-but-null key is a botocore
+      // ParamValidationError before the request is ever signed, and the CLI /
+      // service can only apply its own default when the key is missing.
+      assert.equal("queryLanguage" in payloadFrom(), false);
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+      rmSync(argvFile, { force: true });
+    }
+  });
+
+  it("rebuilds a NON-auth poll failure around the queryId and re-appends the suggestion", async () => {
+    // The v2.2.1 fix, which shipped on manual verification alone: `underlying`
+    // deliberately prefers the RAW stderr over runAwsCall's already-suffixed
+    // message, so a recognized error code's remedy has to be added back or it
+    // is lost from BOTH the message and the envelope -- contradicting README's
+    // Stability promise that `suggestion` is duplicated in `error`.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lq2_poll_access_denied";
+    const r = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, "Check IAM permissions for this operation.");
+    // The queryId is the whole reason this arm rebuilds the message: the query
+    // is unaffected by a poll-side failure and its results stay collectible.
+    assert.match(r.error ?? "", /q-poll-denied-1/);
+    // The non-auth prefix. logs_query_poll_sso_expired takes the isAuthKind
+    // branch instead, so nothing else exercises this string.
+    assert.ok((r.error ?? "").startsWith("Polling the query failed."), `got: ${r.error}`);
+    assert.ok(
+      (r.error ?? "").endsWith("\n\nSuggestion: Check IAM permissions for this operation."),
+      `error must end with the suggestion sentence, got: ${r.error}`,
+    );
+    assert.match(r.rawBody ?? "", /AccessDenied/);
+  });
+
+  it("gives each terminal status its own diagnostic, with the resume hint only where it belongs", async () => {
+    // Only "Failed" was covered end to end. The poll loop's CLASSIFICATION of
+    // these statuses as terminal is tested in logs.test.ts, but that test stops
+    // at the loop's return value -- nothing exercised the message the caller
+    // actually reads, which is the entire diagnostic for a query that produced
+    // no rows.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lq2_terminal_status";
+    const cases: Array<{ status: string | undefined; match: RegExp; resumeHint: boolean }> = [
+      { status: "Failed", match: /failed server-side/, resumeHint: false },
+      { status: "Timeout", match: /60-minute/, resumeHint: false },
+      { status: "Cancelled", match: /stopped elsewhere/, resumeHint: false },
+      { status: "Unknown", match: /no transition out of it/, resumeHint: false },
+      { status: undefined, match: /no 'status' field/, resumeHint: true },
+      { status: "Frobnicated", match: /unrecognized terminal status/, resumeHint: true },
+    ];
+    try {
+      for (const c of cases) {
+        if (c.status === undefined) delete process.env.AWS_MCP_FAKE_QUERY_STATUS;
+        else process.env.AWS_MCP_FAKE_QUERY_STATUS = c.status;
+        const label = c.status ?? "(no status member)";
+        const r = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
+        assert.equal(r.ok, false, label);
+        assert.match(r.error ?? "", c.match, label);
+        // The common `where` suffix rides on every arm.
+        assert.match(r.error ?? "", /q-term-1/, label);
+        assert.match(r.error ?? "", /1 poll\(s\)/, label);
+        // Only the null and default arms append queryResumeHint -- for two of
+        // these messages it is the only place a caller learns the queryId is
+        // still collectible, and for the other four its ABSENCE is a deliberate
+        // design choice that a switch fallthrough would violate.
+        assert.equal((r.error ?? "").includes("7 days"), c.resumeHint, label);
+      }
+    } finally {
+      delete process.env.AWS_MCP_FAKE_QUERY_STATUS;
+    }
+  });
+
+  it("bails without polling when start-query returns no usable queryId", async () => {
+    // Exists to stop the loop handing `--query-id undefined` to the CLI once
+    // per attempt for the whole wait budget. Reachable from a CLI model that
+    // drops the output member, an --output misconfiguration, or a proxy that
+    // reshapes the response. isValidQueryId is unit-tested in isolation, but
+    // nothing connected it to this call site.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lq2_start_bad_query_id";
+    const cases: Array<{ shape: string | undefined; typeName: string }> = [
+      { shape: undefined, typeName: "undefined" },
+      { shape: "number", typeName: "number" },
+      { shape: "hyphen", typeName: "string" },
+    ];
+    try {
+      for (const c of cases) {
+        if (c.shape === undefined) delete process.env.AWS_MCP_FAKE_QUERY_ID_SHAPE;
+        else process.env.AWS_MCP_FAKE_QUERY_ID_SHAPE = c.shape;
+        const label = c.shape ?? "missing member";
+        const r = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
+        assert.equal(r.ok, false, label);
+        assert.match(r.error ?? "", /no usable queryId/, label);
+        assert.match(r.error ?? "", new RegExp(`got ${c.typeName}\\b`), label);
+        // The scenario has no get-query-results branch; its fall-through exits
+        // 2 with a distinctive string, so its absence proves no poll ran --
+        // the same negative proof logs_query_start_malformed relies on.
+        assert.equal(`${r.error ?? ""}${r.rawBody ?? ""}`.includes("unexpected argv"), false, label);
+        // This arm classifies nothing, so errorKind stays absent.
+        assert.equal(r.errorKind, undefined, label);
+      }
+    } finally {
+      delete process.env.AWS_MCP_FAKE_QUERY_ID_SHAPE;
     }
   });
 });
