@@ -644,7 +644,9 @@ describe("flattenQueryRows", () => {
   it("skips every unusable pair shape, including an EMPTY-STRING field name", () => {
     // The empty-string `field` is the branch worth having here; the non-string
     // half of the same condition is already pinned above.
-    const { rows, fields } = flattenQueryRows([[null, "pair", 7, { field: "", value: "x" }, { field: "@ok", value: "y" }]]);
+    const { rows, fields } = flattenQueryRows([
+      [null, "pair", 7, { field: "", value: "x" }, { field: "@ok", value: "y" }],
+    ]);
     // Rows are Object.create(null), so deepStrictEqual against an object
     // literal fails on the prototype check -- assert through Object.keys, the
     // way the __proto__ case above does.

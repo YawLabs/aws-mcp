@@ -248,10 +248,7 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
     );
     // Characters: roughly a third of the cap, because each one cost 3 bytes. A
     // character cut would have kept every one of the body's 100011 chars.
-    assert.ok(
-      payload.length < 90_000,
-      `payload is ${payload.length} chars -- looks cut by character, not by byte`,
-    );
+    assert.ok(payload.length < 90_000, `payload is ${payload.length} chars -- looks cut by character, not by byte`);
     // ...and it really was clipped, not just short.
     assert.ok(payload.length > 80_000, `payload is only ${payload.length} chars`);
   });
@@ -377,11 +374,7 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     const { dirMode, outfileMode, payloadFileMode } = readEcho();
     assert.equal(dirMode, 0o700, `expected dir 0700, got ${dirMode?.toString(8)}`);
     assert.equal(outfileMode, 0o600, `expected outfile 0600, got ${outfileMode?.toString(8)}`);
-    assert.equal(
-      payloadFileMode,
-      0o600,
-      `expected payload file 0600, got ${payloadFileMode?.toString(8)}`,
-    );
+    assert.equal(payloadFileMode, 0o600, `expected payload file 0600, got ${payloadFileMode?.toString(8)}`);
   });
 
   it("keeps the payload out of the command string returned to the model", async () => {
