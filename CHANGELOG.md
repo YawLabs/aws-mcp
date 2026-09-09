@@ -9,6 +9,15 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
+## [Unreleased]
+
+### Fixed
+- **`aws_logs_query` dropped the remedy sentence when a POLL failed.** On a poll-side failure the handler rebuilds its message around the `queryId` -- that recovery hint is the whole reason the arm exists -- and deliberately quotes the RAW stderr in preference to `runAwsCall`'s summary, so nesting a second remedy inside the first cannot displace the token the caller needs. But `runAwsCall` appends its `Suggestion: <remedy>` line to that summary and nowhere else, so preferring the raw body silently dropped it: for a recognized AWS error code (an IAM denial mid-poll, a throttle) the sentence naming the fix was absent from the message AND from the envelope, while the README's Stability section states `suggestion` is duplicated at the end of `error`. `QueryPollResult` now carries it and the arm re-appends it, guarded on containment so a raw body that already quotes the sentence cannot print it twice -- the defect v2.0.1 fixed for `rawBody` itself. Only this one path was affected; every other tool's remedy already survived.
+- `aws_logs_query`'s error envelope now OMITS `suggestion` when there is none, rather than setting the key to `undefined`. Not visible over MCP -- `toMcpResult` never renders that field -- but `aws_script` attaches it to the error it throws, so a script doing `'suggestion' in err` saw a key that was always present and sometimes meaningless.
+
+### Changed
+- Repo tooling only, nothing in the published package: `npm run lint` now routes through `scripts/lint.mjs`, which resolves a biome binary that actually works on the host. On Windows ARM64 the native binary segfaults on every invocation path, so the wrapper provisions the x64 build into `node_modules/.cache` and runs it under emulation; everywhere else it is a passthrough. The cache is keyed by version and re-verified before use, and every spawn is bounded -- `npm run lint` is `release.sh` step 1 and runs unattended, where an unbounded child wedges a release instead of failing it (the same reasoning that bounded the test suite in v1.8.2). `release.sh`'s `SKIP_LINT` / `SKIP_TEST` comments no longer claim CI will catch what they skip: this repo ships no CI, so skipping either step means publishing unchecked.
+
 ## [2.2.0] — 2026-09-08
 
 ### Added
