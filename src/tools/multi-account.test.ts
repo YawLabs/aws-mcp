@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { _resetSession } from "../session.js";
+import { _resetSession, setProfile } from "../session.js";
 import { multiAccountTools } from "./multi-account.js";
 import type { ToolContext } from "./tool.js";
 
@@ -77,6 +77,20 @@ const BASE = {
   profile: "default",
   region: "us-east-1",
 };
+
+// BASE minus `profile`, for the tests that exercise the assuming-identity
+// fallback chain. Spelled out field by field rather than destructured with a
+// rest pattern so the omission is the visible part.
+const BASE_NO_PROFILE = {
+  service: BASE.service,
+  operation: BASE.operation,
+  roleName: BASE.roleName,
+  region: BASE.region,
+};
+
+// The three credential values every macct / macct2 scenario mints for account
+// 111111111111, encoded so they are greppable in a serialized response.
+const MINTED_SECRETS_111 = ["ASIAFAKE111111111111", "fake-secret-111111111111", "fake-token-111111111111"];
 
 describe("aws_multi_account schema", () => {
   it("accepts a minimal call with two accounts", () => {
@@ -172,12 +186,18 @@ describe("aws_multi_account -- credential plumbing", () => {
     });
   });
 
-  it("never writes the shared credentials file", async () => {
+  it("never writes the shared credentials file, on a full batch OR one that dies partway", async () => {
     // The headline correctness claim: aws_assume_role in a loop leaves live
     // credentials on disk for every account it touched, and a sweep killed
     // partway through leaves them there with nothing to clean up. This tool
     // holds them in memory, so a full batch must leave the credentials path
     // untouched -- here, still nonexistent.
+    //
+    // The path asserted is AWS_SHARED_CREDENTIALS_FILE, not the literal
+    // ~/.aws/credentials, and deliberately so: resolveCredentialsPath
+    // (assume.ts) honors the env var, so any write from this module would land
+    // here. The default path cannot be asserted on a machine that has a real
+    // one.
     const dir = mkdtempSync(join(tmpdir(), "aws-mcp-macct-"));
     const credentialsPath = join(dir, "credentials");
     const prev = process.env.AWS_SHARED_CREDENTIALS_FILE;
@@ -189,6 +209,24 @@ describe("aws_multi_account -- credential plumbing", () => {
         assert.equal((res.data as Envelope).okCount, 2, "the batch really ran");
       });
       assert.equal(existsSync(credentialsPath), false, "no profile section may be written for a fan-out");
+
+      // The half the claim is actually about, and the half that was untested:
+      // an all-success batch has nothing to cache for a retry, so the
+      // interesting case is the sweep that dies partway. macct_partial_failure
+      // loses 222222222222 at the ASSUME (no credentials ever minted) and
+      // 333333333333 at the OPERATION -- the only failure path where a live
+      // session existed and could have been written down "for the retry".
+      await withScenario("macct_partial_failure", async () => {
+        const res = await tool.handler({
+          ...BASE,
+          accounts: ["111111111111", "222222222222", "333333333333"],
+        } as never);
+        assert.equal(res.ok, true);
+        const data = res.data as Envelope;
+        assert.equal(data.errorCount, 2, "the failures really happened");
+        assert.equal(data.okCount, 1, "alongside an account that really succeeded");
+      });
+      assert.equal(existsSync(credentialsPath), false, "a sweep that dies halfway still leaves nothing on disk");
     } finally {
       if (prev === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE;
       else process.env.AWS_SHARED_CREDENTIALS_FILE = prev;
@@ -219,7 +257,7 @@ describe("aws_multi_account -- credential hygiene", () => {
       // Serialize the WHOLE envelope, so the assertion covers fields a future
       // change might add as well as the ones checked individually below.
       const serialized = JSON.stringify(res);
-      for (const secret of ["fake-secret-111111111111", "fake-token-111111111111", "ASIAFAKE111111111111"]) {
+      for (const secret of MINTED_SECRETS_111) {
         assert.ok(!serialized.includes(secret), `credential material leaked into the response: ${secret}`);
       }
       // Positive control: the leak attempt really happened and really was
@@ -229,6 +267,230 @@ describe("aws_multi_account -- credential hygiene", () => {
         `expected redaction stubs in the forwarded error, got: ${entry.error}`,
       );
       assert.equal(res.rawBody, undefined, "this tool never carries a raw body");
+    });
+  });
+
+  it("rewrites a POST-assume auth failure to name the account, and scrubs the minted session out of it", async () => {
+    // The arm a real long sweep hits: an hour-long assumed session expiring
+    // mid-batch, an SCP revoking it, a clock skew that breaks signing. It is
+    // also the ONLY place this tool hand-copies raw CLI stderr into a string it
+    // returns (rewriteCredentialError quotes result.rawStderr verbatim), so it
+    // is the one arm where dropping the redactSecrets wrapper would put minted
+    // credentials in front of the model.
+    //
+    // Complement to macct_leaky_stderr above, which is worded so the failure
+    // classifies as nonzero_exit precisely to AVOID this branch.
+    await withScenario("macct2_expired_after_assume", async () => {
+      const res = await tool.handler({ ...BASE, accounts: ["111111111111"] } as never);
+      assert.equal(res.ok, true);
+      const data = res.data as Envelope;
+      assert.equal(data.errorCount, 1);
+      const entry = data.results[0];
+      assert.ok(entry);
+      assert.equal(entry.ok, false);
+      assert.equal(
+        entry.errorKind,
+        "expired_creds",
+        "the rewrite only fires for a CREDENTIAL_CLASS_KIND -- a different kind would take the pass-through branch and test nothing",
+      );
+
+      assert.ok(
+        entry.error?.startsWith("AWS did not accept the credentials for account 111111111111 (expired_creds)"),
+        `the rewrite must lead with the account whose session was rejected, got: ${entry.error}`,
+      );
+      assert.ok(
+        entry.error?.includes("arn:aws:iam::111111111111:role/OrganizationAccountAccessRole"),
+        `the rewrite must name the role whose session actually failed, got: ${entry.error}`,
+      );
+
+      // The defect the rewrite exists to prevent. runAwsCall words its
+      // expired_creds message as "Temporary credentials for profile 'X' have
+      // expired ... call aws_login_start with profile='X'" -- advice about a
+      // profile this call never used (omitProfile keeps it off argv entirely),
+      // pointing the operator at an identity that had nothing to do with the
+      // failure.
+      assert.ok(
+        !entry.error?.includes("Temporary credentials for profile"),
+        `runAwsCall's profile-naming remedy must not survive the rewrite, got: ${entry.error}`,
+      );
+      assert.ok(
+        !entry.error?.includes("aws_login_start"),
+        `re-authenticating a profile cannot fix an expired assumed session, got: ${entry.error}`,
+      );
+
+      const serialized = JSON.stringify(res);
+      for (const secret of MINTED_SECRETS_111) {
+        assert.ok(!serialized.includes(secret), `credential material leaked into the response: ${secret}`);
+      }
+      // Positive control, and asserted on `error` ONLY. `command` is built from
+      // argv while the credentials travel by ENV, so no stub could ever appear
+      // there -- asserting it on `command` would be a control that cannot fail.
+      // On `error` it proves the scrub ran on THIS arm rather than the
+      // absence-of-secrets check passing on an empty or truncated string.
+      assert.ok(
+        entry.error?.includes("<redacted assumed-role credential>"),
+        `expected redaction stubs in the rewritten error, got: ${entry.error}`,
+      );
+      assert.equal(res.rawBody, undefined, "this tool never carries a raw body");
+    });
+  });
+});
+
+describe("aws_multi_account -- per-account child environment", () => {
+  it("strips the inherited credential aliases botocore reads AHEAD of the minted session", async () => {
+    // credentialEnv seeds the child from process.env and then deletes four
+    // keys. Setting the three standard credential vars is not enough on its
+    // own: botocore's environment provider consults AWS_SECURITY_TOKEN (the
+    // legacy spelling) before AWS_SESSION_TOKEN, so a stale one inherited from
+    // the operator's shell pairs THIS account's access key with somebody
+    // else's token; and a stale AWS_CREDENTIAL_EXPIRATION makes freshly minted
+    // credentials look already-expired.
+    //
+    // Both are exported by `aws configure export-credentials --format env` and
+    // by older SAML helpers, and AWS_PROFILE is exported on most operator
+    // machines -- so a regression here fails every account of every sweep on
+    // that one machine and nowhere else.
+    const vars = ["AWS_SECURITY_TOKEN", "AWS_CREDENTIAL_EXPIRATION", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"] as const;
+    const prev = vars.map((v) => [v, process.env[v]] as const);
+    process.env.AWS_SECURITY_TOKEN = "inherited-legacy-session-token";
+    process.env.AWS_CREDENTIAL_EXPIRATION = "2000-01-01T00:00:00Z";
+    process.env.AWS_PROFILE = "operator-sso";
+    process.env.AWS_DEFAULT_PROFILE = "operator-sso-legacy";
+    try {
+      await withScenario("macct2_env_probe", async () => {
+        // BASE passes profile:'default' explicitly, so the AWS_PROFILE set
+        // above cannot perturb sourceProfile resolution -- this test is about
+        // the CHILD's environment, not the assuming identity.
+        const res = await tool.handler({ ...BASE, accounts: ["111111111111"] } as never);
+        assert.equal(res.ok, true);
+        const entry = (res.data as Envelope).results[0];
+        assert.ok(entry);
+        assert.equal(entry.ok, true, `the probe spawn must have run, got: ${entry.error}`);
+        const payload = entry.data as {
+          Account: string;
+          SawSecurityToken: boolean;
+          SawCredExpiration: boolean;
+          SawProfile: boolean;
+          SawDefaultProfile: boolean;
+          SessionTokenMatches: boolean;
+        };
+
+        // Positive control first: without it, four false flags would also be
+        // what a child spawned with an EMPTY environment reports.
+        assert.equal(payload.SessionTokenMatches, true, "the child really received this account's minted session");
+        assert.equal(payload.Account, "111111111111");
+
+        assert.equal(payload.SawSecurityToken, false, "AWS_SECURITY_TOKEN outranks AWS_SESSION_TOKEN in botocore");
+        assert.equal(payload.SawCredExpiration, false, "a stale expiry makes fresh credentials look already-expired");
+        assert.equal(payload.SawProfile, false, "the child must not carry a profile it is forbidden to use");
+        assert.equal(payload.SawDefaultProfile, false, "AWS_DEFAULT_PROFILE is the legacy spelling and is honored too");
+      });
+    } finally {
+      for (const [key, value] of prev) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
+
+describe("aws_multi_account -- assuming identity resolution", () => {
+  // Every other test in this file hardcodes profile:'default' via BASE, so the
+  // fallback chain at `i.profile || getProfile()` is never taken. An operator
+  // who set the profile with aws_session and omitted the argument is the normal
+  // path; a regression to a literal 'default' assumes as the wrong identity for
+  // the whole batch -- loud when 'default' is unprivileged, silently wrong when
+  // it is not.
+  it("assumes from the SESSION profile when the argument is omitted", async () => {
+    await withScenario("macct2_source_profile", async () => {
+      setProfile("ops-sso");
+      const res = await tool.handler({ ...BASE_NO_PROFILE, accounts: ["111111111111"] } as never);
+      assert.equal(res.ok, true);
+      const entry = (res.data as Envelope).results[0];
+      assert.ok(entry);
+      // The scenario's phase 1 refuses to mint at all when --profile is absent
+      // from the assume argv, so reaching ok:true is itself an assertion that
+      // the flag was passed.
+      assert.equal(entry.ok, true, `the assume spawn must carry --profile, got: ${entry.error}`);
+      const payload = entry.data as { SourceProfile: string; SessionTokenMatches: boolean };
+      assert.equal(payload.SourceProfile, "ops-sso", "every sts:AssumeRole in the batch runs as the session profile");
+      assert.equal(payload.SessionTokenMatches, true);
+    });
+  });
+
+  it("lets an explicit profile argument override the session profile", async () => {
+    await withScenario("macct2_source_profile", async () => {
+      setProfile("ops-sso");
+      const res = await tool.handler({ ...BASE, profile: "other", accounts: ["111111111111"] } as never);
+      assert.equal(res.ok, true);
+      const entry = (res.data as Envelope).results[0];
+      assert.ok(entry);
+      assert.equal(entry.ok, true, `the assume spawn must carry --profile, got: ${entry.error}`);
+      const payload = entry.data as { SourceProfile: string };
+      assert.equal(payload.SourceProfile, "other", "the argument wins over the session profile");
+    });
+  });
+
+  it("falls through to the environment when neither the argument nor a session profile is set", async () => {
+    // Cheapest possible proof that the chain is really consulted, and it needs
+    // no subprocess. Env values bypass setProfile's validation entirely, so an
+    // argv-unsafe AWS_PROFILE reaches the handler's own check -- which can only
+    // fire if getProfile() was called. A regression to a literal 'default'
+    // passes validation and turns this test red.
+    const prev = process.env.AWS_PROFILE;
+    process.env.AWS_PROFILE = "--query=evil";
+    try {
+      const res = await tool.handler({ ...BASE_NO_PROFILE, accounts: ["111111111111"] } as never);
+      assert.equal(res.ok, false);
+      assert.match(res.error ?? "", /Invalid profile name '--query=evil'/);
+    } finally {
+      if (prev === undefined) delete process.env.AWS_PROFILE;
+      else process.env.AWS_PROFILE = prev;
+    }
+  });
+});
+
+describe("aws_multi_account -- operation arguments reach the per-account spawn", () => {
+  it("forwards params, query and outputFormat to the OPERATION and keeps them off the assume", async () => {
+    // Every other handler test runs `sts get-caller-identity` with no
+    // arguments, so nothing proves the caller's own operation arguments
+    // survive the fan-out. A regression that dropped `params` would run 32
+    // unparameterized operations; one that leaked them onto the assume spawn
+    // would corrupt the AssumeRole input for the whole batch -- which is why
+    // the scenario's phase 1 exits non-zero if the AssumeRole payload carries
+    // anything beyond RoleArn / RoleSessionName / DurationSeconds, or a
+    // --query. Reaching ok:true here IS that half of the assertion.
+    await withScenario("macct2_echo_args", async () => {
+      const params = { Filters: [{ Name: "instance-state-name", Values: ["running"] }] };
+      const query = "Reservations[].Instances[].InstanceId";
+      const res = await tool.handler({
+        ...BASE,
+        service: "ec2",
+        operation: "describe-instances",
+        params,
+        query,
+        outputFormat: "text",
+        accounts: ["111111111111"],
+      } as never);
+      assert.equal(res.ok, true);
+      const entry = (res.data as Envelope).results[0];
+      assert.ok(entry);
+      assert.equal(entry.ok, true, `phase 1 rejects an assume spawn carrying operation arguments, got: ${entry.error}`);
+
+      // outputFormat 'text' means runAwsCall hands back raw stdout rather than
+      // parsed JSON -- which is itself the proof that the format reached the
+      // spawn AND the parser.
+      assert.equal(typeof entry.data, "string", "a non-json outputFormat returns raw stdout, not a parsed object");
+      const payload = JSON.parse(String(entry.data)) as {
+        SawOutput: string | null;
+        SawQuery: string | null;
+        SawParams: unknown;
+        SessionTokenMatches: boolean;
+      };
+      assert.equal(payload.SawOutput, "text");
+      assert.equal(payload.SawQuery, query);
+      assert.deepEqual(payload.SawParams, params);
+      assert.equal(payload.SessionTokenMatches, true, "and it all rode on this account's own minted session");
     });
   });
 });
@@ -417,6 +679,16 @@ describe("aws_multi_account -- progress reporting", () => {
       );
       for (const c of calls) {
         assert.equal(c.total, 2, "the denominator is the deduped count, matching accountCount");
+        // Not decoration, and not a style rule. The progress message reaches
+        // the client exactly the way the response does, but redactSecrets
+        // covers `command` and `error` only -- so this is the one model-visible
+        // surface in the tool with no scrub in front of it, safe today only
+        // because the template is an account id plus a boolean verdict. The
+        // obvious next change (append r.error so the operator sees WHY account
+        // 7 failed mid-sweep) would forward unscrubbed CLI stderr, and the
+        // leak test one describe up only serializes `res`, so it would stay
+        // green. Pinning the shape is what makes that change fail here.
+        assert.match(c.message ?? "", /^\d{12}: (ok|failed) \(\d+\/\d+\)$/);
       }
     });
   });
