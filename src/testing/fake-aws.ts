@@ -2105,6 +2105,164 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "macct2_expired_after_assume":
+    case "macct2_env_probe":
+    case "macct2_source_profile":
+    case "macct2_echo_args": {
+      // A second aws_multi_account block, shaped exactly like the macct one
+      // above: two spawns per account, with phase 1 minting credentials that
+      // ENCODE what it saw so phase 2 can prove what it was actually handed.
+      //
+      // Kept separate from that block rather than folded into it because every
+      // scenario here needs phase 1 to do something the four above do not --
+      // refuse to mint for a spawn carrying the wrong argv, or carry an extra
+      // field across to phase 2 -- while the existing macct assertions read
+      // named fields off a phase-2 payload whose shape must not move.
+      const argv = process.argv.slice(2);
+      const isAssume = argv[0] === "sts" && argv[1] === "assume-role";
+
+      if (isAssume) {
+        const assumeInputIdx = argv.indexOf("--cli-input-json");
+        const payload = assumeInputIdx >= 0 ? (JSON.parse(argv[assumeInputIdx + 1]) as Record<string, unknown>) : {};
+        const roleArn = typeof payload.RoleArn === "string" ? payload.RoleArn : "";
+        const account = /:([0-9]{12}):role\//.exec(roleArn)?.[1] ?? "unknown";
+
+        // The assume is the one spawn in this tool that still carries
+        // `--profile`: it runs as the OPERATOR, and only the per-account
+        // operation gets omitProfile. Refuse to mint without it, so a
+        // regression that dropped the flag (letting the CLI resolve whatever
+        // the ambient environment points at) surfaces here instead of passing
+        // every downstream assertion unchanged.
+        const profileIdx = argv.indexOf("--profile");
+        const assumeProfile = profileIdx >= 0 ? (argv[profileIdx + 1] ?? "") : "";
+        if (!assumeProfile) {
+          process.stderr.write("fake-aws: sts assume-role spawned with no --profile on argv\n");
+          process.exit(254);
+          return;
+        }
+
+        if (scenario === "macct2_echo_args") {
+          // The caller's params/query belong to the OPERATION spawn and
+          // nowhere else -- leaking them onto the AssumeRole input would
+          // corrupt the STS call for every account in the batch. Checked here
+          // rather than only echoed back from phase 2, so the failure is loud.
+          const keys = Object.keys(payload).sort().join(",");
+          if (keys !== "DurationSeconds,RoleArn,RoleSessionName") {
+            process.stderr.write(`fake-aws: assume payload carried unexpected keys: ${keys}\n`);
+            process.exit(254);
+            return;
+          }
+          if (argv.includes("--query")) {
+            process.stderr.write("fake-aws: assume spawn carried the operation's --query\n");
+            process.exit(254);
+            return;
+          }
+        }
+
+        process.stdout.write(
+          `${JSON.stringify({
+            Credentials: {
+              AccessKeyId: `ASIAFAKE${account}`,
+              SecretAccessKey: `fake-secret-${account}`,
+              // The source profile rides across on the session token, which is
+              // the same channel the macct block uses for the account id, one
+              // field wider. Phase 2 is a separate process and has no other way
+              // to report which identity did the assuming.
+              SessionToken: `fake-token-${account}|${assumeProfile}`,
+              Expiration: "2099-12-31T23:59:59+00:00",
+            },
+            AssumedRoleUser: {
+              AssumedRoleId: `AROAFAKE${account}:macct2`,
+              Arn: `arn:aws:sts::${account}:assumed-role/Fake/macct2`,
+            },
+            PackedPolicySize: 6,
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+
+      const accessKeyId = process.env.AWS_ACCESS_KEY_ID ?? "";
+      const account = accessKeyId.startsWith("ASIAFAKE") ? accessKeyId.slice("ASIAFAKE".length) : "unknown";
+      const sessionToken = process.env.AWS_SESSION_TOKEN ?? "";
+      const sourceProfile = sessionToken.split("|")[1] ?? "";
+      // Cross-check, not a tautology: `account` comes out of the ACCESS KEY and
+      // the prefix out of the SESSION TOKEN, so this goes false the moment a
+      // subprocess is handed a mismatched pair from two different accounts.
+      const sessionTokenMatches = sessionToken.startsWith(`fake-token-${account}|`);
+
+      if (scenario === "macct2_expired_after_assume") {
+        // The post-assume auth failure: credentials really were minted, the
+        // operation really ran on them, and AWS rejected them anyway -- an
+        // hour-long session expiring mid-batch, an SCP revoking it, clock skew.
+        //
+        // The mirror image of macct_leaky_stderr, which is worded so
+        // classifyAuthError does NOT recognize it. Here the ExpiredToken
+        // wrapper is deliberate: it classifies as expired_creds (pinned in
+        // errors.test.ts), which is what routes the handler through
+        // rewriteCredentialError -- the only place this tool hand-copies raw
+        // CLI stderr into a string it returns. The dump rides along so the
+        // scrub on that arm has something real to remove.
+        const dump = `AWS_ACCESS_KEY_ID=${accessKeyId} AWS_SECRET_ACCESS_KEY=${process.env.AWS_SECRET_ACCESS_KEY} AWS_SESSION_TOKEN=${sessionToken}`;
+        process.stderr.write(`debug dump ${dump}\n`);
+        process.stderr.write(
+          "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired\n",
+        );
+        process.exit(254);
+        return;
+      }
+
+      if (scenario === "macct2_env_probe") {
+        process.stdout.write(
+          `${JSON.stringify({
+            Account: account,
+            // The four aliases credentialEnv deletes. `in` rather than a
+            // truthiness test: an inherited-but-empty value is still a key
+            // botocore's environment provider would find and act on.
+            SawSecurityToken: "AWS_SECURITY_TOKEN" in process.env,
+            SawCredExpiration: "AWS_CREDENTIAL_EXPIRATION" in process.env,
+            SawProfile: "AWS_PROFILE" in process.env,
+            SawDefaultProfile: "AWS_DEFAULT_PROFILE" in process.env,
+            SessionTokenMatches: sessionTokenMatches,
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+
+      if (scenario === "macct2_source_profile") {
+        process.stdout.write(
+          `${JSON.stringify({
+            Account: account,
+            // Which identity phase 1's sts:AssumeRole actually ran as. The
+            // OPERATION spawn carries no profile at all -- that half is the
+            // macct block's SawProfileFlag.
+            SourceProfile: sourceProfile,
+            SessionTokenMatches: sessionTokenMatches,
+          })}\n`,
+        );
+        process.exit(0);
+        return;
+      }
+
+      // macct2_echo_args: report the operation flags back, so the test can see
+      // the caller's own arguments survived the fan-out to this spawn.
+      const outputIdx = argv.indexOf("--output");
+      const queryIdx = argv.indexOf("--query");
+      const paramsIdx = argv.indexOf("--cli-input-json");
+      process.stdout.write(
+        `${JSON.stringify({
+          Account: account,
+          SawOutput: outputIdx >= 0 ? (argv[outputIdx + 1] ?? null) : null,
+          SawQuery: queryIdx >= 0 ? (argv[queryIdx + 1] ?? null) : null,
+          SawParams: paramsIdx >= 0 ? (JSON.parse(argv[paramsIdx + 1]) as unknown) : null,
+          SessionTokenMatches: sessionTokenMatches,
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     case "obs2_mr_big_payload": {
       // Drives aws_multi_region's AGGREGATE byte cap (5 MB across the batch)
       // through the real handler. Region-branching like mr_partial_failure:
