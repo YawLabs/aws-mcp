@@ -15,6 +15,7 @@ import {
   MAX_MAX_EVENTS,
   MAX_QUERY_LIMIT,
   MAX_QUERY_LOG_GROUPS,
+  MAX_QUERY_RANGE_MS,
   MAX_SINCE_MS,
   parseLogsJsonOutput,
   pollQueryUntilTerminal,
@@ -610,6 +611,46 @@ describe("flattenQueryRows", () => {
     assert.deepEqual(flattenQueryRows(null), { rows: [], fields: [] });
     assert.deepEqual(flattenQueryRows("nope"), { rows: [], fields: [] });
   });
+
+  it("drops a non-array ROW entirely rather than emitting an empty object", () => {
+    // The consequential one of the malformed shapes: rowCount feeds the
+    // `truncated` comparison, so a discarded row silently shrinking the count
+    // is indistinguishable from "the query matched fewer records" -- and an
+    // empty object in its place would be a row the caller cannot read.
+    const { rows, fields } = flattenQueryRows([
+      [{ field: "@m", value: "a" }],
+      "not-a-row",
+      null,
+      [{ field: "@m", value: "b" }],
+    ]);
+    assert.equal(rows.length, 2);
+    assert.deepEqual(fields, ["@m"]);
+  });
+
+  it("collapses a field repeated within one row to the LAST value, with one fields entry", () => {
+    // Documented in the function's own doc comment ("Two pairs with the same
+    // field name in one row collapse to the last"), and nothing held the code
+    // to it. The single fields entry is the other half: `seen` must dedupe.
+    const { rows, fields } = flattenQueryRows([
+      [
+        { field: "@m", value: "first" },
+        { field: "@m", value: "second" },
+      ],
+    ]);
+    assert.equal(rows[0]["@m"], "second");
+    assert.deepEqual(fields, ["@m"], "one entry, not two");
+  });
+
+  it("skips every unusable pair shape, including an EMPTY-STRING field name", () => {
+    // The empty-string `field` is the branch worth having here; the non-string
+    // half of the same condition is already pinned above.
+    const { rows, fields } = flattenQueryRows([[null, "pair", 7, { field: "", value: "x" }, { field: "@ok", value: "y" }]]);
+    // Rows are Object.create(null), so deepStrictEqual against an object
+    // literal fails on the prototype check -- assert through Object.keys, the
+    // way the __proto__ case above does.
+    assert.deepEqual(Object.keys(rows[0]), ["@ok"]);
+    assert.deepEqual(fields, ["@ok"]);
+  });
 });
 
 describe("pollQueryUntilTerminal", () => {
@@ -772,5 +813,184 @@ describe("pollQueryUntilTerminal", () => {
     );
     assert.equal(r.reason, "terminal");
     assert.equal(r.attempts, 1);
+  });
+
+  it("clamps the inter-poll sleep to the REMAINING budget, never the raw interval", async () => {
+    // The budget test above looks like it covers this but does not: its `now`
+    // accumulator is never compared against anything (its closing assertion is
+    // vacuous) and the loop reads real Date.now(). The only other test that
+    // inspects sleep durations uses maxWaitMs 60000 against pollIntervalMs
+    // 1234, where the clamp never binds. This is a single-threaded stdio
+    // server, so a 30s sleep past a sub-second budget blocks every other tool
+    // call for the overshoot.
+    const { call } = scriptedCaller(["Running"]);
+    const slept: number[] = [];
+    const r = await pollQueryUntilTerminal(
+      { queryId: "q-clamp", pollIntervalMs: 30_000, maxWaitMs: 200 },
+      call,
+      async (ms: number) => {
+        slept.push(ms);
+        // Sleep for REAL so the wall clock advances into the budget (the loop
+        // has no injectable clock), but cap what is actually waited: a
+        // regressed clamp would otherwise hang this test for the full 30s
+        // instead of failing on the recorded value.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5)));
+      },
+    );
+    assert.equal(r.reason, "budget");
+    assert.ok(slept.length > 0, "the loop must have slept at least once for this to assert anything");
+    // Deliberately NOT a fixed slept.length or an exact value -- with no
+    // injectable clock the iteration count is wall-clock dependent. The
+    // ceiling is the invariant.
+    for (const ms of slept) {
+      assert.ok(ms <= 200, `slept ${ms}ms against a 200ms budget`);
+    }
+  });
+
+  it("still makes exactly ONE call when the budget is already spent", async () => {
+    // The one-shot guarantee: the budget check is skipped while attempts === 0,
+    // so a caller always gets a result. Not reachable through the schema (the
+    // maxWaitMs floor is 1000), so this is a unit-level invariant of the
+    // exported function -- and it is what the `attempts > 0` guard is for.
+    const { call, calls } = scriptedCaller(["Running"]);
+    const slept: number[] = [];
+    const r = await pollQueryUntilTerminal(
+      { queryId: "q-zero-budget", pollIntervalMs: 30_000, maxWaitMs: 0 },
+      call,
+      async (ms: number) => {
+        slept.push(ms);
+      },
+    );
+    assert.equal(r.reason, "budget");
+    assert.equal(r.attempts, 1);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(slept, [], "waitMs <= 0 skips the sleep entirely");
+  });
+
+  it("returns call_failed with the kind, the suggestion, and the STDOUT fallback on empty stderr", async () => {
+    // scriptedCaller always succeeds, so this return has only ever run through
+    // one integration scenario -- whose stderr is non-empty and whose kind is
+    // auth-class. `rawBody: result.rawStderr || result.rawStdout` is a `||` on
+    // purpose: rawStderr is "" (not nullish) on a nonzero exit with empty
+    // stderr, and `??` would hand back that "" so the handler's `underlying`
+    // would silently fall back to the summary and lose the only raw diagnostic
+    // a poll failure has.
+    const reported: number[] = [];
+    const failing = async () => ({
+      ok: false as const,
+      kind: "nonzero_exit" as const,
+      error: "boom\n\nSuggestion: fix it",
+      suggestion: "fix it",
+      command: "aws logs get-query-results",
+      rawStderr: "",
+      rawStdout: "diagnostic on stdout",
+    });
+    const r = await pollQueryUntilTerminal(
+      {
+        queryId: "q-callfail",
+        pollIntervalMs: 1,
+        maxWaitMs: 60_000,
+        ctx: { reportProgress: (progress: number) => reported.push(progress) },
+      },
+      failing,
+      async () => {},
+    );
+    assert.equal(r.reason, "call_failed");
+    assert.equal(r.kind, "nonzero_exit");
+    // The suggestion carry is the v2.2.1 fix, and this return is the only place
+    // it is observable.
+    assert.equal(r.suggestion, "fix it");
+    assert.equal(r.rawBody, "diagnostic on stdout");
+    assert.equal(r.command, "aws logs get-query-results");
+    assert.equal(r.attempts, 1, "the attempt is counted before the failure returns");
+    assert.deepEqual(reported, [], "the arm returns BEFORE reportProgress");
+  });
+});
+
+describe("aws_logs_query handler — the 90-day window cap", () => {
+  it("rejects a window far past the ceiling, and classifies nothing", async () => {
+    // startTime is an unbounded free string in the schema, so this line is the
+    // only thing between a fat-fingered window and a real Insights bill --
+    // Insights charges by the uncompressed bytes SCANNED, matched or not.
+    const r = (await queryTool.handler(okQuery({ startTime: "520w" }))) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /maximum is 90/);
+    assert.equal(MAX_QUERY_RANGE_MS, 90 * 86_400_000, "error text above is anchored to MAX_QUERY_RANGE_MS");
+    // Returns before runAwsCall, so nothing classified it -- the same negative
+    // contract the aws_logs_tail no-spawn suite asserts.
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+
+  it("accepts EXACTLY the maximum window and rejects one day more (90d in, 91d out)", async () => {
+    // The cap is inclusive -- `rangeMs > MAX_QUERY_RANGE_MS` rejects -- so
+    // exactly 90 days must still run, and a `>` -> `>=` flip is invisible
+    // without this pair. startTime and endTime both resolve from the SAME
+    // `now` inside the handler, so '90d' -> 'now' is exactly 90 days with no
+    // skew between the two reads.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_complete";
+    const atMax = (await queryTool.handler(okQuery({ startTime: "90d", endTime: "now", pollIntervalMs: 500 }))) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(atMax.ok, true, `exactly 90 days must be allowed, got: ${atMax.error ?? ""}`);
+
+    const overMax = (await queryTool.handler(okQuery({ startTime: "91d", endTime: "now" }))) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(overMax.ok, false, "91 days is one day over the ceiling");
+    assert.match(overMax.error ?? "", /requested window is 91 days/);
+    assert.match(overMax.error ?? "", /maximum is 90/);
+  });
+});
+
+describe("aws_logs_query handler — input validation (no spawn)", () => {
+  it("rejects a flag-like logGroupNames entry and classifies nothing", async () => {
+    const r = (await queryTool.handler(okQuery({ logGroupNames: ["/aws/lambda/ok", "--force"] }))) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid logGroupName/);
+    // An ABSENT errorKind means "unclassified" -- never a manufactured value.
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+
+  it("rejects a bare-number startTime -- '5' is not '5m'", async () => {
+    // Date reads "5" as a date, not a duration, so a dropped unit would
+    // silently become a 25-year window with nothing rejecting it locally.
+    const r = (await queryTool.handler(okQuery({ startTime: "5" }))) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startTime/);
+  });
+
+  it("rejects an offset-less ISO date-time as endTime", async () => {
+    // Reached only because startTime defaults to '1h' and passes first.
+    const r = (await queryTool.handler(okQuery({ endTime: "2026-05-16T10:00:00" }))) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid endTime/);
+  });
+
+  it("rejects an endTime at or before startTime", async () => {
+    // A separate literal from the identical rejection in metrics.ts, and only
+    // the metrics copy was tested.
+    const r = (await queryTool.handler(okQuery({ startTime: "now", endTime: "1h" }))) as {
+      ok: boolean;
+      error?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /must be after startTime/);
   });
 });
