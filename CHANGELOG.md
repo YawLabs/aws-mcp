@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.2.2] — 2026-09-09
 
 ### Added
 - **`aws_lambda_invoke` reports progress.** v2.1.0 gave `aws_resource_*`, `aws_multi_region` and `aws_assume_role` progress notifications on the stated reasoning that "a stdio server that says nothing for minutes is indistinguishable from one that has hung". The tool that can legitimately run LONGEST shipped in v2.2.0 without inheriting it: its own description tells callers to raise `timeoutMs` because a Lambda may run up to 15 minutes, and it then sat silent for all of them. It now emits a single starting notification naming the function, the qualifier when one is given, and the effective timeout -- one line, no `total` and no manufactured intermediate steps, since a single indivisible invoke has no honest denominator. Same shape as `aws_assume_role`.
