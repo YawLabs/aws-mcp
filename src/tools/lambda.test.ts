@@ -17,7 +17,7 @@
 
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,24 @@ type InvokeResult = { ok: boolean; data?: InvokeData; error?: string; errorKind?
 
 let counter = 0;
 
+describe("aws_lambda_invoke — declared annotations", () => {
+  it("declares a destructive, non-idempotent, open-world tool", () => {
+    // This tool executes SOMEBODY ELSE'S CODE, and destructiveHint is the field
+    // an MCP client's auto-approve policy reads to decide whether to run it
+    // without asking. The source carries a 15-line comment ending "and it must
+    // stay that way"; this is what actually holds it there. deepEqual on the
+    // WHOLE object rather than four separate asserts, so an added-and-wrong
+    // sixth field fails too.
+    assert.deepEqual(tool.annotations, {
+      title: "Invoke a Lambda function",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+  });
+});
+
 describe("aws_lambda_invoke — input validation (no subprocess)", () => {
   // These reject before any spawn, so they need no fake wiring at all. That is
   // itself part of the contract: a bad functionName must never reach argv.
@@ -87,6 +105,19 @@ describe("aws_lambda_invoke — input validation (no subprocess)", () => {
     const r = (await tool.handler({ functionName: "fn", qualifier: "-x" })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid qualifier/);
+  });
+
+  it("rejects an empty or over-long qualifier", async () => {
+    // Both are reachable from a plain MCP client: the schema is
+    // z.string().optional() with no .min(1)/.max(128), so this handler-level
+    // guard is the only thing standing between a caller and an argv entry that
+    // is either empty or 129+ chars.
+    for (const qualifier of ["", "a".repeat(129)]) {
+      const r = (await tool.handler({ functionName: "fn", qualifier })) as InvokeResult;
+      assert.equal(r.ok, false, `accepted a ${qualifier.length}-char qualifier`);
+      assert.match(r.error ?? "", /must be 1-128 characters/);
+      assert.equal(r.errorKind, undefined);
+    }
   });
 
   it("rejects a non-RequestResponse invocationType with a message naming the scope decision", async () => {
@@ -192,6 +223,51 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
     assert.equal(typeof r.data?.payload, "string");
     assert.equal((r.data?.payload as string).length, 256 * 1024);
   });
+
+  it("clips an oversized MULTI-BYTE response by byte, not by character", async () => {
+    // The cap is a CONTEXT budget, so it has to be enforced in bytes. On the
+    // all-ASCII body above a byte cut and a character cut are indistinguishable
+    // -- this body is 100k three-byte characters, where they differ by ~3x.
+    //
+    // A "cleanup" to raw.toString("utf8").slice(0, MAX) would cut by UTF-16
+    // unit and let ~300 KB through, blowing the budget the cap exists to
+    // enforce while still reporting payloadTruncated: true.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lam2_invoke_multibyte_large_response";
+    const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.payloadTruncated, true);
+    assert.equal(typeof r.data?.payload, "string");
+    const payload = r.data?.payload as string;
+
+    // The two numbers together are the proof. Bytes: at most the cap plus the
+    // 2 extra bytes a single U+FFFD costs over the one dangling byte it
+    // replaces -- the documented tail a byte cut leaves on a split sequence.
+    assert.ok(
+      Buffer.byteLength(payload, "utf8") <= 256 * 1024 + 2,
+      `byte length ${Buffer.byteLength(payload, "utf8")} exceeds the 256 KB cap (+U+FFFD tail)`,
+    );
+    // Characters: roughly a third of the cap, because each one cost 3 bytes. A
+    // character cut would have kept every one of the body's 100011 chars.
+    assert.ok(
+      payload.length < 90_000,
+      `payload is ${payload.length} chars -- looks cut by character, not by byte`,
+    );
+    // ...and it really was clipped, not just short.
+    assert.ok(payload.length > 80_000, `payload is only ${payload.length} chars`);
+  });
+
+  it("accepts a qualifier and functionName sitting exactly on their length maxima", async () => {
+    // The accepting half of the two length guards above. Without it a `>=`
+    // typo in either bound would reject a legal value and no test would notice.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_success";
+    const maxQualifier = (await tool.handler({
+      functionName: "my-fn",
+      qualifier: "a".repeat(128),
+    })) as InvokeResult;
+    assert.equal(maxQualifier.ok, true, `rejected a 128-char qualifier: ${maxQualifier.error}`);
+    const maxName = (await tool.handler({ functionName: "a".repeat(170) })) as InvokeResult;
+    assert.equal(maxName.ok, true, `rejected a 170-char functionName: ${maxName.error}`);
+  });
 });
 
 describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
@@ -215,7 +291,13 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     _resetSession();
   });
 
-  function readEcho(): { argv: string[]; payloadFile: string | null } {
+  function readEcho(): {
+    argv: string[];
+    payloadFile: string | null;
+    dirMode: number | null;
+    outfileMode: number | null;
+    payloadFileMode: number | null;
+  } {
     return JSON.parse(readFileSync(argvOut, "utf8"));
   }
 
@@ -263,6 +345,43 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     // rather than `{}`, which is a different event.
     assert.equal(argv.includes("--payload"), false);
     assert.equal(payloadFile, null);
+  });
+
+  it("omits --qualifier entirely when no qualifier was given", async () => {
+    await tool.handler({ functionName: "my-fn" });
+    const { argv } = readEcho();
+    // Pushing the flag unconditionally would send the literal string
+    // "undefined", which Lambda resolves as an ALIAS NAME -- so the call either
+    // fails confusingly or, if such an alias exists, runs a DIFFERENT VERSION
+    // of the function than the caller asked for. Same negative assertion
+    // --payload already carries above.
+    assert.equal(argv.includes("--qualifier"), false);
+  });
+
+  it("mints the scratch dir 0700 and both temp files 0600 (skipped on Windows)", async () => {
+    // Observed from INSIDE the fake, because the handler's finally block
+    // removes the whole directory before it returns -- there is no moment in
+    // which the parent could stat these. The dir's 0700 is the load-bearing
+    // bit; the two 0600s are the defense-in-depth layer under it that keeps
+    // the files private if the directory mode ever regresses.
+    //
+    // Both files can carry customer data: the outfile holds the Lambda RESPONSE
+    // BODY and the payload file holds the inbound EVENT. Dropping the 0o600
+    // argument, or relaxing "wx" to "w" (which looks like a harmless
+    // simplification, since the file is new either way), lands the response at
+    // umask-default 0644 -- world-readable on any shared host or CI runner for
+    // the life of the invocation.
+    if (platform() === "win32") return;
+    const r = (await tool.handler({ functionName: "my-fn", payload: { k: 1 } })) as InvokeResult;
+    assert.equal(r.ok, true);
+    const { dirMode, outfileMode, payloadFileMode } = readEcho();
+    assert.equal(dirMode, 0o700, `expected dir 0700, got ${dirMode?.toString(8)}`);
+    assert.equal(outfileMode, 0o600, `expected outfile 0600, got ${outfileMode?.toString(8)}`);
+    assert.equal(
+      payloadFileMode,
+      0o600,
+      `expected payload file 0600, got ${payloadFileMode?.toString(8)}`,
+    );
   });
 
   it("keeps the payload out of the command string returned to the model", async () => {
@@ -329,6 +448,79 @@ describe("aws_lambda_invoke — temp files are cleaned up on every path", () => 
     const r = (await tool.handler({ functionName: "my-fn", payload: { k: 1 } })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "spawn_failure");
+    assert.deepEqual(lambdaTmpDirs(), before);
+  });
+
+  it("leaves nothing behind when runAwsCall rejects BEFORE any spawn", async () => {
+    // Structurally distinct from the four paths above, which all involve a
+    // spawn attempt. Here the scratch dir and BOTH temp files (the payload
+    // argument is what forces the second one) already exist when runAwsCall
+    // rejects the argv-unsafe value and returns without spawning anything --
+    // so a cleanup that ever moved out of the finally and into the post-spawn
+    // code would leak a directory per call while all four tests above still
+    // passed.
+    //
+    // Reachable without malformed tool input, too: profile and region are
+    // resolved from session state and the AWS_PROFILE / AWS_REGION env vars, so
+    // a malformed operator shell sends every invoke down this branch.
+    for (const [override, pattern] of [
+      [{ region: "--evil" }, /Invalid region/],
+      [{ profile: "--evil" }, /Invalid profile name/],
+    ] as const) {
+      const before = lambdaTmpDirs();
+      const r = (await tool.handler({
+        functionName: "my-fn",
+        payload: { k: 1 },
+        ...override,
+      })) as InvokeResult;
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "bad_input");
+      assert.equal(r.data, undefined);
+      assert.match(r.error ?? "", pattern);
+      assert.deepEqual(lambdaTmpDirs(), before);
+    }
+  });
+});
+
+describe("aws_lambda_invoke — concurrent invokes stay isolated", () => {
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "lam2_invoke_echo_payload";
+    _resetSession();
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  });
+
+  it("gives each in-flight call its OWN response body, and neither cleanup takes the other's dir", async () => {
+    // The MCP SDK dispatches tool calls concurrently -- index.ts awaits the
+    // handler with no serialization -- so two in-flight invokes are ordinary,
+    // not a corner case. mkdtempSync is atomic and today's code is correct;
+    // this is what holds it there. A refactor to a fixed
+    // `tmpdir()/aws-mcp-lambda/response.json`, or to the `Date.now()`-suffixed
+    // name the source comment explicitly warns against, would make caller A
+    // read caller B's response body -- customer data crossing between two
+    // unrelated invocations, silently, with ok:true on both.
+    const before = lambdaTmpDirs();
+    const [a, b] = (await Promise.all([
+      tool.handler({ functionName: "fn-a", payload: { id: "A" } }),
+      tool.handler({ functionName: "fn-b", payload: { id: "B" } }),
+    ])) as [InvokeResult, InvokeResult];
+
+    assert.equal(a.ok, true, `call A failed: ${a.error}`);
+    assert.equal(b.ok, true, `call B failed: ${b.error}`);
+    // The fake echoes the fileb:// payload it was handed straight into its own
+    // outfile, so each result's payload is a fingerprint of which scratch dir
+    // the handler read back.
+    assert.deepEqual(a.data?.payload, { id: "A" });
+    assert.deepEqual(b.data?.payload, { id: "B" });
+    // Both cleanups ran and neither removed the other's directory -- a shared
+    // path would show up here as a leftover or as an rmSync that lost a race.
     assert.deepEqual(lambdaTmpDirs(), before);
   });
 });

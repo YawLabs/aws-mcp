@@ -1688,19 +1688,50 @@ async function main(): Promise<void> {
       // payload actually round-tripped through the temp file instead of only
       // asserting that a --payload flag was present. Modeled on
       // metrics_echo_argv.
+      //
+      // It also stats the three paths the handler minted -- the scratch DIR,
+      // the pre-created response outfile, and the fileb:// payload file -- and
+      // reports `mode & 0o777` for each. That observation CANNOT happen in the
+      // parent: the handler's finally block rmSync's the whole directory before
+      // it returns, so this subprocess is the only window in which those files
+      // exist. The modes are meaningless on Windows (statSync reports the
+      // FAT-style 0666/0444 approximation there), so the test that reads them
+      // is POSIX-gated; they are emitted unconditionally to keep this branch
+      // free of platform forks.
       const fs = await import("node:fs");
+      const { dirname } = await import("node:path");
       const argv = process.argv.slice(2);
       const payloadIdx = argv.indexOf("--payload");
       let payloadFile: string | null = null;
+      let payloadPath: string | null = null;
       if (payloadIdx >= 0) {
         const ref = argv[payloadIdx + 1] ?? "";
         if (ref.startsWith("fileb://")) {
-          payloadFile = fs.readFileSync(ref.slice("fileb://".length), "utf8");
+          payloadPath = ref.slice("fileb://".length);
+          payloadFile = fs.readFileSync(payloadPath, "utf8");
         }
       }
-      const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
-      if (outPath) fs.writeFileSync(outPath, JSON.stringify({ argv, payloadFile }));
       const outFile = lambdaOutfileFromArgv();
+      const modeOf = (p: string | null | undefined): number | null =>
+        p === null || p === undefined ? null : fs.statSync(p).mode & 0o777;
+      const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
+      if (outPath) {
+        fs.writeFileSync(
+          outPath,
+          JSON.stringify({
+            argv,
+            payloadFile,
+            // dirname of the outfile IS the mkdtempSync scratch dir: the
+            // handler joins both temp files onto it.
+            dirMode: outFile === undefined ? null : modeOf(dirname(outFile)),
+            // Read BEFORE the outfile write below, so what is reported is the
+            // mode the handler pre-created it with rather than anything this
+            // fake may have done to it.
+            outfileMode: modeOf(outFile),
+            payloadFileMode: modeOf(payloadPath),
+          }),
+        );
+      }
       if (outFile) fs.writeFileSync(outFile, JSON.stringify({ ok: true }));
       process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
       process.exit(0);
@@ -1746,6 +1777,49 @@ async function main(): Promise<void> {
       // never actually elapses -- same "stay alive until reaped" floor as
       // happy_hold.
       await sleep(10 * 60_000);
+      process.exit(0);
+      return;
+    }
+
+    case "lam2_invoke_echo_payload": {
+      // Echoes the REQUEST back as the response: reads the fileb:// payload
+      // file this child was handed and writes those exact bytes into its own
+      // outfile. That makes every response caller-specific, which is what lets
+      // a concurrency test tell "each invoke read back its OWN outfile" apart
+      // from "both read the same one" -- with a fixed response body the two
+      // results are identical either way and the test proves nothing.
+      //
+      // lambda_invoke_echo_argv cannot serve that test: two concurrent children
+      // would both write the single AWS_MCP_FAKE_ARGV_OUT path and the loser's
+      // capture would be lost.
+      const fs = await import("node:fs");
+      const argv = process.argv.slice(2);
+      const payloadIdx = argv.indexOf("--payload");
+      let body = "null";
+      if (payloadIdx >= 0) {
+        const ref = argv[payloadIdx + 1] ?? "";
+        if (ref.startsWith("fileb://")) {
+          body = fs.readFileSync(ref.slice("fileb://".length), "utf8");
+        }
+      }
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, body);
+      process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
+      process.exit(0);
+      return;
+    }
+
+    case "lam2_invoke_multibyte_large_response": {
+      // Same over-cap shape as lambda_invoke_large_response, but the body is
+      // 3-byte UTF-8 characters (U+5B57) instead of ASCII. On an all-ASCII body
+      // a cut by BYTE and a cut by CHARACTER are indistinguishable; here they
+      // differ by ~3x, which is what pins MAX_RESPONSE_PAYLOAD_BYTES as the
+      // byte budget it is documented to be. 100k characters -> 300011 bytes on
+      // the wire, comfortably past the 256 KB cap.
+      const fs = await import("node:fs");
+      const outFile = lambdaOutfileFromArgv();
+      if (outFile) fs.writeFileSync(outFile, JSON.stringify({ blob: "字".repeat(100_000) }));
+      process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
       process.exit(0);
       return;
     }
