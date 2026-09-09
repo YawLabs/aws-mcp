@@ -50,7 +50,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-import type { Tool, ToolResult } from "./tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
  * Cap on the response payload we read back out of the outfile.
@@ -185,7 +185,7 @@ export const lambdaTools: readonly Tool[] = [
           "Timeout in milliseconds. Default 60000 (60s). Raise it for a function whose own timeout is longer — a Lambda may run up to 15 minutes.",
         ),
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         functionName: string;
         payload?: unknown;
@@ -294,6 +294,26 @@ export const lambdaTools: readonly Tool[] = [
         // `--output/--profile/--region` after them, and `aws lambda invoke`
         // accepts the positional before those flags.
         extraFlags.push(outPath);
+
+        // One notification before the call, not a stream during it. This tool's
+        // own description tells callers to raise `timeoutMs` for a function whose
+        // own timeout is longer -- a Lambda may run up to 15 minutes -- and a
+        // stdio server that says nothing for that long is indistinguishable from
+        // one that has hung. That is the exact reasoning v2.1.0 used when it gave
+        // aws_resource_*, aws_multi_region and aws_assume_role progress; this tool
+        // shipped in v2.2.0 without inheriting it.
+        //
+        // No `total`, and no intermediate steps: a single indivisible invoke has
+        // no honest denominator, and manufacturing fake phases would be worse
+        // than one line that says what is being waited on. Same shape as
+        // aws_assume_role's single starting notification.
+        ctx?.reportProgress(
+          0,
+          undefined,
+          // i.timeoutMs may be absent; name the effective bound rather than
+          // "undefined", so the line is useful on the default path too.
+          `Invoking ${i.functionName}${i.qualifier ? `:${i.qualifier}` : ""} (timeout ${Math.round((i.timeoutMs ?? 60_000) / 1000)}s)`,
+        );
 
         const result = await runAwsCall({
           service: "lambda",

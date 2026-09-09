@@ -69,6 +69,57 @@ describe("aws_multi_region schema", () => {
   });
 });
 
+describe("runWithConcurrency — cancellation", () => {
+  it("stops claiming new inputs once the signal aborts, and fills the rest via onCancelled", async () => {
+    // The contract in two halves: work already claimed still finishes (those
+    // calls are spent against AWS and their answers are worth keeping), and
+    // nothing unclaimed is silently dropped.
+    const controller = new AbortController();
+    const started: number[] = [];
+    const results = await runWithConcurrency(
+      [0, 1, 2, 3, 4, 5, 6, 7],
+      1,
+      async (n) => {
+        started.push(n);
+        if (n === 1) controller.abort();
+        return `ran:${n}`;
+      },
+      { signal: controller.signal, onCancelled: (n) => `skipped:${n}` },
+    );
+    assert.equal(results.length, 8, "every slot is occupied -- a short array would under-report the batch");
+    assert.equal(results[0], "ran:0");
+    assert.equal(results[1], "ran:1", "work already claimed when the abort landed still completes");
+    for (let i = 2; i < 8; i++) assert.equal(results[i], `skipped:${i}`);
+    assert.deepEqual(started, [0, 1], "no input is claimed after the abort");
+  });
+
+  it("is a no-op when the signal never aborts", async () => {
+    const controller = new AbortController();
+    const results = await runWithConcurrency([1, 2, 3], 2, async (n) => n * 10, {
+      signal: controller.signal,
+      onCancelled: () => -1,
+    });
+    assert.deepEqual(results, [10, 20, 30]);
+  });
+
+  it("an already-aborted signal runs nothing at all", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let calls = 0;
+    const results = await runWithConcurrency(
+      [1, 2, 3],
+      2,
+      async (n) => {
+        calls++;
+        return n;
+      },
+      { signal: controller.signal, onCancelled: () => -1 },
+    );
+    assert.equal(calls, 0, "the check is before claiming, so a pre-aborted run spends nothing");
+    assert.deepEqual(results, [-1, -1, -1]);
+  });
+});
+
 describe("runWithConcurrency", () => {
   it("preserves input order in results", async () => {
     const inputs = [1, 2, 3, 4, 5];

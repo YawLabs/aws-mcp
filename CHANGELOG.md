@@ -9,6 +9,13 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
+## [Unreleased]
+
+### Added
+- **`aws_lambda_invoke` reports progress.** v2.1.0 gave `aws_resource_*`, `aws_multi_region` and `aws_assume_role` progress notifications on the stated reasoning that "a stdio server that says nothing for minutes is indistinguishable from one that has hung". The tool that can legitimately run LONGEST shipped in v2.2.0 without inheriting it: its own description tells callers to raise `timeoutMs` because a Lambda may run up to 15 minutes, and it then sat silent for all of them. It now emits a single starting notification naming the function, the qualifier when one is given, and the effective timeout -- one line, no `total` and no manufactured intermediate steps, since a single indivisible invoke has no honest denominator. Same shape as `aws_assume_role`.
+- **`aws_multi_region` and `aws_multi_account` honor client cancellation.** Both accepted a `ToolContext` and reported progress but never read `ctx.signal`, so a client that cancelled a 32-region or 32-account sweep left every remaining item running. The shared concurrency runner now checks the signal before CLAIMING each input -- work already in flight is allowed to finish rather than abandoned, because those calls are already spent against AWS and discarding their answers would throw away results the caller has effectively paid for.
+- **New `cancelled` errorKind, fan-out entries only.** An unattempted item is represented rather than dropped: a silently shorter `results` array reads as "these are all the regions", which would quietly under-report a fleet-wide check. Every slot stays occupied, so `okCount`/`errorCount` still describe the full requested set. The entry says plainly that nothing was sent to AWS for it -- and for `aws_multi_account`, that no role was assumed, so there is no credential to redact.
+
 ## [2.2.1] — 2026-09-08
 
 ### Fixed

@@ -472,23 +472,45 @@ export const multiAccountTools: readonly Tool[] = [
         }
       };
 
-      const results = await runWithConcurrency(accounts, concurrency, async (accountId): Promise<AccountResult> => {
-        const result = await runAccount(accountId);
-        // On COMPLETION, never on dispatch -- the limiter keeps only
-        // `concurrency` accounts in flight, so counting at dispatch would race
-        // ahead of what has settled and reach `total` with a window still
-        // running. `completed++` needs no lock: the workers interleave at await
-        // boundaries on one thread.
-        completed++;
-        try {
-          ctx?.reportProgress(completed, total, `${accountId}: ${result.ok ? "ok" : "failed"} (${completed}/${total})`);
-        } catch {
-          // Progress is advisory, and runWithConcurrency's contract is that
-          // `fn` MUST resolve -- a throw here would abandon every other
-          // in-flight account over a notification.
-        }
-        return result;
-      });
+      const results = await runWithConcurrency(
+        accounts,
+        concurrency,
+        async (accountId): Promise<AccountResult> => {
+          const result = await runAccount(accountId);
+          // On COMPLETION, never on dispatch -- the limiter keeps only
+          // `concurrency` accounts in flight, so counting at dispatch would race
+          // ahead of what has settled and reach `total` with a window still
+          // running. `completed++` needs no lock: the workers interleave at await
+          // boundaries on one thread.
+          completed++;
+          try {
+            ctx?.reportProgress(
+              completed,
+              total,
+              `${accountId}: ${result.ok ? "ok" : "failed"} (${completed}/${total})`,
+            );
+          } catch {
+            // Progress is advisory, and runWithConcurrency's contract is that
+            // `fn` MUST resolve -- a throw here would abandon every other
+            // in-flight account over a notification.
+          }
+          return result;
+        },
+        {
+          signal: ctx?.signal,
+          // Same contract as aws_multi_region: accounts already swept keep their
+          // results, accounts never claimed are represented rather than dropped.
+          // It matters more here -- these entries never reached sts:AssumeRole, so
+          // no credential was minted for them and there is nothing to redact.
+          onCancelled: (accountId: string): AccountResult => ({
+            accountId,
+            ok: false,
+            error:
+              "Not attempted: the client cancelled the request before this account was started. No role was assumed and nothing was sent to AWS for it -- re-run to include it.",
+            errorKind: "cancelled",
+          }),
+        },
+      );
 
       // Counted BEFORE the aggregate cap runs: okCount/errorCount describe what
       // the CALLS did, which is unchanged by whether a payload fit the budget.

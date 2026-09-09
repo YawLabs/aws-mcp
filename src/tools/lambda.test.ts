@@ -58,6 +58,60 @@ type InvokeResult = { ok: boolean; data?: InvokeData; error?: string; errorKind?
 
 let counter = 0;
 
+describe("aws_lambda_invoke — progress reporting", () => {
+  // Same fake wiring the result-shaping suite uses; without it the handler
+  // spawns the REAL aws CLI and the assertions fail on a genuine invoke error.
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  });
+
+  it("emits one starting notification naming the function and the effective timeout", async () => {
+    // A Lambda may run up to 15 minutes and this tool's description tells
+    // callers to raise timeoutMs to match, so silence for that long is
+    // indistinguishable from a hang. One line, no fake intermediate steps.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_success";
+    const seen: Array<{ progress: number; total?: number; message?: string }> = [];
+    const r = await tool.handler(
+      { functionName: "my-fn" },
+      {
+        reportProgress: (progress: number, total?: number, message?: string) => seen.push({ progress, total, message }),
+      },
+    );
+    assert.equal(r.ok, true);
+    assert.equal(seen.length, 1, "exactly one notification -- a single invoke has no honest intermediate steps");
+    assert.equal(seen[0].total, undefined, "no denominator is manufactured for an indivisible call");
+    assert.match(seen[0].message ?? "", /Invoking my-fn/);
+    assert.match(seen[0].message ?? "", /timeout 60s/, "names the DEFAULT bound, not 'undefined'");
+  });
+
+  it("names the qualifier and a raised timeout when they are supplied", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_success";
+    const seen: string[] = [];
+    await tool.handler(
+      { functionName: "my-fn", qualifier: "PROD", timeoutMs: 900_000 },
+      { reportProgress: (_p: number, _t?: number, message?: string) => seen.push(message ?? "") },
+    );
+    assert.match(seen[0] ?? "", /Invoking my-fn:PROD \(timeout 900s\)/);
+  });
+
+  it("works with no ctx at all, and with a throwing reportProgress", async () => {
+    // Progress is advisory: a host that sends no progressToken, or one whose
+    // transport hiccups, must not fail an invoke that otherwise succeeded.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_success";
+    const bare = await tool.handler({ functionName: "my-fn" });
+    assert.equal(bare.ok, true);
+  });
+});
+
 describe("aws_lambda_invoke — declared annotations", () => {
   it("declares a destructive, non-idempotent, open-world tool", () => {
     // This tool executes SOMEBODY ELSE'S CODE, and destructiveHint is the field

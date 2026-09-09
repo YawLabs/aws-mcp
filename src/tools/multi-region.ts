@@ -141,11 +141,30 @@ export async function runWithConcurrency<I, R>(
   inputs: readonly I[],
   concurrency: number,
   fn: (input: I, index: number) => Promise<R>,
+  opts?: {
+    /**
+     * When this aborts, workers stop CLAIMING new inputs. Work already in
+     * flight is allowed to finish rather than being abandoned: those calls are
+     * already spent against AWS, and dropping their results would throw away
+     * answers the caller has effectively paid for.
+     */
+    signal?: AbortSignal;
+    /**
+     * Builds the result for an input that was never attempted because the
+     * signal aborted first. REQUIRED for a cancellable run: without it those
+     * slots stay holes, and a caller counting `results` would silently report a
+     * short batch as if it were the whole answer.
+     */
+    onCancelled?: (input: I, index: number) => R;
+  },
 ): Promise<R[]> {
   const results: R[] = new Array(inputs.length);
   let next = 0;
   const worker = async (): Promise<void> => {
     while (true) {
+      // Checked before CLAIMING, so an abort stops the batch growing without
+      // interrupting a call that is already outstanding.
+      if (opts?.signal?.aborted) return;
       const i = next++;
       if (i >= inputs.length) return;
       try {
@@ -161,6 +180,14 @@ export async function runWithConcurrency<I, R>(
   const safeConcurrency = Number.isFinite(concurrency) ? Math.max(1, Math.trunc(concurrency)) : 1;
   const workerCount = Math.min(safeConcurrency, inputs.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  // Fill anything the abort left unclaimed. Every slot ends up occupied, so the
+  // caller's okCount/errorCount still describe the FULL requested set and a
+  // cancelled sweep cannot be mistaken for a smaller successful one.
+  if (opts?.signal?.aborted && opts.onCancelled) {
+    for (let i = 0; i < inputs.length; i++) {
+      if (results[i] === undefined) results[i] = opts.onCancelled(inputs[i], i);
+    }
+  }
   return results;
 }
 
@@ -307,28 +334,48 @@ export const multiRegionTools: readonly Tool[] = [
         }
       };
 
-      const results = await runWithConcurrency(regions, concurrency, async (region): Promise<RegionResult> => {
-        const result = await runRegion(region);
-        // Report on COMPLETION, never on dispatch. The concurrency limiter
-        // keeps only `concurrency` regions in flight at a time, so counting at
-        // dispatch would race ahead of what has actually settled -- and would
-        // hit `total` while the last window was still running.
-        //
-        // `completed++` needs no lock: the workers interleave at await
-        // boundaries on one thread, so the increment is atomic with respect to
-        // them and the sequence 1..total is emitted in order, satisfying the
-        // spec's monotonicity requirement.
-        completed++;
-        try {
-          ctx?.reportProgress(completed, total, `${region}: ${result.ok ? "ok" : "failed"} (${completed}/${total})`);
-        } catch {
-          // Progress is advisory. runWithConcurrency's contract is that `fn`
-          // MUST resolve -- a throw here would abandon every other in-flight
-          // region over a notification, so swallow it and return the result we
-          // already have.
-        }
-        return result;
-      });
+      const results = await runWithConcurrency(
+        regions,
+        concurrency,
+        async (region): Promise<RegionResult> => {
+          const result = await runRegion(region);
+          // Report on COMPLETION, never on dispatch. The concurrency limiter
+          // keeps only `concurrency` regions in flight at a time, so counting at
+          // dispatch would race ahead of what has actually settled -- and would
+          // hit `total` while the last window was still running.
+          //
+          // `completed++` needs no lock: the workers interleave at await
+          // boundaries on one thread, so the increment is atomic with respect to
+          // them and the sequence 1..total is emitted in order, satisfying the
+          // spec's monotonicity requirement.
+          completed++;
+          try {
+            ctx?.reportProgress(completed, total, `${region}: ${result.ok ? "ok" : "failed"} (${completed}/${total})`);
+          } catch {
+            // Progress is advisory. runWithConcurrency's contract is that `fn`
+            // MUST resolve -- a throw here would abandon every other in-flight
+            // region over a notification, so swallow it and return the result we
+            // already have.
+          }
+          return result;
+        },
+        {
+          signal: ctx?.signal,
+          // A cancelled fan-out reports what it KNOWS, not less. The regions that
+          // already ran keep their real results; the ones never claimed say so
+          // explicitly rather than vanishing, because a silently shorter `results`
+          // array reads as "these are all the regions" and would quietly under-
+          // report a fleet-wide check. Distinct from every other errorKind here:
+          // nothing was sent to AWS for these, so there is no failure to diagnose.
+          onCancelled: (region: string): RegionResult => ({
+            region,
+            ok: false,
+            error:
+              "Not attempted: the client cancelled the request before this region was started. Nothing was sent to AWS for it -- re-run to include it.",
+            errorKind: "cancelled",
+          }),
+        },
+      );
 
       // Counted BEFORE the aggregate cap runs: okCount/errorCount describe what
       // the CALLS did, which is unchanged by whether a payload fit in the
