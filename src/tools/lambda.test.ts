@@ -221,7 +221,10 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
     // Text, not an object: a clipped JSON document cannot parse, and blaming the
     // function for our own cap would be the wrong diagnosis.
     assert.equal(typeof r.data?.payload, "string");
-    assert.equal((r.data?.payload as string).length, 256 * 1024);
+    // `?.length` rather than a bare cast: if `data` were ever absent the cast
+    // form throws a TypeError from inside the assertion, which reads as a test
+    // harness crash instead of the clean "expected 262144, got undefined".
+    assert.equal((r.data?.payload as string | undefined)?.length, 256 * 1024);
   });
 
   it("clips an oversized MULTI-BYTE response by byte, not by character", async () => {

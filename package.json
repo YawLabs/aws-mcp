@@ -43,7 +43,7 @@
     "build:binary:oam": "node scripts/build-binary-oam.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.12",
+    "@biomejs/biome": "2.5.4",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/node": "^26.0.1",
     "@types/turndown": "^5.0.6",

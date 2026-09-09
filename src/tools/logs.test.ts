@@ -602,8 +602,15 @@ describe("flattenQueryRows", () => {
     // keys automatically -- so "__proto__" is reachable input, not a hypothetical.
     const { rows } = flattenQueryRows([[{ field: "__proto__", value: "pwned" }]]);
     assert.deepEqual(Object.keys(rows[0]), ["__proto__"]);
+    // Both rules fire on the next line and they contradict each other here:
+    // useLiteralKeys wants dot notation, noProto forbids naming __proto__ at all.
+    // Naming it IS the test -- it asserts an OWN property was created rather than
+    // the prototype setter being reached -- so both are suppressed deliberately.
+    // biome-ignore lint/suspicious/noProto: naming __proto__ is the assertion itself
+    // biome-ignore lint/complexity/useLiteralKeys: bracket form is required by the line above
     assert.equal(JSON.parse(JSON.stringify(rows[0]))["__proto__"], "pwned");
     assert.equal(Object.getPrototypeOf({}), Object.prototype);
+    // biome-ignore lint/suspicious/noProto: the control proving Object.prototype was not polluted
     assert.equal(({} as Record<string, unknown>).__proto__, Object.prototype);
   });
 
