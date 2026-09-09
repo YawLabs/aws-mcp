@@ -42,6 +42,21 @@ const isWindows = process.platform === "win32";
 const exe = isWindows ? ".exe" : "";
 
 /**
+ * Every spawn below is bounded, because `npm run lint` runs UNATTENDED as
+ * release.sh step 1 -- an unbounded child there turns a WEDGED release rather
+ * than a failed one, with no output to say why. This repo already made that
+ * call once for the same caller: v1.8.2 bounded the test suite with
+ * `--test-timeout` on exactly this reasoning.
+ *
+ * Deliberately generous -- these convert an infinite hang into a reported
+ * failure, they are not performance budgets. For scale, biome checks this repo
+ * in well under a second.
+ */
+const PROBE_TIMEOUT_MS = 30_000;
+const INSTALL_TIMEOUT_MS = 5 * 60_000;
+const LINT_TIMEOUT_MS = 10 * 60_000;
+
+/**
  * The biome version to provision, read from biome.json's `$schema` URL rather
  * than hardcoded. The schema URL is what biome validates the config against, so
  * sourcing the version from it is what guarantees the emulated binary and the
@@ -112,7 +127,12 @@ function emulatedX64Binary(version) {
   // truncated .exe that would otherwise be cached forever. Confirm the binary
   // actually runs and reports the version we asked for before trusting it.
   if (existsSync(bin)) {
-    const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
+    // Bounded: a corrupt-but-executable binary, or one stalled inside the x64
+    // emulation layer, would otherwise hang every lint invocation forever. A
+    // timeout leaves `status` null, which fails the check below and routes into
+    // the discard path -- the right answer for a binary that cannot answer
+    // `--version` in 30 seconds.
+    const probe = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: PROBE_TIMEOUT_MS });
     if (probe.status === 0 && String(probe.stdout).includes(version)) return bin;
     // DISCARD the tree rather than reinstalling over it. `npm i` treats an
     // already-present package as satisfied -- even with --force -- so installing
@@ -140,11 +160,17 @@ function emulatedX64Binary(version) {
   const install = spawnSync(
     process.execPath,
     [npmCli, "i", "--no-save", "--force", "--prefix", prefix, `@biomejs/cli-win32-x64@${version}`],
-    { stdio: "inherit", shell: false },
+    { stdio: "inherit", shell: false, timeout: INSTALL_TIMEOUT_MS },
   );
   if (install.status !== 0 || !existsSync(bin)) {
+    // Distinguish the two failures: a registry stall and a genuine install
+    // error need different responses, and "npm exited null" says neither.
+    const why =
+      install.error && install.error.code === "ETIMEDOUT"
+        ? `npm did not finish within ${INSTALL_TIMEOUT_MS / 1000}s and was killed`
+        : `npm exited ${install.status}`;
     throw new Error(
-      `Failed to provision @biomejs/cli-win32-x64@${version} (npm exited ${install.status}).\n` +
+      `Failed to provision @biomejs/cli-win32-x64@${version} (${why}).\n` +
         "This repo has no CI, so there is no other lint signal. Fix the install, or set\n" +
         "AWS_MCP_BIOME_BIN=<path to a working biome> to point this script at one.",
     );
@@ -181,7 +207,17 @@ try {
 // AWS_MCP_BIOME_BIN pointing at a batch file). Everything else -- including
 // every normal .exe path -- stays shell-free so arguments are passed verbatim.
 const needsShell = /\.(cmd|bat)$/i.test(binary);
-const run = spawnSync(binary, process.argv.slice(2), { stdio: "inherit", shell: needsShell });
+const run = spawnSync(binary, process.argv.slice(2), { stdio: "inherit", shell: needsShell, timeout: LINT_TIMEOUT_MS });
+// Checked BEFORE the generic error and crash branches: a timeout kill sets
+// `signal` to SIGTERM, which the crash check below would otherwise report as
+// the known native-binary crash -- the wrong diagnosis entirely.
+if (run.error && run.error.code === "ETIMEDOUT") {
+  console.error(
+    `[lint] biome did not finish within ${LINT_TIMEOUT_MS / 60_000} minutes and was killed (${binary}). ` +
+      "That is far past a normal run, so treat it as a hung binary rather than a slow one.",
+  );
+  process.exit(1);
+}
 if (run.error) {
   console.error(`[lint] could not execute ${binary}: ${run.error.message}`);
   process.exit(1);

@@ -508,7 +508,10 @@ export async function pollQueryUntilTerminal(
         // `result.error` -- so a recognized error code's "Suggestion: ..." line,
         // which runAwsCall appends to `error` and nowhere else, would otherwise
         // be dropped from both the message and the envelope.
-        suggestion: result.suggestion,
+        //
+        // Conditional spread, matching the two consumer sites below and
+        // aws-cli.ts: omit the key rather than setting it to undefined.
+        ...(result.suggestion !== undefined ? { suggestion: result.suggestion } : {}),
         // `||`, not `??`: rawStderr is "" (not nullish) on a nonzero exit with
         // empty stderr, and `??` would return that "" instead of falling back
         // to stdout. Same fix as aws_logs_tail's failure return above.
