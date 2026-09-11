@@ -1,5 +1,7 @@
 # @yawlabs/aws-mcp
 
+[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+
 A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over hundreds of resource types, live docs lookup, server-side scripting for batched workflows.**
 
 It's an **alternative to AWS's official MCP server**, not a complement -- both call any AWS API, so running both just gives the model two redundant tools. Pick one. The honest comparison:
