@@ -91,18 +91,27 @@ assert_changelog_promoted() {
 # no-ops.
 #
 # THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
-# regressed. `npm run lint` routes through scripts/lint.mjs, which picks a
-# biome binary that works on the host -- including Windows ARM64, where the
-# native arm64 build segfaults and the wrapper provisions the x64 build to run
-# under emulation instead. Verified: `npm run lint` exits 0 on that host.
+# regressed. `npm run lint` routes through scripts/lint.mjs, whose job is
+# narrow: when the native biome binary for THIS host is unusable, provision and
+# run the x64 build OF THE SAME VERSION under emulation. Verified: `npm run
+# lint` exits 0 on Windows ARM64.
 #
 # The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper" and
 # justified skipping with "CI catches lint regressions anyway". Both were wrong.
 # `npm run` is fine on that host (a plain node script through the same wrapper
-# exits 0); the SIGSEGV comes from `@biomejs/cli-win32-arm64/biome.exe` itself,
-# reproducible by invoking that binary directly with no npm in the picture. And
-# this repo ships NO CI by design, so nothing downstream re-checks formatting --
-# skipping the lint step means the release is published unlinted, full stop.
+# exits 0); the crash comes from `@biomejs/cli-win32-arm64/biome.exe` itself,
+# reproducible by invoking that binary directly with no npm in the picture.
+#
+# But it is PER-VERSION and CHECK-shaped, not a standing arm64 defect: 2.5.4 --
+# the version this repo installs -- exits 139 / 0xC0000005 on a check run while
+# answering `--version` with exit 0, whereas 2.4.16 and 2.5.13 run correctly on
+# the same host (measured 2026-09-11). So "the binary starts" is never evidence
+# the gate works, and a future bump may need no emulation at all.
+#
+# And this repo ships NO CI by design -- there is no .github/workflows, and
+# `gh api repos/YawLabs/aws-mcp/actions/permissions --jq .enabled` returns false
+# (checked 2026-09-11) -- so nothing downstream re-checks formatting. Skipping
+# the lint step means the release is published unlinted, full stop.
 #
 # So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
 # and treat that as a bug to fix rather than a step to routinely skip.
