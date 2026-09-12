@@ -307,16 +307,21 @@ describe("parseAwsError -- standard CLI shape", () => {
     assert.match(r.suggestion ?? "", /lambda:CreateFunction/);
   });
 
-  it("falls back to a generic IAM suggestion for AccessDenied without a User: line", () => {
-    const r = parseAwsError("An error occurred (AccessDenied) when calling the SomeOp operation: nope");
-    assert.match(r.suggestion ?? "", /IAM permissions/);
-  });
+  // From here on, each test enumerates EVERY code in one branch of the code
+  // ladder, so deleting a code from its list turns a test red. The operation and
+  // message are deliberately meaningless ("SomeOp", "foo"): a fixture message
+  // like "Rate exceeded" keeps a test green even if the branch is rewritten to
+  // match on the message text and its codes are dropped.
 
-  it("suggests retry/backoff for ThrottlingException", () => {
-    const r = parseAwsError(
-      "An error occurred (ThrottlingException) when calling the ListThings operation: Rate exceeded",
-    );
-    assert.match(r.suggestion ?? "", /retry/i);
+  it("falls back to the generic IAM suggestion for every access-denied code without a User: line", () => {
+    // A "User: ... is not authorized to perform:" message is checked before the
+    // code and answers with the principal-specific suggestion, which also says
+    // "IAM permissions" -- hence "for this operation".
+    for (const code of ["AccessDenied", "AccessDeniedException", "UnauthorizedOperation"]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the SomeOp operation: foo`);
+      assert.equal(r.code, code);
+      assert.match(r.suggestion ?? "", /IAM permissions for this operation/, `expected the IAM suggestion for ${code}`);
+    }
   });
 
   it("suggests retry/backoff for every service's spelling of rate-limited", () => {
@@ -325,35 +330,76 @@ describe("parseAwsError -- standard CLI shape", () => {
     // ProvisionedThroughputExceededException. Only the ThrottlingException
     // family was recognized, so the other three got no suggestion at all --
     // the agent had no hint that BACKING OFF was the fix, which is exactly the
-    // case where an agent instead retries in a hot loop.
-    for (const code of ["TooManyRequestsException", "SlowDown", "ProvisionedThroughputExceededException"]) {
-      const r = parseAwsError(`An error occurred (${code}) when calling the PutItem operation: Rate exceeded`);
+    // case where an agent instead retries in a hot loop. So the assertion is
+    // "retry with backoff": a bare /retry/ stays green on "just retry".
+    for (const code of [
+      "ThrottlingException",
+      "Throttling",
+      "RequestLimitExceeded",
+      "TooManyRequestsException",
+      "SlowDown",
+      "ProvisionedThroughputExceededException",
+    ]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the SomeOp operation: foo`);
       assert.equal(r.code, code);
-      assert.match(r.suggestion ?? "", /retry/i, `expected a backoff suggestion for ${code}`);
+      assert.match(r.suggestion ?? "", /retry with backoff/i, `expected a backoff suggestion for ${code}`);
     }
   });
 
-  it("suggests verifying identifier/region for ResourceNotFoundException", () => {
-    const r = parseAwsError(
-      "An error occurred (ResourceNotFoundException) when calling the GetFunction operation: Function not found: my-fn",
-    );
-    assert.match(r.suggestion ?? "", /identifier/);
+  it("suggests verifying identifier/region for every not-found code", () => {
+    // The whole phrase, not /identifier/: the already-exists suggestion says
+    // "identifier" too, so the bare word stays green if a not-found code is
+    // moved into that branch.
+    for (const code of ["ResourceNotFoundException", "NoSuchBucket", "NoSuchKey", "NotFoundException"]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the SomeOp operation: foo`);
+      assert.equal(r.code, code);
+      assert.match(
+        r.suggestion ?? "",
+        /Verify the resource identifier and region/,
+        `expected the not-found suggestion for ${code}`,
+      );
+    }
   });
 
-  it("suggests aws_resource_update for ResourceAlreadyExistsException", () => {
-    const r = parseAwsError(
-      "An error occurred (AlreadyExistsException) when calling the CreateResource operation: foo",
-    );
-    assert.match(r.suggestion ?? "", /aws_resource_update/);
+  it("suggests checking the operation parameters for every validation-error code", () => {
+    // Not /API schema/: the unwrapped "Parameter validation failed" remedy
+    // (non-standard shapes, below) shares that phrase, so only this branch's
+    // own wording catches the two remedy texts being swapped.
+    for (const code of ["ValidationException", "ValidationError", "InvalidParameterValue", "InvalidParameter"]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the SomeOp operation: foo`);
+      assert.equal(r.code, code);
+      assert.match(
+        r.suggestion ?? "",
+        /Check the operation parameters/,
+        `expected the parameter suggestion for ${code}`,
+      );
+    }
+  });
+
+  it("names both credential-refresh tools for every expired-token code", () => {
+    // ExpiredToken is also pinned by the classifyAuthError agreement test near
+    // the top of this file; it is listed here too so the loop matches the branch.
+    for (const code of ["ExpiredToken", "ExpiredTokenException"]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the SomeOp operation: foo`);
+      assert.equal(r.code, code);
+      assert.match(r.suggestion ?? "", /aws_login_start/, `expected aws_login_start for ${code}`);
+      assert.match(r.suggestion ?? "", /aws_assume_role/, `expected aws_assume_role for ${code}`);
+    }
+  });
+
+  it("suggests aws_resource_update for every already-exists code", () => {
+    for (const code of ["ResourceAlreadyExistsException", "AlreadyExistsException"]) {
+      const r = parseAwsError(`An error occurred (${code}) when calling the SomeOp operation: foo`);
+      assert.equal(r.code, code);
+      assert.match(r.suggestion ?? "", /aws_resource_update/, `expected the already-exists suggestion for ${code}`);
+    }
   });
 
   it("suggests aws_resource_get for ConflictException (pins tool name reference)", () => {
     // Pins the cross-module tool-name reference in errors.ts so a rename of
     // aws_resource_get fails this test loudly rather than leaving a stale
     // suggestion string in the field.
-    const r = parseAwsError(
-      "An error occurred (ConflictException) when calling the UpdateResource operation: state conflict",
-    );
+    const r = parseAwsError("An error occurred (ConflictException) when calling the SomeOp operation: foo");
     assert.match(r.suggestion ?? "", /aws_resource_get/);
   });
 });
