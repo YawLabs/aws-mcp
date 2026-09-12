@@ -2,7 +2,7 @@
   "name": "@yawlabs/aws-mcp",
   "version": "2.2.2",
   "mcpName": "io.github.YawLabs/aws-mcp",
-  "description": "AWS MCP server — call any AWS API from AI assistants, with first-class SSO re-login (no more 'browser won't open' dead ends)",
+  "description": "AWS MCP server: call any AWS API from AI assistants - SSO device-code re-login, Cloud Control API CRUD, CloudWatch logs and metrics",
   "license": "MIT",
   "author": "YawLabs <contact@yaw.sh>",
   "repository": {
@@ -11,11 +11,21 @@
   },
   "keywords": [
     "aws",
+    "aws-mcp",
     "mcp",
+    "mcp-server",
     "model-context-protocol",
-    "ai",
+    "aws-cli",
+    "aws-sso",
     "sso",
-    "iam-identity-center"
+    "iam-identity-center",
+    "cloud-control-api",
+    "cloudwatch",
+    "cloudwatch-logs",
+    "iam",
+    "claude",
+    "ai-agents",
+    "ai"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -60,5 +70,6 @@
   },
   "engines": {
     "node": ">=22"
-  }
+  },
+  "homepage": "https://yaw.sh/mcp-servers/aws-mcp/"
 }
