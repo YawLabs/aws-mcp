@@ -145,6 +145,7 @@ function dedupeKey(profile: string, opts: SsoLoginOptions): string {
     // regression this list exists to prevent.
     completedReapMs: opts.completedReapMs ?? null,
     useDeviceCode: opts.useDeviceCode ?? null,
+    versionProbeTimeoutMs: opts.versionProbeTimeoutMs ?? null,
     env: opts.env ? Object.entries(opts.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)) : null,
   });
   return createHash("sha256").update(payload).digest("hex");
@@ -255,7 +256,12 @@ export function _clearCliVersionCache(): void {
   deviceCodeSupport.clear();
 }
 
-function probeDeviceCodeSupport(command: string, prefixArgs: string[], env?: NodeJS.ProcessEnv): Promise<boolean> {
+function probeDeviceCodeSupport(
+  command: string,
+  prefixArgs: string[],
+  env?: NodeJS.ProcessEnv,
+  timeoutMs: number = VERSION_PROBE_TIMEOUT_MS,
+): Promise<boolean> {
   // PATH is part of the key because it decides WHICH `aws` a bare command name
   // resolves to -- two callers with different PATHs are asking about different
   // binaries. Same rule dedupeKey follows: anything that changes the subprocess
@@ -290,7 +296,7 @@ function probeDeviceCodeSupport(command: string, prefixArgs: string[], env?: Nod
     const timer = setTimeout(() => {
       killProc(proc);
       finish(true);
-    }, VERSION_PROBE_TIMEOUT_MS);
+    }, timeoutMs);
     timer.unref();
 
     // One decoder per stream, not one shared: interleaved partial multi-byte
@@ -376,6 +382,14 @@ interface SsoLoginOptions {
    * without standing up a version-reporting fake.
    */
   useDeviceCode?: boolean;
+  /**
+   * Bound on the `aws --version` probe. Production leaves it at the tight 2s
+   * default, sized against a real `aws` binary. Tests point the probe at a Node
+   * fake whose cold start alone can pass 2s under a parallel run, and a probe
+   * that times out silently answers "assume modern" -- so a test asserting a
+   * PARSED version needs room for the fake to actually answer.
+   */
+  versionProbeTimeoutMs?: number;
 }
 
 /**
@@ -421,7 +435,8 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
   const sessionTtlMs = opts.sessionTtlMs ?? SESSION_TTL_MS;
   const completedReapMs = opts.completedReapMs ?? COMPLETED_SESSION_REAP_MS;
   const spawnEnv = opts.env;
-  const useDeviceCode = opts.useDeviceCode ?? (await probeDeviceCodeSupport(command, prefixArgs, spawnEnv));
+  const useDeviceCode =
+    opts.useDeviceCode ?? (await probeDeviceCodeSupport(command, prefixArgs, spawnEnv, opts.versionProbeTimeoutMs));
 
   return new Promise((resolve) => {
     const args = [...prefixArgs, ..._buildLoginArgs(profile, useDeviceCode)];

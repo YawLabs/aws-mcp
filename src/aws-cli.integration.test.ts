@@ -5,10 +5,10 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runAwsCall } from "./aws-cli.js";
 import { _resetSession, setProfile, setRegion } from "./session.js";
@@ -16,13 +16,60 @@ import { _resetSession, setProfile, setRegion } from "./session.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "testing", "fake-aws.js");
 
-function fakeOpts(scenario: string, overrides: { timeoutMs?: number } = {}) {
+function fakeOpts(scenario: string, overrides: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}) {
   return {
     command: process.execPath,
     prefixArgs: [FAKE_AWS],
     timeoutMs: overrides.timeoutMs ?? 5000,
-    env: { ...process.env, AWS_MCP_FAKE_SCENARIO: scenario },
+    env: { ...process.env, AWS_MCP_FAKE_SCENARIO: scenario, ...overrides.env },
   };
+}
+
+/**
+ * The timeoutMs budgets tried, in order, by runWithFlushBeforeTimeout for a
+ * fake that spawns nothing. The first keeps an idle run fast. The last is
+ * sized for a starved machine, not an idle one: spawn-to-first-byte peaked at
+ * ~3.6s with the CPU oversubscribed 2x, but went past 15s once with it
+ * oversubscribed ~3x.
+ */
+const FLUSH_BEFORE_TIMEOUT_BUDGETS_MS = [2_000, 30_000];
+
+/**
+ * For tests whose premise is "the fake wrote its fragment, THEN our timeout
+ * killed it". No fixed timeoutMs guarantees that ordering: Node's cold start
+ * under a parallel `node --test` run can outlast any small budget, and when it
+ * does the kill lands before the write and rawStdout is legitimately empty.
+ * Raising the budget only moves the line: the partial-stdout test below went
+ * from 200ms to 2000ms and still flaked.
+ *
+ * So instead of betting on the scheduler, each attempt asks the fake. It
+ * creates `readyPath` only after its fragment is flushed to the pipe
+ * (AWS_MCP_FAKE_READY_OUT, see writeStdoutThenMarkReady in fake-aws.ts). An
+ * attempt that settled without the file never reached the behavior under test,
+ * so it is discarded and retried at the next budget; the first attempt WITH the
+ * file is returned for the caller to assert on. A discarded attempt never
+ * counts as a pass -- the caller's assertions only ever see a run whose premise
+ * held. An attempt that THROWS (a hang, say) fails the test at once, whatever
+ * the file says.
+ */
+async function runWithFlushBeforeTimeout<T>(
+  t: TestContext,
+  budgetsMs: readonly number[],
+  attempt: (timeoutMs: number, readyPath: string) => Promise<T>,
+): Promise<T> {
+  for (const timeoutMs of budgetsMs) {
+    const readyPath = join(tmpdir(), `aws-mcp-ready-${process.pid}-${randomUUID()}`);
+    try {
+      const result = await attempt(timeoutMs, readyPath);
+      if (existsSync(readyPath)) return result;
+      t.diagnostic(`timeoutMs=${timeoutMs} fired before the fake flushed its fragment; attempt discarded`);
+    } finally {
+      rmSync(readyPath, { force: true });
+    }
+  }
+  return assert.fail(
+    `the fake never confirmed its fragment was flushed before runAwsCall killed it, at any budget up to ${budgetsMs.at(-1)}ms. Either this machine is starved far beyond a cold start, or the child is killed (or spawned without AWS_MCP_FAKE_READY_OUT) before it can write.`,
+  );
 }
 
 afterEach(() => {
@@ -496,7 +543,7 @@ describe("runAwsCall — failure paths", () => {
     assert.match(r.error, /Underlying error: Unable to locate credentials/);
   });
 
-  it("preserves partial stdout when a timeout kills a subprocess mid-stream", async () => {
+  it("preserves partial stdout when a timeout kills a subprocess mid-stream", async (t) => {
     // call_partial_then_hang flushes a JSON fragment, then hangs past our
     // timeoutMs. The timeout branch attaches the partial rawStdout to the
     // failure so the bytes that DID arrive before the kill aren't lost. The
@@ -509,18 +556,19 @@ describe("runAwsCall — failure paths", () => {
     // still sitting in the pipe when the child is reaped can no longer be lost
     // to a settle that beat the read.
     //
-    // timeoutMs is still deliberately roomy and must NOT be tuned back down.
-    // The remaining requirement is unchanged: the fake has to get its write
-    // out before our timeout kills it, so the budget has to cover Node's cold
-    // start and module load. At 200ms that failed roughly 1 run in 6 under a
-    // parallel full-suite run (`node --test` runs files across all cores),
-    // surfacing as an empty rawStdout. Anything comfortably between
-    // startup+50ms and the fake's 10s hang works.
-    const r = await runAwsCall({
-      service: "s3api",
-      operation: "list-buckets",
-      ...fakeOpts("call_partial_then_hang", { timeoutMs: 2000 }),
-    });
+    // The remaining requirement is that the fake gets its write out before our
+    // timeout kills it. A fixed timeoutMs cannot promise that: 200ms failed
+    // about 1 run in 6 under a parallel full-suite run, and 2000ms still failed
+    // 5 runs in 8 with the CPU oversubscribed, both as an empty rawStdout.
+    // runWithFlushBeforeTimeout only asserts on a run where the fake confirmed
+    // the write landed first.
+    const r = await runWithFlushBeforeTimeout(t, FLUSH_BEFORE_TIMEOUT_BUDGETS_MS, (timeoutMs, readyPath) =>
+      runAwsCall({
+        service: "s3api",
+        operation: "list-buckets",
+        ...fakeOpts("call_partial_then_hang", { timeoutMs, env: { AWS_MCP_FAKE_READY_OUT: readyPath } }),
+      }),
+    );
     assert.equal(r.ok, false);
     if (r.ok) return;
     assert.equal(r.kind, "timeout");
@@ -717,7 +765,7 @@ describe("runAwsCall — a descendant holding the stdio pipes must not hang the 
     }
   }
 
-  function orphanOpts(scenario: string, timeoutMs: number) {
+  function orphanOpts(scenario: string, timeoutMs: number, extraEnv: NodeJS.ProcessEnv = {}) {
     const pidPath = join(tmpdir(), `aws-mcp-orphan-${process.pid}-${randomUUID()}.pid`);
     return {
       pidPath,
@@ -729,6 +777,7 @@ describe("runAwsCall — a descendant holding the stdio pipes must not hang the 
           ...process.env,
           AWS_MCP_FAKE_SCENARIO: scenario,
           AWS_MCP_FAKE_ORPHAN_PID_OUT: pidPath,
+          ...extraEnv,
         },
       },
     };
@@ -747,45 +796,91 @@ describe("runAwsCall — a descendant holding the stdio pipes must not hang the 
     rmSync(pidPath, { force: true });
   }
 
-  it("settles kind='timeout' when the child is killed but an orphan keeps the pipes open", async () => {
+  it("settles kind='timeout' when the child is killed but an orphan keeps the pipes open", async (t) => {
     // Path (a): we outlive timeoutMs, so the timeout callback kills us and then
     // waits. killProc guarantees the CHILD exits; it says nothing about a
     // descendant holding the pipes, so 'close' never arrives.
-    const { opts, pidPath } = orphanOpts("awscli_orphan_holds_pipes", 2000);
-    try {
-      const r = await settleWithin(runAwsCall({ service: "ssm", operation: "start-session", ...opts }), 15_000);
-      if (r === PENDING) {
-        assert.fail(
-          "runAwsCall never settled: the orphan still holds the stdio pipes so 'close' cannot fire, and nothing bounds the wait",
+    //
+    // The premise needs the fake to have spawned its orphan AND flushed its
+    // fragment before the kill, and with timeoutMs fixed at 2000ms that lost
+    // to the fake's cold start in all 8 runs with the CPU oversubscribed.
+    // runWithFlushBeforeTimeout only asserts on a run where the fake confirmed
+    // both happened first.
+    //
+    // A discarded attempt needs one more guard here than in the partial-stdout
+    // test, because this fake spawns a detached orphan. libuv creates a detached
+    // child suspended and resumes it right after (CREATE_SUSPENDED, then
+    // ResumeThread -- src/win/process.c), so a kill that lands between the two
+    // leaves a process that never runs, never writes its pid, can never be
+    // reaped, and holds this file's pipes open forever. Seen once in 26 attempts
+    // at a 2000ms budget with the CPU saturated: every test passed, yet the file
+    // process was still running 280s later.
+    //
+    // So each attempt hands the fake a wall-clock deadline half a budget before
+    // the earliest possible kill (runAwsCall starts its timer after this line),
+    // and past it the fake skips the orphan and just hangs -- no spawn for the
+    // kill to interrupt, no ready file, attempt discarded. The 10s first budget
+    // only keeps discards rare: each one costs a whole budget.
+    const r = await runWithFlushBeforeTimeout(t, [10_000, 30_000], async (timeoutMs, readyPath) => {
+      // After the kill, runAwsCall arms a KILL_ESCALATION_MS + 2s window and
+      // shortens it to 2s once the child is reaped, so a correct call settles
+      // ~2-4s past timeoutMs. 30s leaves room for a starved machine; a hang
+      // still fails, because the orphan outlives the bound.
+      const settleBoundMs = timeoutMs + 30_000;
+      const { opts, pidPath } = orphanOpts("awscli_orphan_holds_pipes", timeoutMs, {
+        AWS_MCP_FAKE_READY_OUT: readyPath,
+        AWS_MCP_FAKE_ORPHAN_HOLD_MS: String(settleBoundMs + 10_000),
+        AWS_MCP_FAKE_ORPHAN_SPAWN_BEFORE: String(Date.now() + timeoutMs / 2),
+      });
+      try {
+        const settled = await settleWithin(
+          runAwsCall({ service: "ssm", operation: "start-session", ...opts }),
+          settleBoundMs,
         );
+        if (settled === PENDING) {
+          return assert.fail(
+            "runAwsCall never settled: the orphan still holds the stdio pipes so 'close' cannot fire, and nothing bounds the wait",
+          );
+        }
+        return settled;
+      } finally {
+        reapOrphan(pidPath);
       }
-      assert.equal(r.ok, false);
-      if (r.ok) return;
-      assert.equal(r.kind, "timeout");
-      assert.match(r.error, /timed out/);
-      // Buffered bytes still reach the caller when the fallback settles rather
-      // than 'close' -- the flush is in the shared finish path, not in 'close'.
-      assert.match(
-        r.rawStdout ?? "",
-        /emitted-before-the-orphan-hang/,
-        "stdout read before the kill must survive the fallback settle",
-      );
-    } finally {
-      reapOrphan(pidPath);
-    }
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "timeout");
+    assert.match(r.error, /timed out/);
+    // Buffered bytes still reach the caller when the fallback settles rather
+    // than 'close' -- the flush is in the shared finish path, not in 'close'.
+    assert.match(
+      r.rawStdout ?? "",
+      /emitted-before-the-orphan-hang/,
+      "stdout read before the kill must survive the fallback settle",
+    );
   });
 
   it("settles with the natural result when the child exits cleanly but an orphan keeps the pipes open", async () => {
     // Path (b), the worse one: we exit 0 long before timeoutMs. The timeout
     // callback's procHasExited() guard then returns early and never attempts a
     // kill at all, so before the grace existed nothing bounded this AT ALL -- it
-    // hung past a timeout it could never trip. timeoutMs is deliberately long so
-    // that a pass here cannot be coming from the timeout path.
-    const timeoutMs = 20_000;
-    const { opts, pidPath } = orphanOpts("awscli_orphan_outlives_exit", timeoutMs);
+    // hung past a timeout it could never trip.
+    //
+    // Three deadlines, ordered so a pass can only come from the grace the 'exit'
+    // listener arms (child exit + 2s): the settle bound, then timeoutMs (where a
+    // grace armed only by the timeout callback would settle), then the orphan's
+    // own death (where 'close' would finally fire). The bound was 12s against a
+    // 20s timeoutMs, and it flaked: with the CPU saturated the fake alone took
+    // up to 6.7s to start and exit, so a correct runAwsCall missed 12s about 1
+    // run in 5. The margins are now wide, and the ordering is what still gates.
+    const settleBoundMs = 60_000;
+    const timeoutMs = 120_000;
+    const { opts, pidPath } = orphanOpts("awscli_orphan_outlives_exit", timeoutMs, {
+      AWS_MCP_FAKE_ORPHAN_HOLD_MS: "180000",
+    });
     const started = Date.now();
     try {
-      const r = await settleWithin(runAwsCall({ service: "s3api", operation: "list-buckets", ...opts }), 12_000);
+      const r = await settleWithin(runAwsCall({ service: "s3api", operation: "list-buckets", ...opts }), settleBoundMs);
       if (r === PENDING) {
         assert.fail("runAwsCall never settled after a clean child exit with the pipes held open by an orphan");
       }

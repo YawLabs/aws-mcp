@@ -30,6 +30,12 @@ function fakeOpts(scenario: string, urlWaitMs = 500) {
     prefixArgs: [FAKE_AWS],
     urlWaitMs,
     env: { ...process.env, AWS_MCP_FAKE_SCENARIO: scenario },
+    // The production 2s probe bound is sized for a real `aws`, not this Node
+    // fake, whose cold start passed 2s often enough to fail the version-probe
+    // tests 2-3 runs in 5 on an ordinary loaded box. A timed-out probe answers
+    // "assume modern" silently, so every test asserting a PARSED version lost.
+    // The hung-probe test opts back into the default -- it is what it pins.
+    versionProbeTimeoutMs: 30_000,
   };
 }
 
@@ -692,7 +698,8 @@ describe("startSsoLogin — CLI version probe", () => {
     const { dir, opts } = counterOpts("device_code_flag_echo", { AWS_MCP_FAKE_CLI_VERSION: "hang" }, 10_000);
     try {
       const started = Date.now();
-      const start = await startSsoLogin("hung-probe", opts);
+      // The production default, not fakeOpts' 30s: the default is what's pinned.
+      const start = await startSsoLogin("hung-probe", { ...opts, versionProbeTimeoutMs: undefined });
       const elapsed = Date.now() - started;
       assert.equal(start.ok, true);
       if (!start.ok) return;
