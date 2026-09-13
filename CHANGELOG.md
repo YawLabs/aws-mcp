@@ -9,6 +9,13 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
+## [Unreleased]
+
+### Changed
+- No behavior change in the published package. `startSsoLogin` accepts a `versionProbeTimeoutMs` option, a test knob beside `urlWaitMs` and `sessionTtlMs` that production never sets; the `aws --version` probe keeps its 2s bound.
+- Test-only: the version-probe tests in `sso.integration.test.ts` failed 2-3 runs in 5 on an ordinary loaded machine, because the fake CLI's cold start could outlast the 2s probe bound and a timed-out probe silently answers "assume modern". They now give the fake 30s to answer; the hung-probe test still pins the 2s default.
+- Test-only: three `runAwsCall` timeout tests no longer race the fake CLI's cold start. Two assumed the fake wrote its output before a fixed 2s kill and failed 5 and 8 runs in 8 under load. They now assert only on an attempt where the fake confirmed the write landed first, and retry with a longer timeout otherwise. The orphan test also can no longer strand a suspended orphan process: libuv starts a detached child suspended, and a kill between spawn and resume left one holding the test file's pipes open indefinitely. The third test's 12s settle bound, which a correct call missed about 1 run in 5, is now 60s.
+
 ## [2.2.4] — 2026-09-12
 
 ### Fixed
