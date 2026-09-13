@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.2.5] — 2026-09-13
 
 ### Changed
 - No behavior change in the published package. `startSsoLogin` accepts a `versionProbeTimeoutMs` option, a test knob beside `urlWaitMs` and `sessionTtlMs` that production never sets; the `aws --version` probe keeps its 2s bound.
