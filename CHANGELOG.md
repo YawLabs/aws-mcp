@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.2.7] — 2026-09-13
 
 ### Fixed
 - **The launcher's Node fallback survives a failed oam spawn on an oam host.** When the chosen oam passed its version check but could not be spawned (deleted or replaced in between), the failed child still emitted `close` with the negative errno, and on an oam host -- where the launcher waits for `close` -- that exited the launcher in the middle of the fallback, so nothing served. Stdin was also piped into the child before it ran. Both now wait for the child's `spawn` event. Found by review while porting the 2.2.6 launcher to the other Yaw Labs servers.
