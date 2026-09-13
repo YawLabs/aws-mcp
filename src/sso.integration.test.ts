@@ -24,6 +24,10 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "testing", "fake-aws.js");
 
+// urlWaitMs values below are hang guards for tests that expect the URL to ARRIVE:
+// startSsoLogin settles the moment it does, so a generous value costs nothing,
+// while 2-5s lost to the fake's cold start on a saturated machine. Tests that
+// expect the URL wait to EXPIRE pass a deliberately short one.
 function fakeOpts(scenario: string, urlWaitMs = 500) {
   return {
     command: process.execPath,
@@ -75,7 +79,7 @@ afterEach(() => {
 
 describe("startSsoLogin — happy path", () => {
   it("parses URL + code from fake output and returns a session", async () => {
-    const result = await startSsoLogin("test-profile", fakeOpts("happy", 5000));
+    const result = await startSsoLogin("test-profile", fakeOpts("happy", 30_000));
     assert.equal(result.ok, true);
     if (!result.ok) return;
     assert.equal(result.verificationUrl, "https://device.sso.us-east-1.amazonaws.com/");
@@ -85,7 +89,7 @@ describe("startSsoLogin — happy path", () => {
   });
 
   it("waitForLogin resolves ok=true when the fake exits cleanly", async () => {
-    const start = await startSsoLogin("test-profile", fakeOpts("happy", 5000));
+    const start = await startSsoLogin("test-profile", fakeOpts("happy", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -95,8 +99,8 @@ describe("startSsoLogin — happy path", () => {
 
   it("returns distinct sessionIds for concurrent logins", async () => {
     const [a, b] = await Promise.all([
-      startSsoLogin("profile-a", fakeOpts("happy", 5000)),
-      startSsoLogin("profile-b", fakeOpts("happy", 5000)),
+      startSsoLogin("profile-a", fakeOpts("happy", 30_000)),
+      startSsoLogin("profile-b", fakeOpts("happy", 30_000)),
     ]);
     assert.equal(a.ok, true);
     assert.equal(b.ok, true);
@@ -121,7 +125,7 @@ describe("startSsoLogin — failure paths", () => {
     // healthy run settles in ~100ms and never approaches this bound. At 2000ms
     // it lost the race under a loaded parallel run where the child had not
     // finished booting yet, and reported a timeout instead of the exit.
-    const result = await startSsoLogin("test-profile", fakeOpts("exits_before_url", 10_000));
+    const result = await startSsoLogin("test-profile", fakeOpts("exits_before_url", 30_000));
     assert.equal(result.ok, false);
     if (result.ok) return;
     assert.match(result.error, /exited before printing|exited with code/);
@@ -187,7 +191,7 @@ describe("startSsoLogin — failure paths", () => {
   //       that resolves `completion` after a registered session, and it is
   //       covered by the early_exit_failure / TTL tests below.
   it("returns the URL+code on start, but waitForLogin reports nonzero exit", async () => {
-    const start = await startSsoLogin("test-profile", fakeOpts("early_exit_failure", 2000));
+    const start = await startSsoLogin("test-profile", fakeOpts("early_exit_failure", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     assert.equal(start.userCode, "ABCD-EFGH");
@@ -206,7 +210,7 @@ describe("waitForLogin — session management", () => {
   });
 
   it("drops session after wait resolves (calling twice returns error)", async () => {
-    const start = await startSsoLogin("test-profile", fakeOpts("happy", 5000));
+    const start = await startSsoLogin("test-profile", fakeOpts("happy", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const first = await waitForLogin(start.sessionId);
@@ -229,7 +233,7 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
     // findActiveSessionByProfile assertion below, mark the session completed,
     // and exclude it -- a load-dependent flake. `happy_hold` emits the
     // identical URL+code stdout, so the parsed verificationUrl/userCode match.
-    const start = await startSsoLogin("dedupe-profile", fakeOpts("happy_hold", 5000));
+    const start = await startSsoLogin("dedupe-profile", fakeOpts("happy_hold", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const active = findActiveSessionByProfile("dedupe-profile");
@@ -245,7 +249,7 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
   });
 
   it("stops returning a session after waitForLogin resolves it", async () => {
-    const start = await startSsoLogin("transient-profile", fakeOpts("happy", 5000));
+    const start = await startSsoLogin("transient-profile", fakeOpts("happy", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     await waitForLogin(start.sessionId);
@@ -255,7 +259,7 @@ describe("findActiveSessionByProfile — dedupe helper", () => {
   it("excludes completed sessions before waitForLogin is called", async () => {
     // The 'happy' fake exits ~200ms after emitting URL+code, which flips the
     // session to completed. This test is about the POST-exit exclusion.
-    const start = await startSsoLogin("post-exit-profile", fakeOpts("happy", 5000));
+    const start = await startSsoLogin("post-exit-profile", fakeOpts("happy", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     // NOTE: deliberately no "still alive" assertion here. It used to sit at
@@ -289,7 +293,7 @@ describe("startSsoLogin — TTL killswitch", () => {
     // _ttlKillswitchTick correctly declines to kill an already-dead proc, and
     // the wait reports natural SUCCESS -- failing an assertion that demanded
     // expiry. The kill path is now load-independent.
-    const start = await startSsoLogin("ttl-stuck-profile", fakeOptsWithTtl("happy_hold", 20, 5000));
+    const start = await startSsoLogin("ttl-stuck-profile", fakeOptsWithTtl("happy_hold", 20, 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -306,7 +310,7 @@ describe("startSsoLogin — TTL killswitch", () => {
     // premise is "the TTL must NOT fire", the only thing a tight TTL buys is a
     // race -- and it costs nothing to remove, because the test never WAITS for
     // the TTL: it waits for the natural exit, which clears the (unref'd) timer.
-    const start = await startSsoLogin("ttl-quick-profile", fakeOptsWithTtl("happy", 30_000, 5000));
+    const start = await startSsoLogin("ttl-quick-profile", fakeOptsWithTtl("happy", 30_000, 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -341,7 +345,10 @@ describe("startSsoLogin — TTL killswitch", () => {
     // inspection -- driving that exact ordering deterministically would
     // require timer mocks. The aws-cli.ts:199-200 guard uses the same
     // pattern and is similarly verified by inspection.
-    const start = await startSsoLogin("ttl-natural-fail-profile", fakeOptsWithTtl("early_exit_failure", 30_000, 5000));
+    const start = await startSsoLogin(
+      "ttl-natural-fail-profile",
+      fakeOptsWithTtl("early_exit_failure", 30_000, 30_000),
+    );
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -355,8 +362,8 @@ describe("startSsoLogin — TTL killswitch", () => {
 describe("startSsoLogin — concurrent dedup", () => {
   it("two concurrent calls for the same profile share one subprocess", async () => {
     const [a, b] = await Promise.all([
-      startSsoLogin("race-profile", fakeOpts("happy", 5000)),
-      startSsoLogin("race-profile", fakeOpts("happy", 5000)),
+      startSsoLogin("race-profile", fakeOpts("happy", 30_000)),
+      startSsoLogin("race-profile", fakeOpts("happy", 30_000)),
     ]);
     assert.equal(a.ok, true);
     assert.equal(b.ok, true);
@@ -369,12 +376,12 @@ describe("startSsoLogin — concurrent dedup", () => {
   });
 
   it("a fresh start after the previous completes spawns a new subprocess", async () => {
-    const first = await startSsoLogin("re-spawn-profile", fakeOpts("happy", 5000));
+    const first = await startSsoLogin("re-spawn-profile", fakeOpts("happy", 30_000));
     assert.equal(first.ok, true);
     if (!first.ok) return;
     await waitForLogin(first.sessionId);
     // Pending dedup map self-cleans on settle -- the next call must NOT reuse.
-    const second = await startSsoLogin("re-spawn-profile", fakeOpts("happy", 5000));
+    const second = await startSsoLogin("re-spawn-profile", fakeOpts("happy", 30_000));
     assert.equal(second.ok, true);
     if (!second.ok) return;
     assert.notEqual(first.sessionId, second.sessionId);
@@ -389,9 +396,9 @@ describe("startSsoLogin — concurrent dedup", () => {
     // distinct opts must produce distinct subprocesses even when the
     // profile is identical. Pins the fix.
     const [a, b] = await Promise.all([
-      startSsoLogin("opts-divergence-profile", fakeOpts("happy", 5000)),
+      startSsoLogin("opts-divergence-profile", fakeOpts("happy", 30_000)),
       // Same profile string but different urlWaitMs -> different opts hash.
-      startSsoLogin("opts-divergence-profile", fakeOpts("happy", 4000)),
+      startSsoLogin("opts-divergence-profile", fakeOpts("happy", 29_000)),
     ]);
     assert.equal(a.ok, true);
     assert.equal(b.ok, true);
@@ -481,7 +488,7 @@ describe("completed-session reaping (bounds the sessions Map)", () => {
     // Observe via _hasSession, NOT waitForLogin: waitForLogin CLAIMS the entry,
     // so polling with it would delete the very thing under test and go green
     // whether or not the reap works.
-    const start = await startSsoLogin("reaped-profile", { ...fakeOpts("happy", 5000), completedReapMs: 40 });
+    const start = await startSsoLogin("reaped-profile", { ...fakeOpts("happy", 30_000), completedReapMs: 40 });
     assert.equal(start.ok, true);
     if (!start.ok) return;
     assert.ok(_hasSession(start.sessionId), "precondition: the session is registered");
@@ -495,7 +502,7 @@ describe("completed-session reaping (bounds the sessions Map)", () => {
     // The grace window is the whole reason the reap isn't immediate: a user who
     // finishes auth slowly must still be able to claim the result. A generous
     // window means the claim below cannot race the reap.
-    const start = await startSsoLogin("grace-profile", { ...fakeOpts("happy", 5000), completedReapMs: 30_000 });
+    const start = await startSsoLogin("grace-profile", { ...fakeOpts("happy", 30_000), completedReapMs: 30_000 });
     assert.equal(start.ok, true);
     if (!start.ok) return;
     // Let the subprocess exit (completing the session) without claiming it.
@@ -514,7 +521,7 @@ describe("completed-session reaping (bounds the sessions Map)", () => {
     // entry, and session ids are UUIDs so a stray reap could not collide with a
     // later session. What this pins is that the post-claim state stays stable
     // across the moment the cancelled reap would have fired.
-    const start = await startSsoLogin("claimed-profile", { ...fakeOpts("happy", 5000), completedReapMs: 30 });
+    const start = await startSsoLogin("claimed-profile", { ...fakeOpts("happy", 30_000), completedReapMs: 30 });
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const first = await waitForLogin(start.sessionId);
@@ -535,7 +542,7 @@ describe("startSsoLogin — PKCE / device-code flow selection", () => {
     // Self-contained: the probe cache is shared by every test in this file, so
     // clear it here rather than depending on execution order.
     _clearCliVersionCache();
-    const start = await startSsoLogin("test-profile", fakeOpts("device_code_flag_echo", 5000));
+    const start = await startSsoLogin("test-profile", fakeOpts("device_code_flag_echo", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
     const wait = await waitForLogin(start.sessionId);
@@ -548,7 +555,7 @@ describe("startSsoLogin — PKCE / device-code flow selection", () => {
     // Self-contained: the probe cache is shared by every test in this file, so
     // clear it here rather than depending on execution order.
     _clearCliVersionCache();
-    const opts = fakeOpts("device_code_flag_echo", 5000);
+    const opts = fakeOpts("device_code_flag_echo", 30_000);
     const start = await startSsoLogin("test-profile", {
       ...opts,
       env: { ...opts.env, AWS_MCP_FAKE_CLI_VERSION: "2.21.9" },
@@ -566,7 +573,7 @@ describe("startSsoLogin — PKCE / device-code flow selection", () => {
     // urlWaitMs is deliberately long: a pass here must come from the PKCE
     // detector firing, not from the URL timeout expiring first.
     const result = await startSsoLogin("test-profile", {
-      ...fakeOpts("pkce_no_device_code", 10_000),
+      ...fakeOpts("pkce_no_device_code", 30_000),
       useDeviceCode: true,
     });
     assert.equal(result.ok, false);
@@ -579,7 +586,7 @@ describe("startSsoLogin — PKCE / device-code flow selection", () => {
 
   it("detects the PKCE banner when it lands on stderr instead of stdout", async () => {
     const result = await startSsoLogin("test-profile", {
-      ...fakeOpts("pkce_no_device_code_stderr", 10_000),
+      ...fakeOpts("pkce_no_device_code_stderr", 30_000),
       useDeviceCode: true,
     });
     assert.equal(result.ok, false);
@@ -590,7 +597,7 @@ describe("startSsoLogin — PKCE / device-code flow selection", () => {
 
   it("blames the CLI version when the flag was skipped", async () => {
     const result = await startSsoLogin("test-profile", {
-      ...fakeOpts("pkce_no_device_code", 10_000),
+      ...fakeOpts("pkce_no_device_code", 30_000),
       useDeviceCode: false,
     });
     assert.equal(result.ok, false);
@@ -602,7 +609,7 @@ describe("startSsoLogin — PKCE / device-code flow selection", () => {
     // Self-contained: the probe cache is shared by every test in this file, so
     // clear it here rather than depending on execution order.
     _clearCliVersionCache();
-    const opts = fakeOpts("device_code_flag_echo", 5000);
+    const opts = fakeOpts("device_code_flag_echo", 30_000);
     const start = await startSsoLogin("test-profile", {
       ...opts,
       env: { ...opts.env, AWS_MCP_FAKE_CLI_VERSION: "none" },
@@ -827,7 +834,7 @@ describe("clampRawOutput -- the raw `aws sso login` output forwarded to the mode
     // urlWaitMs is deliberately long: these tests must settle on the parsed
     // URL+code, never on the URL timeout (a different clampRawOutput call site
     // with a different input).
-    const base = fakeOpts("sso2_raw_sized", 10_000);
+    const base = fakeOpts("sso2_raw_sized", 30_000);
     return {
       expected: `${"x".repeat(filler)}${SSO2_TAIL}`,
       opts: { ...base, env: { ...base.env, AWS_MCP_FAKE_SSO2_FILLER: String(filler) } },
@@ -896,7 +903,7 @@ describe("clampRawOutput -- the raw `aws sso login` output forwarded to the mode
     // The fake places U+20BB7 (4 UTF-8 bytes, 2 UTF-16 units) at indices
     // 3999/4000 so the cut lands mid-pair every run -- nothing here is timing
     // dependent.
-    const raw = await rawOutputFor("clamp-surrogate-profile", fakeOpts("sso2_raw_surrogate_boundary", 10_000));
+    const raw = await rawOutputFor("clamp-surrogate-profile", fakeOpts("sso2_raw_surrogate_boundary", 30_000));
     const payload = `${"x".repeat(3_999)}${"\u{20BB7}".repeat(8)}${SSO2_TAIL}`;
     const omitted = payload.length - MAX_RAW_OUTPUT_CHARS;
     assert.equal(

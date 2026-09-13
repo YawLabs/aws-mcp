@@ -20,7 +20,11 @@ function fakeOpts(scenario: string, overrides: { timeoutMs?: number; env?: NodeJ
   return {
     command: process.execPath,
     prefixArgs: [FAKE_AWS],
-    timeoutMs: overrides.timeoutMs ?? 5000,
+    // A hang guard, not the thing under test: success-path calls settle the
+    // moment the fake exits. 5s lost to the fake's cold start with the CPU
+    // saturated (5.3s and 5.8s measured), so size it for a starved machine.
+    // Tests that exercise the timeout path pass their own timeoutMs.
+    timeoutMs: overrides.timeoutMs ?? 30_000,
     env: { ...process.env, AWS_MCP_FAKE_SCENARIO: scenario, ...overrides.env },
   };
 }
