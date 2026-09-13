@@ -9,6 +9,11 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
+## [Unreleased]
+
+### Changed
+- Docs only: the README's Environment section now covers `AWS_DEFAULT_PROFILE`, which the server has always honored, and the launcher's `AWS_MCP_RUNTIME` and `OAM_BIN`, which it never mentioned. The Runtime section no longer says Node is the packaged default -- the published `aws-mcp` command has preferred oam since 1.7.0 -- and its startup table is labeled as an oam 0.8.2 measurement taken before the 0.9.0 floor.
+
 ## [2.2.5] — 2026-09-13
 
 ### Changed

@@ -263,10 +263,11 @@ To run it under oam, point your MCP client's `command` at it:
 }
 ```
 
-**Node remains the packaged default, and that is a measurement, not a
-preference.** An MCP client cold-starts this server once per session, so startup
-is the cost that actually gets paid. On the machine this was measured on, to a
-completed `initialize` + `tools/list` handshake, median of 10 warmed runs:
+**Measure startup on your own hardware.** An MCP client cold-starts this server
+once per session, so startup is the cost that actually gets paid. The numbers
+below were taken with oam 0.8.2, before the 0.9.0 floor, and have not been
+re-run since, so do not read them as a current ranking. To a completed
+`initialize` + `tools/list` handshake, median of 10 warmed runs:
 
 | Runtime | Cold start |
 |---------|-----------|
@@ -274,14 +275,16 @@ completed `initialize` + `tools/list` handshake, median of 10 warmed runs:
 | `oam run dist/index.js` | 650 ms |
 | `oam run src/index.ts` (no build step) | 947 ms |
 
-Preferring oam automatically would mean either probing for it on every start --
-a cost paid by everyone, including the majority who don't have it -- or making
-oam a hard requirement, which breaks the npm package for those users. Neither is
-worth it to reach a runtime that is not faster here. Measure on your own
-hardware before concluding anything; if oam wins on yours, the config above is
-all you need, and the `bin` shim keeps working under Node regardless.
+The published `aws-mcp` command prefers oam when it finds one (see
+`AWS_MCP_RUNTIME` under [Environment](#environment)). Without oam that costs
+almost nothing: discovery is file-existence checks only, never a subprocess, and
+the fallback runs the server inside the Node process npm already started. With a
+usable oam, though, the command boots Node, runs `oam --version` to check the
+floor, and only then boots oam, so it is always slower than pointing your client
+at oam directly with the config above. Under `npx`, `AWS_MCP_RUNTIME=node` skips
+oam entirely.
 
-Two places oam *does* win for this repo, both opt-in and neither touching the
+Two more places oam wins for this repo, both opt-in and neither touching the
 published npm package:
 
 - **`npm run check:oam`** -- type-checks via `oam check` (tsgo, TypeScript 7
@@ -318,17 +321,24 @@ directory -- already in `.gitignore`.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AWS_PROFILE` | `default` | Profile used when a tool call omits `profile`. |
+| `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | `default` | Profile used when a tool call omits `profile`. `AWS_DEFAULT_PROFILE` is the legacy spelling. `AWS_PROFILE` wins if both are set, as in AWS CLI v2 (standalone botocore and boto3 check `AWS_DEFAULT_PROFILE` first). An empty value counts as unset. |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | Region used when a tool call omits `region`. `AWS_REGION` wins if both are set. |
 | `AWS_SHARED_CREDENTIALS_FILE` | `~/.aws/credentials` | Where `aws_assume_role` writes the profile it creates. Honored (with `~` expansion, like botocore) so the write lands in the same file the CLI later reads. |
 
+The launcher that the published `aws-mcp` command runs (`bin/aws-mcp.mjs`, which is what `npx @yawlabs/aws-mcp` starts) reads two more. They pick the runtime, not anything about AWS, and pointing your client straight at `dist/index.js` bypasses both. See [Runtime](#runtime) for what running on oam changes.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AWS_MCP_RUNTIME` | `auto` | `auto`: serve on the oam the launcher is already running under if that is 0.9.0 or newer; otherwise take the first oam binary discovery finds (see `OAM_BIN`) and use it if it is 0.9.0 or newer. Failing both, the server runs in the process that started the launcher -- Node under `npx` -- with a note on stderr when a found oam was too old or would not run. An older copy earlier in the search order is not skipped in favor of a newer one later. `oam`: the same checks, but exit with an error instead of falling back. `node`: never look for or spawn oam; the server still runs in whatever process started the launcher, so a client that launches the command with `oam run` stays on oam -- set its `command` to `node` to force Node. Case-insensitive, and any other value behaves like `auto`. |
+| `OAM_BIN` | unset | Path to the oam binary to use, held to the same 0.9.0 floor. Once set it is the only candidate: a path that does not exist means no oam (under `auto`, a fallback to Node with no warning), and a binary older than 0.9.0 or one that will not run falls back to Node with a note on stderr. Under `AWS_MCP_RUNTIME=oam` each of these is an error. Unset, the launcher looks in the installed location (`%LOCALAPPDATA%\oam\bin` then `~/.oam/bin` on Windows, `~/.oam/bin` elsewhere) and then on `PATH`; on Windows only `oam.exe` counts, and an `oam.cmd` / `oam.bat` shim is named on stderr but never run. Ignored under `AWS_MCP_RUNTIME=node` and when already running on oam 0.9.0+. |
+
 If you authenticate via SAML (Okta / Azure AD / ADFS) or a custom `credential_process`, set `AWS_PROFILE` to that profile.
 
-Every call resolves a profile name first -- **explicit tool `profile` argument -> the session profile set by `aws_session_set` -> `$AWS_PROFILE` -> the literal `default`** -- and then passes it to the CLI as `--profile <name>`. That flag is always present; there is no "no profile" mode. Inside the chosen profile the CLI's own chain resolves as usual: `credential_process`, SSO sessions (both `sso_session` blocks and inline `sso_start_url`), role chaining via `source_profile` / `role_arn`, static keys stored in `~/.aws/credentials`, container credentials, and IMDS.
+Every call resolves a profile name first -- **explicit tool `profile` argument -> the session profile set by `aws_session_set` -> `$AWS_PROFILE` -> `$AWS_DEFAULT_PROFILE` -> the literal `default`** -- and then passes it to the CLI as `--profile <name>`. There is no "no profile" mode, with one exception: `aws_multi_account` uses the resolved profile only for its `sts:AssumeRole` calls, and each per-account operation then runs on that account's assumed-role credentials with no `--profile` flag. Inside the chosen profile the CLI's own chain resolves as usual: `credential_process`, SSO sessions (both `sso_session` blocks and inline `sso_start_url`), role chaining via `source_profile` / `role_arn`, static keys stored in `~/.aws/credentials`, container credentials, and IMDS.
 
 **Exception -- static keys in your environment are not used.** Because a profile is always passed explicitly, botocore drops the environment credential provider from the chain, so `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` exported in your shell are never consulted. (Container credentials and IMDS are unaffected -- they sit later in the chain and are not profile-gated.) To use static keys, put them in a profile section of `~/.aws/credentials` and point `AWS_PROFILE` at it, rather than exporting them.
 
-If neither `AWS_PROFILE` is set nor `aws_session_set` has been called and there's no `[default]` section in `~/.aws/config`, tools will fail with `ProfileNotFound`. Set `AWS_PROFILE` in your MCP config to your usual working profile.
+If a call omits `profile`, `aws_session_set` has not been called, neither `AWS_PROFILE` nor `AWS_DEFAULT_PROFILE` is set to a non-empty value, and neither `~/.aws/config` nor `~/.aws/credentials` defines a `default` profile, the CLI rejects `--profile default` with `ProfileNotFound`, which the tool reports as a `no_creds` error. Set `AWS_PROFILE` in your MCP config to your usual working profile.
 
 ## How the SSO login flow works
 
