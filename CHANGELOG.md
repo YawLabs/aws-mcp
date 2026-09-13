@@ -9,6 +9,13 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
+## [2.2.3] — 2026-09-11
+
+### Changed
+- Package metadata only, no code change in the published package: the npm `description`, `keywords` and `homepage` now match the terms the README actually uses, and `homepage` points at the per-server page.
+- Repo tooling only: `release.sh` now waits for npm to SERVE a freshly published version before the MCP Registry step. `npm publish` returns when the registry accepts the tarball, but the MCP Registry validates by reading it, so step 7 failed with `version 'X' was not found (status: 404)` on v2.2.0, v2.2.1 and v2.2.2 and each release took a second invocation. The wait polls the same URL the registry reads with curl rather than `npm view`, whose 5-minute metadata cache can keep reporting the pre-publish answer, and it warns rather than fails on timeout so `mcp-publisher` still gets to report its own precise error. `SKIP_NPM_WAIT=1` bypasses it and `NPM_WAIT_TIMEOUT_S` retunes the 300s default.
+- Repo tooling only: `scripts/lint.mjs` sizes the emulated biome it provisions on the version npm INSTALLED (`package-lock.json`, then `node_modules/@biomejs/biome/package.json`) rather than on `biome.json`'s `$schema` URL, which pins the config schema and drifts from the binary the moment either is bumped alone. Both agree here today, so this is a guard rather than a behavior change. The `lint.mjs` header and `release.sh`'s `SKIP_LINT` comment no longer overstate the arm64 crash: it is specific to biome 2.5.4 on a check run, not a standing arm64 defect.
+
 ## [2.2.2] — 2026-09-09
 
 ### Added
