@@ -30,6 +30,28 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Write `chunk` to stdout, wait until it has been handed to the OS, then create
+ * the file named by AWS_MCP_FAKE_READY_OUT (when set).
+ *
+ * For the timeout scenarios, whose tests assert that bytes written BEFORE the
+ * parent's timeout survive the kill. That premise holds only if this process
+ * outran its own cold start, and under a parallel `node --test` run Node's
+ * startup alone can exceed any small timeoutMs. The file lets the test tell a
+ * run whose premise held (file present: the bytes were in the pipe before the
+ * kill) from one where the timeout fired first (file absent: nothing to
+ * assert). The file is written only after the write callback, so its presence
+ * can never outrun the bytes it vouches for.
+ */
+async function writeStdoutThenMarkReady(chunk: string): Promise<void> {
+  await new Promise<void>((resolve) => process.stdout.write(chunk, () => resolve()));
+  const readyPath = process.env.AWS_MCP_FAKE_READY_OUT;
+  if (readyPath) {
+    const fs = await import("node:fs");
+    fs.writeFileSync(readyPath, "flushed");
+  }
+}
+
 // The exact stdout the `happy` scenario emits up to and including the URL +
 // code lines. Shared so `happy_hold` is guaranteed byte-for-byte identical
 // through the point findActiveSessionByProfile parses (verificationUrl +
@@ -357,12 +379,17 @@ async function main(): Promise<void> {
       // named for; it is no longer what makes the assertion pass.
       //
       // What DOES still matter is ordering: we must get this write out before
-      // the parent's timeout kills us, so the test's timeoutMs has to clear
-      // Node's cold start. See the note on the caller in
-      // aws-cli.integration.test.ts.
-      process.stdout.write('{"partial":"this-arrived-before-the-timeout"');
+      // the parent's timeout kills us, and no fixed timeoutMs reliably clears
+      // Node's cold start under a loaded parallel run. So the write reports
+      // itself through AWS_MCP_FAKE_READY_OUT, and the caller discards runs
+      // where the timeout won -- see writeStdoutThenMarkReady and
+      // runWithFlushBeforeTimeout in aws-cli.integration.test.ts.
+      await writeStdoutThenMarkReady('{"partial":"this-arrived-before-the-timeout"');
       await sleep(50); // keeps the write split across two chunks
-      await sleep(10_000); // hang well past the test's timeoutMs
+      // Hang past the LARGEST budget the caller will try (30s), so every attempt
+      // ends in the timeout path rather than a natural exit -- but not so long
+      // that a regression which never kills us hangs the test runner.
+      await sleep(60_000);
       process.stdout.write("}\n");
       process.exit(0);
       return;
@@ -471,7 +498,29 @@ async function main(): Promise<void> {
       //                                Must comfortably EXCEED the assertion
       //                                window, or an unfixed runAwsCall settles
       //                                on its own and the test passes vacuously.
+      //   AWS_MCP_FAKE_READY_OUT       holds_pipes only: file created once the
+      //                                fragment is flushed. See
+      //                                writeStdoutThenMarkReady.
+      //   AWS_MCP_FAKE_ORPHAN_SPAWN_BEFORE
+      //                                holds_pipes only: epoch ms. Arriving
+      //                                later than this, we skip the orphan and
+      //                                just hang, so the caller's kill cannot
+      //                                land mid-spawn and strand a suspended
+      //                                orphan. See the caller's note.
       const { spawn } = await import("node:child_process");
+      // Loaded BEFORE the spawn so the pid is written in the same synchronous
+      // run as the spawn itself. An await between the two was a window in which
+      // the caller's timeout could kill us with a live orphan and no pid file,
+      // leaving the orphan unreapable for its whole hold.
+      const fs = await import("node:fs");
+      const spawnBefore = process.env.AWS_MCP_FAKE_ORPHAN_SPAWN_BEFORE;
+      if (spawnBefore !== undefined && Date.now() > Number(spawnBefore)) {
+        // Too close to the caller's kill to spawn safely: hang with no orphan
+        // and no ready file, and let the caller discard this attempt.
+        await sleep(60_000);
+        process.exit(0);
+        return;
+      }
       const parsedHold = Number(process.env.AWS_MCP_FAKE_ORPHAN_HOLD_MS ?? "30000");
       const holdMs = Number.isFinite(parsedHold) && parsedHold > 0 ? parsedHold : 30_000;
       const orphan = spawn(process.execPath, ["-e", `setTimeout(() => {}, ${holdMs})`], {
@@ -483,7 +532,6 @@ async function main(): Promise<void> {
 
       const pidPath = process.env.AWS_MCP_FAKE_ORPHAN_PID_OUT;
       if (pidPath && orphan.pid !== undefined) {
-        const fs = await import("node:fs");
         fs.writeFileSync(pidPath, String(orphan.pid));
       }
 
@@ -500,8 +548,10 @@ async function main(): Promise<void> {
 
       // awscli_orphan_holds_pipes: emit a fragment, then hang past timeoutMs so
       // the timeout path runs. The fragment doubles as proof that buffered bytes
-      // still reach rawStdout when the fallback settles instead of 'close'.
-      process.stdout.write('{"partial":"emitted-before-the-orphan-hang"');
+      // still reach rawStdout when the fallback settles instead of 'close'. It
+      // is written AFTER the orphan is spawned, so the ready file also proves
+      // the orphan was holding the pipes when the kill landed.
+      await writeStdoutThenMarkReady('{"partial":"emitted-before-the-orphan-hang"');
       await sleep(10 * 60_000);
       process.exit(0);
       return;
