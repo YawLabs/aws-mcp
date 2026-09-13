@@ -168,7 +168,11 @@ type LauncherRun = { stdout: string; stderr: string; code: number | null };
  * Env is a whitelist so an AWS_MCP_* var exported by the developer's shell
  * cannot change what is being asserted.
  */
-function runLauncher(hostOam: string | undefined, extraEnv: Record<string, string> = {}): Promise<LauncherRun> {
+function runLauncher(
+  hostOam: string | undefined,
+  extraEnv: Record<string, string> = {},
+  extraPreload = "",
+): Promise<LauncherRun> {
   // Every run also reports, at exit, what the LAUNCHER process's argv[1] ended
   // up as. runInProcess points it at dist/index.js; a handoff leaves it on the
   // launcher. That is the only way to tell "served in-process" from "handed
@@ -178,7 +182,7 @@ function runLauncher(hostOam: string | undefined, extraEnv: Record<string, strin
     hostOam === undefined
       ? ""
       : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
-  const preload = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}`)}`];
+  const preload = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}${extraPreload}`)}`];
   return new Promise((resolvePromise, reject) => {
     const child = spawn(process.execPath, [...preload, LAUNCHER, "--version"], {
       env: { PATH: process.env.PATH ?? "", OAM_BIN: process.execPath, ...extraEnv },
@@ -292,5 +296,30 @@ describe("launcher with no usable oam", () => {
     assert.equal(run.code, 0, JSON.stringify(run));
     assert.equal(run.stdout.trim(), PACKAGE_VERSION);
     assert.match(run.stderr, /LAUNCHER_ARGV1=.*aws-mcp\.mjs/);
+  });
+
+  it("still falls back when the chosen oam fails to spawn on an oam host", { timeout }, async () => {
+    // The chosen binary passed its --version probe and then could not be
+    // spawned (deleted or replaced in between). A failed spawn emits 'error'
+    // and then 'close' with the negative errno, and on an oam host the launcher
+    // waits for 'close' -- so an unguarded close handler exited the launcher
+    // mid-fallback and nothing served. The preload makes the FIRST spawn target
+    // a path that does not exist; the Node fallback spawns normally.
+    const failFirstSpawn = [
+      'import childProcess from "node:child_process";',
+      'import { syncBuiltinESMExports } from "node:module";',
+      "const realSpawn = childProcess.spawn;",
+      "let failed = false;",
+      "childProcess.spawn = function (cmd, args, opts) {",
+      "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+      "  failed = true;",
+      '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+      "};",
+      "syncBuiltinESMExports();",
+    ].join("\n");
+    const run = await runLauncher("0.9.0", isolated({ OAM_BIN: process.execPath }), failFirstSpawn);
+    assert.equal(run.code, 0, JSON.stringify(run));
+    assert.equal(run.stdout.trim(), PACKAGE_VERSION, "the Node fallback must still serve");
+    assert.match(run.stderr, /failed to launch oam at .*using Node instead/);
   });
 });
