@@ -9,7 +9,7 @@ called out explicitly in the entries below but are not necessarily gated on a
 major-version bump. From 1.0 onward the public tool shapes (see the README
 "Stability" section) follow strict SemVer.
 
-## [Unreleased]
+## [2.2.4] — 2026-09-12
 
 ### Fixed
 - **The launcher no longer spawns a nested oam when it is already running on oam.** A host can resolve this package's `bin` and launch `oam run bin/aws-mcp.mjs` rather than `node bin/aws-mcp.mjs` -- Yaw MCP does, and so does oam's sidecar regression matrix. The launcher discovered and spawned an oam without checking what it was already running on, so one server cost two runtime boots: on Windows, an `oam.exe` with a NESTED `oam.exe` and `conhost.exe` underneath it. When `process.versions.oam` clears the same 0.9.0 floor a discovered binary has to, the server is now imported into the running process exactly as the Node fallback is -- no discovery, no `oam --version` probe, no second oam. `OAM_BIN` is a discovery input and is not consulted on that path, since the host has already chosen which oam runs, and already running on oam satisfies `AWS_MCP_RUNTIME=oam`. A host oam below the floor takes the discovery path it always did, and `AWS_MCP_RUNTIME=node` is unchanged.
