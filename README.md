@@ -237,17 +237,17 @@ For multi-region reads:
 
 ## Runtime
 
-This server runs on [oam.js](https://oamjs.org) and on Node, unmodified. Verified
-against oam 0.9.0 and Node 22: full MCP handshake, all 28 tools, `aws_script`'s
-`node:vm` sandbox, and byte-identical error messages -- from the shipped bundle
-*and* straight from the TypeScript source with no build step.
+This server runs on [oam.js](https://oamjs.org) and on Node, unmodified, and
+the launcher only ever uses the **latest oam release, currently 0.15.2**. On
+oam 0.15.2: full MCP handshake with all 28 tools, and the `aws_script` sandbox
+behavior described below.
 
-**oam 0.9.0 is the minimum.** Older releases ran `child_process.execFile`
-arguments through a shell, accepted `exec`'s `timeout` and ignored it, and
-treated `stdio: 'inherit'` as `'pipe'`. This server shells out to the `aws` CLI
-on essentially every tool, so those were reachable bugs rather than theoretical
-ones. The launcher enforces the floor: given an older oam it falls back to Node
-and says so on stderr, and `AWS_MCP_RUNTIME=oam` turns that into a hard error.
+**oam 0.15.2 is the minimum.** The launcher picks the newest oam it can find at
+or above it, never serves on an older one, and falls back to Node when there is
+none (`AWS_MCP_RUNTIME=oam` turns that into a hard error). A floor matters here:
+releases before 0.9.0 ran `child_process.execFile` arguments through a shell,
+accepted `exec`'s `timeout` and ignored it, and treated `stdio: 'inherit'` as
+`'pipe'`, and this server shells out to the `aws` CLI on essentially every tool.
 
 To run it under oam, point your MCP client's `command` at it:
 
@@ -265,8 +265,8 @@ To run it under oam, point your MCP client's `command` at it:
 
 **Measure startup on your own hardware.** An MCP client cold-starts this server
 once per session, so startup is the cost that actually gets paid. The numbers
-below were taken with oam 0.8.2, before the 0.9.0 floor, and have not been
-re-run since, so do not read them as a current ranking. To a completed
+below were taken with oam 0.8.2, long before the current 0.15.2 floor, and have
+not been re-run since, so do not read them as a current ranking. To a completed
 `initialize` + `tools/list` handshake, median of 10 warmed runs:
 
 | Runtime | Cold start |
@@ -275,14 +275,14 @@ re-run since, so do not read them as a current ranking. To a completed
 | `oam run dist/index.js` | 650 ms |
 | `oam run src/index.ts` (no build step) | 947 ms |
 
-The published `aws-mcp` command prefers oam when it finds one (see
+The published `aws-mcp` command prefers the newest oam it finds (see
 `AWS_MCP_RUNTIME` under [Environment](#environment)). Without oam that costs
 almost nothing: discovery is file-existence checks only, never a subprocess, and
-the fallback runs the server inside the Node process npm already started. With a
-usable oam, though, the command boots Node, runs `oam --version` to check the
-floor, and only then boots oam, so it is always slower than pointing your client
-at oam directly with the config above. Under `npx`, `AWS_MCP_RUNTIME=node` skips
-oam entirely.
+the fallback runs the server inside the Node process npm already started. With
+oam installed, though, the command boots Node, runs `--version` on every oam
+binary it found to pick the newest, and only then boots oam, so it is always
+slower than pointing your client at oam directly with the config above.
+`AWS_MCP_RUNTIME=node` skips oam entirely.
 
 Two more places oam wins for this repo, both opt-in and neither touching the
 published npm package:
@@ -306,7 +306,7 @@ nominal.
 
 One behavioral difference worth knowing if you run `aws_script` under oam: Node
 honors `codeGeneration: { strings: false }` on the `node:vm` context, so `eval`
-and `Function` throw; oam does not, so they work. Re-measured against oam 0.9.0
+and `Function` throw; oam does not, so they work. Re-measured against oam 0.15.2
 and still divergent, so treat it as a standing difference. The containment that
 matters is unaffected -- under oam, `Function('return this')()` yields a global
 whose `process` and `require` are both `undefined`, and `Function('return
@@ -329,8 +329,8 @@ The launcher that the published `aws-mcp` command runs (`bin/aws-mcp.mjs`, which
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AWS_MCP_RUNTIME` | `auto` | `auto`: serve on the oam the launcher is already running under if that is 0.9.0 or newer; otherwise take the first oam binary discovery finds (see `OAM_BIN`) and use it if it is 0.9.0 or newer. Failing both, the server runs in the process that started the launcher -- Node under `npx` -- with a note on stderr when a found oam was too old or would not run. An older copy earlier in the search order is not skipped in favor of a newer one later. `oam`: the same checks, but exit with an error instead of falling back. `node`: never look for or spawn oam; the server still runs in whatever process started the launcher, so a client that launches the command with `oam run` stays on oam -- set its `command` to `node` to force Node. Case-insensitive, and any other value behaves like `auto`. |
-| `OAM_BIN` | unset | Path to the oam binary to use, held to the same 0.9.0 floor. Once set it is the only candidate: a path that does not exist means no oam (under `auto`, a fallback to Node with no warning), and a binary older than 0.9.0 or one that will not run falls back to Node with a note on stderr. Under `AWS_MCP_RUNTIME=oam` each of these is an error. Unset, the launcher looks in the installed location (`%LOCALAPPDATA%\oam\bin` then `~/.oam/bin` on Windows, `~/.oam/bin` elsewhere) and then on `PATH`; on Windows only `oam.exe` counts, and an `oam.cmd` / `oam.bat` shim is named on stderr but never run. Ignored under `AWS_MCP_RUNTIME=node` and when already running on oam 0.9.0+. |
+| `AWS_MCP_RUNTIME` | `auto` | `auto`: serve on the oam the launcher is already running under if that is 0.15.2 or newer; otherwise run on the newest oam binary it can find at 0.15.2 or newer (see `OAM_BIN`); otherwise on Node. An oam host older than 0.15.2 never serves the server itself -- it hands off to the newest usable oam, or to Node on `PATH`, or exits with an error when there is neither. A note goes to stderr whenever a found oam, or `OAM_BIN`, was passed over. `oam`: the same, but exit with an error instead of falling back to Node. `node`: always Node -- in-process under `npx`, and handed off to Node on `PATH` when a client launches the command with `oam run`. Case-insensitive, and any other value behaves like `auto`. |
+| `OAM_BIN` | unset | Path to an oam binary to use in preference to discovery, when it is 0.15.2 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery. Discovery looks in the installed location (`%LOCALAPPDATA%\oam\bin` then `~/.oam/bin` on Windows, `~/.oam/bin` elsewhere) and on `PATH`, asks every oam it finds for its version, and uses the newest; on a tie the installed copy wins. On Windows only `oam.exe` counts, and an `oam.cmd` / `oam.bat` shim is named on stderr but never run. Ignored under `AWS_MCP_RUNTIME=node` and when already running on oam 0.15.2+. |
 
 If you authenticate via SAML (Okta / Azure AD / ADFS) or a custom `credential_process`, set `AWS_PROFILE` to that profile.
 
