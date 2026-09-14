@@ -9,6 +9,9 @@
     "type": "git",
     "url": "git+https://github.com/YawLabs/aws-mcp.git"
   },
+  "bugs": {
+    "url": "https://github.com/YawLabs/aws-mcp/issues"
+  },
   "keywords": [
     "aws",
     "aws-mcp",
@@ -25,7 +28,9 @@
     "iam",
     "claude",
     "ai-agents",
-    "ai"
+    "ai",
+    "claude-code",
+    "cursor"
   ],
   "type": "module",
   "main": "dist/index.js",
