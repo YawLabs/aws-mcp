@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.3.2] — 2026-09-14
+
 ### Fixed
 - **The bundled `fast-uri` is out of its advised range.** The published 2.3.1 bundle carried `fast-uri` 3.1.2 (via `@modelcontextprotocol/sdk` -> `ajv`), inside the range of six high-severity host-confusion and SSRF advisories; it is now 3.1.7. The `@modelcontextprotocol/sdk` range is unchanged at `^1.30.0`, and the SDK's other advised dev-tree packages, none of which are bundled, move too: `hono` 4.12.25 -> 4.13.7, `@hono/node-server` 1.19.14 -> 2.1.1, `ip-address` 10.2.0 -> 10.7.0, `qs` 6.15.2 -> 6.16.0, `body-parser` 2.2.2 -> 2.3.0, with the `hono` and `qs` override floors raised to their first patched versions (`^4.13.5`, `^6.16.0`). `npm audit` goes from 6 findings (2 high) to 0.
 
@@ -1038,7 +1040,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.3.1...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.3.2...HEAD
+[2.3.2]: https://github.com/YawLabs/aws-mcp/compare/v2.3.1...v2.3.2
 [2.3.1]: https://github.com/YawLabs/aws-mcp/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/YawLabs/aws-mcp/compare/v2.2.7...v2.3.0
 [2.2.7]: https://github.com/YawLabs/aws-mcp/compare/v2.2.6...v2.2.7
