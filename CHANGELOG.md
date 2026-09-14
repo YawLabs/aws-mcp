@@ -13,6 +13,16 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release -- promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag -- keeps the Keep-a-Changelog link references current, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, a release with nothing under `[Unreleased]` got no entry at all (2.3.0 below is backfilled), and every GitHub release page showed raw commit subjects.
+
+## [2.3.0] — 2026-09-13
+
+Documentation only; no change to the published package's behavior.
+
+### Changed
+- README: the X follow badge moved from the top of the page to the bottom, so the description leads on npm and GitHub (#43).
+- README: says when the launcher names skipped oam binaries on stderr -- an unusable `OAM_BIN` is always named; other skipped binaries and a `.cmd`/`.bat` shim only when no usable oam is found (#41).
+- CHANGELOG: the 2.2.6 `OAM_BIN` bullet corrected (#42).
 
 ## [2.2.7] — 2026-09-13
 
@@ -1023,7 +1033,20 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/YawLabs/aws-mcp/compare/v2.2.7...v2.3.0
+[2.2.7]: https://github.com/YawLabs/aws-mcp/compare/v2.2.6...v2.2.7
+[2.2.6]: https://github.com/YawLabs/aws-mcp/compare/v2.2.5...v2.2.6
+[2.2.5]: https://github.com/YawLabs/aws-mcp/compare/v2.2.4...v2.2.5
+[2.2.4]: https://github.com/YawLabs/aws-mcp/compare/v2.2.3...v2.2.4
+[2.2.3]: https://github.com/YawLabs/aws-mcp/compare/v2.2.2...v2.2.3
+[2.2.2]: https://github.com/YawLabs/aws-mcp/compare/v2.2.1...v2.2.2
+[2.2.1]: https://github.com/YawLabs/aws-mcp/compare/v2.2.0...v2.2.1
+[2.2.0]: https://github.com/YawLabs/aws-mcp/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/YawLabs/aws-mcp/compare/v2.0.1...v2.1.0
+[2.0.1]: https://github.com/YawLabs/aws-mcp/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/YawLabs/aws-mcp/compare/v1.8.2...v2.0.0
+[1.8.2]: https://github.com/YawLabs/aws-mcp/compare/v1.8.1...v1.8.2
 [1.8.1]: https://github.com/YawLabs/aws-mcp/compare/v1.8.0...v1.8.1
 [1.5.3]: https://github.com/YawLabs/aws-mcp/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/YawLabs/aws-mcp/compare/v1.5.1...v1.5.2
