@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.3.1] — 2026-09-14
+
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 - `release.sh` writes a `## [x.y.z]` changelog entry for every release -- promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag -- keeps the Keep-a-Changelog link references current, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, a release with nothing under `[Unreleased]` got no entry at all (2.3.0 below is backfilled), and every GitHub release page showed raw commit subjects.
@@ -1033,7 +1035,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/YawLabs/aws-mcp/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/YawLabs/aws-mcp/compare/v2.2.7...v2.3.0
 [2.2.7]: https://github.com/YawLabs/aws-mcp/compare/v2.2.6...v2.2.7
 [2.2.6]: https://github.com/YawLabs/aws-mcp/compare/v2.2.5...v2.2.6
