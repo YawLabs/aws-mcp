@@ -412,19 +412,25 @@ fi
 #     status; a timeout message from this loop would replace that with something
 #     strictly less informative. This gate can only make the release faster,
 #     never worse than it was before it existed.
+#   * The scope slash is percent-encoded (`@yawlabs%2Faws-mcp`, the `@` left
+#     bare): that is the exact URL the MCP Registry's npm validator builds
+#     (url.PathEscape in internal/validators/registries/npm.go), so this poll
+#     reads the same cache entry it does, as the sibling release scripts do.
+#     The literal-slash spelling also resolves, but can be a different entry.
 if [ "${SKIP_NPM_WAIT:-}" = "1" ]; then
   warn "SKIP_NPM_WAIT=1 -- not waiting for npm to serve v${VERSION}"
 elif ! command -v curl >/dev/null 2>&1; then
   warn "curl not found -- skipping the npm propagation wait; step 7 may 404 on a fresh publish"
 else
   PKG_NAME=$(node -p "require('./package.json').name")
+  NPM_WAIT_URL="https://registry.npmjs.org/${PKG_NAME//\//%2F}/${VERSION}"
   NPM_WAIT_TIMEOUT_S=${NPM_WAIT_TIMEOUT_S:-300}
   NPM_WAITED_S=0
   # 5s: this is a remote read on a minutes-scale wait, so a tighter spin buys
   # nothing. (Under MSYS every `sleep` forks a process -- ~0.1s each -- which is
   # noise at this interval but the reason not to poll sub-second.)
   while [ "$NPM_WAITED_S" -lt "$NPM_WAIT_TIMEOUT_S" ]; do
-    if curl -fsS -o /dev/null "https://registry.npmjs.org/${PKG_NAME}/${VERSION}" 2>/dev/null; then
+    if curl -fsS -o /dev/null "$NPM_WAIT_URL" 2>/dev/null; then
       break
     fi
     sleep 5
