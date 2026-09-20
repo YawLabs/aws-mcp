@@ -982,7 +982,16 @@ describe("spawn-hardening: which binary runs", () => {
           operation: "get-caller-identity",
           prefixArgs: [FAKE_AWS],
           timeoutMs: 30_000,
-          env: { ...process.env, PATH: legit.dir, AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env" },
+          // undefined counts as unset. Without this the case is not hermetic:
+          // an ambient AWS_MCP_AWS_CLI is an explicit command, so the resolver
+          // honours it ahead of the PATH planted here and the operator's real
+          // CLI runs with FAKE_AWS as argv[1].
+          env: {
+            ...process.env,
+            PATH: legit.dir,
+            AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env",
+            AWS_MCP_AWS_CLI: undefined,
+          },
         });
         assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
         if (!r.ok) return;
