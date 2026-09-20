@@ -1001,7 +1001,6 @@ describe("spawn-hardening: which binary runs", () => {
     const empty = mkdtempSync(join(tmpdir(), "aws-mcp-nopath-"));
     try {
       await withoutSpawnOverrides(async () => {
-        const started = Date.now();
         const r = await runAwsCall({
           service: "sts",
           operation: "get-caller-identity",
@@ -1014,8 +1013,13 @@ describe("spawn-hardening: which binary runs", () => {
         assert.equal(r.kind, "spawn_failure");
         assert.match(r.error, /AWS_MCP_AWS_CLI/, "the message has to name the override");
         assert.match(r.error, /working directory is never searched/);
-        // Nothing was spawned, so this cannot have taken a CLI start.
-        assert.ok(Date.now() - started < 2_000, "an unresolvable CLI must fail without spawning anything");
+        // The envelope, not the clock: the resolver failed before any argv was
+        // assembled, so there is no invocation to show. A bare-name fallback would
+        // have spawned something and put its display string here. This file's own
+        // budgets (fakeOpts, FLUSH_BEFORE_TIMEOUT_BUDGETS_MS) document multi-second
+        // scheduler stalls under a parallel `node --test`, so a wall-clock bound on
+        // "nothing ran" would go red on a build where resolution worked perfectly.
+        assert.equal(r.command, undefined, "a resolver failure assembles no invocation, so nothing was spawned");
       });
     } finally {
       rmSync(empty, { recursive: true, force: true });

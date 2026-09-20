@@ -843,29 +843,36 @@ describe("spawn-hardening: sso spawns", () => {
     }
   });
 
-  it("reports an unfindable CLI at once, rather than probing and then waiting out the URL timeout", async () => {
+  it("reports an unfindable CLI by naming the override, not by blaming PATH", async () => {
     // Before the shared resolver, sso.ts spawned the bare name `aws` and read no
-    // override, so a host with no CLI on PATH paid a version probe and then the
-    // full urlWaitMs before saying anything -- and AWS_MCP_AWS_CLI, which fixes
-    // exactly that host, did not apply to logins at all.
+    // override. It answered FAST -- both spawns raise ENOENT in a few ms (measured
+    // 2 ms for `aws --version` and 1 ms for `aws sso login` on this box with PATH
+    // pointing at an empty directory), because probeDeviceCodeSupport and
+    // doStartSsoLogin each resolve from their own 'error' handler rather than
+    // waiting out a timeout. What it got wrong was the WORDING: `Failed to run
+    // 'aws': spawn aws ENOENT. Is the AWS CLI installed and on PATH?`, a PATH hint
+    // on the one host whose actual fix is AWS_MCP_AWS_CLI -- which did not apply to
+    // logins at all. The two message assertions below are the guard; neither
+    // matches that old string.
+    //
+    // No clock assertion: it would pass either way, so it buys no coverage and
+    // costs a wall-clock flake surface. urlWaitMs stays as the hang bound (it
+    // tightens the 15 s default), and versionProbeTimeoutMs is left at its 2 s
+    // default so a reverted short-circuit stalls briefly rather than for 30 s.
     _clearCliVersionCache();
     const empty = mkdtempSync(join(tmpdir(), "aws-mcp-sso-nopath-"));
     const saved = process.env.NoDefaultCurrentDirectoryInExePath;
     try {
       delete process.env.NoDefaultCurrentDirectoryInExePath;
-      const started = Date.now();
       const result = await startSsoLogin("no-cli-prof", {
         // No `command`: this is the production path through the resolver.
         env: { ...process.env, PATH: empty, AWS_MCP_AWS_CLI: undefined },
         urlWaitMs: 10_000,
-        versionProbeTimeoutMs: 30_000,
       });
-      const elapsed = Date.now() - started;
       assert.equal(result.ok, false);
       if (result.ok) return;
       assert.match(result.error, /AWS_MCP_AWS_CLI/, "the message has to name the override");
       assert.match(result.error, /Could not find the AWS CLI/);
-      assert.ok(elapsed < 5_000, `should not have waited for a probe or the URL timeout (${elapsed}ms)`);
     } finally {
       if (saved === undefined) delete process.env.NoDefaultCurrentDirectoryInExePath;
       else process.env.NoDefaultCurrentDirectoryInExePath = saved;
