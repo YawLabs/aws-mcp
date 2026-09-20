@@ -547,9 +547,21 @@ async function main(): Promise<void> {
       // speed or CI load. The earlier 1 MB-chunks-with-10ms-sleeps version was
       // timing-coupled -- it only passed because the parent read fast enough to
       // kill mid-stream before all 8 MB were written and before the test
-      // timeout. This burst makes the cap deterministic.
+      // timeout. The burst makes the cap independent of reader speed.
+      //
+      // The EXIT is the part that has to be careful, and the reason this case
+      // used to pass on Windows and silently pass for the wrong reason on
+      // Linux. Fall out of main() rather than process.exit(0), for
+      // handleVersionProbe's reason above: a multi-megabyte write to a pipe
+      // cannot complete in one tick, and on POSIX stdout-to-a-pipe is
+      // asynchronous, so exiting in the same breath discards whatever libuv
+      // has not flushed. Measured with this exact 6 MB burst: exit-immediately
+      // delivered 146176 of 6291456 bytes on linux/arm64 (Node 22.23.2) and
+      // all 6291456 on win32/arm64 (Node 22.22.2), where stdio pipes are
+      // blocking. So the cap fired on Windows while the same case came back a
+      // successful ~143 KB call on Linux. The parent kills us mid-stream once
+      // the cap trips; if it does not, the flush finishes and Node exits 0.
       process.stdout.write("x".repeat(6 * 1024 * 1024));
-      process.exit(0);
       return;
     }
 
@@ -2753,8 +2765,9 @@ async function main(): Promise<void> {
       if (scenario === "macct_big_payload") {
         // ~2.75 MB per account: under the 5 MB PER-CALL stdout cap in
         // aws-cli.ts, but two of them cross the 5 MB AGGREGATE budget.
+        // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
+        // and exiting in the same breath truncates it on POSIX.
         process.stdout.write(`${JSON.stringify({ Account: account, Blob: "x".repeat(2_750_000) })}\n`);
-        process.exit(0);
         return;
       }
 
@@ -2950,8 +2963,9 @@ async function main(): Promise<void> {
         process.exit(255);
         return;
       }
+      // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
+      // and exiting in the same breath truncates it on POSIX.
       process.stdout.write(`${JSON.stringify({ Region: region, Blob: "x".repeat(2_750_000) })}\n`);
-      process.exit(0);
       return;
     }
 
