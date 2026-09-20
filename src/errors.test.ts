@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { classifyAuthError, parseAwsError } from "./errors.js";
+import { classifyAuthError, parseAwsError, READ_TIMEOUT_RE } from "./errors.js";
 
 describe("classifyAuthError — message text only, err.name is not consulted", () => {
   // The classifier used to have three branches keyed on AWS SDK error CLASS
@@ -574,5 +574,71 @@ describe("parseAwsError -- non-standard shapes", () => {
 
   it("returns empty object for empty stderr", () => {
     assert.deepEqual(parseAwsError(""), {});
+  });
+});
+
+describe("parseAwsError -- transport failures", () => {
+  // Every sample is a verbatim capture from a real AWS CLI driven against a
+  // loopback stub (`lambda-invoke-probe2.out.ndjson`,
+  // `lambda-invoke-rv2-probe.out.ndjson`), in both prefix styles: 2.34.3 writes
+  // "aws: [ERROR]: " ahead of the sentence and 2.22.0 writes it bare. None of
+  // these three had a remedy before, which is how a 60-second Lambda invoke came
+  // back with nothing to act on.
+
+  it("gives a read timeout a remedy that does not claim the request was or was not re-sent", () => {
+    for (const stderr of [
+      '\r\naws: [ERROR]: Read timeout on endpoint URL: "http://127.0.0.1:28763/2015-03-31/functions/slow-6000/invocations"\r\n',
+      '\r\nRead timeout on endpoint URL: "http://127.0.0.1:28841/2015-03-31/functions/slow-4000/invocations?Qualifier=PROD"\r\n',
+    ]) {
+      const r = parseAwsError(stderr);
+      assert.match(r.suggestion ?? "", /socket read timeout/);
+      // Generic on purpose: aws_call and every other tool reach this with the
+      // CLI's retries still ON, so only aws_lambda_invoke -- which turns them off
+      // and reads the URL itself -- may say "sent once".
+      assert.match(r.suggestion ?? "", /may already have re-sent it/);
+      assert.match(r.suggestion ?? "", /check before retrying/);
+      // There is no "An error occurred (Code)" wrapper on a transport failure.
+      assert.equal(r.code, undefined);
+      assert.equal(r.operation, undefined);
+      assert.equal(r.message, stderr.trim());
+    }
+  });
+
+  it("gives a connect timeout the network / proxy / region remedy", () => {
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: Connect timeout on endpoint URL: "http://192.0.2.1:9/2015-03-31/functions/ok/invocations"\r\n',
+    );
+    assert.match(r.suggestion ?? "", /Could not open a connection/);
+    assert.match(r.suggestion ?? "", /HTTPS_PROXY/);
+    assert.equal(r.code, undefined);
+  });
+
+  it("gives a dropped connection the may-or-may-not-have-taken-effect remedy", () => {
+    // Note the trailing "." after the quoted URL: it is in the real message, so
+    // the pattern must not expect the URL to end the line.
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: Connection was closed before we received a valid response from endpoint URL: "http://127.0.0.1:28763/2015-03-31/functions/reset/invocations".\r\n',
+    );
+    assert.match(r.suggestion ?? "", /may or may not have taken effect/);
+    assert.match(r.suggestion ?? "", /NAT gateway, firewall or proxy/);
+  });
+
+  it("does not fire on prose that merely mentions a read timeout", () => {
+    // The patterns are botocore's fmt strings, not keywords -- the whole point of
+    // anchoring on "on endpoint URL:" rather than on "read timeout".
+    const r = parseAwsError("a read timeout happened in my app");
+    assert.equal(r.suggestion, undefined);
+    assert.equal(r.message, "a read timeout happened in my app");
+  });
+
+  it("exports READ_TIMEOUT_RE with the whole line, so a caller can read the URL out of it", () => {
+    // What aws_lambda_invoke tells "the invoke was sent" from "a credential call
+    // never answered" with: this STS capture (`sts_hang_rt3`) came with ZERO
+    // Invoke requests, and the URL is the only thing that says so.
+    const m = READ_TIMEOUT_RE.exec('\r\naws: [ERROR]: Read timeout on endpoint URL: "http://127.0.0.1:28842/"\r\n');
+    assert.ok(m);
+    assert.ok(m[0].includes("http://127.0.0.1:28842/"), `matched line was ${JSON.stringify(m?.[0])}`);
+    // One line only: a multi-line blob must not let the match run past it.
+    assert.ok(!m[0].includes("\r"));
   });
 });

@@ -33,6 +33,29 @@
  * `--cli-input-json` operation aws_call already handles). Anything that aws_call
  * can express, however awkwardly, does not belong here.
  *
+ * RETRIES AND TIMEOUTS. The invoke is sent AT MOST ONCE, because a CLI retry of
+ * an Invoke that already reached Lambda runs the function again -- and the
+ * function is somebody else's code. The child gets AWS_MAX_ATTEMPTS=1
+ * (invokeChildEnv), which also overrides a `max_attempts` in the caller's
+ * profile. Verified against a stubbed Lambda endpoint on aws-cli 2.34.3: a 70 s
+ * function with timeoutMs 200000 received THREE Invoke POSTs 60 s apart on the
+ * CLI's defaults -- five with `max_attempts = 5` -- and the call still came back
+ * with no payload and no log tail after 183 s.
+ *
+ * `timeoutMs` is how long to wait for the FUNCTION, and three timers hang off
+ * it (invokeTimeouts): the CLI's own --cli-read-timeout gets
+ * INVOKE_RESPONSE_SLACK_S more, and our kill sits INVOKE_CLI_GRACE_MS behind
+ * that as a backstop. The CLI therefore reports first on a real hang, which is
+ * what makes the failure legible.
+ *
+ * One property of the CLI shapes that failure path: --cli-read-timeout also
+ * bounds the CLI's CREDENTIAL calls, so a read timeout does NOT by itself prove
+ * the invoke was sent. A `role_arn` profile whose STS endpoint accepts the
+ * connection and never answers produces the identical `Read timeout on endpoint
+ * URL` text with ZERO Invoke requests (verified on 2.34.3 and 2.22.0). The
+ * failure branch reads the URL out of that message instead of assuming the
+ * function ran.
+ *
  * DEFERRED, explicitly and with intent:
  *   - `InvocationType: "Event"` (async fire-and-forget). It returns 202 with no
  *     payload and no logs, so it shares almost nothing with the code below and
@@ -50,6 +73,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
+import { READ_TIMEOUT_RE } from "../errors.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
@@ -86,6 +110,190 @@ const MAX_FUNCTION_NAME_LEN = 170; // Full-ARN maximum per the Lambda API docs.
 /** Version number or alias name. `$LATEST` is why `$` is in the class. */
 const SAFE_QUALIFIER_RE = /^[a-zA-Z0-9$][a-zA-Z0-9\-_$]*$/;
 const MAX_QUALIFIER_LEN = 128;
+
+/** Matches the `timeoutMs` description and runAwsCall's own default. */
+const DEFAULT_INVOKE_TIMEOUT_MS = 60_000;
+
+/**
+ * Lambda's synchronous ceiling, in seconds.
+ *
+ * A larger `timeoutMs` is silently treated as this rather than rejected: the
+ * input schema accepts any positive integer today, so refusing one would be a
+ * breaking input change for a value that cannot help. It also caps the timers
+ * below well under the 2^31-1 ms a Node timer can express -- above that Node
+ * fires the timer after 1 ms instead, which used to make a huge `timeoutMs`
+ * time the call out immediately.
+ *
+ * The 90-minute Lambda Managed Instances timeout (2026-09-09) is for async and
+ * event-source invocations; a synchronous invoke, durable ones included, still
+ * stops at 15 minutes.
+ */
+const MAX_SYNC_INVOKE_S = 900;
+
+/**
+ * What the CLI is allowed beyond the caller's wait, as `--cli-read-timeout`.
+ *
+ * Sized for the on-demand Init phase: Lambda caps init at 10 s and does NOT
+ * count it against the function's own timeout, so a cold function that hits
+ * that timeout answers at up to init + timeout. With less slack a caller who
+ * follows the `timeoutMs` description and sets it to the function's own timeout
+ * would turn the function's "Task timed out" functionError -- with its log tail,
+ * the reason this tool exists -- into a bare read timeout with nothing in it.
+ */
+const INVOKE_RESPONSE_SLACK_S = 10;
+
+/**
+ * Room between the CLI's read timeout and our kill, so the CLI reports first.
+ *
+ * It then exits on its own: no kill, so no Windows EBUSY on the outfile (see the
+ * finally block), and its message names the URL that went unanswered. Sized for
+ * CLI startup, measured at 0.9-1.8 s on this machine.
+ */
+const INVOKE_CLI_GRACE_MS = 5_000;
+
+/**
+ * The three timers one invoke runs on, derived from the caller's `timeoutMs`.
+ *
+ * Pure and exported for direct unit coverage: the RELATIONSHIP between them is
+ * the fix for a function being invoked three times, and pinning it here is far
+ * cheaper than waiting out real timers through a spawned call.
+ *
+ * A non-finite or non-positive value falls back to the default rather than
+ * throwing -- the same defense-in-depth reasoning as the handler's own
+ * validation below: the MCP layer rejects such a value, an in-process caller
+ * does not.
+ */
+export function invokeTimeouts(timeoutMs: number | undefined): {
+  waitS: number;
+  readTimeoutS: number;
+  spawnTimeoutMs: number;
+} {
+  const ms =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : DEFAULT_INVOKE_TIMEOUT_MS;
+  const waitS = Math.min(Math.ceil(ms / 1000), MAX_SYNC_INVOKE_S);
+  // At least 1 + 10, so never 0: `--cli-read-timeout 0` means block forever,
+  // which would leave the kill as the only bound and lose the URL the CLI's
+  // message carries.
+  const readTimeoutS = waitS + INVOKE_RESPONSE_SLACK_S;
+  return { waitS, readTimeoutS, spawnTimeoutMs: readTimeoutS * 1000 + INVOKE_CLI_GRACE_MS };
+}
+
+/**
+ * The child environment for one invoke: a copy of `base` with every spelling of
+ * AWS_MAX_ATTEMPTS dropped and the variable set to "1".
+ *
+ * A whole copy, not a patch, because runAwsCall's `env` REPLACES the parent
+ * environment rather than merging into it (node's spawn semantics; see
+ * AwsCallOptions.env). The spread keeps everything else the call needs, the
+ * fake-aws test knobs included.
+ *
+ * The variable beats `max_attempts` in the caller's ~/.aws/config -- verified on
+ * 2.34.3 and 2.22.0, with a named profile and with [default], and under
+ * `retry_mode = adaptive` -- which is the whole point: the profile belongs to the
+ * user, and one that asks for five attempts would otherwise run the function
+ * five times.
+ *
+ * Deleting the case-variants is load-bearing rather than tidy. Given both
+ * AWS_MAX_ATTEMPTS and aws_max_attempts, Node 22.22.2 hands the child the
+ * upper-case one while oam 0.16.2 -- the runtime the published command uses by
+ * default -- hands it the LAST key in the object (measured both ways). So an
+ * operator's lower-case spelling could win there, on the one setting that keeps
+ * the function from running twice.
+ */
+export function invokeChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base };
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === "AWS_MAX_ATTEMPTS") delete env[key];
+  }
+  env.AWS_MAX_ATTEMPTS = "1";
+  return env;
+}
+
+/**
+ * The Invoke request path as it appears in the CLI's read-timeout message:
+ * `/2015-03-31/functions/<name>/invocations`, with `?Qualifier=...` appended
+ * when a qualifier was passed. The name segment can be a URL-encoded ARN, so the
+ * class excludes only what would end the segment or the URL itself.
+ */
+const INVOKE_PATH_RE = /\/functions\/[^/?#"\\\s]+\/invocations/;
+/** Any URL on that line, so a pre-invoke timeout can name the endpoint. */
+const ANY_URL_RE = /https?:\/\/[^"\\\s]+/;
+
+/**
+ * Test-only override for the backstop kill timer, honored only for a positive
+ * integer (AWS_MCP_TEST_LAMBDA_SPAWN_TIMEOUT_MS).
+ *
+ * The backstop is reachable only when the CLI itself stalls, and with the
+ * constants above that takes 16 s at the very shortest -- too long for a unit
+ * test. The real-CLI suite needs the opposite: a very large value there
+ * guarantees the CLI's own read timeout fires first, so those cases assert on
+ * the CLI's message instead of racing it.
+ *
+ * Never set in production. Same AWS_MCP_TEST_ convention as aws-cli.ts's
+ * command / prefix-args knobs, and a malformed value is ignored the same way
+ * rather than wedging every invoke.
+ */
+function testSpawnTimeoutOverride(): number | undefined {
+  const raw = process.env.AWS_MCP_TEST_LAMBDA_SPAWN_TIMEOUT_MS;
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * The `errorKind: "timeout"` envelope, in three flavors that differ only in what
+ * they can honestly say about whether the invoke went out.
+ *
+ * All three are `timeout` rather than `nonzero_exit`, including the CLI's own
+ * read timeout, which used to arrive as the latter. The condition is exactly
+ * runAwsCall's `timeout` -- no answer in time -- so which clock fired first must
+ * not change the kind a caller branches on.
+ *
+ * "unknown" is the conservative default, and that ordering is the point of the
+ * whole branch: telling a model "not sent" about an invoke that WAS sent invites
+ * a second run of somebody's function, so an unreadable message gets the
+ * may-or-may-not wording instead.
+ */
+function invokeTimeoutFailure(o: {
+  label: string;
+  waitS: number;
+  readTimeoutS: number;
+  spawnTimeoutMs: number;
+  outcome: "sent" | "not-sent" | "unknown";
+  url?: string;
+  rawBody: string;
+  killed: boolean;
+}): ToolResult {
+  // Named once: two of the three flavors end in the same advice, because both
+  // leave a function that may be running.
+  const checkLogs = `Check the function's recent logs with aws_logs_tail (log group /aws/lambda/<function name> unless it sets a custom one) before invoking again; raise timeoutMs if the function's own timeout is longer than ${o.waitS}s (at most 900000).`;
+  let message: string;
+  let suggestion: string;
+  if (o.outcome === "sent") {
+    message = `No response from Lambda function '${o.label}' within ${o.readTimeoutS}s (timeoutMs ${o.waitS}s + ${INVOKE_RESPONSE_SLACK_S}s). The invoke was sent once and not retried, but Lambda does not stop a synchronous invocation when the caller stops waiting: the function may still be running, or may already have finished.`;
+    suggestion = checkLogs;
+  } else if (o.outcome === "not-sent") {
+    message = `The AWS CLI got no response from ${o.url} within ${o.readTimeoutS}s while resolving credentials, before it sent the invoke. '${o.label}' was not invoked.`;
+    suggestion =
+      "Retrying is safe once that endpoint answers; for a role_arn profile it is the STS endpoint, for an SSO profile the SSO portal. Check network access and any proxy.";
+  } else {
+    const bound = o.killed ? `${o.spawnTimeoutMs / 1000}s and was stopped` : `${o.readTimeoutS}s`;
+    message = `The AWS CLI did not finish invoking '${o.label}' within ${bound}. It most likely stalled before the invoke went out (resolving credentials, connecting, or uploading the payload), but the invoke may or may not have been sent. It was not sent more than once.`;
+    suggestion = checkLogs;
+  }
+  return {
+    ok: false,
+    errorKind: "timeout",
+    // Repeated at the end of `error` as well, which is the documented invariant
+    // for this field: toMcpResult does not render `suggestion` separately, so a
+    // remedy that lived only there would never reach the model.
+    error: `${message}\n\nSuggestion: ${suggestion}`,
+    suggestion,
+    ...(o.rawBody ? { rawBody: o.rawBody } : {}),
+  };
+}
 
 /**
  * Shape of the JSON `aws lambda invoke` writes to STDOUT. The response body
@@ -130,7 +338,7 @@ export const lambdaTools: readonly Tool[] = [
   {
     name: "aws_lambda_invoke",
     description:
-      "Invoke a Lambda function synchronously (RequestResponse) and return its response payload plus the DECODED tail of its execution log in one call. Use this instead of aws_call for Lambda invokes: `aws lambda invoke` needs a positional output file and rejects --cli-input-json, so aws_call structurally cannot reach it. The returned `logTail` is the last ~4 KB of the function's own log output, already base64-decoded, which removes the usual invoke -> find the log group -> tail it -> hope the window caught it loop. IMPORTANT: a non-empty `functionError` means the function's HANDLER threw; the invocation itself still succeeded, so ok is true and the thrown error is in `payload`.",
+      "Invoke a Lambda function synchronously (RequestResponse) and return its response payload plus the DECODED tail of its execution log in one call. Use this instead of aws_call for Lambda invokes: `aws lambda invoke` needs a positional output file and rejects --cli-input-json, so aws_call structurally cannot reach it. The returned `logTail` is the last ~4 KB of the function's own log output, already base64-decoded, which removes the usual invoke -> find the log group -> tail it -> hope the window caught it loop. IMPORTANT: a non-empty `functionError` means the function's HANDLER threw; the invocation itself still succeeded, so ok is true and the thrown error is in `payload`. The invoke is sent AT MOST ONCE: the AWS CLI's automatic retries are turned off here, because a retried invoke runs the function again. A TooManyRequestsException, or a connection that could not be opened, means nothing ran, so retrying is safe. On errorKind 'timeout' the error says whether the invoke was sent; if it was, or after a dropped connection or a 5xx, the function may have run and may still be running -- check its logs before invoking again.",
     annotations: {
       title: "Invoke a Lambda function",
       // destructiveHint: true, and it must stay that way.
@@ -182,7 +390,7 @@ export const lambdaTools: readonly Tool[] = [
         .positive()
         .optional()
         .describe(
-          "Timeout in milliseconds. Default 60000 (60s). Raise it for a function whose own timeout is longer — a Lambda may run up to 15 minutes.",
+          "How long to wait for the function to respond, in milliseconds. Default 60000. Set it to at least the function's own configured timeout; a synchronous invoke runs at most 15 minutes, so values above 900000 are treated as 900000. The AWS CLI is allowed 10 s beyond this to cover a cold start, so a function that hits its own timeout still returns as a functionError with its log tail; a call that gets no answer at all fails with errorKind 'timeout' after at most timeoutMs + 15 s.",
         ),
     }),
     handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
@@ -239,6 +447,14 @@ export const lambdaTools: readonly Tool[] = [
           error: `invocationType '${i.invocationType}' is not supported. Only 'RequestResponse' (synchronous) is implemented; 'Event' and 'DryRun' are deliberately out of scope.`,
         };
       }
+
+      // Every timer for this call, settled before anything is created: the CLI's
+      // read timeout goes on argv, the backstop goes to runAwsCall, and `waitS`
+      // is what the caller asked for, named in the progress line and in every
+      // timeout message.
+      const { waitS, readTimeoutS, spawnTimeoutMs: computedSpawnMs } = invokeTimeouts(i.timeoutMs);
+      const spawnTimeoutMs = testSpawnTimeoutOverride() ?? computedSpawnMs;
+      const label = `${i.functionName}${i.qualifier ? `:${i.qualifier}` : ""}`;
 
       // One directory holds both temp files, so cleanup is a single rmSync.
       // mkdtempSync is atomic and collision-free, which a hand-rolled
@@ -297,16 +513,21 @@ export const lambdaTools: readonly Tool[] = [
         // and the API caps it at 4 KB, so there is no payload-size argument for
         // making it opt-in.
         extraFlags.push("--log-type", "Tail", "--invocation-type", "RequestResponse");
+        // The CLI's socket read timeout, which defaults to 60 s: without this
+        // flag a function slower than that lost its response and, worse, had its
+        // Invoke re-sent by the CLI's retry logic. See the header.
+        extraFlags.push("--cli-read-timeout", String(readTimeoutS));
         // The outfile positional goes LAST in extraFlags. runAwsCall appends
         // `--output/--profile/--region` after them, and `aws lambda invoke`
         // accepts the positional before those flags.
         extraFlags.push(outPath);
 
         // One notification before the call, not a stream during it. This tool's
-        // own description tells callers to raise `timeoutMs` for a function whose
-        // own timeout is longer -- a Lambda may run up to 15 minutes -- and a
-        // stdio server that says nothing for that long is indistinguishable from
-        // one that has hung. That is the exact reasoning v2.1.0 used when it gave
+        // own description tells callers to set `timeoutMs` to the function's own
+        // timeout, which a Lambda may carry up to 15 minutes -- safe advice now
+        // that the invoke cannot be re-sent -- and a stdio server that says
+        // nothing for that long is indistinguishable from one that has hung.
+        // That is the exact reasoning v2.1.0 used when it gave
         // aws_resource_*, aws_multi_region and aws_assume_role progress; this tool
         // shipped in v2.2.0 without inheriting it.
         //
@@ -317,9 +538,10 @@ export const lambdaTools: readonly Tool[] = [
         ctx?.reportProgress(
           0,
           undefined,
-          // i.timeoutMs may be absent; name the effective bound rather than
-          // "undefined", so the line is useful on the default path too.
-          `Invoking ${i.functionName}${i.qualifier ? `:${i.qualifier}` : ""} (timeout ${Math.round((i.timeoutMs ?? 60_000) / 1000)}s)`,
+          // waitS, not i.timeoutMs: name the bound that is actually in force, so
+          // the line is useful on the default path and honest when the value was
+          // clamped to Lambda's 15-minute ceiling.
+          `Invoking ${label} (timeout ${waitS}s)`,
         );
 
         const result = await runAwsCall({
@@ -327,7 +549,14 @@ export const lambdaTools: readonly Tool[] = [
           operation: "invoke",
           profile: i.profile,
           region: i.region,
-          timeoutMs: i.timeoutMs,
+          // The backstop, not the caller's value: the CLI is meant to report
+          // first, and a kill leaves the message unable to say whether the
+          // invoke went out.
+          timeoutMs: spawnTimeoutMs,
+          // AWS_MAX_ATTEMPTS=1, on a full copy of this process's environment
+          // because `env` replaces rather than merges. This is the single line
+          // that keeps one tool call from running the function three times.
+          env: invokeChildEnv(process.env),
           // stdout here is the invoke METADATA envelope (StatusCode,
           // FunctionError, LogResult, ExecutedVersion) -- a single JSON
           // document, so the default parse applies cleanly.
@@ -340,6 +569,44 @@ export const lambdaTools: readonly Tool[] = [
           // `||` not `??`: rawStderr is "" (not nullish) on a nonzero exit that
           // wrote its diagnostic to stdout, and `??` would hand back that empty
           // string instead of falling through. Same fix as call.ts and logs.ts.
+          const rawBody = result.rawStderr || result.rawStdout || "";
+          // A read timeout is a TIMEOUT, whichever clock reported it. The CLI
+          // exits 255 on its own read timeout, so it arrives here as
+          // `nonzero_exit` with no usable classification -- that is the shape
+          // that used to reach callers with no payload and nothing to act on.
+          if (result.kind === "nonzero_exit" || result.kind === "timeout") {
+            const rt = READ_TIMEOUT_RE.exec(rawBody);
+            if (rt) {
+              const url = ANY_URL_RE.exec(rt[0])?.[0];
+              // Invoke path -> the request went out. Any other URL -> the CLI was
+              // still resolving credentials, so nothing was invoked. No readable
+              // URL -> say neither.
+              const outcome = INVOKE_PATH_RE.test(rt[0]) ? "sent" : url !== undefined ? "not-sent" : "unknown";
+              return invokeTimeoutFailure({
+                label,
+                waitS,
+                readTimeoutS,
+                spawnTimeoutMs,
+                outcome,
+                ...(url !== undefined ? { url } : {}),
+                rawBody,
+                killed: result.kind === "timeout",
+              });
+            }
+            // A kill with no read-timeout line at all: the CLI never got far
+            // enough to name a URL.
+            if (result.kind === "timeout") {
+              return invokeTimeoutFailure({
+                label,
+                waitS,
+                readTimeoutS,
+                spawnTimeoutMs,
+                outcome: "unknown",
+                rawBody,
+                killed: true,
+              });
+            }
+          }
           return {
             ok: false,
             error: result.error,

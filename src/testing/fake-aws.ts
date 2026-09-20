@@ -154,6 +154,27 @@ const LAMBDA_FAKE_LOG_TEXT =
   "hello from the handler\n" +
   "END RequestId: 8f3a1c2e-0000-4000-8000-abcdefabcdef\n";
 
+/**
+ * Refuse to run a captured-stderr lambda scenario unless AWS_MAX_ATTEMPTS is
+ * "1", the only setting aws_lambda_invoke ever runs the CLI under.
+ *
+ * The strings those scenarios print are verbatim captures from the real CLI with
+ * that variable set -- "(reached max retries: 0)" on a first-attempt failure is
+ * something the CLI writes only then. A fake that printed them under the CLI's
+ * default retry settings would be modelling output the real CLI does not
+ * produce, which is exactly how this tool shipped parsing a format that never
+ * existed. It also makes these scenarios fail loudly against pre-2.3.3 handler
+ * code, instead of passing on a fake that happens to agree with it.
+ */
+function requireSingleAttempt(name: string): void {
+  const v = process.env.AWS_MAX_ATTEMPTS;
+  if (v === "1") return;
+  process.stderr.write(
+    `fake-aws: ${name} models the real CLI under AWS_MAX_ATTEMPTS=1, the only way aws_lambda_invoke runs it; got ${v ?? "unset"}\n`,
+  );
+  process.exit(2);
+}
+
 async function main(): Promise<void> {
   if (await handleVersionProbe()) return;
   switch (scenario) {
@@ -1797,10 +1818,19 @@ async function main(): Promise<void> {
       // deliberately NO outfile write -- the real CLI leaves the file untouched
       // when the call never reaches the function, which is why the handler must
       // not assume a readable body on the failure branch.
+      //
+      // Byte-for-byte what aws-cli 2.34.3 printed against a stub answering
+      // ResourceNotFoundException (`lambda-invoke-probe2.out.ndjson`, record
+      // `notfound_max1`): the enhanced-format prefix, the
+      // " (reached max retries: 0)" infix AWS_MAX_ATTEMPTS=1 puts on every
+      // Lambda service error, the blank-line-separated details block, and exit
+      // 254 -- the real ClientError code, where this scenario used to say 255.
+      requireSingleAttempt("lambda_invoke_not_found");
+      const { EOL } = await import("node:os");
       process.stderr.write(
-        "\nAn error occurred (ResourceNotFoundException) when calling the Invoke operation: Function not found: arn:aws:lambda:us-east-1:123456789012:function:missing-fn\n",
+        `${EOL}aws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the Invoke operation (reached max retries: 0): Function not found: arn:aws:lambda:us-east-1:123456789012:function:missing-fn${EOL}${EOL}Additional error details:${EOL}Type: User${EOL}`,
       );
-      process.exit(255);
+      process.exit(254);
       return;
     }
 
@@ -1843,6 +1873,10 @@ async function main(): Promise<void> {
           JSON.stringify({
             argv,
             payloadFile,
+            // The one environment variable the handler sets for this child. Null
+            // rather than absent when unset, so a test can tell "the handler did
+            // not set it" from "the echo does not report it".
+            env: { AWS_MAX_ATTEMPTS: process.env.AWS_MAX_ATTEMPTS ?? null },
             // dirname of the outfile IS the mkdtempSync scratch dir: the
             // handler joins both temp files onto it.
             dirMode: outFile === undefined ? null : modeOf(dirname(outFile)),
@@ -1943,6 +1977,68 @@ async function main(): Promise<void> {
       if (outFile) fs.writeFileSync(outFile, JSON.stringify({ blob: "字".repeat(100_000) }));
       process.stdout.write(`${JSON.stringify({ StatusCode: 200, ExecutedVersion: "$LATEST" })}\n`);
       process.exit(0);
+      return;
+    }
+
+    // The four transport failures aws_lambda_invoke has to tell apart, each
+    // printing what aws-cli 2.34.3 printed for it against a loopback stub under
+    // AWS_MAX_ATTEMPTS=1 (`lambda-invoke-probe2.out.ndjson` and
+    // `lambda-invoke-rv2-probe.out.ndjson`). None writes an outfile: the real CLI
+    // leaves it untouched when no response body arrives.
+    //
+    // They emit and exit at once. The real timing -- a read timeout that takes
+    // the whole --cli-read-timeout to arrive -- is what lambda.realcli.test.ts
+    // covers against the installed CLI; modelling the wait here would only buy
+    // slow tests. EOL, because the real CLI writes \r\n on Windows and a fake
+    // should not invent a line ending it never produces on this machine.
+
+    case "lambda-invoke_read_timeout": {
+      // The invoke WAS sent: the unanswered URL is the Invoke path, so the
+      // handler must say the function may still be running (`rt_max1`).
+      requireSingleAttempt("lambda-invoke_read_timeout");
+      const { EOL } = await import("node:os");
+      process.stderr.write(
+        `${EOL}aws: [ERROR]: Read timeout on endpoint URL: "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-fn/invocations"${EOL}`,
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "lambda-invoke_sts_read_timeout": {
+      // The same sentence for a request that never reached Lambda: a role_arn
+      // profile whose STS endpoint hangs (`sts_hang_rt3`, zero Invoke POSTs). The
+      // URL is the only thing that distinguishes it from the case above.
+      requireSingleAttempt("lambda-invoke_sts_read_timeout");
+      const { EOL } = await import("node:os");
+      process.stderr.write(
+        `${EOL}aws: [ERROR]: Read timeout on endpoint URL: "https://sts.us-east-1.amazonaws.com/"${EOL}`,
+      );
+      process.exit(255);
+      return;
+    }
+
+    case "lambda-invoke_throttled": {
+      // Lambda refused before running anything, and with retries off it reaches
+      // the caller on the first failure instead of being re-sent (`throttle_max1`).
+      requireSingleAttempt("lambda-invoke_throttled");
+      const { EOL } = await import("node:os");
+      process.stderr.write(
+        `${EOL}aws: [ERROR]: An error occurred (TooManyRequestsException) when calling the Invoke operation (reached max retries: 0): Rate Exceeded.${EOL}${EOL}Additional error details:${EOL}Type: User${EOL}message: Rate Exceeded.${EOL}Reason: ConcurrentInvocationLimitExceeded${EOL}`,
+      );
+      process.exit(254);
+      return;
+    }
+
+    case "lambda-invoke_connection_closed": {
+      // Dropped mid-invoke, so the function may have run. Note the trailing "."
+      // after the quoted URL -- it is in the real message and the connection-closed
+      // pattern must not depend on the URL ending the line (`reset_max1`).
+      requireSingleAttempt("lambda-invoke_connection_closed");
+      const { EOL } = await import("node:os");
+      process.stderr.write(
+        `${EOL}aws: [ERROR]: Connection was closed before we received a valid response from endpoint URL: "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-fn/invocations".${EOL}`,
+      );
+      process.exit(255);
       return;
     }
 
