@@ -102,6 +102,27 @@ describe("aws_paginate handler — startingToken validation (no spawn)", () => {
     assert.equal(validateCursorToken("a".repeat(600), "startingToken"), null);
   });
 
+  it("rejects a file:// startingToken before anything spawns", async () => {
+    // Hazard rule: pin a command that cannot exist and a path that does not, so
+    // a regression here fails to spawn instead of handing the developer's own
+    // credentials file to real AWS as the resume cursor.
+    process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary__";
+    try {
+      const r = (await tool.handler({
+        service: "s3api",
+        operation: "list-buckets",
+        startingToken: "file://fileuri-definitely-missing",
+      })) as { ok: boolean; error?: string; errorKind?: string };
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /^Invalid startingToken: must not start with 'file:\/\//);
+      // The tool's own input validation, so errorKind stays absent -- same
+      // contract as the leading-hyphen reject above it.
+      assert.equal(r.errorKind, undefined);
+    } finally {
+      delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    }
+  });
+
   it("rejects an over-length (>2048 char) startingToken", async () => {
     const r = (await tool.handler({
       service: "s3api",

@@ -14,6 +14,7 @@ import {
   TERMINAL_STATUSES,
   TYPE_NAME_RE,
   validateCursorToken,
+  validateOpaqueToken,
 } from "./resource.js";
 import type { ToolContext } from "./tool.js";
 
@@ -105,6 +106,18 @@ describe("isValidIdentifier", () => {
     assert.equal(isValidIdentifier("has\nnewline"), false);
     assert.equal(isValidIdentifier("has\ttab"), false);
   });
+
+  it("rejects the paramfile prefixes the CLI would expand, and nothing wider", () => {
+    // These predicates are documented as argv-safety checks and cited as such
+    // from script.ts, so "valid" has to mean the CLI will send the value rather
+    // than a local file's contents. The true cases are what the CLI passes
+    // through literally -- an identifier may legitimately contain "file".
+    assert.equal(isValidIdentifier("file://~/.aws/credentials"), false);
+    assert.equal(isValidIdentifier("fileb://x"), false);
+    assert.ok(isValidIdentifier("FILE://x"));
+    assert.ok(isValidIdentifier("my-file-bucket"));
+    assert.ok(isValidIdentifier("key1:value1|key2:value2"));
+  });
 });
 
 describe("isValidOpaqueToken", () => {
@@ -122,6 +135,26 @@ describe("isValidOpaqueToken", () => {
     assert.equal(isValidOpaqueToken(""), false);
     assert.equal(isValidOpaqueToken("-token"), false);
     assert.equal(isValidOpaqueToken("bad\x01"), false);
+  });
+
+  it("rejects the paramfile prefixes", () => {
+    assert.equal(isValidOpaqueToken("file://x"), false);
+    assert.equal(isValidOpaqueToken("fileb://x"), false);
+    assert.ok(isValidOpaqueToken("FILE://x"));
+  });
+});
+
+describe("validateOpaqueToken", () => {
+  it("names the field and the paramfile reason, not the shape rules", () => {
+    // A `file://` token fails for a different reason than a malformed one, and
+    // "must be 1-128 chars" would send the reader looking for a length problem.
+    assert.match(validateOpaqueToken("file://x", "clientToken") ?? "", /^Invalid clientToken: must not start with/);
+    assert.match(validateOpaqueToken("file://x", "clientToken") ?? "", /contents of a local file/);
+    assert.match(validateOpaqueToken("fileb://x", "requestToken") ?? "", /^Invalid requestToken: must not start with/);
+  });
+
+  it("still reports the shape rules for an ordinary bad token", () => {
+    assert.match(validateOpaqueToken("-evil", "clientToken") ?? "", /Must be 1-128 chars/);
   });
 });
 
@@ -144,6 +177,14 @@ describe("validateCursorToken", () => {
 
   it("names the field it was given", () => {
     assert.match(validateCursorToken("-bad", "startingToken") ?? "", /Invalid startingToken/);
+  });
+
+  it("rejects a paramfile cursor with the field named", () => {
+    assert.match(validateCursorToken("file://x", "nextToken") ?? "", /^Invalid nextToken: must not start with/);
+    assert.match(
+      validateCursorToken("fileb://x", "startingToken") ?? "",
+      /^Invalid startingToken: must not start with/,
+    );
   });
 });
 

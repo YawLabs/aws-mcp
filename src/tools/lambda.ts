@@ -280,10 +280,17 @@ export const lambdaTools: readonly Tool[] = [
         // JSON.stringify, so `payload` may be any JSON value; a bare string
         // becomes a JSON string, which is a legal Lambda event.
         const extraFlags: string[] = ["--function-name", i.functionName];
+        // runAwsCall refuses a `file://` / `fileb://` argv value by default --
+        // the CLI would swap it for a local file's contents. This one IS a
+        // server-minted path, so it is exempted by its exact value below; every
+        // other value in the same call (`--qualifier`, the function name) stays
+        // guarded.
+        let payloadArg: string | undefined;
         if (i.payload !== undefined) {
           const payloadPath = join(dir, "payload.json");
           writeFileSync(payloadPath, JSON.stringify(i.payload), { mode: 0o600 });
-          extraFlags.push("--payload", `fileb://${payloadPath}`);
+          payloadArg = `fileb://${payloadPath}`;
+          extraFlags.push("--payload", payloadArg);
         }
         if (i.qualifier !== undefined) extraFlags.push("--qualifier", i.qualifier);
         // Always Tail: the decoded log is this tool's whole reason for existing,
@@ -326,6 +333,7 @@ export const lambdaTools: readonly Tool[] = [
           // document, so the default parse applies cleanly.
           outputFormat: "json",
           extraFlags,
+          ...(payloadArg ? { trustedParamFileArgs: [payloadArg] } : {}),
         });
 
         if (!result.ok) {

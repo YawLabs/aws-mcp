@@ -7,7 +7,10 @@
  *
  * The safety story: spawn uses an argv array (no shell), and service/operation
  * strings are regex-validated as kebab-case so user-supplied input can't pose
- * as a flag to `aws`. Params go through --cli-input-json.
+ * as a flag to `aws`. Params go through --cli-input-json. An extraFlags value
+ * that begins `file://` or `fileb://` is refused unless the caller minted it
+ * itself, because the CLI would replace such a value with the contents of that
+ * local file before signing the request (see isParamFileUri).
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -57,6 +60,44 @@ const PIPE_CLOSE_GRACE_MS = 2_000;
 // Also defends against argv injection: leading-hyphen input like "--profile evil"
 // would otherwise become a flag to `aws`.
 export const SAFE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * The AWS CLI's paramfile loader (`awscli/paramfile.py`, registered as a
+ * `load-cli-arg` handler) replaces any operation-parameter value beginning
+ * `file://` or `fileb://` with the contents of that local file, before the
+ * request is signed. It runs `os.path.expanduser` then `os.path.expandvars` on
+ * the path first, so `~/...`, `$HOME/...` and `%USERPROFILE%/...` all resolve,
+ * and it unwraps a one-element list, so a single-value `nargs='+'` argument is
+ * expanded too. v2 stores the `no_paramfile` setting but never reads it, so
+ * there is no per-parameter opt-out: refusing the value is the only defense.
+ *
+ * The match is the loader's own `str.startswith` -- exact, case-sensitive, no
+ * leading whitespace. Verified on aws-cli 2.34.3 and 2.22.0 against a loopback
+ * stub: `FILE://x`, `' file://x'` and `file:/x` all reach AWS as themselves, so
+ * matching them too would make the rejection message a false claim about the
+ * CLI and would narrow input that works today.
+ *
+ * `http(s)://` is deliberately absent. Only CLI v1 fetches a URL parameter
+ * (`cli_follow_urlparam`, which v2 ignores), and this server does not support
+ * v1 -- while an `https://` value is a legitimate Cloud Control identifier: an
+ * `AWS::SQS::Queue`'s primary identifier IS its queue URL.
+ */
+const PARAM_FILE_PREFIX_RE = /^fileb?:\/\//;
+
+/** True when the AWS CLI would swap `value` for the contents of a local file. */
+export function isParamFileUri(value: string): boolean {
+  return PARAM_FILE_PREFIX_RE.test(value);
+}
+
+/**
+ * Rejection message for a tool validating its OWN input field, where the
+ * convention is to name the field and leave errorKind unset. runAwsCall's
+ * backstop below writes its own message, because there it is an argv entry
+ * rather than a named input.
+ */
+export function paramFileUriMessage(fieldName: string): string {
+  return `Invalid ${fieldName}: must not start with 'file://' or 'fileb://'. The AWS CLI replaces such a value with the contents of a local file before sending the request.`;
+}
 
 /**
  * Flags whose NEXT argv entry is a JSON blob that can carry secrets (IAM
@@ -157,8 +198,22 @@ interface AwsCallOptions {
   timeoutMs?: number;
   // Additional CLI-level flags (not API params) to inject before --profile.
   // Internal callers only -- e.g. aws_paginate adds --max-items and
-  // --starting-token here. Each entry is appended verbatim to argv.
+  // --starting-token here. Each entry is appended verbatim to argv, except that
+  // an entry beginning `file://` or `fileb://` is refused unless it is listed in
+  // trustedParamFileArgs.
   extraFlags?: string[];
+  /**
+   * Exact argv entries this caller minted itself, compared by `===`. The
+   * paramfile guard skips those values and nothing else, so every other value
+   * in the same call stays guarded.
+   *
+   * The only user today is tools/lambda.ts, whose
+   * `--payload fileb://<mkdtemp>/payload.json` names a path the server wrote --
+   * the caller controls the file's contents, never its location. Never put a
+   * caller-supplied string here: a whole-call opt-out would unguard the rest of
+   * that argv too, `--qualifier` included.
+   */
+  trustedParamFileArgs?: readonly string[];
   // Set when the operation emits NEWLINE-DELIMITED JSON rather than one JSON
   // document -- `aws logs tail --format json` is the only such op today.
   //
@@ -359,6 +414,35 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       ok: false,
       kind: "bad_input",
       error: invalidRegionMessage(region, "Check the 'region' arg or AWS_REGION / AWS_DEFAULT_REGION env var."),
+    });
+  }
+  // The paramfile backstop (see isParamFileUri). It covers every tool's argv
+  // values -- including the ones that come back from AWS, such as the request
+  // token awaitCompletion polls with -- from one place, so a new extraFlags
+  // call site is guarded before anyone remembers to guard it.
+  //
+  // extraFlags is the whole scope, deliberately:
+  //   - `query` goes to --query, a GLOBAL arg the loader does not run on
+  //     (verified: a `file://` query is a JMESPath parse error, no request);
+  //   - `params` is JSON.stringify'd, so the value always starts with `{` and
+  //     its nested members are passed through literally;
+  //   - `prefixArgs` are test-only injection;
+  //   - `service` and the operation tokens match SAFE_NAME_RE, which has no `/`.
+  // Scanning opts.extraFlags rather than the assembled argv is also what keeps
+  // a future server-minted `--cli-input-json file://<temp>` transport out of it.
+  const extra = opts.extraFlags ?? [];
+  for (let idx = 0; idx < extra.length; idx++) {
+    const value = extra[idx];
+    if (!isParamFileUri(value) || opts.trustedParamFileArgs?.includes(value)) continue;
+    // Name the flag when there is one, so the caller learns WHICH field it was.
+    // A positional entry (lambda's outfile, say) has no flag to name.
+    const where =
+      idx > 0 && extra[idx - 1].startsWith("--") ? `the value of ${extra[idx - 1]}` : "a command-line argument";
+    const preview = value.length > 60 ? `${value.slice(0, 60)}...` : value;
+    return Promise.resolve({
+      ok: false,
+      kind: "bad_input",
+      error: `Refusing '${preview}' as ${where}: the AWS CLI would replace a value starting with 'file://' or 'fileb://' with the contents of that local file and send them to AWS.`,
     });
   }
   const outputFormat = opts.outputFormat ?? "json";

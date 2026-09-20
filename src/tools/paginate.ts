@@ -99,7 +99,9 @@ export const paginateTools: readonly Tool[] = [
       };
       // startingToken lands in extraFlags as a bare --starting-token arg, so
       // argv-safety it the same way resource.ts guards its cursors: a
-      // leading-hyphen or absurdly long token would otherwise leak as a flag.
+      // leading-hyphen or absurdly long token would otherwise leak as a flag,
+      // and a `file://` / `fileb://` one would make the CLI send the contents of
+      // a local file as the cursor.
       // Cursor bound (2048), NOT the 128-char RequestToken/ClientToken bound
       // -- real resume cursors are base64 blobs that run well past 128, and
       // the tighter cap rejected page 2 of every list.

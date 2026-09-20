@@ -1,5 +1,12 @@
 import { z } from "zod";
-import { type AwsCallFailure, type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
+import {
+  type AwsCallFailure,
+  type AwsCallFailureKind,
+  type AwsCallResult,
+  isParamFileUri,
+  paramFileUriMessage,
+  runAwsCall,
+} from "../aws-cli.js";
 import { getProfile } from "../session.js";
 import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
@@ -13,9 +20,11 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
  * We shell to `aws cloudcontrol <verb>` so the pattern matches aws_call (zero
  * SDK weight, coverage matches whatever the installed CLI knows). Safety:
  * leading-hyphen defense on every user-supplied free-text field (typeName,
- * identifier, requestToken, clientToken) stops argv-injection; JSON payloads
- * (desiredState, patchDocument, resourceModel) are serialized into single argv
- * entries so they can't leak flags.
+ * identifier, requestToken, clientToken) stops argv-injection, and those same
+ * fields refuse a `file://` / `fileb://` prefix, which the AWS CLI would replace
+ * with the contents of a local file before signing (see isParamFileUri in
+ * aws-cli.ts); JSON payloads (desiredState, patchDocument, resourceModel) are
+ * serialized into single argv entries so they can't leak flags.
  *
  * Mutation verbs return a ProgressEvent with OperationStatus=IN_PROGRESS and a
  * RequestToken. By default we surface that event and let the caller poll via
@@ -34,17 +43,36 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
 export const TYPE_NAME_RE = /^[A-Z][A-Za-z0-9]*::[A-Z][A-Za-z0-9]*::[A-Z][A-Za-z0-9]*$/;
 
 /**
- * Identifier shapes are open-ended (ARNs, bucket names, composite ids, ...).
- * Only enforce argv-safety: non-empty, bounded length, no leading hyphen, no
- * ASCII control chars. AWS resource identifiers don't exceed 2048 in practice.
+ * The one argv-safety test behind all three predicates below: a non-empty,
+ * bounded value that cannot pose as a flag, carries no ASCII control character,
+ * and will not be swapped for a local file's contents by the CLI's paramfile
+ * loader.
+ *
+ * The paramfile check belongs HERE and not only in the validateX wrappers:
+ * isValidIdentifier and isValidOpaqueToken are exported as argv-safety
+ * predicates (script.ts cites the first as one), and a predicate that called
+ * `file://~/.aws/credentials` safe would be wrong about the one thing it is
+ * asked. The wrappers still test it again first, so the message names the real
+ * reason instead of reciting the shape rules.
  */
-export function isValidIdentifier(id: string): boolean {
-  if (id.length === 0 || id.length > 2048) return false;
-  if (id.startsWith("-")) return false;
-  for (let i = 0; i < id.length; i++) {
-    if (id.charCodeAt(i) < 0x20) return false;
+function isArgvSafeValue(value: string, maxLen: number): boolean {
+  if (value.length === 0 || value.length > maxLen) return false;
+  if (value.startsWith("-")) return false;
+  if (isParamFileUri(value)) return false;
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) < 0x20) return false;
   }
   return true;
+}
+
+/**
+ * Identifier shapes are open-ended (ARNs, bucket names, composite ids, ...).
+ * Only enforce argv-safety: non-empty, bounded length, no leading hyphen, no
+ * ASCII control chars, no `file://` / `fileb://` prefix. AWS resource
+ * identifiers don't exceed 2048 in practice.
+ */
+export function isValidIdentifier(id: string): boolean {
+  return isArgvSafeValue(id, 2048);
 }
 
 /**
@@ -58,12 +86,7 @@ export function isValidIdentifier(id: string): boolean {
  * Cursors go through `validateCursorToken` below.
  */
 export function isValidOpaqueToken(token: string): boolean {
-  if (token.length === 0 || token.length > 128) return false;
-  if (token.startsWith("-")) return false;
-  for (let i = 0; i < token.length; i++) {
-    if (token.charCodeAt(i) < 0x20) return false;
-  }
-  return true;
+  return isArgvSafeValue(token, 128);
 }
 
 /**
@@ -98,6 +121,7 @@ function validateTypeName(typeName: string): string | null {
 }
 
 function validateIdentifier(id: string): string | null {
+  if (isParamFileUri(id)) return paramFileUriMessage("identifier");
   if (!isValidIdentifier(id)) {
     const preview = id.length > 40 ? `${id.slice(0, 40)}...` : id;
     return `Invalid identifier '${preview}'. Must be 1-2048 chars, not start with '-', and contain no control characters.`;
@@ -106,6 +130,7 @@ function validateIdentifier(id: string): string | null {
 }
 
 export function validateOpaqueToken(token: string, fieldName: string): string | null {
+  if (isParamFileUri(token)) return paramFileUriMessage(fieldName);
   if (!isValidOpaqueToken(token)) {
     return `Invalid ${fieldName}. Must be 1-128 chars, not start with '-', and contain no control characters.`;
   }
@@ -121,6 +146,7 @@ export function validateOpaqueToken(token: string, fieldName: string): string | 
  * entirely expected input failing loudly.
  */
 export function validateCursorToken(token: string, fieldName: string): string | null {
+  if (isParamFileUri(token)) return paramFileUriMessage(fieldName);
   if (!isValidIdentifier(token)) {
     return `Invalid ${fieldName}. Must be 1-2048 chars, not start with '-', and contain no control characters.`;
   }

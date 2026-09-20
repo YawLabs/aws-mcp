@@ -404,6 +404,46 @@ describe("runAwsCall — argv construction", () => {
     assert.match(r.command, /(^|\s)s3api\s/);
     assert.match(r.command, /\s--query\s/);
   });
+
+  it("passes a trusted fileb:// value through to argv untouched", async () => {
+    // The exemption has to reach the child verbatim: the CLI resolves that path
+    // itself, so a guard that rewrote or dropped the entry would break
+    // aws_lambda_invoke's payload rather than protect anything. Windows
+    // backslashes and a drive letter are part of the string it compares.
+    const payloadArg = "fileb://C:\\aws-mcp\\payload.json";
+    const r = await runAwsCall({
+      service: "lambda",
+      operation: "invoke",
+      extraFlags: ["--function-name", "my-fn", "--payload", payloadArg],
+      trustedParamFileArgs: [payloadArg],
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    const idx = argv.indexOf("--payload");
+    assert.ok(idx >= 0, "expected --payload to be present");
+    assert.equal(argv[idx + 1], payloadArg);
+  });
+
+  it("leaves a clean extraFlags list exactly as given", async () => {
+    // The guard reads extraFlags and never edits it. Asserted on a list with no
+    // paramfile value at all, so a future "sanitize instead of refuse" change
+    // fails here rather than silently altering what the CLI receives.
+    const extraFlags = ["--max-items", "100", "--starting-token", "eyJOZXh0VG9rZW4iOiAiYWJjIn0="];
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-objects-v2",
+      extraFlags,
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    const start = argv.indexOf("--max-items");
+    assert.ok(start >= 0, "expected --max-items to be present");
+    assert.deepEqual(argv.slice(start, start + extraFlags.length), extraFlags);
+  });
 });
 
 describe("runAwsCall — failure paths", () => {
