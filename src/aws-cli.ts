@@ -18,7 +18,8 @@
  * in ~/.aws/config that break this server rather than their own terminal. The
  * binary itself is resolved to an absolute path from the child environment's
  * PATH, or from AWS_MCP_AWS_CLI, and never from the working directory -- which
- * belongs to the MCP host, not to us.
+ * belongs to the MCP host, not to us. A call that carries params also pins
+ * --cli-binary-format base64, the one such setting with no environment variable.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -684,6 +685,22 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   let paramsDisplay: { index: number; inline: string } | null = null;
   if (opts.params !== undefined && Object.keys(opts.params).length > 0) {
     const json = JSON.stringify(opts.params);
+    // The one CLI setting that cannot be pinned through the environment:
+    // `cli_binary_format` is config-only, and with the common
+    // `raw-in-base64-out` value the CLI base64-encodes a blob parameter AGAIN.
+    // Measured on 2.34.3 and 2.22.0 against a loopback stub: `dynamodb put-item`
+    // with `B: "aGVsbG8="` put `YUdWc2JHOD0=` on the wire, so AWS stored the
+    // base64 text instead of the bytes, silently. Both CLIs accept the flag (it
+    // exists in every 2.x) and the flag beats the config.
+    //
+    // Only on calls that CARRY params, and immediately before --cli-input-json,
+    // for three reasons: a blob can only arrive inside that payload (extraFlags
+    // carry CCAPI JSON strings, pagination tokens and lambda's fileb://, which is
+    // raw regardless); AWS CLI v1 has no such global option, so pinning it on
+    // every call would turn "unsupported but mostly working" into "nothing
+    // works"; and here it leaves the contiguous `--output F --profile P --region
+    // R` block that fake-aws and lambdaOutfileFromArgv index into alone.
+    args.push("--cli-binary-format", "base64");
     if (json.length <= INLINE_CLI_INPUT_JSON_MAX_CHARS) {
       args.push("--cli-input-json", json);
     } else {

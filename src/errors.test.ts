@@ -507,6 +507,35 @@ describe("parseAwsError -- retry-exhausted and CRLF-terminated CLI messages", ()
   });
 });
 
+describe("parseAwsError -- an AWS CLI v1 rejecting the pinned --cli-binary-format", () => {
+  // aws-cli.ts pins `--cli-binary-format base64` on every call that carries
+  // params, so blob members are not double-encoded by a
+  // `cli_binary_format = raw-in-base64-out` config. v1 has no such global option
+  // -- see CLI_V1_UNKNOWN_BINARY_FORMAT_RE for its whole list -- so a v1 install,
+  // which this server documents as unsupported, now fails those calls with an
+  // argument-parser error the model cannot act on unless we name the cause.
+  it("says it is v1, on both the clidriver and hand-written command spellings", () => {
+    for (const stderr of [
+      "\r\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\r\nTo see help text, you can run:\r\n\r\nUnknown options: --cli-binary-format, base64\r\n",
+      'Unknown options: --cli-binary-format,base64,--cli-input-json,{"Bucket":"b"}\n',
+    ]) {
+      const r = parseAwsError(stderr);
+      assert.match(r.suggestion ?? "", /AWS CLI v1/, stderr);
+      assert.match(r.suggestion ?? "", /Install AWS CLI v2/, stderr);
+    }
+  });
+
+  it("does not claim v1 for any other unknown option", () => {
+    // Every 2.x accepts --cli-binary-format, so an "Unknown options" naming
+    // something else is a different problem -- a typo in extraFlags, or an option
+    // newer than the installed CLI -- and answering "you are on v1" would be a
+    // confident wrong diagnosis. 2.22.0 answers exactly this way for
+    // --cli-error-format (measured).
+    const r = parseAwsError("\r\nUnknown options: --cli-error-format, enhanced\r\n");
+    assert.equal(r.suggestion, undefined);
+  });
+});
+
 describe("parseAwsError -- not-authorized text OUTSIDE the standard wrapper", () => {
   // NOT_AUTHORIZED_RE only ever ran against the message captured INSIDE "An
   // error occurred (...) when calling ...". The same sentence also arrives

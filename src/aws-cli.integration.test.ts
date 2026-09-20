@@ -788,6 +788,44 @@ describe("spawn-hardening: the pinned child environment", () => {
   });
 });
 
+describe("spawn-hardening: --cli-binary-format on calls that carry params", () => {
+  it("pins base64 once, right before --cli-input-json, leaving the output/profile/region block contiguous", async () => {
+    const r = await runAwsCall({
+      service: "kms",
+      operation: "encrypt",
+      params: { KeyId: "alias/k", Plaintext: "aGVsbG8=" },
+      profile: "prod",
+      region: "eu-west-1",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    assert.equal(argv.filter((a) => a === "--cli-binary-format").length, 1, "exactly once");
+    const at = argv.indexOf("--cli-binary-format");
+    assert.equal(argv[at + 1], "base64");
+    assert.equal(at, argv.indexOf("--cli-input-json") - 2, "immediately before the payload");
+    // The block several fake scenarios and lambdaOutfileFromArgv index into has
+    // to stay exactly as it was.
+    const out = argv.indexOf("--output");
+    assert.deepEqual(argv.slice(out, out + 6), ["--output", "json", "--profile", "prod", "--region", "eu-west-1"]);
+  });
+
+  it("leaves a call without params alone, so AWS CLI v1 and every no-params call are untouched", async () => {
+    // v1 has no --cli-binary-format at all, so pinning it on every call would
+    // turn "unsupported but mostly working" into "nothing works".
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    assert.ok(!argv.includes("--cli-binary-format"));
+  });
+});
+
 describe("spawn-hardening: params too long for a command line", () => {
   // café-日本-😀: a cp1252 character, a CJK one and an astral one, which is what
   // caught the first attempt at this -- a plain UTF-8 temp file reached the
@@ -804,9 +842,10 @@ describe("spawn-hardening: params too long for a command line", () => {
     });
     assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
     if (!r.ok) return;
-    const data = r.data as { viaFile: boolean; params: { Item: { pk: { S: string } } } };
+    const data = r.data as { viaFile: boolean; binaryFormat: string | null; params: { Item: { pk: { S: string } } } };
     assert.equal(data.viaFile, false);
     assert.equal(data.params.Item.pk.S, UNICODE_VALUE);
+    assert.equal(data.binaryFormat, "base64", "the blob pin rides with the inline payload");
   });
 
   it("sends params over the inline cap through a private ASCII-only temp file, and removes it", async () => {
@@ -830,9 +869,11 @@ describe("spawn-hardening: params too long for a command line", () => {
       path: string;
       asciiOnly: boolean;
       mode: number | null;
+      binaryFormat: string | null;
       params: typeof params;
     };
     assert.equal(data.viaFile, true, "a payload this size must not be on the command line");
+    assert.equal(data.binaryFormat, "base64", "and it rides with the file transport too");
     assert.equal(data.asciiOnly, true, "the file has to be ASCII-only or the CLI decodes it in the code page");
     assert.deepEqual(data.params, params, "and it still has to parse back to exactly what was asked for");
     if (process.platform !== "win32") assert.equal(data.mode, 0o600);

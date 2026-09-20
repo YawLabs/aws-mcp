@@ -287,6 +287,32 @@ describe(`runAwsCall -- installed AWS CLI${detected?.ok ? ` (${detected.cli.vers
     assert.ok(!(r.ok ? r.command : "").includes("file://"), r.ok ? r.command : "");
   });
 
+  it("sends a blob param as the base64 it was given, even under cli_binary_format = raw-in-base64-out", async () => {
+    // AWS's own advice for `aws lambda invoke --payload` is to set
+    // `cli_binary_format = raw-in-base64-out`, and that setting makes the CLI
+    // base64-encode a blob member AGAIN: measured on 2.34.3 and 2.22.0, `B:
+    // "aGVsbG8="` went on the wire as `YUdWc2JHOD0=`, so AWS stored the base64
+    // text instead of the bytes and nothing said so. It is config-only -- no
+    // environment variable exists -- which is why this one pin is a flag.
+    await withConfig("[default]\nregion = us-east-1\ncli_binary_format = raw-in-base64-out\n", async () => {
+      const seenBefore = stub.requests.length;
+      const r = await runAwsCall({
+        service: "dynamodb",
+        operation: "put-item",
+        params: { TableName: "aws-mcp-realcli", Item: { pk: { S: "k" }, blob: { B: "aGVsbG8=" } } },
+        prefixArgs: ["--endpoint-url", stub.url],
+        profile: "default",
+        region: "us-east-1",
+        timeoutMs: 120_000,
+      });
+      assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error} / ${r.rawStderr ?? ""}`);
+      const sent = stub.requests.slice(seenBefore).at(-1);
+      assert.ok(sent, "the CLI never reached the stub");
+      const body = JSON.parse(sent.body) as { Item: { blob: { B: string } } };
+      assert.equal(body.Item.blob.B, "aGVsbG8=", "a second base64 pass would make this YUdWc2JHOD0=");
+    });
+  });
+
   it("runs the installed CLI even from a working directory holding an aws.exe", async () => {
     // The same planting shape as the integration test, but with the real CLI as
     // the thing that must win: nothing here passes `command`, the parent's
