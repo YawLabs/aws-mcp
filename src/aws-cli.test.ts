@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { syncBuiltinESMExports } from "node:module";
-import { afterEach, describe, it, mock } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import {
   _resetParseTestPrefixArgsDedupe,
   isParamFileUri,
@@ -136,6 +136,80 @@ describe("runAwsCall — input validation (no spawn)", () => {
     assert.equal(r.ok, false);
     if (r.ok) return;
     assert.equal(r.kind, "bad_input");
+  });
+
+  // Local commands that print secrets. Every case here must reject BEFORE a spawn:
+  // the whole point is that nothing reads the credentials file, so a regression
+  // that lets one through would print a real secret on a developer's machine.
+  // AWS_MCP_TEST_AWS_COMMAND is pinned to a binary that cannot exist so that a
+  // regression fails to spawn instead.
+  describe("local credential-disclosure commands", () => {
+    const realCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+    beforeEach(() => {
+      process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary_aws_mcp__";
+    });
+    afterEach(() => {
+      if (realCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+      else process.env.AWS_MCP_TEST_AWS_COMMAND = realCommand;
+    });
+
+    for (const operation of ["export-credentials", "get"]) {
+      it(`refuses configure ${operation}`, async () => {
+        const r = await runAwsCall({ service: "configure", operation });
+        assert.equal(r.ok, false);
+        if (r.ok) return;
+        assert.equal(r.kind, "bad_input");
+        assert.match(r.error, new RegExp(`Refusing to run 'configure ${operation}'`));
+        // The message has to say why no IAM policy helps here, because that is
+        // the reason this guard exists at all.
+        assert.match(r.error, /sends no request to AWS/);
+      });
+    }
+
+    for (const operation of ["show", "list"]) {
+      it(`refuses history ${operation}`, async () => {
+        const r = await runAwsCall({ service: "history", operation });
+        assert.equal(r.ok, false);
+        if (r.ok) return;
+        assert.equal(r.kind, "bad_input");
+        assert.match(r.error, new RegExp(`Refusing to run 'history ${operation}'`));
+      });
+    }
+
+    it("refuses the command however the caller spaces the operation", async () => {
+      const r = await runAwsCall({ service: "configure", operation: "  export-credentials  " });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.match(r.error, /Refusing to run 'configure export-credentials'/);
+    });
+
+    it("refuses it with trailing tokens, which the CLI would ignore", async () => {
+      const r = await runAwsCall({ service: "configure", operation: "export-credentials json" });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.match(r.error, /Refusing to run 'configure export-credentials'/);
+    });
+
+    it("leaves the rest of configure alone", async () => {
+      // `configure list` masks all but the last four characters of a key, and is
+      // how a caller is meant to see which profile resolved. It must still run:
+      // spawning the pinned nonexistent binary is the proof it got past the guard.
+      const r = await runAwsCall({ service: "configure", operation: "list" });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.doesNotMatch(r.error, /Refusing to run/);
+      assert.equal(r.kind, "spawn_failure");
+    });
+
+    it("does not refuse a real AWS operation whose name collides in another service", async () => {
+      // `aws s3api list-buckets`-shaped traffic must be untouched; only the two
+      // local services are listed, and the guard keys on both halves.
+      const r = await runAwsCall({ service: "s3api", operation: "get" });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.doesNotMatch(r.error, /Refusing to run/);
+      assert.equal(r.kind, "spawn_failure");
+    });
   });
 
   it("rejects profile that looks like a flag (argv-injection defense)", async () => {

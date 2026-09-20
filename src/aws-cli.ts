@@ -370,6 +370,40 @@ export function parseTestPrefixArgs(raw: string | undefined): string[] | undefin
   return parsed as string[];
 }
 
+/**
+ * Local CLI commands that print credentials or recorded traffic to stdout, keyed
+ * by `<service> <operation>`.
+ *
+ * These are the one class of `aws` command IAM cannot gate: they send no request,
+ * so there is no policy to deny them, and whatever they print lands in the
+ * model's context and the host's transcript. Measured on aws-cli 2.34.3 against a
+ * throwaway credentials file: `configure export-credentials` returns
+ * `{"Version":1,"AccessKeyId":"AKIA...","SecretAccessKey":"..."}` -- the full
+ * secret, not the masked form `configure list` shows -- and for a static-key
+ * profile those are long-lived keys no STS call would ever hand out. `history
+ * show` / `list` replay the requests and responses the CLI recorded locally.
+ *
+ * `configure get` cannot be reached through these tools today (it needs a
+ * positional `varname`, and `configure` rejects `--cli-input-json`, so the call
+ * fails with ParamValidation before any secret is read), but it reads the same
+ * values by name and is listed so that stays true if a positional path is ever
+ * added.
+ *
+ * This is an accident guard, not an authority boundary -- the escape hatch is the
+ * operator's own shell, which is where reading your own keys belongs. It does not
+ * revisit the project's "IAM is the authority" decision: that is about AWS API
+ * calls, where scoping credentials is the right gate, and none of these makes one.
+ */
+const LOCAL_DISCLOSURE_COMMANDS = new Map<string, string>([
+  [
+    "configure export-credentials",
+    "prints that profile's resolved credentials, including the full secret access key and any long-lived keys from ~/.aws/credentials",
+  ],
+  ["configure get", "reads any value out of your AWS config by name, including the stored secret access key"],
+  ["history show", "replays the requests and responses the AWS CLI recorded locally, which can include credentials"],
+  ["history list", "lists the AWS CLI commands recorded locally, with their arguments"],
+]);
+
 function validateNames(service: string, operationTokens: string[]): string | null {
   if (!SAFE_NAME_RE.test(service)) {
     return `Invalid service '${service}'. Must be kebab-case alphanumeric (e.g. 's3api', 'ec2', 'lambda').`;
@@ -381,6 +415,16 @@ function validateNames(service: string, operationTokens: string[]): string | nul
     if (!SAFE_NAME_RE.test(token)) {
       return `Invalid operation token '${token}'. Each token must be kebab-case alphanumeric.`;
     }
+  }
+  // Checked after the shape rules, so a malformed name still gets the message
+  // about its shape. Each of these commands is the service plus ONE token, and
+  // only that pair is matched: a caller who appends anything ("export-credentials
+  // json") still names the same command, and the CLI ignores or rejects the extra
+  // rather than doing something else.
+  const command = `${service} ${operationTokens[0]}`;
+  const disclosure = LOCAL_DISCLOSURE_COMMANDS.get(command);
+  if (disclosure) {
+    return `Refusing to run '${command}': it ${disclosure}, and that output would land in this conversation. It sends no request to AWS, so no IAM policy can limit it. Run it yourself in a terminal if you need those values.`;
   }
   return null;
 }
