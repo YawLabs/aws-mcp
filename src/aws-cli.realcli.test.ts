@@ -18,7 +18,9 @@
  */
 
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, linkSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { runAwsCall } from "./aws-cli.js";
 import {
@@ -246,5 +248,38 @@ describe(`runAwsCall -- installed AWS CLI${detected?.ok ? ` (${detected.cli.vers
       assert.equal(r.kind, "nonzero_exit");
       assert.match(r.error, /Unable to parse config file/i);
     });
+  });
+
+  it("runs the installed CLI even from a working directory holding an aws.exe", async () => {
+    // The same planting shape as the integration test, but with the real CLI as
+    // the thing that must win: nothing here passes `command`, the parent's
+    // NoDefaultCurrentDirectoryInExePath is removed for the call, and the cwd
+    // holds an `aws.exe` that is really this Node. If the planted one ran it
+    // would die on "Cannot find module 'sts'" and the stub would see nothing.
+    const plant = mkdtempSync(join(tmpdir(), "aws-mcp-realcli-plant-"));
+    const binary = join(plant, process.platform === "win32" ? "aws.exe" : "aws");
+    try {
+      linkSync(process.execPath, binary);
+    } catch {
+      copyFileSync(process.execPath, binary);
+      if (process.platform !== "win32") chmodSync(binary, 0o755);
+    }
+    const cwd = process.cwd();
+    const savedNoDefault = process.env.NoDefaultCurrentDirectoryInExePath;
+    const seenBefore = stub.requests.length;
+    try {
+      delete process.env.NoDefaultCurrentDirectoryInExePath;
+      process.chdir(plant);
+      const r = await callSts();
+      assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+      if (!r.ok) return;
+      assert.equal((r.data as { Account: string }).Account, "123456789012", "the stub's answer, so the real CLI ran");
+      assert.equal(stub.requests.length - seenBefore, 1);
+    } finally {
+      process.chdir(cwd);
+      if (savedNoDefault === undefined) delete process.env.NoDefaultCurrentDirectoryInExePath;
+      else process.env.NoDefaultCurrentDirectoryInExePath = savedNoDefault;
+      rmSync(plant, { recursive: true, force: true });
+    }
   });
 });

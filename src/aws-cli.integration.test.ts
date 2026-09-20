@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
@@ -785,6 +785,154 @@ describe("spawn-hardening: the pinned child environment", () => {
     if (r.ok) return;
     assert.equal(r.kind, "invalid_creds", `stderr was: ${r.rawStderr}`);
     assert.match(r.error, /rejected by AWS/);
+  });
+});
+
+describe("spawn-hardening: which binary runs", () => {
+  /**
+   * A directory holding an `aws.exe` (win32) or `aws` (POSIX) that is really
+   * this Node -- a hard link where the filesystem allows one, a copy otherwise
+   * -- so spawning it with the fake's path as argv[1] behaves like the fake CLI.
+   * That is what makes "which binary did we run" observable: the fake echoes
+   * process.execPath back.
+   */
+  function plantNode(prefix: string): { dir: string; binary: string } {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const binary = join(dir, process.platform === "win32" ? "aws.exe" : "aws");
+    try {
+      linkSync(process.execPath, binary);
+    } catch {
+      copyFileSync(process.execPath, binary);
+      if (process.platform !== "win32") chmodSync(binary, 0o755);
+    }
+    return { dir, binary };
+  }
+
+  /**
+   * Run `fn` with the two environment variables that would otherwise decide the
+   * spawn for us removed, and put them back afterwards:
+   *   - NoDefaultCurrentDirectoryInExePath, because libuv reads it from the
+   *     PARENT's environment and this harness runs with it set, so leaving it in
+   *     place would let a reverted bare spawn pass the planted-cwd test;
+   *   - AWS_MCP_TEST_AWS_COMMAND, because it is an explicit command and would
+   *     skip resolution entirely.
+   */
+  async function withoutSpawnOverrides(fn: () => Promise<void>): Promise<void> {
+    const saved = {
+      noDefault: process.env.NoDefaultCurrentDirectoryInExePath,
+      testCommand: process.env.AWS_MCP_TEST_AWS_COMMAND,
+    };
+    delete process.env.NoDefaultCurrentDirectoryInExePath;
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    try {
+      await fn();
+    } finally {
+      if (saved.noDefault === undefined) delete process.env.NoDefaultCurrentDirectoryInExePath;
+      else process.env.NoDefaultCurrentDirectoryInExePath = saved.noDefault;
+      if (saved.testCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+      else process.env.AWS_MCP_TEST_AWS_COMMAND = saved.testCommand;
+    }
+  }
+
+  it("runs the aws on PATH, not one planted in the working directory", async () => {
+    // The regression test for the planting vector: on Windows a bare
+    // spawn("aws") searches the working directory before PATH, and that
+    // directory belongs to the MCP host. Reproduced on Node 22.22.2 before the
+    // resolver landed -- the planted binary ran and its made-up JSON came back
+    // as a successful aws_call. Kept on every platform: POSIX has the same shape
+    // through an empty or "." PATH entry, and the assertion is the same.
+    const plant = plantNode("aws-mcp-plant-");
+    const legit = plantNode("aws-mcp-legit-");
+    const cwd = process.cwd();
+    try {
+      await withoutSpawnOverrides(async () => {
+        process.chdir(plant.dir);
+        const r = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          prefixArgs: [FAKE_AWS],
+          timeoutMs: 30_000,
+          env: { ...process.env, PATH: legit.dir, AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env" },
+        });
+        assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+        if (!r.ok) return;
+        const { execPath } = r.data as { execPath: string };
+        assert.equal(execPath, legit.binary, "the binary that ran must be the one on PATH");
+        assert.notEqual(execPath, plant.binary);
+      });
+    } finally {
+      process.chdir(cwd);
+      rmSync(plant.dir, { recursive: true, force: true });
+      rmSync(legit.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("spawns nothing and says how to fix it when no CLI can be found", async () => {
+    const empty = mkdtempSync(join(tmpdir(), "aws-mcp-nopath-"));
+    try {
+      await withoutSpawnOverrides(async () => {
+        const started = Date.now();
+        const r = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          // undefined counts as unset, so this also covers a machine where the
+          // developer really has the override set.
+          env: { ...process.env, PATH: empty, AWS_MCP_AWS_CLI: undefined },
+        });
+        assert.equal(r.ok, false);
+        if (r.ok) return;
+        assert.equal(r.kind, "spawn_failure");
+        assert.match(r.error, /AWS_MCP_AWS_CLI/, "the message has to name the override");
+        assert.match(r.error, /working directory is never searched/);
+        // Nothing was spawned, so this cannot have taken a CLI start.
+        assert.ok(Date.now() - started < 2_000, "an unresolvable CLI must fail without spawning anything");
+      });
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  it("honors AWS_MCP_AWS_CLI, and refuses an unusable one instead of falling back", async () => {
+    const override = plantNode("aws-mcp-override-");
+    const onPath = plantNode("aws-mcp-onpath-");
+    try {
+      await withoutSpawnOverrides(async () => {
+        const ok = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          prefixArgs: [FAKE_AWS],
+          timeoutMs: 30_000,
+          env: {
+            ...process.env,
+            PATH: onPath.dir,
+            AWS_MCP_AWS_CLI: override.binary,
+            AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env",
+          },
+        });
+        assert.equal(ok.ok, true, ok.ok ? "" : `${ok.kind}: ${ok.error}`);
+        if (!ok.ok) return;
+        assert.equal((ok.data as { execPath: string }).execPath, override.binary, "the override beats PATH");
+        // The absolute path is not what the reader needs to see; `aws` is.
+        assert.match(ok.command, /^aws /);
+
+        // A relative value is the shape a user most easily gets wrong, and the
+        // whole point of the loud failure is that it does NOT quietly run the
+        // perfectly good CLI sitting on PATH instead.
+        const bad = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          prefixArgs: [FAKE_AWS],
+          env: { ...process.env, PATH: onPath.dir, AWS_MCP_AWS_CLI: "relative/aws" },
+        });
+        assert.equal(bad.ok, false);
+        if (bad.ok) return;
+        assert.equal(bad.kind, "spawn_failure");
+        assert.match(bad.error, /AWS_MCP_AWS_CLI must be an absolute path/);
+      });
+    } finally {
+      rmSync(override.dir, { recursive: true, force: true });
+      rmSync(onPath.dir, { recursive: true, force: true });
+    }
   });
 });
 

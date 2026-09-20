@@ -24,7 +24,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
-import { awsChildEnv } from "./aws-spawn.js";
+import { awsChildEnv, envLookup, resolveAwsCommand } from "./aws-spawn.js";
 import { killProc, procHasExited } from "./kill-proc.js";
 import { isValidProfileName } from "./session.js";
 
@@ -263,11 +263,13 @@ function probeDeviceCodeSupport(
   env?: NodeJS.ProcessEnv,
   timeoutMs: number = VERSION_PROBE_TIMEOUT_MS,
 ): Promise<boolean> {
-  // PATH is part of the key because it decides WHICH `aws` a bare command name
-  // resolves to -- two callers with different PATHs are asking about different
-  // binaries. Same rule dedupeKey follows: anything that changes the subprocess
-  // belongs in the key. (Windows env objects may spell it `Path`.)
-  const key = JSON.stringify([command, prefixArgs, env?.PATH ?? env?.Path ?? null]);
+  // `command` is an absolute path by the time it gets here (doStartSsoLogin
+  // resolves it), so PATH no longer decides which binary this answer is about.
+  // It stays in the key anyway: it is a cheap identity input, and a caller that
+  // changed PATH is asking about a different install often enough that sharing
+  // one verdict would be the wrong default. Same rule dedupeKey follows.
+  // (envLookup because a Windows env object may spell it `Path`.)
+  const key = JSON.stringify([command, prefixArgs, envLookup(env ?? {}, "PATH") ?? null]);
   const cached = deviceCodeSupport.get(key);
   if (cached) return cached;
 
@@ -435,7 +437,14 @@ export function startSsoLogin(
 }
 
 async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginStartResult | LoginStartError> {
-  const command = opts.command ?? "aws";
+  // Same resolution as every aws_call, so `aws sso login` cannot be a different
+  // binary than the rest of the server runs -- and so AWS_MCP_AWS_CLI covers
+  // the login too. Resolved before the version probe: with no CLI to run there
+  // is nothing to probe, and the caller gets the resolver's message instead of
+  // waiting out the probe and then the URL timeout.
+  const resolution = resolveAwsCommand({ explicit: opts.command, env: opts.env ?? process.env });
+  if (!resolution.ok) return { ok: false, error: resolution.error };
+  const command = resolution.command;
   const prefixArgs = opts.prefixArgs ?? [];
   const urlWaitMs = opts.urlWaitMs ?? URL_WAIT_MS;
   const sessionTtlMs = opts.sessionTtlMs ?? SESSION_TTL_MS;
@@ -691,7 +700,13 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
       // the sessionId doesn't hang forever when the subprocess errors after
       // URL+code were emitted (settled=true, session registered).
       finalizeSession();
-      const errorMsg = `Failed to run 'aws': ${err.message}. Is the AWS CLI installed and on PATH?`;
+      // Names the binary that failed rather than the literal `aws`, now that it
+      // is a resolved absolute path -- and keeps the PATH hint only for ENOENT,
+      // the one errno PATH could explain (see the same rule in aws-cli.ts).
+      const enoent = (err as NodeJS.ErrnoException).code === "ENOENT";
+      const errorMsg = `Failed to run '${command}': ${err.message}.${
+        enoent ? " Is the AWS CLI installed and on PATH?" : ""
+      }`;
       completionResolve({
         ok: false,
         exitCode: null,

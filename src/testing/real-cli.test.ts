@@ -13,7 +13,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { Agent, request } from "node:http";
 import { connect } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { describe, it } from "node:test";
 import {
   DEAD_PROXY_URL,
@@ -77,6 +77,10 @@ describe("isolateAwsEnv", () => {
       aws_mcp_realcli_selftest_lower: "lower",
       AWS_MCP_REALCLI_SELFTEST_UPPER: "upper",
       AWS_MCP_TEST_AWS_COMMAND: "not-the-real-cli",
+      // Kept, not scrubbed: it names which aws binary to run, which is how a
+      // release check points these suites at an older CLI. Planted here so the
+      // expectation is the same whether or not the developer has it set.
+      AWS_MCP_AWS_CLI: join(tmpdir(), "aws-mcp-realcli-selftest-not-a-real-path", "aws.exe"),
       AWS_PROFILE: "someone-elses-profile",
       AWS_ACCESS_KEY_ID: "planted-key-id",
       Https_Proxy: "http://proxy.invalid:3128",
@@ -102,8 +106,15 @@ describe("isolateAwsEnv", () => {
         );
         assert.deepEqual(
           names.filter((k) => k.toUpperCase().startsWith("AWS_")).sort(),
-          ["AWS_CONFIG_FILE", "AWS_EC2_METADATA_DISABLED", "AWS_PAGER", "AWS_REGION", "AWS_SHARED_CREDENTIALS_FILE"],
-          "only the harness's own AWS_* variables are left",
+          [
+            "AWS_CONFIG_FILE",
+            "AWS_EC2_METADATA_DISABLED",
+            "AWS_MCP_AWS_CLI",
+            "AWS_PAGER",
+            "AWS_REGION",
+            "AWS_SHARED_CREDENTIALS_FILE",
+          ],
+          "only the harness's own AWS_* variables, plus the kept binary override, are left",
         );
         assert.deepEqual(
           names.filter((k) => /^(HTTPS?|ALL|NO)_PROXY$/i.test(k)).sort(),
@@ -256,7 +267,12 @@ describe("detectRealAwsCli", () => {
     try {
       const r = detectRealAwsCli({ env: { PATH: empty } });
       assert.equal(r.ok, false);
-      if (!r.ok) assert.match(r.reason, /^no aws(\.exe)? on PATH$/);
+      // The reason is the resolver's own not-found message, so a skipped suite
+      // tells the reader the same thing a failed call would.
+      if (!r.ok) {
+        assert.match(r.reason, /Could not find the AWS CLI/);
+        assert.match(r.reason, /AWS_MCP_AWS_CLI/);
+      }
     } finally {
       rmSync(empty, { recursive: true, force: true });
     }
@@ -300,7 +316,10 @@ describe("detectRealAwsCli", () => {
   }, () => {
     assert.ok(installed.ok);
     const { cli } = installed;
-    assert.equal(cli.command, "aws", "a real-CLI call resolves the bare name itself");
+    // An absolute path, from the same resolver runAwsCall uses -- a bare name
+    // would mean the suite and the server could run different binaries.
+    assert.equal(isAbsolute(cli.command), true, cli.command);
+    assert.match(cli.command, process.platform === "win32" ? /[\\/]aws\.exe$/i : /\/aws$/);
     assert.equal(cli.version[0], 2);
     assert.ok(cli.versionLine.startsWith(`aws-cli/${cli.version.join(".")}`), cli.versionLine);
     const tooNew: [number, number, number] = [cli.version[0], cli.version[1], cli.version[2] + 1];

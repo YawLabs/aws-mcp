@@ -842,6 +842,36 @@ describe("spawn-hardening: sso spawns", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("reports an unfindable CLI at once, rather than probing and then waiting out the URL timeout", async () => {
+    // Before the shared resolver, sso.ts spawned the bare name `aws` and read no
+    // override, so a host with no CLI on PATH paid a version probe and then the
+    // full urlWaitMs before saying anything -- and AWS_MCP_AWS_CLI, which fixes
+    // exactly that host, did not apply to logins at all.
+    _clearCliVersionCache();
+    const empty = mkdtempSync(join(tmpdir(), "aws-mcp-sso-nopath-"));
+    const saved = process.env.NoDefaultCurrentDirectoryInExePath;
+    try {
+      delete process.env.NoDefaultCurrentDirectoryInExePath;
+      const started = Date.now();
+      const result = await startSsoLogin("no-cli-prof", {
+        // No `command`: this is the production path through the resolver.
+        env: { ...process.env, PATH: empty, AWS_MCP_AWS_CLI: undefined },
+        urlWaitMs: 10_000,
+        versionProbeTimeoutMs: 30_000,
+      });
+      const elapsed = Date.now() - started;
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /AWS_MCP_AWS_CLI/, "the message has to name the override");
+      assert.match(result.error, /Could not find the AWS CLI/);
+      assert.ok(elapsed < 5_000, `should not have waited for a probe or the URL timeout (${elapsed}ms)`);
+    } finally {
+      if (saved === undefined) delete process.env.NoDefaultCurrentDirectoryInExePath;
+      else process.env.NoDefaultCurrentDirectoryInExePath = saved;
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
 });
 
 /**

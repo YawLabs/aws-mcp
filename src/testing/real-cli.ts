@@ -37,11 +37,12 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
+import { resolveAwsCommand } from "../aws-spawn.js";
 
 /**
  * True when AWS_MCP_REAL_CLI_TESTS=1. Gates the real-CLI suites that are too
@@ -51,7 +52,7 @@ import { delimiter, join } from "node:path";
 export const REAL_CLI_SLOW: boolean = process.env.AWS_MCP_REAL_CLI_TESTS === "1";
 
 export interface RealAwsCli {
-  /** What runAwsCall will spawn: the bare name, resolved through PATH. */
+  /** The absolute path runAwsCall will spawn, straight from resolveAwsCommand. */
   command: string;
   /** The line `aws --version` printed, for a suite title. */
   versionLine: string;
@@ -90,45 +91,26 @@ export function meetsMinVersion(version: readonly number[], min: readonly [numbe
   return true;
 }
 
-// Windows env keys are case-insensitive, and a plain object passed as `env`
-// can spell PATH as "Path".
-function pathOf(env: NodeJS.ProcessEnv): string {
-  if (process.platform !== "win32") return env.PATH ?? "";
-  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH");
-  return (key && env[key]) || "";
-}
-
-function notFoundReason(env: NodeJS.ProcessEnv): string {
-  if (process.platform === "win32") {
-    // A spawn without a shell only ever finds aws.exe (or aws.com). A
-    // pip-installed AWS CLI v1 leaves an aws.cmd, which is not an AWS CLI v2
-    // either way -- name it rather than claim nothing is installed.
-    for (const dir of pathOf(env).split(delimiter)) {
-      if (!dir) continue;
-      for (const shim of ["aws.cmd", "aws.bat"]) {
-        const candidate = join(dir, shim);
-        if (existsSync(candidate) && statSync(candidate).isFile()) {
-          return `no aws.exe on PATH; found ${candidate}, a script shim (a pip-installed AWS CLI v1 leaves one), which cannot be started without a shell`;
-        }
-      }
-    }
-    return "no aws.exe on PATH";
-  }
-  return "no aws on PATH";
-}
-
 /**
- * Find the AWS CLI v2 a real-CLI call would run, by running `aws --version`
- * with `opts.env` (default process.env) -- the same PATH lookup runAwsCall's
- * spawn does. `ok: false` when there is no CLI, it cannot be started, it is
- * not v2, or it is older than `minVersion`; `reason` says which, for a skip
- * message.
+ * Find the AWS CLI v2 a real-CLI call would run, by resolving it exactly the way
+ * runAwsCall does -- resolveAwsCommand over `opts.env` (default process.env),
+ * AWS_MCP_AWS_CLI included -- and then running `--version` on the path it
+ * returns. `ok: false` when there is no CLI, it cannot be started, it is not v2,
+ * or it is older than `minVersion`; `reason` says which, for a skip message.
+ *
+ * Sharing the resolver is the point: a suite that found its CLI some other way
+ * could skip while runAwsCall runs something else, or run against a binary the
+ * server would refuse. The resolver's own not-found message already names an
+ * `aws.cmd` shim it had to pass over, which is why there is no separate
+ * explanation here.
  */
 export function detectRealAwsCli(
   opts: { env?: NodeJS.ProcessEnv; minVersion?: [number, number, number] } = {},
 ): { ok: true; cli: RealAwsCli } | { ok: false; reason: string } {
   const env = opts.env ?? process.env;
-  const command = "aws";
+  const resolution = resolveAwsCommand({ env });
+  if (!resolution.ok) return { ok: false, reason: resolution.error };
+  const command = resolution.command;
   const r = spawnSync(command, ["--version"], {
     env,
     encoding: "utf8",
@@ -136,20 +118,20 @@ export function detectRealAwsCli(
     timeout: VERSION_PROBE_TIMEOUT_MS,
   });
   if (r.error) {
-    const code = (r.error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return { ok: false, reason: notFoundReason(env) };
-    return { ok: false, reason: `'aws --version' could not run: ${r.error.message}` };
+    // The resolver stat-ed this path a moment ago, so a failure here is the file
+    // going away, a permission problem, or a binary this runtime will not start.
+    return { ok: false, reason: `'${command} --version' could not run: ${r.error.message}` };
   }
   const output = `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
   if (r.status !== 0) {
-    return { ok: false, reason: `'aws --version' exited with code ${r.status}: ${output.trim().slice(0, 300)}` };
+    return { ok: false, reason: `'${command} --version' exited with code ${r.status}: ${output.trim().slice(0, 300)}` };
   }
   const parsed = parseAwsCliVersion(output);
   if (!parsed) {
-    return { ok: false, reason: `'aws --version' printed no aws-cli version: ${output.trim().slice(0, 300)}` };
+    return { ok: false, reason: `'${command} --version' printed no aws-cli version: ${output.trim().slice(0, 300)}` };
   }
   if (parsed.version[0] !== 2) {
-    return { ok: false, reason: `'aws --version' printed "${parsed.versionLine}", which is not AWS CLI v2` };
+    return { ok: false, reason: `'${command} --version' printed "${parsed.versionLine}", which is not AWS CLI v2` };
   }
   if (opts.minVersion && !meetsMinVersion(parsed.version, opts.minVersion)) {
     return {
@@ -245,6 +227,19 @@ const DEFAULT_CREDENTIALS = `[default]\naws_access_key_id = ${FAKE_ACCESS_KEY_ID
 
 const PROXY_VARS: ReadonlySet<string> = new Set(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]);
 
+/**
+ * The one AWS_* variable the scrub keeps. It names which `aws` binary to run and
+ * carries no credentials, and keeping it is what makes
+ * `AWS_MCP_AWS_CLI=<old aws.exe> npm test` run these suites against that CLI --
+ * the release check that a fix works on an older 2.x as well as the installed
+ * one. Scrubbing it would have left the operator watching a suite titled with
+ * the old version while every call ran the new one.
+ *
+ * AWS_MCP_TEST_AWS_COMMAND is deliberately NOT here: it is an in-process test
+ * seam that bypasses resolution, and a real-CLI suite must not use it.
+ */
+const KEPT_AWS_VARS: ReadonlySet<string> = new Set(["AWS_MCP_AWS_CLI"]);
+
 export interface IsolatedAwsEnv {
   /** Private temp directory holding the two files below; removed by restore(). */
   dir: string;
@@ -259,7 +254,8 @@ export interface IsolatedAwsEnv {
  * loopback, with fake credentials:
  *   1. delete every variable whose upper-case name starts with AWS_ (this
  *      covers AWS_MCP_TEST_*) or PYTHON, and every spelling of HTTP_PROXY,
- *      HTTPS_PROXY, ALL_PROXY and NO_PROXY;
+ *      HTTPS_PROXY, ALL_PROXY and NO_PROXY -- except AWS_MCP_AWS_CLI, which
+ *      names the binary to run rather than an identity (KEPT_AWS_VARS);
  *   2. set HTTP_PROXY and HTTPS_PROXY to DEAD_PROXY_URL, NO_PROXY to the
  *      loopback, AWS_EC2_METADATA_DISABLED=true, AWS_REGION=us-east-1, an
  *      empty AWS_PAGER, and AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE to
@@ -288,6 +284,7 @@ export function isolateAwsEnv(
 
   for (const key of Object.keys(process.env)) {
     const upper = key.toUpperCase();
+    if (KEPT_AWS_VARS.has(upper)) continue;
     if (upper.startsWith("AWS_") || upper.startsWith("PYTHON") || PROXY_VARS.has(upper)) {
       delete process.env[key];
     }

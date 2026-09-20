@@ -15,12 +15,15 @@
  * Every child runs with the CLI settings this server depends on pinned in its
  * environment (aws-spawn.ts PINNED_CLI_ENV): the error format the classifier
  * reads, auto-prompt off, and UTF-8 output. Those are settings a user can put
- * in ~/.aws/config that break this server rather than their own terminal.
+ * in ~/.aws/config that break this server rather than their own terminal. The
+ * binary itself is resolved to an absolute path from the child environment's
+ * PATH, or from AWS_MCP_AWS_CLI, and never from the working directory -- which
+ * belongs to the MCP host, not to us.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { awsChildEnv } from "./aws-spawn.js";
+import { awsChildEnv, resolveAwsCommand } from "./aws-spawn.js";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { KILL_ESCALATION_MS, killProc, procHasExited } from "./kill-proc.js";
 import {
@@ -524,6 +527,21 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   const outputFormat = opts.outputFormat ?? "json";
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+  // The --query length check, hoisted out of the argv block below so it runs
+  // BEFORE the binary is resolved: an over-long JMESPath expression is the
+  // caller's bad_input whether or not this machine has an AWS CLI, and
+  // reporting it as spawn_failure would send the reader after the wrong thing.
+  // Same empty-query rule as the push below -- a whitespace-only query is not
+  // passed and so is not measured.
+  const query = opts.query !== undefined && opts.query.trim().length > 0 ? opts.query : undefined;
+  if (query !== undefined && query.length > 2048) {
+    return Promise.resolve({
+      ok: false,
+      kind: "bad_input",
+      error: `query expression too long (${query.length} chars; max 2048). Simplify the JMESPath expression.`,
+    });
+  }
+
   // Test-only override path: handler-level tests (e.g. tools/paginate.test.ts)
   // can't pass command/prefixArgs through the MCP-level handler signature, so
   // we honor these env vars as a fallback. Never set in production -- the
@@ -536,8 +554,24 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   const envCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
   const envPrefixArgsRaw = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
   const envPrefixArgs = parseTestPrefixArgs(envPrefixArgsRaw);
-  const command = opts.command ?? envCommand ?? "aws";
   const prefixArgs = opts.prefixArgs ?? envPrefixArgs ?? [];
+
+  // WHICH binary runs, resolved to an absolute path -- never the bare name
+  // `aws`. On Windows a bare spawn searches the process's working directory
+  // before PATH (libuv's search_path, unless the host set
+  // NoDefaultCurrentDirectoryInExePath, which not every MCP host does), and on
+  // POSIX an empty or `.` PATH entry means the working directory to execvp --
+  // and that directory belongs to the MCP host, typically the user's open
+  // project. See aws-spawn.ts resolveAwsCommand, which also reads the
+  // AWS_MCP_AWS_CLI override.
+  const resolution = resolveAwsCommand({ explicit: opts.command ?? envCommand, env: opts.env ?? process.env });
+  if (!resolution.ok) {
+    // No `command` in the envelope: nothing was assembled and nothing ran, so
+    // there is no invocation to show -- the same shape as every other failure
+    // this function returns before the spawn.
+    return Promise.resolve({ ok: false, kind: "spawn_failure", error: resolution.error });
+  }
+  const command = resolution.command;
 
   const args: string[] = [
     ...prefixArgs,
@@ -555,15 +589,8 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     "--region",
     region,
   ];
-  if (opts.query !== undefined && opts.query.trim().length > 0) {
-    if (opts.query.length > 2048) {
-      return Promise.resolve({
-        ok: false,
-        kind: "bad_input",
-        error: `query expression too long (${opts.query.length} chars; max 2048). Simplify the JMESPath expression.`,
-      });
-    }
-    args.push("--query", opts.query);
+  if (query !== undefined) {
+    args.push("--query", query);
   }
   if (opts.params !== undefined && Object.keys(opts.params).length > 0) {
     args.push("--cli-input-json", JSON.stringify(opts.params));
@@ -573,7 +600,11 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   // it survives a paste into a POSIX shell. The real invocation still uses the
   // argv array above (no shell involved), so the quoting here is purely about
   // what the caller SEES -- and the caller is a model that will paste it.
-  const displayCommand = [command, ...redactDisplayArgs(args)].map(shellQuoteArg).join(" ");
+  // `resolution.display`, not `command`: for a resolved or overridden binary
+  // that is the literal `aws`, because the absolute path is noise to the reader
+  // (and, for the override, the operator's own file layout). A test seam's
+  // command still shows itself.
+  const displayCommand = [resolution.display, ...redactDisplayArgs(args)].map(shellQuoteArg).join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;
@@ -866,10 +897,16 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     });
 
     proc.on("error", (err) => {
+      // The PATH hint only where PATH could be the answer. ENOENT after a
+      // successful resolution means the file went away between the stat and the
+      // spawn, or a test seam named a binary that does not exist; any other
+      // errno (EACCES, EINVAL for a script shim) is not about PATH at all, and
+      // the old unconditional sentence sent readers to check one that was fine.
+      const enoent = (err as NodeJS.ErrnoException).code === "ENOENT";
       settle({
         ok: false,
         kind: "spawn_failure",
-        error: `Failed to run '${command}': ${err.message}. Is the AWS CLI installed and on PATH?`,
+        error: `Failed to run '${command}': ${err.message}.${enoent ? " Is the AWS CLI installed and on PATH?" : ""}`,
         command: displayCommand,
       });
     });
