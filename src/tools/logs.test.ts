@@ -3,12 +3,19 @@ import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { runAwsCall } from "../aws-cli.js";
+import { REAL_CLI_CAPTURES, TAIL_QUERY_RE } from "../testing/logs-tail-fake.js";
 import {
+  _resetLogsTailCliModelCache,
+  buildTailParams,
+  buildTailQuery,
   DEFAULT_MAX_EVENTS,
   DEFAULT_QUERY_LIMIT,
+  detectFleModelGaps,
+  fetchIgnoredStartFromHead,
   flattenQueryRows,
   isValidLogStreamName,
   isValidQueryId,
+  LOG_GROUP_IDENTIFIER_MIN_CLI,
   LOG_GROUP_RE,
   LOG_STREAM_NAME_RE,
   logsTools,
@@ -17,11 +24,14 @@ import {
   MAX_QUERY_LOG_GROUPS,
   MAX_QUERY_RANGE_MS,
   MAX_SINCE_MS,
-  parseLogsJsonOutput,
+  parseLogGroupArn,
+  parseTailOutput,
   pollQueryUntilTerminal,
   RELATIVE_TIME_RE,
   relativeTimeMs,
   resolveLogGroupName,
+  START_FROM_HEAD_MIN_CLI,
+  selectTailWindow,
 } from "./logs.js";
 
 const tool = logsTools.find((t) => t.name === "aws_logs_tail");
@@ -140,48 +150,341 @@ describe("relativeTimeMs (shared with aws_metrics_query)", () => {
   });
 });
 
-describe("parseLogsJsonOutput", () => {
-  it("splits NDJSON into an array of events", () => {
-    const raw =
-      '{"timestamp":"2026-04-21T00:00:00Z","message":"hello"}\n{"timestamp":"2026-04-21T00:00:01Z","message":"world"}\n';
-    const parsed = parseLogsJsonOutput(raw);
-    assert.ok(Array.isArray(parsed));
-    assert.equal(parsed.length, 2);
-    assert.equal((parsed[0] as { message: string }).message, "hello");
+// The instant every fixture below is anchored to (2026-09-19T10:00:00Z), the
+// same one logs-tail-fake.ts uses.
+const T0 = Date.UTC(2026, 8, 19, 10, 0, 0);
+const rawEvent = (ms: number | null, message: string, logStreamName = "s1") => ({
+  timestampMs: ms,
+  logStreamName,
+  message,
+});
+/** n events NEWEST first, which is what `startFromHead: false` returns. */
+const descendingEvents = (n: number) =>
+  Array.from({ length: n }, (_, k) => rawEvent(T0 + (n - 1 - k) * 1000, `event-${n - 1 - k}`));
+/** n events OLDEST first, which is what an endpoint ignoring the member returns. */
+const ascendingEvents = (n: number) => Array.from({ length: n }, (_, k) => rawEvent(T0 + k * 1000, `event-${k}`));
+
+describe("parseTailOutput", () => {
+  it("reads the document the real CLI printed for the basic dataset", () => {
+    // The verbatim 2.34.3 capture, through the same JSON.parse runAwsCall does.
+    const parsed = parseTailOutput(JSON.parse(REAL_CLI_CAPTURES.legacyBasicStdout));
+    assert.ok(parsed, "the captured whole-window read must parse");
+    assert.equal(parsed.total, 6);
+    assert.equal(parsed.events.length, 6);
+    const window = selectTailWindow(parsed, 500, "full-window");
+    assert.equal(window.eventCount, 6);
+    assert.equal(window.totalEvents, 6);
+    assert.equal(window.truncated, false);
+    // Timestamps convert from epoch ms to ISO 8601 UTC with milliseconds.
+    assert.equal(window.events[0].timestamp, "2026-09-19T10:00:00.000Z");
+    assert.equal(window.events[1].timestamp, "2026-09-19T10:00:01.123Z");
+    // Messages are VERBATIM: the trailing newline Lambda's START line carries,
+    // both newlines of the traceback, the JSON message byte-for-byte (the old
+    // path got it back re-indented by the CLI's formatter), a stream name with a
+    // space in it, a bare scalar as a string, and a message that reads like one
+    // of the formatter's own header lines.
+    assert.equal(window.events[0].message, "START RequestId: 11-22 Version: $LATEST\n");
+    assert.equal(window.events[1].message, '{"level":"error","msg":"boom","ctx":{"id":7}}');
+    assert.equal(
+      window.events[2].message,
+      'Traceback (most recent call last):\n  File "x.py", line 1\nValueError: bad',
+    );
+    assert.equal(window.events[3].logStreamName, "my stream/2026");
+    assert.equal(window.events[4].message, "42");
+    assert.match(window.events[5].message ?? "", /LOOKS like a tail header$/);
   });
 
-  it("handles an empty string as an empty array", () => {
-    assert.deepEqual(parseLogsJsonOutput(""), []);
+  it("reads an empty window", () => {
+    const parsed = parseTailOutput({ total: 0, events: [] });
+    assert.deepEqual(parsed, { total: 0, events: [] });
   });
 
-  it("handles null/undefined as an empty array", () => {
-    assert.deepEqual(parseLogsJsonOutput(null), []);
-    assert.deepEqual(parseLogsJsonOutput(undefined), []);
+  it("refuses anything that is not the {total, events} document", () => {
+    // THE regression pin. The parser this replaced turned `aws logs tail --format
+    // json`'s TEXT into ok:true with the blob as `events`, which is how the tool
+    // shipped never returning a structured event against a real CLI. Each input
+    // below must be a refusal, not a guess.
+    assert.equal(parseTailOutput(REAL_CLI_CAPTURES.tailFormatJsonStdout), null, "the real tail text");
+    assert.equal(parseTailOutput(null), null, "empty stdout");
+    assert.equal(parseTailOutput(undefined), null);
+    assert.equal(parseTailOutput("something"), null, "a scalar string");
+    assert.equal(parseTailOutput([{ timestamp: 1, message: "x" }]), null, "a bare array");
+    assert.equal(parseTailOutput({ events: [] }), null, "no total");
+    assert.equal(parseTailOutput({ total: "6", events: [] }), null, "total as a string");
+    assert.equal(parseTailOutput({ total: 1.5, events: [] }), null, "a fractional total");
+    assert.equal(parseTailOutput({ total: -1, events: [] }), null, "a negative total");
+    assert.equal(parseTailOutput({ total: 1, events: "x" }), null, "events not an array");
   });
 
-  it("wraps an already-parsed single object in a 1-element array", () => {
-    // runAwsCall's JSON.parse succeeds when there's exactly one event on one
-    // line, so `data` arrives as an object rather than a string.
-    const single = { timestamp: "2026-04-21T00:00:00Z", message: "only" };
-    const parsed = parseLogsJsonOutput(single);
-    assert.deepEqual(parsed, [single]);
+  it("maps a missing member to null instead of dropping the event", () => {
+    // A caller counting events has to see the number the service returned.
+    const parsed = parseTailOutput({ total: 2, events: [{ timestamp: T0 }, {}] });
+    assert.ok(parsed);
+    assert.equal(parsed.events.length, 2);
+    assert.deepEqual(parsed.events[1], { timestampMs: null, logStreamName: null, message: null });
+    const window = selectTailWindow(parsed, 10, "full-window");
+    assert.deepEqual(window.events[1], { timestamp: null, logStreamName: null, message: null });
   });
 
-  it("returns an already-parsed array unchanged", () => {
-    const input = [{ a: 1 }, { b: 2 }];
-    assert.equal(parseLogsJsonOutput(input), input);
+  it("turns a timestamp Date cannot represent into null", () => {
+    const parsed = parseTailOutput({
+      total: 3,
+      events: [{ timestamp: 9e15 }, { timestamp: "nope" }, { timestamp: T0 }],
+    });
+    assert.ok(parsed);
+    const window = selectTailWindow(parsed, 10, "full-window");
+    assert.equal(window.events[0].timestamp, null, "9e15 ms is past Date's range");
+    assert.equal(window.events[1].timestamp, null, "a non-numeric timestamp");
+    assert.equal(window.events[2].timestamp, "2026-09-19T10:00:00.000Z");
+  });
+});
+
+describe("buildTailQuery", () => {
+  it("projects every event on the newest-first path and the newest maxEvents on the other", () => {
+    assert.equal(
+      buildTailQuery("newest-first", 500),
+      "{total: length(events), events: events[].{timestamp: timestamp, logStreamName: logStreamName, message: message}}",
+    );
+    assert.equal(
+      buildTailQuery("full-window", 500),
+      "{total: length(events), events: events[-500:].{timestamp: timestamp, logStreamName: logStreamName, message: message}}",
+    );
   });
 
-  it("ignores trailing blank lines", () => {
-    const raw = '{"a":1}\n\n{"b":2}\n\n';
-    const parsed = parseLogsJsonOutput(raw);
-    assert.ok(Array.isArray(parsed));
-    assert.equal(parsed.length, 2);
+  it("writes the only projection the fake answers, for every maxEvents", () => {
+    // Drift pin between the handler and the fake CLI: the emulator exits 2 on any
+    // other --query, so a projection change here without a re-capture fails loudly
+    // rather than being humoured.
+    for (const maxEvents of [1, 10, DEFAULT_MAX_EVENTS, MAX_MAX_EVENTS]) {
+      for (const mode of ["newest-first", "full-window"] as const) {
+        const query = buildTailQuery(mode, maxEvents);
+        assert.match(query, TAIL_QUERY_RE, `${mode} ${maxEvents}`);
+        assert.ok(query.length < 2048, "runAwsCall rejects a --query over 2048 chars");
+      }
+    }
+  });
+});
+
+describe("buildTailParams", () => {
+  const base = { logGroupName: "/aws/lambda/my-fn", logGroupIdentifier: null, startTime: T0, newestFirst: true };
+
+  it("sends a bare name as logGroupName and an ARN as logGroupIdentifier, never both", () => {
+    const bare = buildTailParams(base);
+    assert.equal(bare.logGroupName, "/aws/lambda/my-fn");
+    assert.equal("logGroupIdentifier" in bare, false);
+    const arn = buildTailParams({
+      ...base,
+      logGroupIdentifier: "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
+    });
+    assert.equal(arn.logGroupIdentifier, "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn");
+    assert.equal("logGroupName" in arn, false);
   });
 
-  it("falls back to the raw text when any line is malformed", () => {
-    const raw = '{"a":1}\nnot json\n{"b":2}\n';
-    assert.equal(parseLogsJsonOutput(raw), raw);
+  it("sends startFromHead:false exactly when the read is newest-first", () => {
+    assert.equal(buildTailParams(base).startFromHead, false);
+    assert.equal("startFromHead" in buildTailParams({ ...base, newestFirst: false }), false);
+  });
+
+  it("never sends limit, nextToken, interleaved, unmask or endTime", () => {
+    // `limit` or `nextToken` in the payload turns the CLI's own pagination off, and
+    // with --max-items the call then fails with `Unknown parameter in input:
+    // "PaginationConfig"` (measured, exit 252). The other three have no input.
+    const params = buildTailParams({
+      ...base,
+      filterPattern: "ERROR",
+      logStreamNames: ["s1"],
+    });
+    for (const banned of ["limit", "nextToken", "interleaved", "unmask", "endTime"]) {
+      assert.equal(banned in params, false, `${banned} must never be sent`);
+    }
+    assert.deepEqual(Object.keys(params).sort(), [
+      "filterPattern",
+      "logGroupName",
+      "logStreamNames",
+      "startFromHead",
+      "startTime",
+    ]);
+  });
+
+  it("omits an empty stream list, prefix or filter pattern", () => {
+    // botocore refuses an empty logStreamNames or logStreamNamePrefix before any
+    // request (`Invalid length for parameter ..., value: 0, valid min length: 1`,
+    // exit 252, measured on 2.34.3 and 2.22.0), and the schema accepts both -- so
+    // sending them would break calls that work today. An empty filterPattern IS
+    // accepted by botocore; it is omitted for parity with the truthiness check the
+    // handler has always applied.
+    const params = buildTailParams({ ...base, logStreamNames: [], logStreamNamePrefix: "", filterPattern: "" });
+    assert.deepEqual(Object.keys(params).sort(), ["logGroupName", "startFromHead", "startTime"]);
+  });
+});
+
+describe("detectFleModelGaps", () => {
+  it("recognizes a startFromHead rejection in every form the CLI prints it", () => {
+    // 2.34.3's, 2.22.0's (no `aws: [ERROR]: An error occurred (ParamValidation):`
+    // header), and the JSON error format, where the name carries escaped quotes.
+    for (const [label, stderr] of [
+      ["2.34.3", REAL_CLI_CAPTURES.startFromHeadRejectStderr],
+      ["2.22.0", REAL_CLI_CAPTURES.startFromHeadRejectLegacyCliStderr],
+      ["json error format", REAL_CLI_CAPTURES.startFromHeadRejectJsonFormatStderr],
+      ["pre-2.9.2 model, bare name", REAL_CLI_CAPTURES.ancientBareNameRejectStderr],
+    ] as const) {
+      assert.deepEqual(
+        detectFleModelGaps(stderr),
+        { startFromHead: true, logGroupIdentifier: false },
+        `expected a startFromHead gap from ${label}`,
+      );
+    }
+  });
+
+  it("recognizes a model that has no logGroupIdentifier at all", () => {
+    // botocore reports every problem in one message, so ARN input against a
+    // pre-2.9.2 model rejects the identifier AND misses the required name.
+    assert.deepEqual(detectFleModelGaps(REAL_CLI_CAPTURES.ancientRejectStderr), {
+      startFromHead: true,
+      logGroupIdentifier: true,
+    });
+    // The optional-name change (AWS CLI 2.9.15) is the same era, and a model from
+    // 2.9.2..2.9.14 knows logGroupIdentifier but still requires logGroupName.
+    assert.deepEqual(detectFleModelGaps('Missing required parameter in input: "logGroupName"'), {
+      startFromHead: false,
+      logGroupIdentifier: true,
+    });
+  });
+
+  it("reads the same rejection whatever the line endings are", () => {
+    const lf = REAL_CLI_CAPTURES.ancientRejectStderr.replaceAll("\r\n", "\n");
+    assert.deepEqual(detectFleModelGaps(lf), { startFromHead: true, logGroupIdentifier: true });
+  });
+
+  it("treats a bad VALUE for a known member as no gap at all", () => {
+    // The member exists; the value was wrong. Falling back to a whole-window read
+    // here would hide a real bug behind a second, slower call.
+    for (const stderr of [
+      "Invalid type for parameter startFromHead, value: no, type: <class 'str'>, valid types: <class 'bool'>",
+      "Invalid length for parameter logStreamNames, value: 0, valid min length: 1",
+      "An error occurred (AccessDeniedException) when calling the FilterLogEvents operation: User is not authorized",
+      "An error occurred (ResourceNotFoundException) when calling the FilterLogEvents operation: The specified log group does not exist.",
+      "",
+    ]) {
+      assert.deepEqual(
+        detectFleModelGaps(stderr),
+        { startFromHead: false, logGroupIdentifier: false },
+        `expected no gap from: ${stderr.slice(0, 40)}`,
+      );
+    }
+  });
+});
+
+describe("selectTailWindow — newest-first", () => {
+  const msg = (e: { message: string | null }) => e.message;
+
+  it("keeps the newest maxEvents and reverses them to oldest-first", () => {
+    // The fetch asks for maxEvents + 1, so 501 events back means the window held
+    // more than 500 -- exact, without trusting a NextToken that over-reports.
+    const window = selectTailWindow({ total: 501, events: descendingEvents(501) }, 500, "newest-first");
+    assert.equal(window.truncated, true);
+    assert.equal(window.eventCount, 500);
+    assert.equal(window.totalEvents, null, "the read stopped early, so the window's size is unknown");
+    assert.equal(msg(window.events[0]), "event-1", "the sentinel event-0 is dropped as the oldest");
+    assert.equal(msg(window.events[499]), "event-500");
+  });
+
+  it("treats exactly maxEvents as a complete window", () => {
+    const window = selectTailWindow({ total: 500, events: descendingEvents(500) }, 500, "newest-first");
+    assert.equal(window.truncated, false);
+    assert.equal(window.eventCount, 500);
+    assert.equal(window.totalEvents, 500, "nothing was left unread, so the count is exact");
+    assert.equal(msg(window.events[0]), "event-0");
+  });
+
+  it("answers an empty window", () => {
+    const window = selectTailWindow({ total: 0, events: [] }, 500, "newest-first");
+    assert.deepEqual(window, { events: [], eventCount: 0, totalEvents: 0, truncated: false });
+  });
+
+  it("keeps an ascending, complete fetch exactly as it came", () => {
+    // An endpoint that ignored startFromHead, but the whole window arrived: the
+    // same events are the answer either way, so reversing them would be the bug.
+    const window = selectTailWindow({ total: 3, events: ascendingEvents(3) }, 500, "newest-first");
+    assert.equal(window.totalEvents, 3);
+    assert.equal(window.truncated, false);
+    assert.deepEqual(window.events.map(msg), ["event-0", "event-1", "event-2"]);
+  });
+
+  it("reads equal timestamps as newest-first, the API's documented order", () => {
+    const events = [rawEvent(T0, "a"), rawEvent(T0, "b")];
+    const window = selectTailWindow({ total: 2, events }, 500, "newest-first");
+    assert.deepEqual(window.events.map(msg), ["b", "a"], "unclassifiable order is reversed like a descending one");
+  });
+});
+
+describe("fetchIgnoredStartFromHead", () => {
+  it("flags an ascending fetch that was truncated -- the wrong end of the window", () => {
+    // moto and LocalStack never read startFromHead, so a newest-first read comes
+    // back oldest-first; keeping the first maxEvents would present the OLDEST
+    // events as the newest with truncated:true.
+    assert.equal(fetchIgnoredStartFromHead(ascendingEvents(501), 500), true);
+  });
+
+  it("does not flag a descending fetch, a complete window, or one event", () => {
+    assert.equal(fetchIgnoredStartFromHead(descendingEvents(501), 500), false);
+    assert.equal(fetchIgnoredStartFromHead(ascendingEvents(3), 500), false, "the whole window arrived");
+    assert.equal(fetchIgnoredStartFromHead(ascendingEvents(1), 0), false, "one event has no order");
+    assert.equal(fetchIgnoredStartFromHead([], 0), false);
+  });
+
+  it("does not flag a fetch whose ends carry no timestamp", () => {
+    const events = [rawEvent(null, "a"), rawEvent(T0, "b"), rawEvent(null, "c")];
+    assert.equal(fetchIgnoredStartFromHead(events, 1), false);
+  });
+});
+
+describe("selectTailWindow — full-window", () => {
+  it("reports the window's exact size and keeps the newest maxEvents", () => {
+    // The projection already sliced events[-maxEvents:]; `total` is what the CLI
+    // fetched, which on this path is the whole window.
+    const window = selectTailWindow({ total: 1200, events: ascendingEvents(500) }, 500, "full-window");
+    assert.equal(window.truncated, true);
+    assert.equal(window.totalEvents, 1200);
+    assert.equal(window.eventCount, 500);
+  });
+
+  it("flips truncated exactly at maxEvents", () => {
+    assert.equal(selectTailWindow({ total: 500, events: ascendingEvents(500) }, 500, "full-window").truncated, false);
+    assert.equal(selectTailWindow({ total: 501, events: ascendingEvents(500) }, 500, "full-window").truncated, true);
+  });
+});
+
+describe("parseLogGroupArn", () => {
+  it("splits an ARN into its parts and drops a trailing ':*'", () => {
+    assert.deepEqual(parseLogGroupArn("arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn:*"), {
+      partition: "aws",
+      region: "us-east-1",
+      account: "123456789012",
+      name: "/aws/lambda/my-fn",
+      identifier: "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
+    });
+  });
+
+  it("handles a non-commercial partition", () => {
+    const parts = parseLogGroupArn("arn:aws-us-gov:logs:us-gov-west-1:123456789012:log-group:app/svc");
+    assert.equal(parts?.partition, "aws-us-gov");
+    assert.equal(parts?.region, "us-gov-west-1");
+    assert.equal(parts?.identifier, "arn:aws-us-gov:logs:us-gov-west-1:123456789012:log-group:app/svc");
+  });
+
+  it("returns null for a bare name and for every near miss", () => {
+    for (const input of [
+      "/aws/lambda/my-fn",
+      "arn:aws:logs:us-east-1:12345:log-group:/aws/lambda/fn",
+      "arn:aws:s3:::my-bucket",
+      "arn:aws:logs:us-east-1:123456789012:log-group:-force",
+      "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/foo;rm",
+      "--force",
+      "",
+    ]) {
+      assert.equal(parseLogGroupArn(input), null, `expected null for '${input}'`);
+    }
   });
 });
 
@@ -290,10 +593,11 @@ describe("aws_logs_tail schema", () => {
     }
   });
 
-  it("rejects uppercase unit suffixes (aws logs tail accepts lowercase only)", () => {
-    // The CLI rejects "15M"/"2H"/etc.; the schema must too, else we Zod-OK
-    // an input the CLI then errors on. Anchored case so a future `/i` flip
-    // gets caught here rather than at runtime.
+  it("rejects uppercase unit suffixes (the vocabulary is lowercase-only)", () => {
+    // The vocabulary came from `aws logs tail --since`, which rejects "15M"/"2H";
+    // the window is resolved here now, but the accepted input set is unchanged, so
+    // the schema still rejects them. Anchored case so a future `/i` flip gets
+    // caught here rather than at runtime.
     for (const since of ["15M", "2H", "1D", "1W", "30S"]) {
       assert.equal(
         tool.inputSchema.safeParse({ logGroupName: "/aws/lambda/my-fn", since }).success,
@@ -324,6 +628,19 @@ describe("aws_logs_tail schema", () => {
 
   it("rejects missing logGroupName", () => {
     assert.equal(tool.inputSchema.safeParse({}).success, false);
+  });
+
+  it("names both AWS CLI floors its behavior depends on, inside the description budget", () => {
+    // A caller reading the description has to know which floor explains
+    // `totalEvents: null` and which one explains an ARN rejection, and the whole
+    // string has to stay inside the 2,000-byte budget every tool is held to.
+    const escaped = (v: string) => v.replaceAll(".", ".");
+    assert.match(tool.description, new RegExp(`AWS CLI ${escaped(START_FROM_HEAD_MIN_CLI)}+`));
+    assert.match(tool.description, new RegExp(`AWS CLI ${escaped(LOG_GROUP_IDENTIFIER_MIN_CLI)}+`));
+    assert.ok(
+      Buffer.byteLength(tool.description) < 2000,
+      `description is ${Buffer.byteLength(tool.description)} bytes`,
+    );
   });
 });
 
@@ -423,8 +740,8 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
   });
 
   it("rejects a since window beyond the maximum", async () => {
-    // 'aws logs tail' drains FilterLogEvents internally; the 60s timeout and
-    // the 5MB stdout cap only fire AFTER the API calls are spent.
+    // A window this wide spends FilterLogEvents call after call; the timeout and
+    // the 5 MB stdout cap only fire AFTER those calls are paid for.
     const r = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "520w" })) as {
       ok: boolean;
       error?: string;
@@ -437,7 +754,7 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
   it("still runs the windows the description documents (boundary: 4w in, 5w out)", async () => {
     // The cap must not shrink the vocabulary the tool advertises ('1w', '3d').
     // 4w (28 days) is inside the 30-day ceiling and runs; 5w (35 days) is not.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_empty";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_current_empty";
     const inside = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "4w" })) as {
       ok: boolean;
       error?: string;
@@ -457,7 +774,7 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     // instead of `>`) survives it. The cap is inclusive: sinceMs > MAX_SINCE_MS
     // rejects, so exactly 30 days must still run.
     assert.equal(relativeTimeMs("30d"), MAX_SINCE_MS, "precondition: '30d' is exactly the ceiling");
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_empty";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_current_empty";
     const atMax = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "30d" })) as {
       ok: boolean;
       error?: string;
@@ -473,12 +790,11 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
   });
 
   it("rejects a filterPattern that starts with '-'", async () => {
-    // filterPattern lands as the value position after --filter-pattern in
-    // argv, so a leading '-' is not actually exploitable -- but the file
-    // header comment promises uniform leading-hyphen defense across every
-    // free-text field. Real CloudWatch filter patterns never start with '-'
-    // (they start with a literal word, a quote, or '[' for structured
-    // matching), so the reject costs nothing and keeps the invariant honest.
+    // The pattern travels inside --cli-input-json now, so a leading '-' was never
+    // exploitable and is not an argv concern at all -- the guard stays so this
+    // release does not widen the accepted input set as well. Real CloudWatch filter
+    // patterns never start with '-' (they start with a literal word, a quote, or
+    // '[' for structured matching), so the reject costs nothing.
     const r = (await tool.handler({
       logGroupName: "/aws/lambda/my-fn",
       filterPattern: "-x",
@@ -486,6 +802,69 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /filterPattern/);
     assert.match(r.error ?? "", /must not start with '-'/);
+  });
+});
+
+describe("aws_logs_tail handler — log-group ARN region check (no spawn)", () => {
+  // FilterLogEvents is regional, so an ARN from another region is rejected HERE
+  // rather than read as a same-named group in the call's region, which is what the
+  // old name-extraction did silently. Every case pins the region explicitly: the
+  // check reads `i.region ?? getRegion()`, and a developer shell carrying
+  // AWS_REGION=eu-west-1 must not change the answer.
+  const ARN = "arn:aws:logs:us-west-2:123456789012:log-group:/aws/lambda/my-fn";
+  let prevRegion: string | undefined;
+  let prevDefaultRegion: string | undefined;
+  before(() => {
+    prevRegion = process.env.AWS_REGION;
+    prevDefaultRegion = process.env.AWS_DEFAULT_REGION;
+    _resetLogsTailCliModelCache();
+  });
+  after(() => {
+    if (prevRegion === undefined) delete process.env.AWS_REGION;
+    else process.env.AWS_REGION = prevRegion;
+    if (prevDefaultRegion === undefined) delete process.env.AWS_DEFAULT_REGION;
+    else process.env.AWS_DEFAULT_REGION = prevDefaultRegion;
+  });
+
+  it("refuses an ARN whose region is not the call's, naming both regions", async () => {
+    const r = (await tool.handler({ logGroupName: ARN, region: "us-east-1" })) as {
+      ok: boolean;
+      error?: string;
+      errorKind?: string;
+      suggestion?: string;
+    };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /us-west-2/);
+    assert.match(r.error ?? "", /us-east-1/);
+    assert.match(r.error ?? "", /FilterLogEvents is regional/);
+    assert.match(r.error ?? "", /pass the bare name '\/aws\/lambda\/my-fn'/);
+    // Nothing was spawned, so nothing classified this failure.
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+
+  it("says which region it compared against when the call named none", async () => {
+    process.env.AWS_REGION = "us-east-1";
+    delete process.env.AWS_DEFAULT_REGION;
+    const r = (await tool.handler({ logGroupName: ARN })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /'us-east-1' \(the session\/default region\)/);
+  });
+
+  it("lets a matching region through to the call", async () => {
+    process.env.AWS_REGION = "us-east-1";
+    delete process.env.AWS_DEFAULT_REGION;
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_current_empty";
+    const r = (await tool.handler({
+      logGroupName: "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
+      region: "us-east-1",
+    })) as { ok: boolean; error?: string; data?: { logGroupIdentifier: string | null } };
+    assert.equal(r.ok, true, `expected the ARN to be accepted, got: ${r.error ?? ""}`);
+    assert.equal(
+      r.data?.logGroupIdentifier,
+      "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
+      "the envelope echoes the identifier that was sent",
+    );
   });
 });
 

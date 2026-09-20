@@ -1248,68 +1248,6 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "logs_tail_ndjson": {
-      // 'aws logs tail --format json' emits one JSON object per line.
-      process.stdout.write(
-        `${JSON.stringify({ timestamp: "2026-04-21T00:00:00Z", logStreamName: "s1", message: "hello" })}\n${JSON.stringify(
-          {
-            timestamp: "2026-04-21T00:00:01Z",
-            logStreamName: "s1",
-            message: "world",
-          },
-        )}\n${JSON.stringify({ timestamp: "2026-04-21T00:00:02Z", logStreamName: "s2", message: "ok" })}\n`,
-      );
-      process.exit(0);
-      return;
-    }
-
-    case "logs_tail_empty": {
-      // No events in the window -- empty stdout, exit 0.
-      process.exit(0);
-      return;
-    }
-
-    case "logs_tail_ndjson_malformed": {
-      // Multi-line NDJSON where ONE line is not valid JSON. The aws CLI
-      // normally never emits this, but a partially-flushed event, an injected
-      // CLI warning line, or a truncated final record can produce it.
-      // parseLogsJsonOutput in logs.ts gives up on the first un-parseable line
-      // and returns the RAW string unchanged; the handler then renders
-      // eventCount=null (since events is a string, not an array) while still
-      // surfacing the blob in `events` for diagnosis. First line is valid JSON,
-      // second line is garbage, third line is valid JSON -- so the failure is
-      // mid-stream, not at the very start.
-      process.stdout.write(
-        `${JSON.stringify({ timestamp: "2026-04-21T00:00:00Z", logStreamName: "s1", message: "hello" })}\n` +
-          "this-line-is-not-json\n" +
-          `${JSON.stringify({ timestamp: "2026-04-21T00:00:02Z", logStreamName: "s2", message: "ok" })}\n`,
-      );
-      process.exit(0);
-      return;
-    }
-
-    case "logs_tail_ndjson_bulk": {
-      // A busy window: more events than aws_logs_tail's default maxEvents cap,
-      // emitted OLDEST-FIRST the way `aws logs tail` does. Each message carries
-      // its index so a test can assert WHICH end of the window survived the cap
-      // -- "keep the newest" is the tool's contract, and first-N vs last-N is
-      // indistinguishable unless the events are individually identifiable.
-      // ~1200 events is ~110 KB in one write, far below the 5 MB stdout cap.
-      const bulkLines: string[] = [];
-      for (let i = 0; i < 1200; i++) {
-        bulkLines.push(
-          JSON.stringify({
-            timestamp: new Date(Date.UTC(2026, 3, 21, 0, 0, 0) + i * 1000).toISOString(),
-            logStreamName: "s1",
-            message: `event-${i}`,
-          }),
-        );
-      }
-      process.stdout.write(`${bulkLines.join("\n")}\n`);
-      process.exit(0);
-      return;
-    }
-
     case "logs_query_complete": {
       // aws_logs_query happy path across the two CLI calls one handler run
       // makes: `logs start-query` -> a queryId, then `logs get-query-results`
