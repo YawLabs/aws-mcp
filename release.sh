@@ -468,11 +468,19 @@ if gh release view "v${VERSION}" >/dev/null 2>&1; then
   info "GitHub release v${VERSION} already exists — skipping"
 else
   PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^v${VERSION}$" | tail -1)
-  NOTES=$(release_notes "$PREV_TAG")
+  # --notes-file, never --notes: the notes come from a CHANGELOG entry, and this
+  # release's was long enough that passing it through argv died with "Argument
+  # list too long" (exit 126) AFTER npm had published -- so the release had to be
+  # finished by hand. A file has no such limit on any platform. (Windows caps a
+  # command line at 32,767 characters, which one thorough entry can reach.)
+  NOTES_FILE=$(mktemp)
+  # shellcheck disable=SC2064  # expand NOTES_FILE now, not at trap time
+  trap "rm -f '$NOTES_FILE'" EXIT
+  release_notes "$PREV_TAG" > "$NOTES_FILE"
 
   gh release create "v${VERSION}" \
     --title "v${VERSION}" \
-    --notes "$NOTES"
+    --notes-file "$NOTES_FILE"
   info "GitHub release created (notes from CHANGELOG.md [${VERSION}])"
 fi
 
