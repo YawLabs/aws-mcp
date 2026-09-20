@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it, mock } from "node:test";
 import {
+  CLI_S3API_INDEX_HTML,
+  JSV3_SHELL_HTML,
+  LAMBDA_LANDING_STUB_HTML,
+  POWERTOOLS_PAGE_HTML,
+  SWIFT_SHELL_HTML,
+} from "../testing/docs-fixtures.js";
+import {
   _resetParseSearchSchemaWarn,
   buildDocsTools,
+  classifyFinalDocsUrl,
   DOC_CACHE_MAX_ENTRIES,
+  detectUnrenderablePage,
   docsTools,
   docTerms,
   extractMainContent,
@@ -14,6 +23,7 @@ import {
   paginateContent,
   parseSearchResults,
   queryTerms,
+  resolveDocsLink,
   scoreSearchResults,
 } from "./docs.js";
 
@@ -209,6 +219,187 @@ describe("isValidDocsUrl", () => {
     // anchored allowlist must reject anything trailing the .html suffix.
     assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/x.html.evil"), false);
     assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/x.htmlx"), false);
+  });
+});
+
+describe("classifyFinalDocsUrl", () => {
+  const D = "https://docs.aws.amazon.com";
+
+  it("accepts a page that landed on a page", () => {
+    assert.equal(
+      classifyFinalDocsUrl(`${D}/AmazonS3/latest/dev/Welcome.html`, `${D}/AmazonS3/latest/userguide/Welcome.html`),
+      "page",
+      "a real move 301s .html -> .html and must stay readable",
+    );
+  });
+
+  it("accepts the directory form of the index.html that was requested", () => {
+    // The regression: docs.aws.amazon.com answers every <path>/index.html with a
+    // 301 to <path>/, and one in six search results is such a URL.
+    assert.equal(
+      classifyFinalDocsUrl(`${D}/cli/latest/reference/s3api/index.html`, `${D}/cli/latest/reference/s3api/`),
+      "page",
+    );
+    assert.equal(
+      classifyFinalDocsUrl(
+        `${D}/powertools/typescript/latest/environment-variables/index.html`,
+        `${D}/powertools/typescript/latest/environment-variables/`,
+      ),
+      "page",
+    );
+  });
+
+  it("compares the index.html form case-insensitively", () => {
+    assert.equal(classifyFinalDocsUrl(`${D}/X/Index.HTML`, `${D}/X/`), "page");
+  });
+
+  it("calls a page that landed on some other directory a soft 404", () => {
+    // Not a 404: the site 302s a missing page to the guide's landing page, and a
+    // missing CLI command to that service's command index.
+    assert.equal(classifyFinalDocsUrl(`${D}/lambda/latest/dg/no-such.html`, `${D}/lambda/latest/dg/`), "soft_404");
+    assert.equal(
+      classifyFinalDocsUrl(`${D}/cli/latest/reference/s3api/no-such-cmd.html`, `${D}/cli/latest/reference/s3api/`),
+      "soft_404",
+    );
+  });
+
+  it("lets a directory request land on any docs directory", () => {
+    // A directory was never a claim about a particular page, so a directory
+    // landing cannot be "that page does not exist". (Directory input arrives in
+    // 2.4.0; the classifier is written for it now so it cannot mis-report then.)
+    assert.equal(classifyFinalDocsUrl(`${D}/lambda/latest/dg/`, `${D}/lambda/latest/dg/`), "page");
+    assert.equal(classifyFinalDocsUrl(`${D}/a/`, `${D}/b/`), "page");
+  });
+
+  it("accepts an explicit default port and rejects any other", () => {
+    assert.equal(classifyFinalDocsUrl(`${D}/x.html`, "https://docs.aws.amazon.com:443/x.html"), "page");
+    assert.equal(classifyFinalDocsUrl(`${D}/x.html`, "https://docs.aws.amazon.com:8443/x.html"), "off_allowlist");
+  });
+
+  it("keeps every 2.0.0 rejection", () => {
+    for (const final of [
+      "https://evil.example.com/landing.html",
+      "http://docs.aws.amazon.com/x.html",
+      "https://user:pass@docs.aws.amazon.com/x.html",
+      "https://docs.aws.amazon.com./x.html",
+      "https://docs.aws.amazon.com.evil.com/x.html",
+      `${D}/asset.pdf`,
+      "not a url at all",
+    ]) {
+      assert.equal(classifyFinalDocsUrl(`${D}/x.html`, final), "off_allowlist", final);
+    }
+  });
+
+  it("refuses a directory landing it cannot compare the request against", () => {
+    // An unparseable request URL fails closed rather than accepting the landing.
+    assert.equal(classifyFinalDocsUrl("not a url", `${D}/lambda/latest/dg/`), "off_allowlist");
+  });
+});
+
+describe("resolveDocsLink", () => {
+  const BASE = "https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html";
+
+  it("makes a relative docs .md target absolute and points it at the .html twin", () => {
+    // .html is the form aws_docs_read accepts, so the URL it returns is one a
+    // caller can pass straight back in.
+    assert.equal(
+      resolveDocsLink("create-bucket-overview.md", BASE),
+      "https://docs.aws.amazon.com/AmazonS3/latest/userguide/create-bucket-overview.html",
+    );
+  });
+
+  it("keeps a fragment and resolves a parent-relative target against a directory base", () => {
+    // The real link out of the s3api command index, whose base IS a directory:
+    // `../` off `/cli/latest/reference/s3api/` is the CLI reference root.
+    assert.equal(
+      resolveDocsLink("../index.html#cli-aws", "https://docs.aws.amazon.com/cli/latest/reference/s3api/"),
+      "https://docs.aws.amazon.com/cli/latest/reference/index.html#cli-aws",
+    );
+  });
+
+  it("leaves a fragment-only link, an empty target and a non-http scheme alone", () => {
+    assert.equal(resolveDocsLink("#frag", BASE), "#frag");
+    assert.equal(resolveDocsLink("", BASE), "");
+    assert.equal(resolveDocsLink("mailto:aws@example.com", BASE), "mailto:aws@example.com");
+    assert.equal(resolveDocsLink("javascript:void(0)", BASE), "javascript:void(0)");
+  });
+
+  it("does not rewrite .md on another host", () => {
+    assert.equal(resolveDocsLink("https://example.com/readme.md", BASE), "https://example.com/readme.md");
+  });
+});
+
+describe("detectUnrenderablePage", () => {
+  const LAMBDA_DG = "https://docs.aws.amazon.com/lambda/latest/dg/";
+
+  it("names the page a meta-refresh stub forwards to, as an absolute URL", () => {
+    const md = htmlToMarkdown(LAMBDA_LANDING_STUB_HTML);
+    const reason = detectUnrenderablePage(
+      LAMBDA_LANDING_STUB_HTML,
+      md,
+      "https://docs.aws.amazon.com/lambda/latest/dg/index.html",
+      LAMBDA_DG,
+    );
+    assert.match(reason ?? "", /only forwards the browser/);
+    assert.match(reason ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\/welcome\.html/);
+  });
+
+  it("resolves the refresh target against the FINAL url, not the requested one", () => {
+    // A page that moved guides lands in the new directory, and the stub's
+    // `URL=welcome.html` means THAT directory's welcome page. Resolving against
+    // the requested URL would name a page in the old, dead guide.
+    const reason = detectUnrenderablePage(
+      LAMBDA_LANDING_STUB_HTML,
+      "",
+      "https://docs.aws.amazon.com/AmazonS3/latest/dev/Foo.html",
+      "https://docs.aws.amazon.com/AmazonS3/latest/userguide/",
+    );
+    assert.match(reason ?? "", /AmazonS3\/latest\/userguide\/welcome\.html/);
+    // The requested URL is still echoed, but no target in the message points
+    // back into the guide that moved.
+    assert.doesNotMatch(reason ?? "", /forwards the browser to '[^']*latest\/dev\//);
+    assert.doesNotMatch(reason ?? "", /aws_docs_read on '[^']*latest\/dev\//);
+  });
+
+  it("does not offer a target the read tool would refuse", () => {
+    const html = '<html><head><meta http-equiv="refresh" content="0;URL=https://example.com/elsewhere"></head></html>';
+    const reason = detectUnrenderablePage(html, "", "https://docs.aws.amazon.com/x.html", LAMBDA_DG);
+    assert.match(reason ?? "", /not a readable AWS documentation page/);
+    assert.doesNotMatch(reason ?? "", /example\.com/);
+  });
+
+  it("explains a client-rendered shell, for both shapes that produce one", () => {
+    for (const html of [JSV3_SHELL_HTML, SWIFT_SHELL_HTML]) {
+      const reason = detectUnrenderablePage(
+        html,
+        htmlToMarkdown(html),
+        "https://docs.aws.amazon.com/x.html",
+        LAMBDA_DG,
+      );
+      assert.match(reason ?? "", /rendered in the browser by JavaScript/);
+    }
+  });
+
+  it("leaves a short real page alone", () => {
+    // No marker, so length alone never triggers it.
+    const md = "x".repeat(150);
+    assert.equal(detectUnrenderablePage("<html><body><main>short</main></body></html>", md, "u", "u"), null);
+  });
+
+  it("leaves a long page alone even when it carries a marker", () => {
+    // The length gate runs first: a real page that happens to ship a Next.js
+    // asset must not be refused.
+    const html = `<html><body><main><p>${"x".repeat(5000)}</p><script src="/_next/static/x.js"></script></main></body></html>`;
+    assert.equal(detectUnrenderablePage(html, htmlToMarkdown(html), "u", "u"), null);
+  });
+
+  it("measures the text, not the link syntax", () => {
+    // The JS v3 shell's whole conversion is `[Skip to main content](#main)`: 29
+    // characters of markdown, 20 of text. Counting the markdown would let a
+    // shell whose skip-link URL is long enough pass as content.
+    const md = htmlToMarkdown(JSV3_SHELL_HTML);
+    assert.equal(md, "[Skip to main content](#main)");
+    assert.ok(md.length > 20, "precondition: the link syntax inflates the raw length");
   });
 });
 
@@ -531,6 +722,106 @@ describe("aws_docs_read handler", () => {
     const r = await read.handler({ url: "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html" });
     assert.equal(r.ok, true);
     assert.match((r.data as { content: string }).content, /localized/);
+  });
+
+  it("reads the index.html pages aws_docs_search returns", async () => {
+    // The 2.0.0 regression: the site 301s every <path>/index.html to <path>/,
+    // and the post-redirect check demanded a .html suffix -- so 16% of search
+    // results failed with an error that read like a blocked off-site redirect.
+    // Both fake `url` values are the real 301 targets (re-verified 2026-09-19).
+    for (const [requested, landed, body, expect] of [
+      [
+        "https://docs.aws.amazon.com/powertools/typescript/latest/environment-variables/index.html",
+        "https://docs.aws.amazon.com/powertools/typescript/latest/environment-variables/",
+        POWERTOOLS_PAGE_HTML,
+        /# Environment variables/,
+      ],
+      [
+        "https://docs.aws.amazon.com/cli/latest/reference/s3api/index.html",
+        "https://docs.aws.amazon.com/cli/latest/reference/s3api/",
+        CLI_S3API_INDEX_HTML,
+        /Available Commands/,
+      ],
+    ] as const) {
+      const fetchImpl = (async () => fakeResponse({ url: landed, text: body })) as unknown as typeof fetch;
+      const [, read] = buildDocsTools(fetchImpl);
+      const r = await read.handler({ url: requested, maxLength: 4000 });
+      assert.equal(r.ok, true, `${requested} must be readable: ${r.error}`);
+      assert.match((r.data as { content: string }).content, expect);
+    }
+  });
+
+  it("says a guessed page name does not exist instead of returning the guide landing page", async () => {
+    // docs.aws.amazon.com does not 404 a missing page inside a guide that
+    // exists: it 302s to the guide's landing page. Accepting that would answer
+    // the guess with the wrong page's content under the requested url.
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ url: "https://docs.aws.amazon.com/lambda/latest/dg/", text: LAMBDA_LANDING_STUB_HTML });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const url = "https://docs.aws.amazon.com/lambda/latest/dg/no-such-page-zz.html";
+    const r = await read.handler({ url });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /does not exist/);
+    assert.match(r.error ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\//);
+    // Slice 1 still refuses a URL ending in '/' as input, so the message must not
+    // tell the caller to read the landing page.
+    assert.doesNotMatch(r.error ?? "", /aws_docs_read on/);
+
+    assert.equal((await read.handler({ url })).ok, false);
+    assert.equal(fetchCount, 2, "a failure must not be cached");
+  });
+
+  it("says a guessed CLI command does not exist instead of returning the command index", async () => {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://docs.aws.amazon.com/cli/latest/reference/s3api/",
+        text: CLI_S3API_INDEX_HTML,
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/cli/latest/reference/s3api/no-such-cmd-zz.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /does not exist/);
+    // The whole s3api command index would otherwise have come back as the
+    // content of a command that does not exist.
+    assert.doesNotMatch(r.error ?? "", /abort-multipart-upload/);
+  });
+
+  it("refuses a landing-page stub, naming the page it forwards to", async () => {
+    // lambda/latest/dg/index.html is a legitimate request that lands on the
+    // guide's directory: a page by the classifier, but a meta-refresh stub with
+    // nothing to read, which the redirect fix would otherwise return as an
+    // empty success.
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ url: "https://docs.aws.amazon.com/lambda/latest/dg/", text: LAMBDA_LANDING_STUB_HTML });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const url = "https://docs.aws.amazon.com/lambda/latest/dg/index.html";
+    const r = await read.handler({ url });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /only forwards the browser/);
+    assert.match(r.error ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\/welcome\.html/);
+
+    assert.equal((await read.handler({ url })).ok, false);
+    assert.equal(fetchCount, 2, "a thin conversion must not be cached");
+  });
+
+  it("refuses a client-rendered API reference shell", async () => {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-s3/Variable/PutObject$/",
+        text: JSV3_SHELL_HTML,
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({
+      url: "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-s3/Variable/PutObject$/index.html",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /rendered in the browser by JavaScript/);
   });
 
   it("serves but does not cache a conversion larger than the per-entry bound", async () => {

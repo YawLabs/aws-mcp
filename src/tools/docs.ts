@@ -32,6 +32,11 @@ const USER_AGENT = "@yawlabs/aws-mcp (https://github.com/YawLabs/aws-mcp)";
 // link we shouldn't be fetching.
 const DOCS_URL_RE = /^https:\/\/docs\.aws\.amazon\.com\/[^\s]*\.html(?:[?#][^\s]*)?$/i;
 
+// The same host and origin DOCS_URL_RE spells, for the checks that parse a URL
+// instead of matching it (classifyFinalDocsUrl, resolveDocsLink).
+const DOCS_HOSTNAME = "docs.aws.amazon.com";
+const DOCS_ORIGIN = `https://${DOCS_HOSTNAME}`;
+
 const DEFAULT_MAX_LENGTH = 5_000;
 const MAX_MAX_LENGTH = 1_000_000;
 const DEFAULT_SEARCH_LIMIT = 10;
@@ -45,6 +50,16 @@ const FETCH_TIMEOUT_MS = 30_000;
 // 5 MB mirrors aws-cli.ts's per-stream stdout cap so both ingress paths into
 // this process carry the same ceiling; real AWS doc pages are 10-800 KB.
 const MAX_DOC_HTML_BYTES = 5 * 1024 * 1024;
+
+// Gates the unrenderable-page check in detectUnrenderablePage and nothing else.
+// It is not a floor on what a read may return: a genuinely short page is served
+// as-is. Only a conversion this thin makes it worth looking at the raw HTML for
+// the markers of a page that has no server-rendered content at all. The two
+// real shapes measured on 2026-09-19 are far under it -- a guide landing stub
+// converts to 0 characters, the JS SDK v3 shell to `[Skip to main content]`
+// (20 characters of text) -- while the pages the redirect fix unblocks are far
+// over: 5,310 for the CLI's s3api command index, 2,848 for the Powertools page.
+const THIN_PAGE_CHARS = 200;
 
 // aws_docs_read is paginated: an agent reading a long page calls it N times
 // with different startIndex windows. Without a cache that's N full fetches +
@@ -141,6 +156,98 @@ export function parseSearchResults(json: unknown, limit: number): DocsSearchResu
 /** Match the read-side URL allowlist. Exposed for tests. */
 export function isValidDocsUrl(url: string): boolean {
   return DOCS_URL_RE.test(url);
+}
+
+/**
+ * Judge where a docs fetch actually LANDED. Three outcomes, because a docs-host
+ * redirect can mean two very different things.
+ *
+ * fetch follows redirects, so the check on the requested URL only vouches for
+ * the first hop and the landing URL has to be judged too. 2.0.0 judged it with
+ * DOCS_URL_RE, which demands a `.html` suffix -- and docs.aws.amazon.com answers
+ * every `<path>/index.html` with a 301 to `<path>/`. So the canonical form of a
+ * URL the site itself hands out came back "not an 'https://docs.aws.amazon.com/
+ * ...html' page", worded like a blocked off-site redirect. Re-verified live on
+ * 2026-09-19: the Powertools pages, the AWS CLI's own per-service command
+ * indexes (`cli/latest/reference/s3api/index.html`) and every guide landing
+ * page do exactly this, and one in six search results is such a URL.
+ *
+ * The 2.0.0 hardening is kept whole: the landing URL must still be https, on
+ * docs.aws.amazon.com, on the default port, with no credentials in it. Every
+ * final URL that check accepted is still accepted.
+ *
+ *   - `off_allowlist` -- anywhere outside that host, or a same-host landing that
+ *     is neither a page nor a directory (an asset, say).
+ *   - `page` -- a `.html` / `.md` landing; the directory form of the page that
+ *     was requested (`x/index.html` -> `x/`, compared case-insensitively); or
+ *     any docs directory when a directory is what was requested.
+ *   - `soft_404` -- a PAGE request that landed on some OTHER directory. The site
+ *     does not 404 a missing page inside a guide that exists: it 302s to the
+ *     guide's landing page, and a missing CLI command to that service's command
+ *     index. Accepting every same-host redirect, which is what an origin-only
+ *     check does, would answer a guessed page name with another page's content
+ *     echoed under the requested URL.
+ */
+export function classifyFinalDocsUrl(
+  requestedFetchUrl: string,
+  finalUrl: string,
+): "page" | "soft_404" | "off_allowlist" {
+  let final: URL;
+  try {
+    final = new URL(finalUrl);
+  } catch {
+    return "off_allowlist";
+  }
+  // `hostname` is already lowercased by the URL parser; `port` is "" when the
+  // URL carries the scheme's default, so an explicit :443 is a page and :8443
+  // is not.
+  if (
+    final.protocol !== "https:" ||
+    final.hostname !== DOCS_HOSTNAME ||
+    final.port !== "" ||
+    final.username !== "" ||
+    final.password !== ""
+  ) {
+    return "off_allowlist";
+  }
+  if (/\.(?:html|md)$/i.test(final.pathname)) return "page";
+  if (!final.pathname.endsWith("/")) return "off_allowlist";
+  // A directory landing: canonicalization or soft-404, decided by what was
+  // asked for. An unparseable request URL cannot be compared, so it fails
+  // closed rather than silently accepting the landing.
+  let requested: URL;
+  try {
+    requested = new URL(requestedFetchUrl);
+  } catch {
+    return "off_allowlist";
+  }
+  if (requested.pathname.endsWith("/")) return "page";
+  if (requested.pathname.toLowerCase() === `${final.pathname.toLowerCase()}index.html`) return "page";
+  return "soft_404";
+}
+
+/**
+ * Absolutize a link target found inside a docs page against the URL it came
+ * from, and point a docs-host `.md` target at its `.html` twin -- that twin is
+ * the form aws_docs_read accepts, so the URL this returns is one a caller can
+ * actually pass back in.
+ *
+ * Left alone: an empty target, a fragment-only link, and any non-http(s) scheme
+ * (`mailto:`, `javascript:`). A target that will not parse is returned unchanged
+ * rather than guessed at.
+ */
+export function resolveDocsLink(target: string, baseUrl: string): string {
+  if (target === "" || target.startsWith("#")) return target;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^https?:/i.test(target)) return target;
+  try {
+    const url = new URL(target, baseUrl);
+    if (url.origin === DOCS_ORIGIN && /\.md$/i.test(url.pathname)) {
+      url.pathname = `${url.pathname.slice(0, -".md".length)}.html`;
+    }
+    return url.href;
+  } catch {
+    return target;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -554,6 +661,54 @@ export function htmlToMarkdown(html: string): string {
   return md.replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// `<meta http-equiv="refresh" content="0;URL=welcome.html">` -- the whole body
+// of a guide landing page. Case-insensitive because the site writes the
+// attribute lower-case and the parameter `URL=`.
+const META_REFRESH_RE = /<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*?url=([^"'>\s;]+)/i;
+// The three markers of a page whose content is assembled in the browser: a
+// Next.js app (the JS SDK v3 reference, which ships both markers) and Swift
+// DocC, whose <noscript> is the only prose in the response.
+const CLIENT_RENDERED_RE = /\/_next\/static\/|<div id="__next"|requires JavaScript/i;
+
+/**
+ * Name the reason a page converted to (almost) nothing, or null when the
+ * conversion is real content.
+ *
+ * Without this the redirect fix above would trade a loud, misleading failure for
+ * a silent empty success: the landing pages and client-rendered references it
+ * unblocks have no server-rendered content to extract. Measured live on
+ * 2026-09-19 -- `lambda/latest/dg/` converts to 0 characters, the JS SDK v3
+ * shell to `[Skip to main content](#main)`, a Swift DocC page to 0.
+ *
+ * Two gates, so a short real page is never touched: the conversion must be under
+ * THIN_PAGE_CHARS of text AND the HTML must carry an explicit marker.
+ */
+export function detectUnrenderablePage(
+  html: string,
+  markdown: string,
+  requestedUrl: string,
+  finalUrl: string,
+): string | null {
+  // Link syntax stripped before measuring, so a nav-only shell counts as the
+  // ~20 characters of text it really is rather than the 29 of its one link.
+  if (markdown.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1").trim().length >= THIN_PAGE_CHARS) return null;
+  const refresh = html.match(META_REFRESH_RE);
+  if (refresh) {
+    // Resolved against the FINAL url, which is where a browser would be when it
+    // reads the stub: a page that moved guides lands on the new directory, and
+    // its stub's `URL=welcome.html` means that directory's welcome page.
+    const target = resolveDocsLink(refresh[1], finalUrl);
+    if (isValidDocsUrl(target)) {
+      return `${requestedUrl} is a landing page with no content of its own -- it only forwards the browser to '${target}' (an HTML meta refresh). Call aws_docs_read on '${target}' instead.`;
+    }
+    return `${requestedUrl} is a landing page with no content of its own -- it only forwards the browser to another page (an HTML meta refresh) that is not a readable AWS documentation page. Use aws_docs_search to find the page you want.`;
+  }
+  if (CLIENT_RENDERED_RE.test(html)) {
+    return `${requestedUrl} is rendered in the browser by JavaScript -- the HTML the server returns is an empty application shell -- so aws_docs_read cannot extract its content. The AWS SDK for JavaScript v3 and Swift API references are built this way; read the service's API Reference page for the same operation instead, or re-query aws_docs_search with different terms.`;
+  }
+  return null;
+}
+
 interface PaginatedContent {
   content: string;
   startIndex: number;
@@ -905,18 +1060,28 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
           }
           // fetch FOLLOWS redirects, so the isValidDocsUrl check on i.url above
-          // only vouches for the first hop. Re-check where we actually landed:
+          // only vouches for the first hop. Judge where we actually landed:
           // without this, an allowlisted docs URL that 302s off-domain gets
           // fetched and converted with nothing but the content-type gate
-          // between us and arbitrary third-party HTML.
+          // between us and arbitrary third-party HTML. A docs-host landing is
+          // then two more things -- the site's `index.html` -> `/` canonical
+          // form, which is fine, and its redirect-to-the-landing-page answer for
+          // a page that does not exist, which is not. See classifyFinalDocsUrl.
           // `response.url` is absent/empty on a Response-like object that
           // doesn't set it (test doubles); that means "no redirect
           // information", so fall back to the URL we already validated.
           const finalUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : i.url;
-          if (!isValidDocsUrl(finalUrl)) {
+          const landing = classifyFinalDocsUrl(i.url, finalUrl);
+          if (landing === "off_allowlist") {
             return {
               ok: false,
-              error: `${i.url} redirected to '${finalUrl}', which is not an 'https://docs.aws.amazon.com/...html' page. aws_docs_read only follows redirects that stay inside the AWS documentation allowlist.`,
+              error: `${i.url} redirected to '${finalUrl}', which is outside the AWS documentation allowlist (https://docs.aws.amazon.com pages). aws_docs_read only follows redirects that stay inside it.`,
+            };
+          }
+          if (landing === "soft_404") {
+            return {
+              ok: false,
+              error: `${i.url} does not exist: docs.aws.amazon.com redirected it to '${finalUrl}', the landing page of that guide or command group, which is how the site answers a request for a page it does not have at that path. Use aws_docs_search to find the page you want.`,
             };
           }
           // A 200 doesn't guarantee HTML -- a docs URL can redirect to a
@@ -942,6 +1107,10 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             };
           }
           markdown = htmlToMarkdown(body.html);
+          // Before the cache write, so nothing thin is stored and a retry after
+          // the page is fixed is not served the empty conversion for 5 minutes.
+          const unrenderable = detectUnrenderablePage(body.html, markdown, i.url, finalUrl);
+          if (unrenderable !== null) return { ok: false, error: unrenderable };
           // Only cache what the DOC_CACHE_MAX_ENTRIES footprint math assumes:
           // at most MAX_MAX_LENGTH of markdown per entry. An over-size page is
           // still served in full (paginateContent slices the whole string
