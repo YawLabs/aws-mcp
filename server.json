@@ -17,7 +17,23 @@
       "version": "2.3.3",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "AWS_PROFILE",
+          "description": "AWS profile used when a tool call omits `profile`. Any profile your aws CLI can use (SSO, credential_process, role chaining, static keys). Unset: AWS_DEFAULT_PROFILE, then `default`.",
+          "isRequired": false,
+          "format": "string",
+          "placeholder": "my-sso-profile"
+        },
+        {
+          "name": "AWS_REGION",
+          "description": "Region used when a tool call omits `region`. Unset: AWS_DEFAULT_REGION, then us-east-1 (a profile's own region setting is not read).",
+          "isRequired": false,
+          "format": "string",
+          "placeholder": "us-west-2"
+        }
+      ]
     }
   ]
 }
