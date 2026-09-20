@@ -28,8 +28,10 @@
  * measures UTF-8 BYTES, which are never fewer for the same text (a BMP
  * character is 1-3 bytes for 1 unit, an astral character 4 bytes for 2 units).
  * So text within this bound is never cut. The two counts are equal for ASCII,
- * and the gate is merely conservative otherwise -- aws_call's and
- * aws_assume_role's descriptions each carry one em-dash (3 bytes, 1 unit), so
- * they measure 2 bytes above what the host counts.
+ * and the gate is merely conservative otherwise -- today exactly one
+ * description carries a non-ASCII character at all: aws_assume_role's single
+ * em-dash (3 bytes, 1 unit), so it measures 2 bytes above what the host counts
+ * (701 against 699). A one-line scan of the built bundle re-checks that, which
+ * is why the claim is framed as a count rather than a list.
  */
 export const HOST_TEXT_CAP_BYTES = 2048;
