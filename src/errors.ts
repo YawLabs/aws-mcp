@@ -151,13 +151,35 @@ interface ParsedAwsError {
   operation?: string;
   message?: string;
   suggestion?: string;
+  // How many times the CLI had already retried before it gave up, when its
+  // message says so. RETRIES, not attempts: 0 means the first attempt was also
+  // the last. Only the throttling suggestion reads it.
+  retries?: number;
 }
 
 // `An error occurred (Code) when calling the Operation operation: Message`
-// -- the standard botocore / aws CLI shape. We bound the gap with `[\s\S]*?`
-// non-greedy so the regex can't run away on a multi-line stderr blob that
-// happens to contain another "An error occurred" later (rare; defensive).
-const STD_ERROR_RE = /An error occurred \(([^)]+)\) when calling the (\S+) operation:\s*([\s\S]*?)(?:\n\n|$)/;
+// -- the standard botocore / aws CLI shape, with two variations that both
+// defeated the earlier pattern (each reproduced against a loopback stub on
+// aws-cli 2.34.3 and 2.22.0):
+//
+//   - Once botocore stops retrying it marks the error MaxAttemptsReached, and
+//     its MSG_TEMPLATE then inserts " (reached max retries: N)" between the
+//     operation name and the colon. Requiring `operation:` immediately meant
+//     no match at all, so every retry-exhausted error -- throttling and 5xx,
+//     the cases the backoff suggestion was written for -- lost its code,
+//     operation and suggestion. The infix appears on the FIRST failure too
+//     when max_attempts is 1 (`AWS_MAX_ATTEMPTS=1`, which aws_lambda_invoke
+//     sets), and then N is 0.
+//   - The terminator accepts CRLF. On Windows the CLI separates the message
+//     from its "Additional error details:" block with "\r\n\r\n", which
+//     contains no "\n\n", so the captured message used to run on into that
+//     block.
+//
+// We bound the gap with `[\s\S]*?` non-greedy so the regex can't run away on a
+// multi-line stderr blob that happens to contain another "An error occurred"
+// later (rare; defensive).
+const STD_ERROR_RE =
+  /An error occurred \(([^)]+)\) when calling the (\S+) operation(?: \(reached max retries: (\d+)\))?:\s*([\s\S]*?)(?:\r?\n\r?\n|$)/;
 // "User: arn:aws:iam::123:user/foo is not authorized to perform: lambda:CreateFunction"
 const NOT_AUTHORIZED_RE = /User:\s*(\S+)\s*is not authorized to perform:\s*(\S+)/i;
 // "Could not connect to the endpoint URL: \"https://lambda.us-east-9.amazonaws.com/\""
@@ -179,8 +201,10 @@ export function parseAwsError(stderr: string): ParsedAwsError {
   if (m) {
     const code = m[1];
     const operation = m[2];
-    const message = m[3].trim();
+    const retries = m[3] === undefined ? undefined : Number(m[3]);
+    const message = m[4].trim();
     const out: ParsedAwsError = { code, operation, message };
+    if (retries !== undefined) out.retries = retries;
     const naMatch = NOT_AUTHORIZED_RE.exec(message);
     if (naMatch) {
       out.suggestion = `Check IAM permissions: principal ${naMatch[1]} lacks ${naMatch[2]}.`;
@@ -198,7 +222,14 @@ export function parseAwsError(stderr: string): ParsedAwsError {
       code === "SlowDown" ||
       code === "ProvisionedThroughputExceededException"
     ) {
-      out.suggestion = "Reduce request rate or retry with backoff.";
+      // How many retries the CLI already spent matters to the remedy: "retry
+      // with backoff" after the CLI itself backed off twice means wait longer
+      // than a bare first-failure throttle does.
+      const alreadyRetried =
+        retries !== undefined && retries > 0
+          ? ` The AWS CLI had already retried ${retries} time${retries === 1 ? "" : "s"}.`
+          : "";
+      out.suggestion = `Reduce request rate or retry with backoff.${alreadyRetried}`;
     } else if (
       code === "ResourceNotFoundException" ||
       code === "NoSuchBucket" ||

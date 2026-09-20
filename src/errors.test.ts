@@ -404,6 +404,109 @@ describe("parseAwsError -- standard CLI shape", () => {
   });
 });
 
+describe("parseAwsError -- retry-exhausted and CRLF-terminated CLI messages", () => {
+  // Every string in this describe is a VERBATIM capture from a real AWS CLI
+  // driven through runAwsCall against a loopback stub -- not a hand-written
+  // approximation -- because both defects here are about characters the fake
+  // CLI never emitted: the " (reached max retries: N)" infix botocore adds once
+  // it stops retrying, and the CRLF the Windows CLI writes before its
+  // "Additional error details:" block.
+
+  // Stub answering 400 Throttling, three requests each. The first two are the
+  // same failure on the two CLIs (2.34.3 wraps it in its enhanced format,
+  // 2.22.0 in the legacy one); the third is what AWS_MAX_ATTEMPTS=1 produces,
+  // where botocore marks MaxAttemptsReached on the very first failure.
+  const RETRY_EXHAUSTED_CAPTURES: { label: string; stderr: string; retries: number }[] = [
+    {
+      label: "2.34.3, enhanced error format",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (Throttling) when calling the GetCallerIdentity operation (reached max retries: 2): Rate exceeded\r\n\r\nAdditional error details:\r\nType: Sender\r\n",
+      retries: 2,
+    },
+    {
+      label: "2.22.0, legacy error format",
+      stderr:
+        "\r\nAn error occurred (Throttling) when calling the GetCallerIdentity operation (reached max retries: 2): Rate exceeded\r\n",
+      retries: 2,
+    },
+    {
+      label: "AWS_MAX_ATTEMPTS=1, so zero retries",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (Throttling) when calling the GetCallerIdentity operation (reached max retries: 0): Rate exceeded\r\n",
+      retries: 0,
+    },
+  ];
+
+  it("pulls code, operation and the retry count out of every captured retry-exhausted throttle", () => {
+    for (const { label, stderr, retries } of RETRY_EXHAUSTED_CAPTURES) {
+      const r = parseAwsError(stderr);
+      assert.equal(r.code, "Throttling", label);
+      assert.equal(r.operation, "GetCallerIdentity", label);
+      assert.equal(r.retries, retries, label);
+      // The message stops at the blank line, CRLF or not -- the enhanced
+      // capture's "Additional error details:" block must not be in it.
+      assert.equal(r.message, "Rate exceeded", label);
+      assert.match(r.suggestion ?? "", /retry with backoff/, label);
+    }
+  });
+
+  it("says how many times the CLI had already retried, and says nothing when it had not", () => {
+    const [enhanced, legacy, zero] = RETRY_EXHAUSTED_CAPTURES.map((c) => parseAwsError(c.stderr));
+    assert.match(enhanced.suggestion ?? "", /already retried 2 times/);
+    assert.match(legacy.suggestion ?? "", /already retried 2 times/);
+    // Not "0 times", and not "1 time" either: with nothing retried the clause
+    // is absent, so the suggestion is byte-identical to the pre-2.3.3 one.
+    assert.equal(zero.suggestion, "Reduce request rate or retry with backoff.");
+  });
+
+  it("uses the singular for a single retry", () => {
+    const r = parseAwsError(
+      "An error occurred (TooManyRequestsException) when calling the Invoke operation (reached max retries: 1): Rate Exceeded.",
+    );
+    assert.equal(r.retries, 1);
+    assert.match(r.suggestion ?? "", /already retried 1 time\./);
+  });
+
+  it("leaves retries absent when the CLI did not report any", () => {
+    // The infix is optional, so a plain message must still parse -- and must
+    // not pick up a retry count from prose inside the message.
+    const r = parseAwsError(
+      "An error occurred (Throttling) when calling the GetCallerIdentity operation: Rate exceeded (reached max retries: 9)",
+    );
+    assert.equal(r.retries, undefined);
+    assert.equal(r.suggestion, "Reduce request rate or retry with backoff.");
+  });
+
+  it("stops a CRLF-terminated message before the CLI's 'Additional error details' block", () => {
+    // Captured from 2.34.3 with a stub answering 403 InvalidClientTokenId.
+    // Latent before 2.3.3 (only `suggestion` was consumed), but the parsed
+    // message is what a caller reads once anything surfaces it.
+    const r = parseAwsError(
+      "\r\naws: [ERROR]: An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: The security token included in the request is invalid.\r\n\r\nAdditional error details:\r\nType: Sender\r\n",
+    );
+    assert.equal(r.code, "InvalidClientTokenId");
+    assert.equal(r.message, "The security token included in the request is invalid.");
+  });
+
+  it("keeps the not-found remedy on the Lambda error AWS_MAX_ATTEMPTS=1 reshapes", () => {
+    // Verbatim from lambda-invoke-probe2.out.ndjson, record `notfound_max1`
+    // (aws-cli 2.34.3, `aws lambda invoke` with AWS_MAX_ATTEMPTS=1 against a
+    // stub answering ResourceNotFoundException). aws_lambda_invoke sets that
+    // variable so an invoke is sent at most once, which makes the CLI print
+    // "(reached max retries: 0)" on EVERY Lambda service error -- so without
+    // the infix in the pattern this suggestion would go missing on the most
+    // common Lambda mistake there is.
+    const r = parseAwsError(
+      "\r\naws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the Invoke operation (reached max retries: 0): Function not found: arn:aws:lambda:us-east-1:123456789012:function:notfound\r\n\r\nAdditional error details:\r\nType: User\r\n",
+    );
+    assert.equal(r.code, "ResourceNotFoundException");
+    assert.equal(r.operation, "Invoke");
+    assert.equal(r.retries, 0);
+    assert.equal(r.message, "Function not found: arn:aws:lambda:us-east-1:123456789012:function:notfound");
+    assert.match(r.suggestion ?? "", /Verify the resource identifier and region/);
+  });
+});
+
 describe("parseAwsError -- not-authorized text OUTSIDE the standard wrapper", () => {
   // NOT_AUTHORIZED_RE only ever ran against the message captured INSIDE "An
   // error occurred (...) when calling ...". The same sentence also arrives
