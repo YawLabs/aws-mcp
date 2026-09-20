@@ -107,7 +107,7 @@ describe("aws_multi_region schema", () => {
   });
 
   it("accepts the full commercial partition, which the old cap of 32 refused", () => {
-    assert.equal(COMMERCIAL_PARTITION.length, 34, "precondition: the partition this cap has to clear");
+    assert.ok(COMMERCIAL_PARTITION.length > 32, "precondition: the fixture must exceed the old cap of 32");
     const r = tool.inputSchema.safeParse({
       service: "sts",
       operation: "get-caller-identity",
@@ -436,7 +436,7 @@ describe("aws_multi_region input bounds (regression)", () => {
     assert.match(res.error ?? "", new RegExp(`Too many regions: ${regions.length} requested, max ${MAX_REGIONS}`));
   });
 
-  it("fans out across the whole 34-region commercial partition", async () => {
+  it("fans out across the whole commercial partition", async () => {
     // The schema test above proves the boundary accepts 34; this one proves the
     // HANDLER's own bound does too, and that all 34 regions actually dispatch.
     // At the default concurrency (8), which is gentler on a parallel node --test
