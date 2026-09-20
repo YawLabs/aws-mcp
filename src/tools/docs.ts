@@ -857,21 +857,36 @@ export interface FetchEnvFacts {
   oamVersion: string | null;
 }
 
-function readFetchEnvFacts(): FetchEnvFacts {
+/**
+ * Read those facts off the environment.
+ *
+ * Both sources are parameters so a test can pin the variable NAMES and their
+ * precedence without mutating process.env: this is one long-lived stdio process,
+ * and a leaked variable would change what a later test's handler reports. Every
+ * arm went untested while they were read inline, so renaming NODE_USE_ENV_PROXY
+ * or swapping the `??` order kept the suite green and handed a proxied user the
+ * wrong half of the remedy.
+ */
+export function readFetchEnvFacts(
+  env: NodeJS.ProcessEnv = process.env,
+  // Cast because oam adds the key at runtime and Node's own type does not know
+  // it -- the same cast this read has always carried.
+  versions: { oam?: string } = process.versions as { oam?: string },
+): FetchEnvFacts {
   // Node's fetch ignores HTTPS_PROXY unless it is opted into, by
   // NODE_USE_ENV_PROXY=1 or the equivalent --use-env-proxy flag (both Node
   // 22.21+, and NODE_OPTIONS accepts the flag -- all three verified on 22.22.2:
   // with the opt-in a dead proxy failed the request, with NODE_USE_ENV_PROXY=0
   // or unset the same request went direct and returned 200). oam honours the
   // variable with no opt-in at all (verified on 0.16.2, same dead proxy).
-  const nodeOptions = process.env.NODE_OPTIONS ?? "";
+  const nodeOptions = env.NODE_OPTIONS ?? "";
   return {
-    proxyUrl: process.env.HTTPS_PROXY ?? process.env.https_proxy ?? null,
+    proxyUrl: env.HTTPS_PROXY ?? env.https_proxy ?? null,
     envProxyEnabled:
-      process.env.NODE_USE_ENV_PROXY === "1" ||
+      env.NODE_USE_ENV_PROXY === "1" ||
       /(?:^|\s)--use-env-proxy(?:\s|$)/.test(nodeOptions) ||
-      (process.versions as { oam?: string }).oam !== undefined,
-    oamVersion: (process.versions as { oam?: string }).oam ?? null,
+      versions.oam !== undefined,
+    oamVersion: versions.oam ?? null,
   };
 }
 
@@ -1067,7 +1082,14 @@ export function makeDocCache(): DocCache {
   };
 }
 
-export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
+/**
+ * `envFacts` is for tests only, and left undefined it changes nothing: each
+ * fetch-failure site still reads the environment when it fails. Without it a
+ * handler test that drives a failure branch passes or fails on whether the
+ * DEVELOPER is behind a proxy, since HTTPS_PROXY plus a causeless rejection
+ * earns the proxy remedy in place of the sentence the test is asserting.
+ */
+export function buildDocsTools(fetchImpl: FetchImpl = fetch, envFacts?: FetchEnvFacts): readonly Tool[] {
   const docCache = makeDocCache();
   // One session per buildDocsTools() instance. Production calls
   // buildDocsTools once at module load, so the prod-server lifetime UUID
@@ -1134,7 +1156,7 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
           // backend, so blaming the backend's undocumented shape for it sends
           // whoever is debugging in the wrong direction. That sentence is kept
           // for the case where there is nothing else to say.
-          const why = describeFetchFailure(err);
+          const why = describeFetchFailure(err, envFacts);
           if (isAbortError(err)) {
             return {
               ok: false,
@@ -1250,7 +1272,7 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
               FETCH_TIMEOUT_MS,
             );
           } catch (err) {
-            const why = describeFetchFailure(err);
+            const why = describeFetchFailure(err, envFacts);
             if (isAbortError(err)) {
               return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.${why}` };
             }

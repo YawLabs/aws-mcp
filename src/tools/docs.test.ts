@@ -25,6 +25,7 @@ import {
   paginateContent,
   parseSearchResults,
   queryTerms,
+  readFetchEnvFacts,
   resolveDocsLink,
   scoreSearchResults,
 } from "./docs.js";
@@ -32,6 +33,14 @@ import {
 const searchTool = docsTools.find((t) => t.name === "aws_docs_search");
 const readTool = docsTools.find((t) => t.name === "aws_docs_read");
 if (!searchTool || !readTool) throw new Error("docsTools missing aws_docs_search / aws_docs_read");
+
+/**
+ * What a machine with no proxy configured reports. Handler tests that drive a
+ * fetch failure pass this to buildDocsTools so the branch they assert is the one
+ * they get: the developer's own HTTPS_PROXY would otherwise earn the proxy
+ * remedy in place of it.
+ */
+const NO_PROXY_ENV: FetchEnvFacts = { proxyUrl: null, envProxyEnabled: false, oamVersion: null };
 
 /** Build a Response-like object good enough for the handlers under test. */
 function fakeResponse(opts: {
@@ -427,11 +436,22 @@ describe("detectUnrenderablePage", () => {
     const md = htmlToMarkdown(JSV3_SHELL_HTML);
     assert.equal(md, "[Skip to main content](#main)");
     assert.ok(md.length > 20, "precondition: the link syntax inflates the raw length");
+
+    // The same shell with a query string on the skip-link: 264 characters of
+    // markdown, still 20 of text. Both numbers sit on the useful side of the
+    // 200-character gate, so this is the case that holds the strip honest --
+    // without it the length gate returns null and the shell is served as its own
+    // content, the silent-empty-success the check exists to prevent. Derived
+    // through htmlToMarkdown like the cases above rather than hand-written, so
+    // the converter has to keep producing a link here.
+    const html = `<html><body><div id="__next"><a href="/AWSJavaScriptSDK/v3/latest/Package/x?q=${"y".repeat(200)}"><span>Skip to main content</span></a></div></body></html>`;
+    const long = htmlToMarkdown(html);
+    assert.ok(long.length >= 200, "precondition: the href pushes the raw markdown over the gate");
+    assert.match(detectUnrenderablePage(html, long, "u", "u") ?? "", /rendered in the browser by JavaScript/);
   });
 });
 
 describe("describeFetchFailure", () => {
-  const NO_PROXY_ENV: FetchEnvFacts = { proxyUrl: null, envProxyEnabled: false, oamVersion: null };
   /** The shape Node's fetch really rejects with: the verdict lives in .cause. */
   const fetchFailed = (message: string, code?: string): unknown =>
     Object.assign(new TypeError("fetch failed"), {
@@ -587,6 +607,45 @@ describe("describeFetchFailure", () => {
   });
 });
 
+describe("readFetchEnvFacts", () => {
+  // The names and precedence the remedies above are built on. Every case passes a
+  // plain object, so nothing here touches process.env -- this is one long-lived
+  // stdio process and a leaked variable would change what a later test reports.
+  // Untested, a renamed variable or a swapped `??` left the suite green and gave
+  // a proxied user the opposite arm of the remedy: "this request went through the
+  // proxy" when Node in fact bypassed it, or the reverse.
+
+  it("prefers HTTPS_PROXY over https_proxy, and reports neither as null", () => {
+    assert.equal(
+      readFetchEnvFacts({ HTTPS_PROXY: "http://a:3128", https_proxy: "http://b:3128" }, {}).proxyUrl,
+      "http://a:3128",
+    );
+    assert.equal(readFetchEnvFacts({ https_proxy: "http://b:3128" }, {}).proxyUrl, "http://b:3128");
+    assert.equal(readFetchEnvFacts({}, {}).proxyUrl, null);
+  });
+
+  it("reads the opt-in from the variable or from NODE_OPTIONS", () => {
+    assert.equal(readFetchEnvFacts({ NODE_USE_ENV_PROXY: "1" }, {}).envProxyEnabled, true);
+    assert.equal(
+      readFetchEnvFacts({ NODE_OPTIONS: "--max-old-space-size=4096 --use-env-proxy" }, {}).envProxyEnabled,
+      true,
+    );
+    // The boundary the NODE_OPTIONS pattern is anchored for: a longer flag that
+    // merely starts with the same characters is a different flag.
+    assert.equal(readFetchEnvFacts({ NODE_OPTIONS: "--use-env-proxy-something" }, {}).envProxyEnabled, false);
+    // "1" exactly, which is what Node itself accepts.
+    assert.equal(readFetchEnvFacts({ NODE_USE_ENV_PROXY: "0" }, {}).envProxyEnabled, false);
+    assert.equal(readFetchEnvFacts({}, {}).envProxyEnabled, false);
+  });
+
+  it("treats the oam runtime as the opt-in, with no variable set at all", () => {
+    const facts = readFetchEnvFacts({}, { oam: "0.16.2" });
+    assert.equal(facts.oamVersion, "0.16.2");
+    assert.equal(facts.envProxyEnabled, true);
+    assert.equal(readFetchEnvFacts({}, {}).oamVersion, null);
+  });
+});
+
 describe("extractMainContent", () => {
   it("prefers #awsdocs-content", () => {
     const html = `<html><body><nav>NAV</nav><div id="awsdocs-content"><p>real content</p></div></body></html>`;
@@ -722,7 +781,7 @@ describe("aws_docs_search handler", () => {
         cause: Object.assign(new Error("self-signed certificate"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" }),
       });
     }) as unknown as typeof fetch;
-    const [search] = buildDocsTools(fetchImpl);
+    const [search] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /self-signed certificate \(DEPTH_ZERO_SELF_SIGNED_CERT\)/);
@@ -736,7 +795,9 @@ describe("aws_docs_search handler", () => {
     const fetchImpl = (async () => {
       throw new Error("something odd");
     }) as unknown as typeof fetch;
-    const [search] = buildDocsTools(fetchImpl);
+    // NO_PROXY_ENV, not the developer's: HTTPS_PROXY plus a rejection with no
+    // cause earns the proxy remedy, which REPLACES the sentence asserted here.
+    const [search] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /something odd/);
@@ -744,7 +805,7 @@ describe("aws_docs_search handler", () => {
   });
 
   it("reports a timeout distinctly from a generic failure", async () => {
-    const [search] = buildDocsTools(abortingFetch);
+    const [search] = buildDocsTools(abortingFetch, NO_PROXY_ENV);
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /timed out/);
@@ -831,7 +892,7 @@ describe("aws_docs_read handler", () => {
   });
 
   it("reports a fetch timeout distinctly", async () => {
-    const [, read] = buildDocsTools(abortingFetch);
+    const [, read] = buildDocsTools(abortingFetch, NO_PROXY_ENV);
     const r = await read.handler({ url: "https://docs.aws.amazon.com/x.html" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /timed out/);
