@@ -768,6 +768,166 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
+ * OpenSSL verify verdicts for "I cannot trust this certificate chain". On a
+ * corporate network that is a TLS-inspecting gateway or a private CA, not
+ * anything wrong at AWS. DEPTH_ZERO_SELF_SIGNED_CERT was reproduced here against
+ * a local self-signed server on Node 22.22.2; the rest are the sibling verdicts
+ * for the same untrusted-chain condition and take the same remedy. An expired
+ * certificate or a hostname mismatch is deliberately NOT here: adding a CA does
+ * not fix either, and they fall through to the plain cause line.
+ */
+const TLS_TRUST_CODES = new Set([
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "CERT_UNTRUSTED",
+]);
+
+/**
+ * Nothing answered, or nothing resolved -- the shapes a blocked egress path
+ * produces. ECONNREFUSED and ENOTFOUND were reproduced here (a dead local port
+ * and an unresolvable host); UND_ERR_CONNECT_TIMEOUT is undici's own timeout for
+ * a TCP connect that never completes, which is what a silently dropping firewall
+ * looks like before our 30s abort fires.
+ */
+const CONNECT_FAILURE_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * oam's HTTP stack reports a transport failure with no code at all -- a
+ * self-signed certificate comes back as this message and nothing else (measured
+ * on oam 0.16.2). A refused proxy there DOES carry ECONNREFUSED, so an uncoded
+ * failure under oam points at the certificate first.
+ */
+const UNCODED_TRANSPORT_RE = /error sending request for url/i;
+
+/**
+ * How to trust a private CA. Both variables are read at process start, and both
+ * fixed the local self-signed case here -- NODE_EXTRA_CA_CERTS on Node 22.22.2
+ * and on oam 0.16.2. Version floors are from Node's own cli.md: NODE_USE_SYSTEM_CA
+ * landed in 22.19.0, and this package supports Node >= 22.
+ */
+const CA_TRUST_REMEDY =
+  "Point NODE_EXTRA_CA_CERTS at the PEM file holding that CA's certificate (or set NODE_USE_SYSTEM_CA=1, Node 22.19+, to trust the operating system's store) in this server's MCP-config `env` block -- both are read when the process starts, so exporting them in your own shell does not reach a server your MCP client launched.";
+
+/**
+ * The environment facts the remedies below depend on. Passed in by tests so no
+ * test has to mutate process.env: this is one long-lived stdio process, and a
+ * leaked variable would change what a later test's handler reports.
+ */
+export interface FetchEnvFacts {
+  /** HTTPS_PROXY / https_proxy, whichever is set. */
+  proxyUrl: string | null;
+  /** Whether this process actually uses proxyUrl (see readFetchEnvFacts). */
+  envProxyEnabled: boolean;
+  /** process.versions.oam, set only when the server runs under the oam runtime. */
+  oamVersion: string | null;
+}
+
+function readFetchEnvFacts(): FetchEnvFacts {
+  // Node's fetch ignores HTTPS_PROXY unless it is opted into, by
+  // NODE_USE_ENV_PROXY=1 or the equivalent --use-env-proxy flag (both Node
+  // 22.21+, and NODE_OPTIONS accepts the flag -- all three verified on 22.22.2:
+  // with the opt-in a dead proxy failed the request, with NODE_USE_ENV_PROXY=0
+  // or unset the same request went direct and returned 200). oam honours the
+  // variable with no opt-in at all (verified on 0.16.2, same dead proxy).
+  const nodeOptions = process.env.NODE_OPTIONS ?? "";
+  return {
+    proxyUrl: process.env.HTTPS_PROXY ?? process.env.https_proxy ?? null,
+    envProxyEnabled:
+      process.env.NODE_USE_ENV_PROXY === "1" ||
+      /(?:^|\s)--use-env-proxy(?:\s|$)/.test(nodeOptions) ||
+      (process.versions as { oam?: string }).oam !== undefined,
+    oamVersion: (process.versions as { oam?: string }).oam ?? null,
+  };
+}
+
+/** Strip `user:password@` out of any URL in text we are about to report. */
+function redactUrlUserinfo(text: string): string {
+  return text.replace(/\/\/[^/\s@]+:[^/\s@]*@/g, "//<redacted>@");
+}
+
+interface FetchFailureCause {
+  code: string | null;
+  message: string | null;
+}
+
+function readFetchFailureCause(err: unknown): FetchFailureCause {
+  const cause = typeof err === "object" && err !== null ? (err as { cause?: unknown }).cause : undefined;
+  if (typeof cause !== "object" || cause === null) return { code: null, message: null };
+  const rawCode = (cause as { code?: unknown }).code;
+  // A non-empty STRING only. undici and OpenSSL codes are strings; a numeric
+  // errno would print as a bare "0" that tells a reader nothing.
+  const code = typeof rawCode === "string" && rawCode.length > 0 ? rawCode : null;
+  const rawMessage = (cause as { message?: unknown }).message;
+  const trimmed = typeof rawMessage === "string" ? rawMessage.trim() : "";
+  return { code, message: trimmed.length > 0 ? redactUrlUserinfo(trimmed) : null };
+}
+
+function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): string | null {
+  if (cause.code !== null && TLS_TRUST_CODES.has(cause.code)) {
+    return `A certificate in the chain could not be verified, which on a corporate network means a TLS-inspecting gateway or a private CA rather than a problem at AWS. ${CA_TRUST_REMEDY}`;
+  }
+  if (
+    env.oamVersion !== null &&
+    cause.code === null &&
+    cause.message !== null &&
+    UNCODED_TRANSPORT_RE.test(cause.message)
+  ) {
+    return `This server is running under the oam runtime, which reports no failure code for a transport error. The usual cause is a certificate it does not trust. ${CA_TRUST_REMEDY} A proxy in HTTPS_PROXY that cannot be reached looks the same from here.`;
+  }
+  // A missing code covers the timeout branches, where the abort is all there is
+  // to read: a proxy-only network with the proxy ignored has nothing to connect
+  // to, so the request hangs until our own 30s abort.
+  const connectFailed = cause.code === null || CONNECT_FAILURE_CODES.has(cause.code);
+  if (env.proxyUrl !== null && connectFailed) {
+    const proxy = redactUrlUserinfo(env.proxyUrl);
+    if (!env.envProxyEnabled) {
+      return `HTTPS_PROXY is set to '${proxy}', but Node's fetch does not use it unless NODE_USE_ENV_PROXY=1 is set as well (Node 22.21+), so this request tried to reach docs.aws.amazon.com directly. Add NODE_USE_ENV_PROXY=1 to this server's MCP-config \`env\` block -- it is read when the process starts. The aws CLI the other tools shell out to reads HTTPS_PROXY on its own, which is why they can work while these two do not.`;
+    }
+    return `This request went through the proxy in HTTPS_PROXY ('${proxy}'), so it is that proxy, not docs.aws.amazon.com, that did not answer.`;
+  }
+  return null;
+}
+
+/**
+ * Say what actually failed under a rejected fetch, and what to do about it.
+ *
+ * Node's fetch rejects with a bare `TypeError: fetch failed` and puts the real
+ * verdict in `err.cause`, which nothing here read. So behind a TLS-inspecting
+ * gateway every docs call reported "fetch failed" and aws_docs_search went on to
+ * blame AWS's undocumented search backend for a request that never left the
+ * machine. Reproduced here on 2026-09-19: Node 22.22.2 against a local
+ * self-signed server gives cause code DEPTH_ZERO_SELF_SIGNED_CERT, and oam
+ * 0.16.2 gives the same condition with no code at all.
+ *
+ * Returns "" when there is nothing to add, and otherwise a string that starts
+ * with a space -- every caller appends it to a sentence that already ends in a
+ * period.
+ */
+export function describeFetchFailure(err: unknown, env: FetchEnvFacts = readFetchEnvFacts()): string {
+  const cause = readFetchFailureCause(err);
+  const parts: string[] = [];
+  if (cause.message !== null) {
+    parts.push(`Underlying failure: ${cause.message}${cause.code !== null ? ` (${cause.code})` : ""}.`);
+  } else if (cause.code !== null) {
+    parts.push(`Underlying failure: ${cause.code}.`);
+  }
+  const remedy = fetchFailureRemedy(cause, env);
+  if (remedy !== null) parts.push(remedy);
+  return parts.length > 0 ? ` ${parts.join(" ")}` : "";
+}
+
+/**
  * Outcome of a capped body read. `too_large` carries the observed byte count
  * when we learned it from Content-Length (i.e. before downloading anything)
  * and null when we hit the cap mid-stream and stopped counting.
@@ -937,16 +1097,24 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             FETCH_TIMEOUT_MS,
           );
         } catch (err) {
+          // The cause (and any remedy it implies) comes first because it is what
+          // the reader can act on: a TLS or proxy failure never reached the
+          // backend, so blaming the backend's undocumented shape for it sends
+          // whoever is debugging in the wrong direction. That sentence is kept
+          // for the case where there is nothing else to say.
+          const why = describeFetchFailure(err);
           if (isAbortError(err)) {
             return {
               ok: false,
-              error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (proxy.search.docs.aws.com) may be slow or unreachable.`,
+              error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (proxy.search.docs.aws.com) may be slow or unreachable.${why}`,
             };
           }
           const msg = err instanceof Error ? err.message : String(err);
           return {
             ok: false,
-            error: `AWS docs search request failed: ${msg}. The search backend (proxy.search.docs.aws.com) is undocumented and may have changed or be unreachable.`,
+            error: why
+              ? `AWS docs search request failed: ${msg}.${why}`
+              : `AWS docs search request failed: ${msg}. The search backend (proxy.search.docs.aws.com) is undocumented and may have changed or be unreachable.`,
           };
         }
         if (!response.ok) {
@@ -1050,11 +1218,12 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
               FETCH_TIMEOUT_MS,
             );
           } catch (err) {
+            const why = describeFetchFailure(err);
             if (isAbortError(err)) {
-              return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.` };
+              return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.${why}` };
             }
             const msg = err instanceof Error ? err.message : String(err);
-            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.` };
+            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.${why}` };
           }
           if (!response.ok) {
             return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };

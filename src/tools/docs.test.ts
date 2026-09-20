@@ -12,10 +12,12 @@ import {
   buildDocsTools,
   classifyFinalDocsUrl,
   DOC_CACHE_MAX_ENTRIES,
+  describeFetchFailure,
   detectUnrenderablePage,
   docsTools,
   docTerms,
   extractMainContent,
+  type FetchEnvFacts,
   htmlToMarkdown,
   isValidDocsUrl,
   LOW_RELEVANCE_OVERLAP,
@@ -403,6 +405,132 @@ describe("detectUnrenderablePage", () => {
   });
 });
 
+describe("describeFetchFailure", () => {
+  const NO_PROXY_ENV: FetchEnvFacts = { proxyUrl: null, envProxyEnabled: false, oamVersion: null };
+  /** The shape Node's fetch really rejects with: the verdict lives in .cause. */
+  const fetchFailed = (message: string, code?: string): unknown =>
+    Object.assign(new TypeError("fetch failed"), {
+      cause: code === undefined ? new Error(message) : Object.assign(new Error(message), { code }),
+    });
+  /** The shape the AbortController timeout produces: a DOMException, no cause. */
+  const aborted = (): unknown => Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+
+  it("gives an untrusted certificate chain the private-CA remedy", () => {
+    // Reproduced on Node 22.22.2 against a local self-signed server: cause
+    // message "self-signed certificate", cause code DEPTH_ZERO_SELF_SIGNED_CERT.
+    const s = describeFetchFailure(fetchFailed("self-signed certificate", "DEPTH_ZERO_SELF_SIGNED_CERT"), NO_PROXY_ENV);
+    assert.match(s, /self-signed certificate \(DEPTH_ZERO_SELF_SIGNED_CERT\)/);
+    assert.match(s, /TLS-inspecting gateway or a private CA/);
+    assert.match(s, /NODE_EXTRA_CA_CERTS/);
+    assert.match(s, /NODE_USE_SYSTEM_CA=1/);
+    assert.match(s, /MCP-config `env` block/, "the variables are read at process start, not from the user's shell");
+  });
+
+  it("gives the same remedy to the sibling chain verdicts", () => {
+    for (const code of [
+      "SELF_SIGNED_CERT_IN_CHAIN",
+      "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+      "CERT_UNTRUSTED",
+    ]) {
+      assert.match(
+        describeFetchFailure(fetchFailed("unable to verify", code), NO_PROXY_ENV),
+        /NODE_EXTRA_CA_CERTS/,
+        code,
+      );
+    }
+  });
+
+  it("does not offer a CA to a verdict a CA cannot fix", () => {
+    // An expired certificate or a hostname mismatch is a real failure with a
+    // different cause; adding a CA would not change either.
+    const s = describeFetchFailure(fetchFailed("certificate has expired", "CERT_HAS_EXPIRED"), NO_PROXY_ENV);
+    assert.match(s, /certificate has expired \(CERT_HAS_EXPIRED\)/);
+    assert.doesNotMatch(s, /NODE_EXTRA_CA_CERTS/);
+  });
+
+  it("explains an uncoded transport failure under the oam runtime", () => {
+    // Measured on oam 0.16.2 against the same self-signed server: the identical
+    // condition Node codes as DEPTH_ZERO_SELF_SIGNED_CERT arrives with no code.
+    const s = describeFetchFailure(fetchFailed("error sending request for url (https://docs.aws.amazon.com/x.html)"), {
+      ...NO_PROXY_ENV,
+      envProxyEnabled: true,
+      oamVersion: "0.16.2",
+    });
+    assert.match(s, /oam runtime, which reports no failure code/);
+    assert.match(s, /NODE_EXTRA_CA_CERTS/);
+    assert.match(s, /HTTPS_PROXY/, "an unreachable proxy looks the same under oam");
+  });
+
+  it("says when Node is ignoring the HTTPS_PROXY that is set", () => {
+    // Verified on Node 22.22.2: with HTTPS_PROXY pointing at a dead port and
+    // NODE_USE_ENV_PROXY unset, the request went direct and returned 200 -- so
+    // on a proxy-only network it fails while the aws CLI, which reads
+    // HTTPS_PROXY itself, keeps working.
+    const s = describeFetchFailure(fetchFailed("connect ECONNREFUSED 10.1.2.3:443", "ECONNREFUSED"), {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: false,
+      oamVersion: null,
+    });
+    assert.match(s, /HTTPS_PROXY is set to 'http:\/\/proxy\.corp\.example:3128'/);
+    assert.match(s, /NODE_USE_ENV_PROXY=1/);
+    assert.match(s, /aws CLI/);
+  });
+
+  it("gives the ignored-proxy hint to a timeout too, which has no cause at all", () => {
+    // On a proxy-only network the likelier symptom is nothing answering until
+    // our own 30s abort, so the hint has to reach that branch as well.
+    const s = describeFetchFailure(aborted(), {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: false,
+      oamVersion: null,
+    });
+    assert.match(s, /NODE_USE_ENV_PROXY=1/);
+    assert.doesNotMatch(s, /Underlying failure/, "there is no cause on an abort -- do not invent one");
+  });
+
+  it("blames the proxy, not AWS, when the proxy is the one being used", () => {
+    const s = describeFetchFailure(fetchFailed("connect ECONNREFUSED 127.0.0.1:3128", "ECONNREFUSED"), {
+      proxyUrl: "http://127.0.0.1:3128",
+      envProxyEnabled: true,
+      oamVersion: null,
+    });
+    assert.match(s, /that proxy, not docs\.aws\.amazon\.com, that did not answer/);
+    assert.doesNotMatch(s, /NODE_USE_ENV_PROXY/);
+  });
+
+  it("redacts credentials out of the proxy URL and the cause message", () => {
+    const s = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED http://bob:hunter2@proxy.corp.example:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://bob:hunter2@proxy.corp.example:3128", envProxyEnabled: false, oamVersion: null },
+    );
+    assert.doesNotMatch(s, /hunter2/);
+    assert.match(s, /\/\/<redacted>@proxy\.corp\.example:3128/);
+  });
+
+  it("ignores a code that is not a non-empty string", () => {
+    // libuv errnos are numbers; printing one would put a bare "0" in the message.
+    const numeric = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("write EPIPE"), { code: 0 }),
+    });
+    const s = describeFetchFailure(numeric, NO_PROXY_ENV);
+    assert.match(s, /Underlying failure: write EPIPE\./);
+    assert.doesNotMatch(s, /\(0\)/);
+  });
+
+  it("adds nothing when there is nothing to add", () => {
+    assert.equal(describeFetchFailure(new Error("plain failure"), NO_PROXY_ENV), "");
+    assert.equal(describeFetchFailure(aborted(), NO_PROXY_ENV), "");
+    assert.equal(describeFetchFailure("a string, not an error", NO_PROXY_ENV), "");
+    assert.equal(describeFetchFailure(Object.assign(new TypeError("fetch failed"), { cause: null }), NO_PROXY_ENV), "");
+  });
+
+  it("reports an unrecognized cause without pretending to have a remedy", () => {
+    const s = describeFetchFailure(fetchFailed("socket hang up", "UND_ERR_SOCKET"), NO_PROXY_ENV);
+    assert.equal(s, " Underlying failure: socket hang up (UND_ERR_SOCKET).");
+  });
+});
+
 describe("extractMainContent", () => {
   it("prefers #awsdocs-content", () => {
     const html = `<html><body><nav>NAV</nav><div id="awsdocs-content"><p>real content</p></div></body></html>`;
@@ -528,14 +656,35 @@ describe("aws_docs_search handler", () => {
     assert.match(r.error ?? "", /503/);
   });
 
-  it("surfaces a network failure", async () => {
+  it("surfaces the CAUSE of a network failure, and stops blaming the backend for it", async () => {
+    // The shape Node's fetch really produces: a bare `TypeError: fetch failed`
+    // with the verdict in err.cause. The old double here threw
+    // `new Error("ECONNREFUSED")` -- a shape fetch never produces -- so the
+    // suite passed while the handler reported nothing a reader could act on.
     const fetchImpl = (async () => {
-      throw new Error("ECONNREFUSED");
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("self-signed certificate"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" }),
+      });
     }) as unknown as typeof fetch;
     const [search] = buildDocsTools(fetchImpl);
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /ECONNREFUSED/);
+    assert.match(r.error ?? "", /self-signed certificate \(DEPTH_ZERO_SELF_SIGNED_CERT\)/);
+    assert.match(r.error ?? "", /NODE_EXTRA_CA_CERTS/);
+    // The request never reached proxy.search.docs.aws.com, so the undocumented
+    // backend cannot be what went wrong.
+    assert.doesNotMatch(r.error ?? "", /may have changed/);
+  });
+
+  it("keeps the undocumented-backend sentence when the failure has no cause to read", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("something odd");
+    }) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl);
+    const r = await search.handler({ query: "x" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /something odd/);
+    assert.match(r.error ?? "", /undocumented and may have changed/);
   });
 
   it("reports a timeout distinctly from a generic failure", async () => {
