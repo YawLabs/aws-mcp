@@ -152,6 +152,34 @@ describe(`aws_call parse-failure hint -- installed AWS CLI${detected?.ok ? ` (${
     assert.match(r.suggestion ?? "", /The installed aws CLI has no subcommand /, `CLI stderr was: ${r.rawBody}`);
   });
 
+  it("never quotes aws_call's own params back as a misspelled subcommand", async () => {
+    // `ec2 wait` is a subcommand GROUP, and a group's parser registers no
+    // --cli-input-json (`aws ec2 wait help` lists it 0 times on 2.34.3, the leaf
+    // `ec2 wait instance-running help` 3 times), so argparse reads the params
+    // JSON as the missing positional and names it as the invalid choice. Only a
+    // real CLI produces that, which is why the pin lives here: the fake has no
+    // argument parser.
+    const r = await call({
+      service: "ec2",
+      operation: "wait",
+      params: { InstanceIds: ["i-1"] },
+      profile: "default",
+      region: "us-east-1",
+    });
+    assert.equal(r.ok, false);
+    // Whatever this CLI printed, the payload never reaches the one-line remedy.
+    assert.doesNotMatch(r.suggestion ?? "", /InstanceIds/, `CLI stderr was: ${r.rawBody}`);
+    if (/Found invalid choice '\{/.test(r.rawBody ?? "")) {
+      // 2.34.x names the choice, so the group remedy is reachable.
+      assert.match(r.suggestion ?? "", /is a subcommand group, not an operation/);
+      assert.match(r.suggestion ?? "", /wait instance-running/);
+    } else {
+      // 2.22.0's wording names no choice at all, so this shape is
+      // indistinguishable from a mistyped waiter and keeps the spelling remedy.
+      assert.match(r.suggestion ?? "", /The installed aws CLI has no subcommand by that name/);
+    }
+  });
+
   it("says nothing on a botocore validation failure, which already has its own remedy", async () => {
     // head-object WITH one of its two members: this one gets past argparse and
     // fails inside botocore, where parseAwsError's "Fix parameter shape" applies.

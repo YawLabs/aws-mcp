@@ -29,6 +29,17 @@ const UNKNOWN_CLI_INPUT_JSON_RE = /Unknown options: (?:[^\r\n]*[ ,])?--cli-input
 // A CLI flag (--bucket) or an argparse positional dest (outfile, group_name,
 // paths, varname).
 const ARG_TOKEN_RE = /^(?:--[a-z0-9][a-z0-9-]*|[a-z][a-z0-9_]*)$/;
+// `operation` named a subcommand GROUP rather than a leaf operation. The group's
+// parser registers no --cli-input-json, so argparse takes the JSON VALUE as the
+// missing positional and reports it as the invalid choice: `aws_call {service:
+// "ec2", operation: "wait", params: {InstanceIds: ["i-1"]}}` gives `argument
+// subcommand: Found invalid choice '{"InstanceIds":["i-1"]}'` on 2.34.3.
+// Recognized on the leading `{` of our own payload, which is what distinguishes
+// this from a genuinely mistyped waiter name -- errors.ts declines the shape for
+// the same reason and leaves the remedy here. `subcommand` is the only dest this
+// reaches: `command` and `operation` are filled by aws_call's own two inputs,
+// and an empty `operation` is rejected before the spawn (all measured).
+const JSON_AS_SUBCOMMAND_RE = /argument subcommand: Found invalid choice '\{/;
 
 // The way out, for the handful of unreachable commands a model actually asks
 // for. Keyed "<service> <operation>" on the same tokenization runAwsCall uses.
@@ -92,6 +103,14 @@ export interface CliArgParseContext {
  */
 export function cliArgParseHint(stderr: string, ctx: CliArgParseContext): string | undefined {
   if (ctx.exitCode !== CLI_PARSE_EXIT_CODE) return undefined;
+  // Mirrors runAwsCall's own operation tokenization so 'wait  object-exists'
+  // and ' get-object ' resolve the same key the CLI was given.
+  const key = `${ctx.service} ${ctx.operation.trim().split(/\s+/).filter(Boolean).join(" ")}`;
+  // Before the two sentences below, because the group case carries neither of
+  // them. See JSON_AS_SUBCOMMAND_RE.
+  if (ctx.sentParams && JSON_AS_SUBCOMMAND_RE.test(stderr)) {
+    return `\`aws ${key}\` is a subcommand group, not an operation, so it needs one more name in \`operation\` -- for a waiter, the waiter's own name ('wait instance-running'). \`aws ${key} help\` lists them. The name argparse called an invalid choice is the \`params\` JSON, not anything you passed as \`operation\`: aws_call sends params through --cli-input-json, a group's parser does not register that flag, and argparse read its value as the missing subcommand.`;
+  }
   const required = ARGPARSE_REQUIRED_RE.exec(stderr);
   let unreachable: boolean;
   if (ctx.sentParams) {
@@ -115,9 +134,6 @@ export function cliArgParseHint(stderr: string, ctx: CliArgParseContext): string
     unreachable = tokens.some((t) => !t.startsWith("-"));
   }
 
-  // Mirrors runAwsCall's own operation tokenization so 'wait  object-exists'
-  // and ' get-object ' resolve the same key the CLI was given.
-  const key = `${ctx.service} ${ctx.operation.trim().split(/\s+/).filter(Boolean).join(" ")}`;
   if (unreachable) {
     const alternative =
       CLI_INPUT_JSON_ALTERNATIVES.get(key) ?? `Run it in a shell with explicit flags (\`aws ${key} help\` lists them).`;

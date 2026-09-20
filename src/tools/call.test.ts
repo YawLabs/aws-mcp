@@ -446,6 +446,39 @@ describe("cliArgParseHint — classifying a real AWS CLI argparse failure", () =
       });
     }
 
+    it("tells a subcommand-GROUP call to name the subcommand, not to check a spelling", () => {
+      // Verbatim 2.34.3 for `aws_call {service: "ec2", operation: "wait",
+      // params: {InstanceIds: ["i-1"]}}`. `ec2 wait` is a group, its parser
+      // registers no --cli-input-json, so argparse read the JSON VALUE as the
+      // missing positional. parseAwsError used to quote that payload back as a
+      // misspelled subcommand and recommend `aws update`; it now declines the
+      // shape so this hint is reached.
+      const hint = cliArgParseHint(
+        `\r\naws: [ERROR]: An error occurred (ParamValidation): argument subcommand: Found invalid choice '{"InstanceIds":["i-1"]}'${USAGE}`,
+        { service: "ec2", operation: "wait", ...sent },
+      );
+      assert.match(hint ?? "", /`aws ec2 wait` is a subcommand group, not an operation/);
+      assert.match(hint ?? "", /wait instance-running/, "the fix is one more name in `operation`");
+      assert.match(hint ?? "", /--cli-input-json/, "and why argparse blamed a name nobody typed");
+      // Never echo the payload argparse quoted: `suggestion` is a one-line
+      // remedy, and params can carry anything the caller sent.
+      assert.doesNotMatch(hint ?? "", /InstanceIds/);
+      // Appending the waiter name works, so this is not the unreachable class.
+      assert.doesNotMatch(hint ?? "", /cannot run through aws_call/);
+    });
+
+    it("leaves a genuinely mistyped waiter to parseAwsError's spelling remedy", () => {
+      // Same dest, same sentence -- the choice is a command TOKEN, so this is a
+      // name the caller really typed and errors.ts keeps it.
+      assert.equal(
+        cliArgParseHint(
+          `\r\naws: [ERROR]: An error occurred (ParamValidation): argument subcommand: Found invalid choice 'instance-runningx'${USAGE}`,
+          { service: "ec2", operation: "wait instance-runningx", ...sent },
+        ),
+        undefined,
+      );
+    });
+
     it("points s3 ls at the s3api list operations", () => {
       const hint = cliArgParseHint("\r\nUnknown options: --cli-input-json\r\n", {
         service: "s3",
@@ -565,9 +598,12 @@ describe("cliArgParseHint — classifying a real AWS CLI argparse failure", () =
         { service: "s3api", operation: "not-an-op", ...sent },
       ],
       [
+        // With params the same command gets argparse's invalid-choice sentence
+        // instead (the group case above), so `unsent` is the only context that
+        // can produce these bytes.
         "bare `ec2 wait`, which argparse answers with 'too few arguments'",
         "\r\naws: [ERROR]: An error occurred (ParamValidation): usage: aws [options] ec2 wait <subcommand> [parameters]\r\naws: [ERROR]: too few arguments\r\n",
-        { service: "ec2", operation: "wait", ...sent },
+        { service: "ec2", operation: "wait", ...unsent },
       ],
       [
         "a service message that merely mentions outfile",

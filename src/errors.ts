@@ -212,6 +212,22 @@ const INVALID_CHOICE_NOUN: ReadonlyMap<string, string> = new Map([
   ["operation", "operation"],
   ["subcommand", "subcommand"],
 ]);
+// argparse's choice is a name the CALLER typed only when it is token-shaped.
+// When `operation` names a subcommand GROUP (`ec2 wait`), that group's parser
+// registers no --cli-input-json -- `aws ec2 wait help` lists the flag 0 times on
+// 2.34.3, the leaf `aws ec2 wait instance-running help` 3 times -- so argparse
+// reads the params JSON aws_call passes through that flag as the missing
+// positional, and the capture is the whole payload. Quoting it back claimed the
+// CLI has no subcommand by that name, told the caller to check that string's
+// spelling or run `aws update`, and copied `params` into a field the README
+// documents as a one-line remedy. Anything that is not a command token falls
+// through to no suggestion here, and cliArgParseHint (tools/call.ts) answers
+// the group case, since only the tool side knows whether params were sent.
+// No length bound: the longest operation name in the botocore data the 2.34.3
+// CLI bundles is 71 characters (ec2's
+// describe-local-gateway-route-table-virtual-interface-group-associations), and
+// all 17,869 of them match this class.
+const COMMAND_TOKEN_RE = /^[a-z0-9][a-z0-9._-]*$/i;
 
 // "Could not connect to the endpoint URL: \"https://lambda.us-east-9.amazonaws.com/\""
 const BAD_ENDPOINT_RE = /Could not connect to the endpoint URL[:\s]+"?([^"\s]+)"?/i;
@@ -347,8 +363,10 @@ export function parseAwsError(stderr: string): ParsedAwsError {
   // message that merely contains the phrase keeps its code-based suggestion.
   // No `code` or `operation` is set: argparse exits before a request is signed,
   // so there is no AWS error code to report and nothing reached an operation.
+  // The second alternative names no choice at all (2.22.0), so there is nothing
+  // to vet -- see COMMAND_TOKEN_RE for what the vet is for.
   const invalidChoice = INVALID_CHOICE_RE.exec(trimmed);
-  if (invalidChoice) {
+  if (invalidChoice && (invalidChoice[2] === undefined || COMMAND_TOKEN_RE.test(invalidChoice[2]))) {
     const noun = INVALID_CHOICE_NOUN.get(invalidChoice[1]) ?? "command";
     const which = invalidChoice[2] ? `no ${noun} named '${invalidChoice[2]}'` : `no ${noun} by that name`;
     // Spelling first: a model's mistyped operation is at least as common as an

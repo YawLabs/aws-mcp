@@ -644,6 +644,20 @@ describe("parseAwsError -- a service, operation or subcommand the installed CLI 
     assert.match(r.suggestion ?? "", /API schema/);
   });
 
+  it("does not read aws_call's own params payload back as a misspelled subcommand", () => {
+    // Verbatim 2.34.3, from `aws_call {service: "ec2", operation: "wait",
+    // params: {InstanceIds: ["i-1"]}}`: `ec2 wait` is a subcommand GROUP, whose
+    // parser registers no --cli-input-json, so argparse took the JSON value as
+    // the missing positional. Quoting that back told the caller the CLI has no
+    // subcommand named '{"InstanceIds":["i-1"]}' and to check its spelling or
+    // run `aws update`. Silence here is what lets cliArgParseHint answer it.
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: An error occurred (ParamValidation): argument subcommand: Found invalid choice \'{"InstanceIds":["i-1"]}\'\r\n\r\n\r\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\r\n',
+    );
+    assert.equal(r.suggestion, undefined);
+    assert.match(r.message ?? "", /\{"InstanceIds":\["i-1"\]\}/, "the CLI's own text is still preserved");
+  });
+
   it("stays out of the way of the missing-arguments shape aws_call explains itself", () => {
     // cliArgParseHint (tools/call.ts) only runs when parseAwsError found no
     // remedy, so if this pattern claimed the required-arguments stderr the
