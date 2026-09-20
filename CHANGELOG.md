@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-09-20
+
 ### Added
 - **`commandArgv`: the exact argv beside every `command` string.** Every envelope that carries `command` now also carries `commandArgv` -- the same call as an array of unquoted tokens, entry 0 the binary as displayed and one entry per argument, redacted identically. This is the fix for something no amount of quoting could solve. 2.4.0 stopped `command` from EXECUTING when pasted into PowerShell, but it could not make one string correct everywhere: in `cmd.exe` single quotes are not quoting characters at all, so `&`, `|`, `^` and a raw newline stay live whatever is done to the string (measured: 0 of 24 character-class probes correct, unchanged by the 2.4.0 fix -- `--query 'x & echo PWNED_CMD'` printed PWNED_CMD, and a value carrying a newline ran its tail as a fresh command line). It also could not serve Git Bash on Windows, where the PowerShell-correct doubled-quote form reads as concatenation and silently drops the quotes, turning `Buckets[?Name=='prod'].Name` into a different, invalid expression. And fish treats `\\` and `\'` as escapes inside single quotes, so a backslash-bearing value arrived corrupted there -- the one POSIX shell the string form is wrong for. An array has none of these problems: there is nothing for a shell to re-interpret. The string is now RENDERED from the array rather than built beside it, so the two cannot drift and a redaction cannot apply to one and not the other. `command` remains, unchanged in shape, as the form for a human to read; parse `commandArgv` instead of it.
 
@@ -1122,7 +1124,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/YawLabs/aws-mcp/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/YawLabs/aws-mcp/compare/v2.3.4...v2.4.0
 [2.3.4]: https://github.com/YawLabs/aws-mcp/compare/v2.3.3...v2.3.4
 [2.3.3]: https://github.com/YawLabs/aws-mcp/compare/v2.3.2...v2.3.3
