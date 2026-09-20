@@ -243,12 +243,25 @@ describe("buildTailQuery", () => {
   it("projects every event on the newest-first path and the newest maxEvents on the other", () => {
     assert.equal(
       buildTailQuery("newest-first", 500),
-      "{total: length(events), events: events[].{timestamp: timestamp, logStreamName: logStreamName, message: message}}",
+      "{total: length(events || `[]`), events: (events || `[]`)[].{timestamp: timestamp, logStreamName: logStreamName, message: message}}",
     );
     assert.equal(
       buildTailQuery("full-window", 500),
-      "{total: length(events), events: events[-500:].{timestamp: timestamp, logStreamName: logStreamName, message: message}}",
+      "{total: length(events || `[]`), events: (events || `[]`)[-500:].{timestamp: timestamp, logStreamName: logStreamName, message: message}}",
     );
+  });
+
+  it("defaults both members, so a reply with no events key neither errors nor parses as null", () => {
+    // Both halves matter, and neither is cosmetic. `length(null)` is a hard CLI
+    // failure (`In function length(), invalid type for value: None`, exit 255 on
+    // 2.34.3 and 2.22.0), while a slice of null quietly yields null, which
+    // parseTailOutput refuses -- so defaulting `total` alone just moves the
+    // failure. The real-CLI suite proves the pair end to end; this pins the text.
+    for (const mode of ["newest-first", "full-window"] as const) {
+      const query = buildTailQuery(mode, 500);
+      assert.match(query, /length\(events \|\| `\[\]`\)/, `${mode}: total is defaulted`);
+      assert.match(query, /\(events \|\| `\[\]`\)\[/, `${mode}: the projected list is defaulted`);
+    }
   });
 
   it("writes the only projection the fake answers, for every maxEvents", () => {

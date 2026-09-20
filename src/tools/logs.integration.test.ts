@@ -146,7 +146,10 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     assert.ok(argv.includes("filter-log-events"), "the operation is filter-log-events, not tail");
     assert.equal(argv[argv.indexOf("--page-size") + 1], String(DEFAULT_MAX_EVENTS + 1));
     assert.equal(argv[argv.indexOf("--max-items") + 1], String(DEFAULT_MAX_EVENTS + 1), "one sentinel event");
-    assert.match(argv[argv.indexOf("--query") + 1], /^\{total: length\(events\), events: events\[\]\./);
+    assert.match(
+      argv[argv.indexOf("--query") + 1],
+      /^\{total: length\(events \|\| `\[\]`\), events: \(events \|\| `\[\]`\)\[\]\./,
+    );
     assert.deepEqual(calls[0].params, {
       logGroupName: "/aws/lambda/my-fn",
       startTime: (calls[0].params as { startTime: number }).startTime,
@@ -298,7 +301,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     assert.equal("startFromHead" in (calls[1].params ?? {}), false);
     assert.equal(calls[1].argv.includes("--max-items"), false, "the whole-window read pages to the end");
     assert.equal(calls[1].argv.includes("--page-size"), false);
-    assert.match(calls[1].argv[calls[1].argv.indexOf("--query") + 1], /events\[-500:\]/);
+    assert.match(calls[1].argv[calls[1].argv.indexOf("--query") + 1], /\(events \|\| `\[\]`\)\[-500:\]/);
 
     // The negative answer is cached, so a second call costs one invocation.
     const second = await tail("logs-tail_legacy_bulk");

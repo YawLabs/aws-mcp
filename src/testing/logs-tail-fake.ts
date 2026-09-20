@@ -121,11 +121,15 @@ const captured = (lines: readonly string[]): string => `${lines.join(CRLF)}${CRL
  */
 export const REAL_CLI_CAPTURES = {
   /**
-   * `aws logs filter-log-events --query '{total: length(events), events:
-   * events[-500:].{...}}' --cli-input-json '{"logGroupName":"/stub/basic",
-   * "startTime":1789812000000}' --output json` on 2.34.3: the whole-window read
-   * of BASIC_EVENTS. 1,226 bytes, exit 0, one request. This is the shape
-   * parseTailOutput must accept.
+   * `aws logs filter-log-events --query '{total: length(events || `[]`), events:
+   * (events || `[]`)[-500:].{...}}' --cli-input-json
+   * '{"logGroupName":"/stub/basic","startTime":1789812000000}' --output json` on
+   * 2.34.3: the whole-window read of BASIC_EVENTS. 1,226 bytes, exit 0, one
+   * request. This is the shape parseTailOutput must accept.
+   *
+   * The `|| `[]`` defaults buildTailQuery grew are invisible here: they only
+   * change a reply that OMITS `events`, and re-running the capture with them
+   * printed the same 1,226 bytes.
    */
   legacyBasicStdout: captured([
     "{",
@@ -274,7 +278,7 @@ export const REAL_CLI_CAPTURES = {
  * real CLI would not have produced.
  */
 export const TAIL_QUERY_RE =
-  /^\{total: length\(events\), events: events\[(?:-(\d+):)?\]\.\{timestamp: timestamp, logStreamName: logStreamName, message: message\}\}$/;
+  /^\{total: length\(events \|\| `\[\]`\), events: \(events \|\| `\[\]`\)\[(?:-(\d+):)?\]\.\{timestamp: timestamp, logStreamName: logStreamName, message: message\}\}$/;
 
 export type FleModelVariant = "current" | "legacy" | "ancient";
 
@@ -465,7 +469,7 @@ export function runLogsTailScenario(
       if ("startFromHead" in payload) return paramValidation(REAL_CLI_CAPTURES.startFromHeadRejectStderr);
       if (!isCapturedLegacyBasicCall(argv, payload)) {
         return fail(
-          "logs-tail_legacy_basic serves the captured whole-window read (no startFromHead, no --max-items, events[-500:]); this call asked for something else",
+          "logs-tail_legacy_basic serves the captured whole-window read (no startFromHead, no --max-items, the [-500:] slice); this call asked for something else",
         );
       }
       return { stdout: REAL_CLI_CAPTURES.legacyBasicStdout, stderr: "", exitCode: 0 };

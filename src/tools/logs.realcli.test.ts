@@ -109,6 +109,7 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
    *   /stub/ignored  the same, but startFromHead is IGNORED (moto, LocalStack)
    *   /stub/unicode  the three non-ASCII messages
    *   /stub/empty    no events at all
+   *   /stub/noevents an empty window reported with NO `events` member at all
    */
   const page = (
     all: readonly FakeFilteredLogEvent[],
@@ -138,7 +139,10 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
       bodies.push(body);
       const group = String(body.logGroupName ?? body.logGroupIdentifier ?? "");
       let answer: unknown;
-      if (group.includes("/empty")) answer = { events: [], searchedLogStreams: [] };
+      // Checked before /empty, whose substring it does not contain, but keeping the
+      // narrower route first makes the ordering independent of the names.
+      if (group.includes("/noevents")) answer = { searchedLogStreams: [] };
+      else if (group.includes("/empty")) answer = { events: [], searchedLogStreams: [] };
       else if (group.includes("/unicode")) answer = { events: UNICODE_EVENTS, searchedLogStreams: [] };
       else if (group.includes("/ignored")) answer = page(BULK, body, 500, false);
       else if (group.includes("/bulk")) answer = page(BULK, body, 500, true);
@@ -360,6 +364,26 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     const data = r.data as TailEnvelope;
     assert.deepEqual(data.events, []);
+    assert.equal(data.eventCount, 0);
+    assert.equal(data.totalEvents, 0);
+    assert.equal(data.truncated, false);
+  });
+
+  it("case 7b: an endpoint that omits the events member is still an empty window", async () => {
+    // The one case only a real CLI can show: the --query is evaluated by the CLI's
+    // own JMESPath, and logs-tail-fake.ts's emulator always builds an `events`
+    // list, so no fake call can reach this. Before the `|| `[]`` defaults in
+    // buildTailQuery, `length(events)` raised on the null and the CLI exited 255
+    // with `In function length(), invalid type for value: None` -- forwarded to the
+    // caller as nonzero_exit, for the one window the tool always got right.
+    //
+    // Real CloudWatch Logs and moto both send `events: []`; the reachable
+    // population is a compatible endpoint behind AWS_ENDPOINT_URL. The projection
+    // is ours either way.
+    const r = await tailReal("/stub/noevents", {}, "current");
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    const data = r.data as TailEnvelope;
+    assert.deepEqual(data.events, [], "no events member reads as no events, not as a failure");
     assert.equal(data.eventCount, 0);
     assert.equal(data.totalEvents, 0);
     assert.equal(data.truncated, false);

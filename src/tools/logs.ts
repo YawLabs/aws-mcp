@@ -269,11 +269,24 @@ export type TailReadMode = "newest-first" | "full-window";
  * `total` counts what the CLI FETCHED, which is the whole window on the
  * full-window path and at most maxEvents + 1 on the newest-first one (measured:
  * an 8-event window with `--max-items 4` answers `total: 4`). Both forms stay
- * around 130 characters, far below runAwsCall's 2,048-character --query cap.
+ * around 130 characters (130 and 135), far below runAwsCall's 2,048-character
+ * --query cap.
+ *
+ * `events || `[]`` in BOTH members, because a reply that omits `events`
+ * otherwise fails the whole call: JMESPath's length() raises on a null operand,
+ * so `length(events)` printed `In function length(), invalid type for value:
+ * None` and exit 255 -- measured on 2.34.3 and 2.22.0 against a loopback stub
+ * answering `{"searchedLogStreams": []}`. Real CloudWatch Logs and moto both
+ * send `events: []`, so the reachable population is a compatible endpoint
+ * behind AWS_ENDPOINT_URL, but the projection is ours and an empty window is
+ * the one case this tool always got right. Defaulting `total` alone is not
+ * enough: a slice of null yields null rather than erroring, so `events` came
+ * back `null` (exit 0) and parseTailOutput's deliberate strictness then
+ * reported it as stdout that was not the document asked for.
  */
 export function buildTailQuery(mode: TailReadMode, maxEvents: number): string {
   const slice = mode === "newest-first" ? "" : `-${maxEvents}:`;
-  return `{total: length(events), events: events[${slice}].{timestamp: timestamp, logStreamName: logStreamName, message: message}}`;
+  return `{total: length(events || \`[]\`), events: (events || \`[]\`)[${slice}].{timestamp: timestamp, logStreamName: logStreamName, message: message}}`;
 }
 
 /**
