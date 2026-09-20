@@ -66,7 +66,7 @@ interface ToolAnnotations {
  *
  * Exists because several tools run far longer than a caller can be expected to
  * sit through blind -- `awaitCompletion` polls Cloud Control for up to 30
- * minutes, aws_multi_region fans out across up to 32 regions, aws_assume_role
+ * minutes, aws_multi_region fans out across up to 64 regions, aws_assume_role
  * allows 120s for a cold-start SAML round-trip -- and a stdio MCP server that
  * says nothing for that long is indistinguishable from one that has hung.
  */

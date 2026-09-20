@@ -3,7 +3,13 @@ import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
-import { capAggregateResults, multiRegionTools, type RegionResult, runWithConcurrency } from "./multi-region.js";
+import {
+  capAggregateResults,
+  MAX_REGIONS,
+  multiRegionTools,
+  type RegionResult,
+  runWithConcurrency,
+} from "./multi-region.js";
 import type { ToolContext } from "./tool.js";
 
 const tool = multiRegionTools.find((t) => t.name === "aws_multi_region");
@@ -35,6 +41,50 @@ afterEach(() => {
   _resetSession();
 });
 
+/**
+ * Every region in the `aws` partition, read out of the local aws-cli 2.34.3's
+ * `awscli/botocore/data/partitions.json` with the `aws-global` pseudo-region
+ * dropped. This is what `ec2 describe-regions` returns for an account with every
+ * opt-in region enabled -- the input F67 fixed, which used to come back as
+ * `Too many regions: 34 requested, max 32`.
+ */
+const COMMERCIAL_PARTITION = [
+  "af-south-1",
+  "ap-east-1",
+  "ap-east-2",
+  "ap-northeast-1",
+  "ap-northeast-2",
+  "ap-northeast-3",
+  "ap-south-1",
+  "ap-south-2",
+  "ap-southeast-1",
+  "ap-southeast-2",
+  "ap-southeast-3",
+  "ap-southeast-4",
+  "ap-southeast-5",
+  "ap-southeast-6",
+  "ap-southeast-7",
+  "ca-central-1",
+  "ca-west-1",
+  "eu-central-1",
+  "eu-central-2",
+  "eu-north-1",
+  "eu-south-1",
+  "eu-south-2",
+  "eu-west-1",
+  "eu-west-2",
+  "eu-west-3",
+  "il-central-1",
+  "me-central-1",
+  "me-south-1",
+  "mx-central-1",
+  "sa-east-1",
+  "us-east-1",
+  "us-east-2",
+  "us-west-1",
+  "us-west-2",
+];
+
 describe("aws_multi_region schema", () => {
   it("accepts a minimal call with two regions", () => {
     const r = tool.inputSchema.safeParse({
@@ -50,10 +100,20 @@ describe("aws_multi_region schema", () => {
     assert.equal(r.success, false);
   });
 
-  it("rejects more than 32 regions", () => {
-    const regions = Array.from({ length: 33 }, (_, i) => `us-east-${i + 1}`);
+  it("rejects more than MAX_REGIONS regions", () => {
+    const regions = Array.from({ length: MAX_REGIONS + 1 }, (_, i) => `us-east-${i + 1}`);
     const r = tool.inputSchema.safeParse({ service: "s3api", operation: "list-buckets", regions });
     assert.equal(r.success, false);
+  });
+
+  it("accepts the full commercial partition, which the old cap of 32 refused", () => {
+    assert.equal(COMMERCIAL_PARTITION.length, 34, "precondition: the partition this cap has to clear");
+    const r = tool.inputSchema.safeParse({
+      service: "sts",
+      operation: "get-caller-identity",
+      regions: COMMERCIAL_PARTITION,
+    });
+    assert.equal(r.success, true);
   });
 
   it("rejects out-of-range concurrency", () => {
@@ -339,7 +399,8 @@ describe("aws_multi_region input bounds (regression)", () => {
   }
 
   it("rejects more regions than MAX_REGIONS rather than truncating", async () => {
-    const regions = Array.from({ length: 40 }, (_, n) => `us-east-${n + 1}`);
+    const over = MAX_REGIONS + 1;
+    const regions = Array.from({ length: over }, (_, n) => `us-east-${n + 1}`);
     const res = await tool.handler({
       service: "s3api",
       operation: "list-buckets",
@@ -347,20 +408,24 @@ describe("aws_multi_region input bounds (regression)", () => {
       profile: "default",
     });
     assert.equal(res.ok, false);
-    assert.match(res.error ?? "", /Too many regions: 40 requested, max 32/);
+    assert.match(res.error ?? "", new RegExp(`Too many regions: ${over} requested, max ${MAX_REGIONS}`));
   });
 
   it("counts the RAW list, not the deduped one, so it agrees with the schema", async () => {
-    // 40 entries, 10 of them duplicates -> 30 distinct. The schema's
-    // .max(32) applies to the raw array and rejects this, so the handler must
-    // too; counting distinct regions here would make the same call succeed via
-    // a direct handler invocation and fail through the MCP boundary.
+    // Distinct count UNDER the cap, raw count OVER it: (MAX_REGIONS - 2) distinct
+    // plus 10 duplicates. The schema's .max(MAX_REGIONS) applies to the raw
+    // array and rejects this, so the handler must too; counting distinct regions
+    // here would make the same call succeed via a direct handler invocation and
+    // fail through the MCP boundary.
+    const distinct = MAX_REGIONS - 2;
     const regions = [
-      ...Array.from({ length: 30 }, (_, n) => `us-east-${n + 1}`),
+      ...Array.from({ length: distinct }, (_, n) => `us-east-${n + 1}`),
       ...Array.from({ length: 10 }, (_, n) => `us-east-${n + 1}`),
     ];
-    assert.equal(regions.length, 40);
-    assert.equal(new Set(regions).size, 30);
+    assert.equal(regions.length, distinct + 10);
+    assert.equal(new Set(regions).size, distinct);
+    assert.ok(distinct <= MAX_REGIONS, "precondition: the DISTINCT count is within the cap");
+    assert.ok(regions.length > MAX_REGIONS, "precondition: the RAW count is over it");
     assert.equal(
       tool.inputSchema.safeParse({ service: "s3api", operation: "list-buckets", regions }).success,
       false,
@@ -368,14 +433,40 @@ describe("aws_multi_region input bounds (regression)", () => {
     );
     const res = await tool.handler({ service: "s3api", operation: "list-buckets", regions, profile: "default" });
     assert.equal(res.ok, false, "handler must agree with the schema");
-    assert.match(res.error ?? "", /Too many regions: 40 requested, max 32/);
+    assert.match(res.error ?? "", new RegExp(`Too many regions: ${regions.length} requested, max ${MAX_REGIONS}`));
+  });
+
+  it("fans out across the whole 34-region commercial partition", async () => {
+    // The schema test above proves the boundary accepts 34; this one proves the
+    // HANDLER's own bound does too, and that all 34 regions actually dispatch.
+    // At the default concurrency (8), which is gentler on a parallel node --test
+    // run than raising it. mr_partial_failure branches on --region, so us-west-2
+    // fails by design and the other 33 succeed.
+    const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+    process.env.AWS_MCP_FAKE_SCENARIO = "mr_partial_failure";
+    try {
+      const res = await tool.handler({
+        service: "sts",
+        operation: "get-caller-identity",
+        regions: COMMERCIAL_PARTITION,
+        profile: "default",
+      });
+      assert.equal(res.ok, true);
+      const data = res.data as { regionCount: number; okCount: number; errorCount: number };
+      assert.equal(data.regionCount, 34);
+      assert.equal(data.okCount, 33);
+      assert.equal(data.errorCount, 1);
+    } finally {
+      if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+      else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+    }
   });
 });
 
 describe("capAggregateResults -- aggregate response budget", () => {
   // Per-CALL output is capped in aws-cli.ts (5MB of stdout kills the
-  // subprocess), but the BATCH had no ceiling: 32 regions x 5MB each is 160MB
-  // held in `results` and serialized into one MCP response.
+  // subprocess), but the BATCH had no ceiling: MAX_REGIONS regions x 5MB each is
+  // hundreds of MB held in `results` and serialized into one MCP response.
   const bigData = { blob: "x".repeat(4096) };
   const okEntry = (region: string): RegionResult => ({ region, ok: true, command: `aws s3api ...`, data: bigData });
 
@@ -534,7 +625,7 @@ describe("aws_multi_region aggregate cap -- end-to-end envelope", () => {
 });
 
 describe("aws_multi_region -- progress reporting", () => {
-  // Fanning out across up to 32 regions is the second-longest wait this server
+  // Fanning out across up to MAX_REGIONS regions is the second-longest wait this server
   // imposes, and unlike the CCAPI poll loop it has a REAL denominator: the
   // deduped region list. So these reports carry (completed, total).
   interface ProgressCall {
