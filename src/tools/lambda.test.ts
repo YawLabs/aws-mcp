@@ -218,6 +218,23 @@ describe("aws_lambda_invoke — invoke timers and child environment (pure)", () 
 describe("aws_lambda_invoke — input validation (no subprocess)", () => {
   // These reject before any spawn, so they need no fake wiring at all. That is
   // itself part of the contract: a bad functionName must never reach argv.
+  //
+  // Hazard rule, the same one paginate.test.ts and resource.integration.test.ts
+  // follow: pin a command that cannot exist, so a regression in any validator
+  // below fails to SPAWN instead of invoking Lambda under the developer's own
+  // profile. Without it runAwsCall falls back to the bare name `aws`
+  // (`opts.command ?? envCommand ?? "aws"`) and resolves it on PATH -- verified:
+  // a validation-passing input from this describe's ambient environment reached
+  // the installed CLI. Only `file://` and `fileb://` values have a second line
+  // of defence in runAwsCall; a name past the length cap, or a qualifier with
+  // `/` or `:`, has none.
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary__";
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+  });
 
   it("rejects a missing functionName", async () => {
     const r = (await tool.handler({})) as InvokeResult;
@@ -235,8 +252,9 @@ describe("aws_lambda_invoke — input validation (no subprocess)", () => {
   });
 
   it("rejects a functionName past the 256-char Invoke maximum", async () => {
-    // 257, not 171: this describe has no fake wiring, so a name that PASSES
-    // validation would spawn the developer's real `aws lambda invoke`.
+    // 257, not 171: the accepting half of this bound is at the fake (see the
+    // maxima test in the result-shaping suite), and the pin above is what keeps
+    // a regression here from spawning anything.
     const r = (await tool.handler({ functionName: "a".repeat(257) })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /256-char maximum/);

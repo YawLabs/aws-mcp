@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runAwsCall } from "../aws-cli.js";
 import { _resetSession } from "../session.js";
@@ -83,6 +83,20 @@ describe("aws_paginate schema", () => {
 });
 
 describe("aws_paginate handler — startingToken validation (no spawn)", () => {
+  // Hazard rule: every handler call in here is meant to be refused before a
+  // spawn, and that refusal is the only thing between the test's value and the
+  // developer's real `aws` -- runAwsCall falls back to the bare name on PATH,
+  // under their own profile. Pin a command that cannot exist for the whole
+  // describe, so a guard regression -- or the next raise of CURSOR_MAX_LEN --
+  // surfaces as a spawn_failure instead of sending that value to real AWS.
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary__";
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+  });
+
   it("rejects a leading-hyphen startingToken (argv-injection defense)", async () => {
     const r = (await tool.handler({
       service: "s3api",
@@ -107,30 +121,23 @@ describe("aws_paginate handler — startingToken validation (no spawn)", () => {
   });
 
   it("rejects a file:// startingToken before anything spawns", async () => {
-    // Hazard rule: pin a command that cannot exist and a path that does not, so
-    // a regression here fails to spawn instead of handing the developer's own
-    // credentials file to real AWS as the resume cursor.
-    process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary__";
-    try {
-      const r = (await tool.handler({
-        service: "s3api",
-        operation: "list-buckets",
-        startingToken: "file://fileuri-definitely-missing",
-      })) as { ok: boolean; error?: string; errorKind?: string };
-      assert.equal(r.ok, false);
-      assert.match(r.error ?? "", /^Invalid startingToken: must not start with 'file:\/\//);
-      // The tool's own input validation, so errorKind stays absent -- same
-      // contract as the leading-hyphen reject above it.
-      assert.equal(r.errorKind, undefined);
-    } finally {
-      delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    }
+    // A path that does not exist either, so even a regression that got past the
+    // pin could not hand a real file to real AWS as the resume cursor.
+    const r = (await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      startingToken: "file://fileuri-definitely-missing",
+    })) as { ok: boolean; error?: string; errorKind?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /^Invalid startingToken: must not start with 'file:\/\//);
+    // The tool's own input validation, so errorKind stays absent -- same
+    // contract as the leading-hyphen reject above it.
+    assert.equal(r.errorKind, undefined);
   });
 
   it("rejects an over-length (>8192 char) startingToken", async () => {
     // 8193, not 2049: once the cap moved to 8192 a 2049-char token CLEARS
-    // validation, and this handler has no fake-aws pinned -- it would spawn the
-    // developer's real `aws s3api list-buckets`.
+    // validation, so the old value stopped testing the boundary.
     const r = (await tool.handler({
       service: "s3api",
       operation: "list-buckets",
