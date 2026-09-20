@@ -312,6 +312,15 @@ info "Lint passed"
 
 step 2 "Test"
 npm run build || fail "Build failed"
+# There is no CI, so this is the only run of the whole suite that is guaranteed
+# to happen before a publish -- and the opt-in real-CLI suites
+# (*.realcli.test.ts, the ones that wait out real timeouts and retries) are the
+# only tests that check the fake CLI's claims against the AWS CLI actually
+# installed here. They add a minute or two and need nothing but loopback; the
+# fast real-CLI suites already run on every `npm test`. Respects an explicit
+# AWS_MCP_REAL_CLI_TESTS=0 for a box with no AWS CLI v2, where every such suite
+# skips itself anyway.
+export AWS_MCP_REAL_CLI_TESTS="${AWS_MCP_REAL_CLI_TESTS:-1}"
 npm test || fail "Tests failed"
 info "All tests passed"
 
