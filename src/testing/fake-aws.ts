@@ -71,6 +71,37 @@ const PKCE_BANNER =
   "If you are unable to open the URL on this device, run this command again with the '--use-device-code' option.\n\n" +
   "https://oidc.us-east-1.amazonaws.com/authorize?response_type=code&client_id=fake&redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2Foauth%2Fcallback&code_challenge=fake&code_challenge_method=S256\n";
 
+/** The AWS CLI v2's exit code for an argument-parsing failure (argparser.py's
+ * `self.exit(252, ...)`); measured on 2.34.3 and 2.22.0 for every case in the
+ * new-tools capture matrix. Mirrors CLI_PARSE_EXIT_CODE in tools/call.ts. */
+const CLI_PARSE_EXIT = 252;
+
+/**
+ * Real 2.34.3 stderr for an argparse "required arguments" failure, with the
+ * required list as the only variable. Captured from
+ * `aws s3api get-object --cli-input-json '{"Bucket":"b","Key":"k"}'` and from
+ * the same command with no params; the usage block below the sentence is
+ * byte-identical in both.
+ */
+const ARGPARSE_REQUIRED_STDERR = (requiredList: string): string =>
+  `\naws: [ERROR]: An error occurred (ParamValidation): the following arguments are required: ${requiredList}\n\n` +
+  "usage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\n" +
+  "To see help text, you can run:\n\n" +
+  "  aws help\n  aws <command> help\n  aws <command> <subcommand> help\n";
+
+/**
+ * Write CLI stderr using the line ending the real CLI uses on THIS platform.
+ *
+ * The scenarios above emit bare LF, which is what the CLI writes on POSIX. On
+ * Windows the real 2.34.3 writes CRLF -- 9 CRLF and 0 bare LF in the
+ * get-object capture, re-measured while writing this. The classifier in
+ * tools/call.ts has to tolerate both, so the fake must be able to produce the
+ * one the developer's own platform would.
+ */
+function writeStderrWithPlatformEol(text: string): void {
+  process.stderr.write(process.platform === "win32" ? text.replace(/\n/g, "\r\n") : text);
+}
+
 /**
  * `aws --version` intercept, ahead of the scenario switch.
  *
@@ -334,6 +365,39 @@ async function main(): Promise<void> {
     case "call_access_denied": {
       process.stderr.write("An error occurred (AccessDenied) when calling the ListBuckets operation: Access Denied\n");
       process.exit(255);
+      return;
+    }
+
+    case "new-tools_argparse_required_bucket_key": {
+      // Verbatim stderr from real aws-cli 2.34.3 for
+      //   aws s3api get-object --cli-input-json '{"Bucket":"b","Key":"k"}'
+      // -- the CLI naming, as missing, the two values the caller DID supply in
+      // params. The point of the scenario is that `s3api head-object` with NO
+      // params emits these same bytes, so only the caller's own context can tell
+      // "this command can never run here" from "you forgot params".
+      writeStderrWithPlatformEol(ARGPARSE_REQUIRED_STDERR("--bucket, --key"));
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
+    case "new-tools_argparse_required_outfile": {
+      // Real 2.34.3 stderr for `aws s3api get-object` with NO params: the
+      // required list now includes the positional `outfile`, which is what
+      // proves the command is unreachable rather than under-supplied.
+      writeStderrWithPlatformEol(ARGPARSE_REQUIRED_STDERR("--bucket, --key, outfile"));
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
+    case "new-tools_unknown_cli_input_json": {
+      // Real 2.34.3 stderr for `aws logs tail g --cli-input-json '{"logGroupName":"g"}'`
+      // -- a hand-written (BasicCommand) command, which registers no
+      // --cli-input-json at all. `aws s3 ls` and `aws configure get` emit the
+      // same bytes.
+      writeStderrWithPlatformEol(
+        "\naws: [ERROR]: An error occurred (ParamValidation): Unknown options: --cli-input-json\n",
+      );
+      process.exit(CLI_PARSE_EXIT);
       return;
     }
 

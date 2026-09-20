@@ -30,12 +30,14 @@ export interface ToolResult {
    */
   errorKind?: string;
   /**
-   * The one-line remedy parseAwsError (src/errors.ts) derives from a recognized
-   * AWS error code, carried structurally so a caller does not have to split it
-   * back out of `error`.
+   * The one-line remedy for a recognized failure -- usually the one parseAwsError
+   * (src/errors.ts) derives from an AWS error code -- carried structurally so a
+   * caller does not have to split it back out of `error`.
    *
    * NOT rendered by toMcpResult, deliberately. Its producers -- runAwsCall's
-   * nonzero_exit branch and aws_lambda_invoke's timeout remap -- both already
+   * nonzero_exit branch, aws_lambda_invoke's timeout remap, and aws_call's
+   * parse-failure hint (cliArgParseHint in tools/call.ts, which explains a
+   * command the CLI can never run through --cli-input-json) -- all three already
    * append "\n\nSuggestion: <text>" to the message they build, so rendering the
    * field too would print the same sentence twice: the defect v2.0.1 fixed for
    * rawBody. Its consumers are in-process
