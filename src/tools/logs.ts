@@ -460,6 +460,11 @@ export interface TailWindow {
  *   - full-window: the CLI read every page, so `total` is exact and the
  *     projection already sliced the newest maxEvents; the slice here is
  *     defensive.
+ *
+ * In newest-first mode a caller MUST run fetchIgnoredStartFromHead first and re-read
+ * the whole window when it answers true. This function cannot fix that case: an
+ * ascending fetch that was truncated holds the oldest events of the window, and no
+ * arrangement of them is the newest maxEvents.
  */
 export function selectTailWindow(
   parsed: { total: number; events: RawTailEvent[] },
@@ -1171,13 +1176,18 @@ export const logsTools: readonly Tool[] = [
       if (a.kind === "rejected") {
         const gaps = detectFleModelGaps(a.failure.rawStderr ?? "");
         if (gaps.startFromHead) startFromHeadUnsupported = true;
-        if (gaps.logGroupIdentifier) {
-          // Only reachable with ARN input. No `suggestion`: parseAwsError's "Fix
-          // parameter shape" remedy for ParamValidation is the wrong advice when
-          // the shape is right and the CLI is old.
+        if (arn && gaps.logGroupIdentifier) {
+          // Gated on `arn` as well as on the gap: a bare-name call sends
+          // logGroupName and no identifier, so neither half of that gap can be
+          // about a group this call named -- and this message would then be
+          // nonsense. Such a failure is forwarded as it stands instead.
+          //
+          // No `suggestion`: parseAwsError's "Fix parameter shape" remedy for
+          // ParamValidation is the wrong advice when the shape is right and the CLI
+          // is old.
           return {
             ok: false,
-            error: `This AWS CLI predates addressing a log group by ARN: FilterLogEvents' logGroupIdentifier needs AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+, and nothing was sent. Pass the bare name '${logGroupName}' to read that group in the account profile '${i.profile ?? getProfile()}' resolves to -- which is not necessarily the ARN's account ${arn?.account} -- or upgrade the AWS CLI.`,
+            error: `This AWS CLI predates addressing a log group by ARN: FilterLogEvents' logGroupIdentifier needs AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+, and nothing was sent. Pass the bare name '${logGroupName}' to read that group in the account profile '${i.profile ?? getProfile()}' resolves to -- which is not necessarily the ARN's account ${arn.account} -- or upgrade the AWS CLI.`,
             errorKind: "nonzero_exit",
             rawBody: a.failure.rawStderr || a.failure.rawStdout,
           };
