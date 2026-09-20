@@ -1068,6 +1068,7 @@ describe("pollQueryUntilTerminal", () => {
         ok: true as const,
         data: { ...(status === null ? {} : { status }), results: rows, statistics: {} },
         command: "aws logs get-query-results",
+        commandArgv: ["aws", "logs", "get-query-results"],
         rawStdout: "",
       };
     };

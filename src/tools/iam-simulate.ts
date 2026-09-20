@@ -534,6 +534,7 @@ export const iamSimulateTools: readonly Tool[] = [
         ok: true,
         data: {
           command: result.command,
+          commandArgv: result.commandArgv,
           principalArn: i.principalArn,
           summary: { allowed, denied, unknown, total: results.length },
           results,

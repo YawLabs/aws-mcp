@@ -269,6 +269,7 @@ export const callTools: readonly Tool[] = [
         ok: true,
         data: {
           command: result.command,
+          commandArgv: result.commandArgv,
           result: result.data,
         },
       };

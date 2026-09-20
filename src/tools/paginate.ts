@@ -165,6 +165,7 @@ export const paginateTools: readonly Tool[] = [
         ok: true,
         data: {
           command: result.command,
+          commandArgv: result.commandArgv,
           result: resultBody,
           nextToken,
           hasMore: nextToken !== null,

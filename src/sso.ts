@@ -284,6 +284,15 @@ function probeDeviceCodeSupport(
         // probe exists to predict what the LOGIN spawn will do, and one helper
         // for every child is what keeps the two environments from drifting.
         env: awsChildEnv(env ?? process.env),
+        // Matches every spawn in bin/aws-mcp.mjs, which passes it on its version
+        // probe and both launch paths. libuv only adds CREATE_NO_WINDOW when asked,
+        // so without it a console window can flash for each aws child -- bounded
+        // honestly: a console app inherits its parent's console, so this is visible
+        // only when the server itself has none, which is a GUI-subsystem MCP host
+        // launching it detached. ASSERTED, not measured: discriminating it needs a
+        // console-less parent plus a window probe, and MainWindowHandle is
+        // unreliable under ConPTY here. Inert on POSIX.
+        windowsHide: true,
       });
     } catch {
       // Can't even spawn — let the login attempt itself report the missing
@@ -465,6 +474,15 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         // `aws sso login` exits without ever printing a URL and this tool has
         // nothing to show. See aws-spawn.ts PINNED_CLI_ENV.
         env: awsChildEnv(spawnEnv ?? process.env),
+        // Matches every spawn in bin/aws-mcp.mjs, which passes it on its version
+        // probe and both launch paths. libuv only adds CREATE_NO_WINDOW when asked,
+        // so without it a console window can flash for each aws child -- bounded
+        // honestly: a console app inherits its parent's console, so this is visible
+        // only when the server itself has none, which is a GUI-subsystem MCP host
+        // launching it detached. ASSERTED, not measured: discriminating it needs a
+        // console-less parent plus a window probe, and MainWindowHandle is
+        // unreliable under ConPTY here. Inert on POSIX.
+        windowsHide: true,
       });
     } catch (err) {
       resolve({

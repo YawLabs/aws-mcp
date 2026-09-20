@@ -47,6 +47,7 @@ function progressResponse(event: Record<string, unknown> | null): AwsCallResult 
     ok: true,
     data: { ProgressEvent: event },
     command: "aws cloudcontrol get-resource-request-status --request-token tok-1",
+    commandArgv: ["aws", "cloudcontrol", "get-resource-request-status", "--request-token", "tok-1"],
     rawStdout: JSON.stringify({ ProgressEvent: event }),
   };
 }

@@ -720,6 +720,8 @@ interface QueryPollResult {
   /** Last successful GetQueryResults body; null when the first call failed. */
   body: QueryResultsBody | null;
   command: string;
+  /** The exact argv behind `command`, unquoted and redacted identically. */
+  commandArgv: string[];
   attempts: number;
   elapsedMs: number;
   /** Set on every reason except "terminal". */
@@ -787,6 +789,9 @@ export async function pollQueryUntilTerminal(
   let attempts = 0;
   let lastBody: QueryResultsBody | null = null;
   let lastCommand = "";
+  // Tracked beside lastCommand so a poll that ends without a fresh result still
+  // reports the argv of the last call it actually made, not an empty array.
+  let lastCommandArgv: string[] = [];
   let lastStatus: string | null = null;
 
   while (true) {
@@ -797,6 +802,7 @@ export async function pollQueryUntilTerminal(
         status: lastStatus,
         body: lastBody,
         command: lastCommand,
+        commandArgv: lastCommandArgv,
         attempts,
         elapsedMs: elapsed,
         error: `Cancelled by the client after ${Math.round(elapsed / 1000)}s and ${attempts} poll(s) (last status: ${lastStatus ?? "unknown"}). Polling stopped; the CloudWatch Logs Insights query itself was NOT cancelled. ${queryResumeHint(opts.queryId)}`,
@@ -809,6 +815,7 @@ export async function pollQueryUntilTerminal(
         status: lastStatus,
         body: lastBody,
         command: lastCommand,
+        commandArgv: lastCommandArgv,
         attempts,
         elapsedMs: elapsed,
         error: `Polled for ${Math.round(elapsed / 1000)}s over ${attempts} attempt(s) without the query reaching a terminal status (last status: ${lastStatus ?? "unknown"}). This is this tool's maxWaitMs, not AWS's -- AWS gives a query 60 minutes. Raise maxWaitMs, or narrow the time range / add a filter so the query scans less. ${queryResumeHint(opts.queryId)}`,
@@ -834,6 +841,7 @@ export async function pollQueryUntilTerminal(
         status: lastStatus,
         body: lastBody,
         command: result.command ?? lastCommand,
+        commandArgv: result.commandArgv ?? lastCommandArgv,
         attempts,
         elapsedMs: Date.now() - start,
         error: result.error,
@@ -854,6 +862,7 @@ export async function pollQueryUntilTerminal(
       };
     }
     lastCommand = result.command;
+    lastCommandArgv = result.commandArgv;
     lastBody = result.data && typeof result.data === "object" ? (result.data as QueryResultsBody) : null;
     lastStatus = lastBody && typeof lastBody.status === "string" ? lastBody.status : null;
     const elapsed = Date.now() - start;
@@ -868,6 +877,7 @@ export async function pollQueryUntilTerminal(
         status: lastStatus,
         body: lastBody,
         command: lastCommand,
+        commandArgv: lastCommandArgv,
         attempts,
         elapsedMs: Date.now() - start,
       };
@@ -1160,7 +1170,12 @@ export const logsTools: readonly Tool[] = [
       ): Promise<
         | { kind: "rejected"; failure: AwsCallFailure }
         | { kind: "failed"; result: ToolResult }
-        | { kind: "read"; command: string; parsed: { total: number; events: RawTailEvent[] } }
+        | {
+            kind: "read";
+            command: string;
+            commandArgv: string[];
+            parsed: { total: number; events: RawTailEvent[] };
+          }
       > => {
         const r = await read(mode);
         if (!r.ok) {
@@ -1180,7 +1195,7 @@ export const logsTools: readonly Tool[] = [
             },
           };
         }
-        return { kind: "read", command: r.command, parsed };
+        return { kind: "read", command: r.command, commandArgv: r.commandArgv, parsed };
       };
 
       let mode: TailReadMode = startFromHeadUnsupported ? "full-window" : "newest-first";
@@ -1233,6 +1248,7 @@ export const logsTools: readonly Tool[] = [
         ok: true,
         data: {
           command: a.command,
+          commandArgv: a.commandArgv,
           // The bare group NAME, as it has always been echoed; logGroupIdentifier
           // below says whether an ARN was sent, which `command` cannot show because
           // it redacts the --cli-input-json payload.
@@ -1554,6 +1570,7 @@ export const logsTools: readonly Tool[] = [
         ok: true,
         data: {
           command: polled.command,
+          commandArgv: polled.commandArgv,
           startCommand: started.command,
           profile: effectiveProfile,
           region: effectiveRegion,
