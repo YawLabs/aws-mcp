@@ -676,6 +676,17 @@ describe("redactDisplayArgs -- CCAPI payload flags (regression)", () => {
 });
 
 describe("runAwsCall — a child killed by a signal exits with code === null", () => {
+  // Bypass command resolution with the explicit-command seam resolveAwsCommand
+  // documents ("verbatim, no checks: these are in-process test seams"). spawn is
+  // mocked here so the value is never executed -- but resolution runs BEFORE the
+  // spawn, so without this the suite depends on an aws being findable on PATH and
+  // settles spawn_failure ("Could not find the AWS CLI") on any machine without
+  // one. That is a normal state for a contributor running unit tests, and it is
+  // new in 2.4.0: before the resolver landed, the mocked spawn was reached
+  // directly. Measured in WSL Ubuntu (linux/arm64, no aws installed), where these
+  // two were the only failures in the entire compiled suite.
+  const STUB_COMMAND = "aws-mcp-signal-kill-stub";
+
   // Every other failure test in this suite carries a NUMERIC exit code (255 or
   // 1), so the nonzero_exit fallback message -- which interpolates `code` --
   // had only ever rendered with a number. A child killed by a signal reaches
@@ -737,7 +748,7 @@ describe("runAwsCall — a child killed by a signal exits with code === null", (
 
   it("settles nonzero_exit with exitCode null rather than treating the kill as success", async () => {
     const r = await withMockedSpawn(signalKilledSpawn(""), () =>
-      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000 }),
+      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000, command: STUB_COMMAND }),
     );
     assert.equal(r.ok, false, "a signal-killed child must not settle as a successful call");
     if (r.ok) return;
@@ -758,7 +769,7 @@ describe("runAwsCall — a child killed by a signal exits with code === null", (
     // so a signal death that managed to emit something keeps the real text --
     // the half of the branch that never renders "code null" at all.
     const r = await withMockedSpawn(signalKilledSpawn("Killed\n"), () =>
-      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000 }),
+      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000, command: STUB_COMMAND }),
     );
     assert.equal(r.ok, false);
     if (r.ok) return;
