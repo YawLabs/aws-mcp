@@ -209,10 +209,12 @@ describe("aws_lambda_invoke — input validation (no subprocess)", () => {
     assert.match(r.error ?? "", /Invalid functionName/);
   });
 
-  it("rejects a functionName past the 170-char ARN maximum", async () => {
-    const r = (await tool.handler({ functionName: "a".repeat(171) })) as InvokeResult;
+  it("rejects a functionName past the 256-char Invoke maximum", async () => {
+    // 257, not 171: this describe has no fake wiring, so a name that PASSES
+    // validation would spawn the developer's real `aws lambda invoke`.
+    const r = (await tool.handler({ functionName: "a".repeat(257) })) as InvokeResult;
     assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /170-char maximum/);
+    assert.match(r.error ?? "", /256-char maximum/);
   });
 
   it("rejects a qualifier that would pose as a flag", async () => {
@@ -230,6 +232,19 @@ describe("aws_lambda_invoke — input validation (no subprocess)", () => {
       const r = (await tool.handler({ functionName: "fn", qualifier })) as InvokeResult;
       assert.equal(r.ok, false, `accepted a ${qualifier.length}-char qualifier`);
       assert.match(r.error ?? "", /must be 1-128 characters/);
+      assert.equal(r.errorKind, undefined);
+    }
+  });
+
+  it("rejects a qualifier that leads with a dot or could become a paramfile reference", async () => {
+    // `.` is in the charset now, for $LATEST.PUBLISHED -- but only inside the
+    // value. `:` and `/` stay out precisely so a qualifier can never spell
+    // `file://`: the CLI would replace it with the contents of that local file
+    // (verified), and a qualifier is a value a prompt can reach.
+    for (const qualifier of [".x", ".", "file://x", "fileb://x", "a/b", "a:b"]) {
+      const r = (await tool.handler({ functionName: "fn", qualifier })) as InvokeResult;
+      assert.equal(r.ok, false, `accepted the qualifier ${JSON.stringify(qualifier)}`);
+      assert.match(r.error ?? "", /Invalid qualifier/);
       assert.equal(r.errorKind, undefined);
     }
   });
@@ -384,8 +399,8 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
       qualifier: "a".repeat(128),
     })) as InvokeResult;
     assert.equal(maxQualifier.ok, true, `rejected a 128-char qualifier: ${maxQualifier.error}`);
-    const maxName = (await tool.handler({ functionName: "a".repeat(170) })) as InvokeResult;
-    assert.equal(maxName.ok, true, `rejected a 170-char functionName: ${maxName.error}`);
+    const maxName = (await tool.handler({ functionName: "a".repeat(256) })) as InvokeResult;
+    assert.equal(maxName.ok, true, `rejected a 256-char functionName: ${maxName.error}`);
   });
 });
 
@@ -456,6 +471,17 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     // raw JSON at all.
     assert.match(ref, /^fileb:\/\//);
     assert.equal(payloadFile, JSON.stringify({ hello: "world" }));
+  });
+
+  it("accepts $LATEST.PUBLISHED and puts it on argv verbatim", async () => {
+    // Wired at the fake because this qualifier now PASSES validation: an unwired
+    // call would spawn the real `aws`. It is what an unqualified invoke resolves
+    // to on Lambda Managed Instances, and the pattern used to refuse it over the
+    // dot alone.
+    const r = (await tool.handler({ functionName: "my-fn", qualifier: "$LATEST.PUBLISHED" })) as InvokeResult;
+    assert.equal(r.ok, true, `rejected $LATEST.PUBLISHED: ${r.error}`);
+    const { argv } = readEcho();
+    assert.equal(argv[argv.indexOf("--qualifier") + 1], "$LATEST.PUBLISHED");
   });
 
   it("omits --payload entirely when no payload was given", async () => {

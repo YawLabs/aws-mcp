@@ -221,6 +221,36 @@ describe(`aws_lambda_invoke -- installed AWS CLI${detected?.ok ? ` (${detected.c
     assert.deepEqual(JSON.parse(stub.requests.at(-1)?.body ?? "null"), { hello: "realcli" });
   });
 
+  it("sends $LATEST.PUBLISHED and a 256-char function name through to the endpoint", async () => {
+    // The two validator limits, checked where it counts: against the real CLI and
+    // the URL it builds. Both values used to be refused locally, before anything
+    // spawned, so no CLI ever saw them.
+    const published = await countRequests(() =>
+      invoke({ functionName: "ok", qualifier: "$LATEST.PUBLISHED", profile: "realcli-static", region: "us-east-1" }),
+    );
+    assert.equal(published.r.ok, true, `${published.r.errorKind}: ${published.r.error}`);
+    assert.equal(published.requests, 1);
+    // The CLI percent-encodes the `$`; the dot travels as itself.
+    assert.match(stub.requests.at(-1)?.path ?? "", /\?Qualifier=%24LATEST\.PUBLISHED$/);
+
+    const longName = "a".repeat(256);
+    const long = await countRequests(() =>
+      invoke({ functionName: longName, profile: "realcli-static", region: "us-east-1" }),
+    );
+    assert.equal(long.r.ok, true, `${long.r.errorKind}: ${long.r.error}`);
+    assert.equal(long.requests, 1);
+    assert.ok(stub.requests.at(-1)?.path.includes(`/functions/${longName}/invocations`), "the whole name was sent");
+
+    // And the half that must NOT reach a CLI: a qualifier the CLI would expand
+    // into a local file's contents is refused with nothing sent.
+    const refused = await countRequests(() =>
+      invoke({ functionName: "ok", qualifier: "file://x", profile: "realcli-static", region: "us-east-1" }),
+    );
+    assert.equal(refused.r.ok, false);
+    assert.equal(refused.requests, 0, "rejected before any process started");
+    assert.match(refused.r.error ?? "", /Invalid qualifier/);
+  });
+
   it("sends a slow invoke ONCE and reports the read timeout as a timeout that says so", async () => {
     // The whole defect, at the scale of a test: timeoutMs 1000 gives the CLI an
     // 11s read timeout, the function answers in 30s, and the CLI must report

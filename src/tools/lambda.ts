@@ -61,7 +61,9 @@
  *     payload and no logs, so it shares almost nothing with the code below and
  *     wants its own result contract.
  *   - `InvocationType: "DryRun"` (permission check only). aws_iam_simulate
- *     already answers "may this principal invoke it" without running anything.
+ *     covers the identity-policy half (it wraps simulate-principal-policy and
+ *     never fetches the function's resource-based policy), and nothing else here
+ *     needs a DryRun.
  *   - `--client-context`. Base64 client metadata for mobile SDK callers; no
  *     demand from an MCP context.
  *   - The aws_script bridge binding. Registering this tool for in-process
@@ -105,10 +107,29 @@ const MAX_RESPONSE_PAYLOAD_BYTES = 256 * 1024;
  * positional.
  */
 const SAFE_FUNCTION_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9\-_.:$]*$/;
-const MAX_FUNCTION_NAME_LEN = 170; // Full-ARN maximum per the Lambda API docs.
+// Invoke's own FunctionName maximum (the 2.34.3 model and `aws lambda invoke
+// help`), and 170 was wrong for longer than it looked: a full ARN is 47
+// characters plus the name (up to 64), a colon, and the alias (up to 128), so a
+// 64-character name with a 59-character alias was already refused here -- before
+// anything spawned, with a length complaint rather than anything Lambda said. The
+// CLI itself enforces no maximum: a 257-character name was sent.
+const MAX_FUNCTION_NAME_LEN = 256;
 
-/** Version number or alias name. `$LATEST` is why `$` is in the class. */
-const SAFE_QUALIFIER_RE = /^[a-zA-Z0-9$][a-zA-Z0-9\-_$]*$/;
+/**
+ * Version number or alias name. `$LATEST` is why `$` is in the class, and `.` is
+ * for `$LATEST.PUBLISHED` -- the qualifier an unqualified invoke resolves to on
+ * Lambda Managed Instances, which the CLI accepts (verified: sent as
+ * `?Qualifier=%24LATEST.PUBLISHED`) and this pattern used to refuse.
+ *
+ * Deliberately looser than the service's own Qualifier pattern, the same
+ * reasoning as SAFE_FUNCTION_NAME_RE above. NEVER add `:` or `/`: the CLI
+ * replaces a `file://` or `fileb://` value with the contents of that local file
+ * (verified on 2.34.3, which sent `?Qualifier=CONTENTS-OF-LOCAL-FILE`).
+ * runAwsCall's central guard refuses such a value too -- lambda exempts only its
+ * own payload path from it -- so this is the defense-in-depth layer under that,
+ * not the only one.
+ */
+const SAFE_QUALIFIER_RE = /^[a-zA-Z0-9$][a-zA-Z0-9\-_.$]*$/;
 const MAX_QUALIFIER_LEN = 128;
 
 /** Matches the `timeoutMs` description and runAwsCall's own default. */
@@ -338,7 +359,7 @@ export const lambdaTools: readonly Tool[] = [
   {
     name: "aws_lambda_invoke",
     description:
-      "Invoke a Lambda function synchronously (RequestResponse) and return its response payload plus the DECODED tail of its execution log in one call. Use this instead of aws_call for Lambda invokes: `aws lambda invoke` needs a positional output file and rejects --cli-input-json, so aws_call structurally cannot reach it. The returned `logTail` is the last ~4 KB of the function's own log output, already base64-decoded, which removes the usual invoke -> find the log group -> tail it -> hope the window caught it loop. IMPORTANT: a non-empty `functionError` means the function's HANDLER threw; the invocation itself still succeeded, so ok is true and the thrown error is in `payload`. The invoke is sent AT MOST ONCE: the AWS CLI's automatic retries are turned off here, because a retried invoke runs the function again. A TooManyRequestsException, or a connection that could not be opened, means nothing ran, so retrying is safe. On errorKind 'timeout' the error says whether the invoke was sent; if it was, or after a dropped connection or a 5xx, the function may have run and may still be running -- check its logs before invoking again.",
+      "Invoke a Lambda function synchronously (RequestResponse) and return its response payload plus the DECODED tail of its execution log in one call. Use this instead of aws_call for Lambda invokes: `aws lambda invoke` needs a positional output file and rejects --cli-input-json, so aws_call structurally cannot reach it. The returned `logTail` is the last ~4 KB of the function's own log output, already base64-decoded, which removes the usual invoke -> find the log group -> tail it -> hope the window caught it loop. Functions on Lambda Managed Instances do not support the log tail; read their logs with aws_logs_tail. IMPORTANT: a non-empty `functionError` means the function's HANDLER threw; the invocation itself still succeeded, so ok is true and the thrown error is in `payload`. The invoke is sent AT MOST ONCE: the AWS CLI's automatic retries are turned off here, because a retried invoke runs the function again. A TooManyRequestsException, or a connection that could not be opened, means nothing ran, so retrying is safe. On errorKind 'timeout' the error says whether the invoke was sent; if it was, or after a dropped connection or a 5xx, the function may have run and may still be running -- check its logs before invoking again.",
     annotations: {
       title: "Invoke a Lambda function",
       // destructiveHint: true, and it must stay that way.
@@ -375,12 +396,14 @@ export const lambdaTools: readonly Tool[] = [
       qualifier: z
         .string()
         .optional()
-        .describe("Version number or alias to invoke, e.g. '3' or 'PROD'. Defaults to $LATEST."),
+        .describe(
+          "Version number or alias to invoke, e.g. '3' or 'PROD'. Omit for the service default: $LATEST for a standard function, $LATEST.PUBLISHED for one on Lambda Managed Instances. Durable functions need an explicit qualifier (a version, an alias, or $LATEST).",
+        ),
       invocationType: z
         .enum(["RequestResponse"])
         .optional()
         .describe(
-          "Only 'RequestResponse' (synchronous) is supported. Async 'Event' and permission-check 'DryRun' are deliberately not implemented — 'Event' returns no payload or logs and needs its own result shape; for 'DryRun', use aws_iam_simulate instead.",
+          "Only 'RequestResponse' (synchronous) is supported. Async 'Event' and permission-check 'DryRun' are deliberately not implemented — 'Event' returns no payload or logs and needs its own result shape. For a pre-flight permission check, aws_iam_simulate evaluates the caller's identity policies but not the function's resource-based policy.",
         ),
       profile: z.string().optional().describe("Override session profile for this call."),
       region: z.string().optional().describe("Override session region for this call."),
@@ -418,7 +441,7 @@ export const lambdaTools: readonly Tool[] = [
       if (i.functionName.length > MAX_FUNCTION_NAME_LEN) {
         return {
           ok: false,
-          error: `Invalid functionName: ${i.functionName.length} chars exceeds the ${MAX_FUNCTION_NAME_LEN}-char maximum for a Lambda function ARN.`,
+          error: `Invalid functionName: ${i.functionName.length} chars exceeds the ${MAX_FUNCTION_NAME_LEN}-char maximum the Invoke API documents for FunctionName.`,
         };
       }
       if (!SAFE_FUNCTION_NAME_RE.test(i.functionName)) {
@@ -437,7 +460,7 @@ export const lambdaTools: readonly Tool[] = [
         if (!SAFE_QUALIFIER_RE.test(i.qualifier)) {
           return {
             ok: false,
-            error: `Invalid qualifier '${i.qualifier}'. Use a version number or alias name — letters, digits, and - _ $ only, not starting with '-'.`,
+            error: `Invalid qualifier '${i.qualifier}'. Use a version number or alias name — letters, digits, and - _ . $ only, not starting with '-' or '.'.`,
           };
         }
       }
