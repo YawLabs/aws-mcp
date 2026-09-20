@@ -94,12 +94,16 @@ describe("aws_paginate handler — startingToken validation (no spawn)", () => {
   });
 
   it("accepts a long (>128 char) startingToken -- real cursors are base64 blobs", () => {
-    // The bound is the 2048-char cursor bound, NOT the 128-char
-    // RequestToken/ClientToken one. AWS documents ListResources NextToken at
-    // up to 2048; the old 128 cap rejected page 2 of a normal list. Asserted
-    // against the validator rather than the handler so the test doesn't have
-    // to spawn a CLI just to get past the guard.
+    // The bound is the 8192-char cursor bound, NOT the 128-char
+    // RequestToken/ClientToken one. AWS documents ListResources NextToken at up
+    // to 4096, and the CLI hands --starting-token the base64-JSON wrapping of
+    // it (5,484 chars for 4096); the old 128 cap rejected page 2 of a normal
+    // list, and 2048 rejected a documented maximum. Asserted against the
+    // validator rather than the handler so the test doesn't have to spawn a CLI
+    // just to get past the guard.
     assert.equal(validateCursorToken("a".repeat(600), "startingToken"), null);
+    assert.equal(validateCursorToken("a".repeat(5484), "startingToken"), null);
+    assert.equal(validateCursorToken("a".repeat(8192), "startingToken"), null);
   });
 
   it("rejects a file:// startingToken before anything spawns", async () => {
@@ -123,11 +127,14 @@ describe("aws_paginate handler — startingToken validation (no spawn)", () => {
     }
   });
 
-  it("rejects an over-length (>2048 char) startingToken", async () => {
+  it("rejects an over-length (>8192 char) startingToken", async () => {
+    // 8193, not 2049: once the cap moved to 8192 a 2049-char token CLEARS
+    // validation, and this handler has no fake-aws pinned -- it would spawn the
+    // developer's real `aws s3api list-buckets`.
     const r = (await tool.handler({
       service: "s3api",
       operation: "list-buckets",
-      startingToken: "a".repeat(2049),
+      startingToken: "a".repeat(8193),
     })) as { ok: boolean; error?: string };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid startingToken/);

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { AwsCallResult } from "../aws-cli.js";
 import { _resetSession } from "../session.js";
 import {
+  CURSOR_MAX_LEN,
   extractProgressFields,
   isValidIdentifier,
   isValidOpaqueToken,
@@ -160,16 +161,26 @@ describe("validateOpaqueToken", () => {
 
 describe("validateCursorToken", () => {
   // Pagination cursors are NOT RequestToken/ClientToken: AWS documents
-  // ListResources NextToken at up to 2048 chars, and real ones are base64
-  // blobs well past 128. Validating them with the 128-char opaque-token
-  // guard rejected page 2 of every list on entirely expected input.
+  // ListResources NextToken (HandlerNextToken) at up to 4096 chars, and the
+  // CLI wraps a raw token as base64 JSON for --starting-token, which turns a
+  // 4096-char token into 5,484. Validating them with the 128-char opaque-token
+  // guard rejected page 2 of every list on entirely expected input, and 2048
+  // was the same failure one limit higher.
   it("accepts a cursor longer than the 128-char opaque-token cap", () => {
     assert.equal(validateCursorToken("a".repeat(600), "nextToken"), null);
     assert.equal(validateCursorToken("a".repeat(2048), "nextToken"), null);
   });
 
-  it("still rejects over-2048, empty, leading-hyphen, and control chars", () => {
-    assert.match(validateCursorToken("a".repeat(2049), "nextToken") ?? "", /Invalid nextToken/);
+  it("accepts the documented 4096-char NextToken, its wrapped form, and the 8192 boundary", () => {
+    assert.equal(validateCursorToken("a".repeat(2049), "nextToken"), null, "the old 2048 cap is gone");
+    assert.equal(validateCursorToken("a".repeat(4096), "nextToken"), null, "AWS's documented maximum");
+    assert.equal(validateCursorToken("a".repeat(5484), "startingToken"), null, "4096 wrapped as base64 JSON");
+    assert.equal(validateCursorToken("a".repeat(CURSOR_MAX_LEN), "nextToken"), null);
+  });
+
+  it("still rejects over-8192, empty, leading-hyphen, and control chars", () => {
+    assert.match(validateCursorToken("a".repeat(CURSOR_MAX_LEN + 1), "nextToken") ?? "", /Invalid nextToken/);
+    assert.match(validateCursorToken("a".repeat(CURSOR_MAX_LEN + 1), "nextToken") ?? "", /1-8192/);
     assert.match(validateCursorToken("", "nextToken") ?? "", /Invalid nextToken/);
     assert.match(validateCursorToken("-bad", "nextToken") ?? "", /Invalid nextToken/);
     assert.match(validateCursorToken("bad\x01", "nextToken") ?? "", /Invalid nextToken/);

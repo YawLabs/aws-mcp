@@ -82,8 +82,9 @@ export function isValidIdentifier(id: string): boolean {
  *
  * Explicitly not for pagination cursors. A CCAPI NextToken is a different
  * thing that happens to be another opaque string: AWS documents ListResources
- * NextToken at up to 2048 chars, and real ones are base64 blobs well past 128.
- * Cursors go through `validateCursorToken` below.
+ * NextToken (HandlerNextToken) at up to 4096 chars, and the CLI's
+ * `--starting-token` wraps a raw token as base64 of JSON -- 5,484 chars for a
+ * 4096-char token. Cursors go through `validateCursorToken` below.
  */
 export function isValidOpaqueToken(token: string): boolean {
   return isArgvSafeValue(token, 128);
@@ -138,17 +139,29 @@ export function validateOpaqueToken(token: string, fieldName: string): string | 
 }
 
 /**
+ * How long a pagination cursor may be. AWS documents Cloud Control's
+ * ListResources NextToken (HandlerNextToken) at up to 4096 characters, and the
+ * CLI's paginator wraps a raw token as base64 of `{"NextToken": "..."}` for
+ * `--starting-token` -- 5,484 characters for a 4096-character token -- so the
+ * widest legitimate cursor is well past 4096. 8192 covers both with headroom
+ * and stays far under Windows' 32,767-character command line.
+ */
+export const CURSOR_MAX_LEN = 8192;
+
+/**
  * Argv-safety guard for PAGINATION cursors (CCAPI `nextToken`, the CLI's
- * `--starting-token`). Same leading-hyphen / control-char defense as
- * `validateOpaqueToken`, but bounded at 2048 rather than 128: these carry a
- * base64 continuation blob, not a request id. The 128 cap was borrowed from
- * the RequestToken/ClientToken limit and rejected page 2 of every list -- an
- * entirely expected input failing loudly.
+ * `--starting-token`). Same leading-hyphen / control-char / paramfile defense as
+ * `validateOpaqueToken`, but bounded at CURSOR_MAX_LEN rather than 128: these
+ * carry a base64 continuation blob, not a request id. The 128 cap was borrowed
+ * from the RequestToken/ClientToken limit and rejected page 2 of every list --
+ * an entirely expected input failing loudly. 2048 was the same bug one limit
+ * higher: it rejected a documented 4096-character NextToken, and the wrapped
+ * form of one before that.
  */
 export function validateCursorToken(token: string, fieldName: string): string | null {
   if (isParamFileUri(token)) return paramFileUriMessage(fieldName);
-  if (!isValidIdentifier(token)) {
-    return `Invalid ${fieldName}. Must be 1-2048 chars, not start with '-', and contain no control characters.`;
+  if (!isArgvSafeValue(token, CURSOR_MAX_LEN)) {
+    return `Invalid ${fieldName}. Must be 1-8192 chars, not start with '-', and contain no control characters.`;
   }
   return null;
 }
