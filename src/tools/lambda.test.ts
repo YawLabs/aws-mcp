@@ -787,7 +787,7 @@ describe("aws_lambda_invoke — a failed invoke says whether it went out", () =>
   });
 
   it("surfaces a dropped connection with the check-before-retrying remedy", async () => {
-    // Re-sent three times on the CLI's defaults, and every re-send of an invoke
+    // Sent three times on the CLI's defaults, and every re-send of an invoke
     // that reached Lambda is another run. The remedy comes from errors.ts, which
     // had no pattern for any transport failure before.
     process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_connection_closed";

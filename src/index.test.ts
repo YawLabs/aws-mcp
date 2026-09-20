@@ -431,9 +431,12 @@ describe("hardenWindowsExeSearch", () => {
 
   for (const key of [VAR, "NODEFAULTCURRENTDIRECTORYINEXEPATH", "nodefaultcurrentdirectoryinexepath"]) {
     it(`leaves an existing value alone, spelled ${key}`, () => {
-      // A host that deliberately set it to "0" -- wanting the working directory
-      // searched -- keeps that answer, and the value is never re-spelled into a
-      // second key (which on a case-sensitive object would leave both).
+      // A host that set it to "0" keeps that answer. Windows reads this variable
+      // for presence, not truth: "0", "false" and an empty value disable the
+      // working-directory search exactly as "1" does (measured on Node 22.22.2),
+      // so leaving the host's value alone is still fail-safe. The value is never
+      // re-spelled into a second key, which on a case-sensitive object would
+      // leave both.
       const env: NodeJS.ProcessEnv = { [key]: "0" };
 
       hardenWindowsExeSearch(env, "win32");
@@ -443,9 +446,10 @@ describe("hardenWindowsExeSearch", () => {
   }
 
   it("leaves an empty existing value alone — present is present", () => {
-    // Windows treats an empty value as unset for this variable, but re-setting
-    // it would still be overruling the host, and the plan's rule is "no key
-    // upper-cases to it".
+    // An empty value still disables the search -- and on win32 process.env an
+    // empty assignment keeps the key rather than deleting it -- so re-setting it
+    // would overrule the host for no gain. The rule is "no key upper-cases to
+    // it".
     const env: NodeJS.ProcessEnv = { [VAR]: "" };
 
     hardenWindowsExeSearch(env, "win32");

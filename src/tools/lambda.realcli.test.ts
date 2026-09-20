@@ -166,7 +166,7 @@ describe(`aws_lambda_invoke -- installed AWS CLI${detected?.ok ? ` (${detected.c
       if (fn === "reset") {
         // The request arrived and is recorded; the response never does. This is
         // what the CLI reports as "Connection was closed before we received a
-        // valid response", and what it used to re-send three times.
+        // valid response", and what it used to send three times.
         res.socket?.destroy();
         return;
       }
