@@ -35,7 +35,6 @@ import esbuild from 'esbuild';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
-const isWin = process.platform === 'win32';
 
 const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
 const { version } = pkg;
@@ -194,7 +193,12 @@ if (isCross) {
   // can execute it. Say which one happened rather than implying both.
   console.log(`NOTE: cross-built for ${TARGET} -- not executed here. Smoke it on that target.`);
 }
-if (!isWin) chmodSync(outExe, 0o755);
+// Keyed on the TARGET, not the host. Keyed on the host, a POSIX asset
+// cross-built on Windows shipped with no execute bit -- and the cross case is
+// exactly where it matters, because a host build is already executable where it
+// was made. chmod does not move a mode on a Windows host anyway, so keying this
+// on the target is only ever additive.
+if (!targetIsWin) chmodSync(outExe, 0o755);
 
 // 3. macOS: ad-hoc re-sign. Apple Silicon SIGKILLs a Mach-O with no/invalid
 // signature at exec, and `--sign -` is the free ad-hoc identity. Best-effort:
@@ -212,7 +216,22 @@ if (process.platform === 'darwin') {
 // 4. Smoke: --verify proves a signature, not that the thing runs. Actually
 // launch it, exactly as build-binary.mjs does on darwin, but on every platform
 // since oam compile is the newer path and deserves the check everywhere.
-run(outExe, ['--version']);
+//
+// Except a cross build, which cannot be launched here by definition -- the NOTE
+// above already says so. MEASURED 2026-09-20 on win32-arm64, oam 0.16.1:
+// AWS_MCP_BINARY_TARGET=darwin-arm64 now completes (exit 0) and produces a real
+// 64-bit arm64 Mach-O (magic feedfacf, cputype 0x0100000c, 62.77 MB). Unguarded,
+// the last line of that SUCCESSFUL build threw -- ENOENT here rather than the
+// ENOEXEC one might expect, because Windows refuses the image before it is ever a
+// question of format -- so a caller checking the exit status threw away a good
+// artifact. macOS is review-only on this account, which makes cross-building the
+// only way a macOS binary can exist at all: this was the whole path to that
+// asset, not an edge of it.
+if (isCross) {
+  console.log('SKIP smoke: ' + TARGET + ' cannot run on ' + HOST_TARGET + '. Run --version on that target: ' + outExe);
+} else {
+  run(outExe, ['--version']);
+}
 
 console.log('');
 console.log(`OK  ${outExe}`);
