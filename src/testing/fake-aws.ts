@@ -1216,6 +1216,38 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "logs-tail_current_basic":
+    case "logs-tail_current_bulk":
+    case "logs-tail_current_empty":
+    case "logs-tail_current_unicode":
+    case "logs-tail_legacy_basic":
+    case "logs-tail_legacy_bulk":
+    case "logs-tail_legacy_empty":
+    case "logs-tail_ancient_basic":
+    case "logs-tail_ignored_bulk":
+    case "logs-tail_jsonfmt_bulk":
+    case "logs-tail_echo_argv":
+    case "logs-tail_real_tail_text": {
+      // aws_logs_tail's FilterLogEvents scenarios. The datasets, the verbatim
+      // real-CLI captures and the emulator live in logs-tail-fake.ts, which is
+      // imported lazily so no other scenario pays for a ~600-line module at
+      // startup. The names say which CLI model the call meets: `current` knows
+      // FilterLogEvents' startFromHead (AWS CLI 2.35.8+), `legacy` rejects it
+      // (2.9.15 through 2.35.7), `ancient` also rejects logGroupIdentifier
+      // (before 2.9.2); `ignored` is an endpoint that accepts startFromHead and
+      // pages ascending anyway (moto, LocalStack); `jsonfmt` prints the
+      // rejection in the CLI's JSON error format.
+      const { runLogsTailScenario } = await import("./logs-tail-fake.js");
+      const out = runLogsTailScenario(scenario, process.argv.slice(2), process.env);
+      if (out.stdout) process.stdout.write(out.stdout);
+      if (out.stderr) process.stderr.write(out.stderr);
+      // exitCode + return rather than process.exit(): a bulk window is ~100 KB
+      // on one stdout write, and exiting in the same breath truncates it. Same
+      // reason handleVersionProbe returns.
+      process.exitCode = out.exitCode;
+      return;
+    }
+
     case "logs_tail_ndjson": {
       // 'aws logs tail --format json' emits one JSON object per line.
       process.stdout.write(
