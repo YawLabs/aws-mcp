@@ -395,6 +395,31 @@ describe("detectUnrenderablePage", () => {
     assert.equal(detectUnrenderablePage(html, htmlToMarkdown(html), "u", "u"), null);
   });
 
+  it("reads a stub whose attributes are the other way round", () => {
+    // `content=` before `http-equiv=` is a shape the old tag-scan regex, which
+    // required that order, silently missed -- such a page came back as an empty
+    // success with no target named.
+    const html = '<html><head><meta content="0;URL=welcome.html" http-equiv="refresh"></head></html>';
+    assert.match(
+      detectUnrenderablePage(html, "", "https://docs.aws.amazon.com/x.html", LAMBDA_DG) ?? "",
+      /welcome\.html/,
+    );
+  });
+
+  it("stays linear on a body with a long run of unclosed <meta", () => {
+    // readBodyWithCap admits 5 MB, and a `<meta[^>]+...[^>]*content=` scan
+    // re-walks the rest of the document from every `<meta` once per following
+    // `http-equiv=` in a stretch carrying no `>`. Measured on 22.22.2: 5 KB of
+    // this body cost the old scan 186 ms, 16 KB 4.7 s, 26 KB 22 s -- synchronous
+    // CPU in a single-threaded stdio server, after the body has arrived, so
+    // FETCH_TIMEOUT_MS does not reach it and every other tool call queues behind
+    // it. Walking the parsed tags does the whole 5 MB in 62 ms.
+    const hostile = '<meta http-equiv="refresh" '.repeat(2400);
+    const started = performance.now();
+    assert.equal(detectUnrenderablePage(hostile, "", "u", "u"), null);
+    assert.ok(performance.now() - started < 5000, "the old scan needed minutes for this 64 KB body");
+  });
+
   it("measures the text, not the link syntax", () => {
     // The JS v3 shell's whole conversion is `[Skip to main content](#main)`: 29
     // characters of markdown, 20 of text. Counting the markdown would let a
@@ -506,6 +531,37 @@ describe("describeFetchFailure", () => {
     );
     assert.doesNotMatch(s, /hunter2/);
     assert.match(s, /\/\/<redacted>@proxy\.corp\.example:3128/);
+  });
+
+  it("redacts a password containing '@', and a colonless token userinfo", () => {
+    // Node parses userinfo to the LAST '@' (22.22.2: `new URL` on the first URL
+    // below gives password "Pa%40ss"), so `Pa@ssw0rd` is a real password and
+    // `token@` is real auth. A class that stopped at the first '@' printed the
+    // tail, and one that demanded a ':' printed the token whole -- into the tool
+    // error the model reads back and the host logs. Both call sites are covered:
+    // the proxy URL goes through the remedy, the cause through its own call.
+    const withAt = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED http://svc:Pa@ssw0rd@proxy.corp.example:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://svc:Pa@ssw0rd@proxy.corp.example:3128", envProxyEnabled: true, oamVersion: null },
+    );
+    assert.doesNotMatch(withAt, /ssw0rd/);
+    const token = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED http://sup3rs3cr3t@proxy.corp.example:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://sup3rs3cr3t@proxy.corp.example:3128", envProxyEnabled: true, oamVersion: null },
+    );
+    assert.doesNotMatch(token, /sup3rs3cr3t/);
+    assert.match(token, /\/\/<redacted>@proxy\.corp\.example:3128/);
+  });
+
+  it("leaves a credential-free URL alone, fragment or query included", () => {
+    // `?` and `#` end the authority, so an '@' past either is page text, not a
+    // secret -- redacting there would mangle the URL the reader needs.
+    const s = describeFetchFailure(
+      fetchFailed("error sending request for url (https://docs.aws.amazon.com/x.html#a@b)"),
+      { proxyUrl: "http://proxy.corp.example:3128", envProxyEnabled: true, oamVersion: null },
+    );
+    assert.match(s, /docs\.aws\.amazon\.com\/x\.html#a@b/);
+    assert.doesNotMatch(s, /<redacted>/);
   });
 
   it("ignores a code that is not a non-empty string", () => {

@@ -661,14 +661,38 @@ export function htmlToMarkdown(html: string): string {
   return md.replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// `<meta http-equiv="refresh" content="0;URL=welcome.html">` -- the whole body
-// of a guide landing page. Case-insensitive because the site writes the
-// attribute lower-case and the parameter `URL=`.
-const META_REFRESH_RE = /<meta[^>]+http-equiv=["']?refresh["']?[^>]*content=["'][^"']*?url=([^"'>\s;]+)/i;
 // The three markers of a page whose content is assembled in the browser: a
 // Next.js app (the JS SDK v3 reference, which ships both markers) and Swift
 // DocC, whose <noscript> is the only prose in the response.
 const CLIENT_RENDERED_RE = /\/_next\/static\/|<div id="__next"|requires JavaScript/i;
+
+/**
+ * The target of a `<meta http-equiv="refresh" content="0;URL=welcome.html">`,
+ * which is the whole body of a guide landing page, or null when there is none.
+ *
+ * Read off the parsed tags rather than matched on the raw HTML. A single
+ * `<meta[^>]+http-equiv=...[^>]*content=` scan re-walks the rest of the document
+ * from every `<meta` once per following `http-equiv=` in any stretch carrying no
+ * `>`, and MAX_DOC_HTML_BYTES lets 5 MB of such a stretch through: measured here
+ * on 22.22.2, 5 KB of it took 186 ms, 16 KB 4.7 s and 26 KB 22 s. Nothing
+ * interrupts that -- FETCH_TIMEOUT_MS bounds the fetch, and this is synchronous
+ * CPU in a single-threaded stdio server after the body has arrived, so every
+ * other tool call on the session queues behind it. The same 5 MB body walks the
+ * tags in 62 ms. The parse is paid only on a page already measured as thin, so
+ * the ordinary read still parses once.
+ *
+ * Case-insensitive on both, because the site writes the attribute lower-case and
+ * the parameter `URL=`. Reversed attribute order (`content=` before
+ * `http-equiv=`) now matches, which the tag scan silently missed.
+ */
+function findMetaRefreshTarget(html: string): string | null {
+  for (const meta of parseHtml(html).querySelectorAll("meta")) {
+    if (!/^refresh$/i.test((meta.getAttribute("http-equiv") ?? "").trim())) continue;
+    const url = /url=([^"'>\s;]+)/i.exec(meta.getAttribute("content") ?? "");
+    if (url) return url[1];
+  }
+  return null;
+}
 
 /**
  * Name the reason a page converted to (almost) nothing, or null when the
@@ -692,12 +716,12 @@ export function detectUnrenderablePage(
   // Link syntax stripped before measuring, so a nav-only shell counts as the
   // ~20 characters of text it really is rather than the 29 of its one link.
   if (markdown.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1").trim().length >= THIN_PAGE_CHARS) return null;
-  const refresh = html.match(META_REFRESH_RE);
-  if (refresh) {
+  const refresh = findMetaRefreshTarget(html);
+  if (refresh !== null) {
     // Resolved against the FINAL url, which is where a browser would be when it
     // reads the stub: a page that moved guides lands on the new directory, and
     // its stub's `URL=welcome.html` means that directory's welcome page.
-    const target = resolveDocsLink(refresh[1], finalUrl);
+    const target = resolveDocsLink(refresh, finalUrl);
     if (isValidDocsUrl(target)) {
       return `${requestedUrl} is a landing page with no content of its own -- it only forwards the browser to '${target}' (an HTML meta refresh). Call aws_docs_read on '${target}' instead.`;
     }
@@ -851,9 +875,17 @@ function readFetchEnvFacts(): FetchEnvFacts {
   };
 }
 
-/** Strip `user:password@` out of any URL in text we are about to report. */
+/** Strip any `userinfo@` out of a URL in text we are about to report. */
 function redactUrlUserinfo(text: string): string {
-  return text.replace(/\/\/[^/\s@]+:[^/\s@]*@/g, "//<redacted>@");
+  // To the LAST `@` of the authority, with no `:` required. WHATWG userinfo runs
+  // to the final `@` -- verified on 22.22.2, `new URL("http://svc:Pa@ss@h:3128")`
+  // gives username "svc" and password "Pa%40ss" -- so an unencoded `@` in a
+  // password is a legitimate value, and a class that forbade `@` inside userinfo
+  // stopped at the first one and printed the tail into text the model reads. A
+  // colonless `token@proxy` carries a secret too, and needing the `:` missed it
+  // whole. `?` and `#` end the authority the way `/` does, so a docs URL whose
+  // query or fragment holds an `@` is left alone.
+  return text.replace(/\/\/[^/\s?#]*@/g, "//<redacted>@");
 }
 
 interface FetchFailureCause {
