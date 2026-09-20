@@ -9,12 +9,12 @@
     "id": "1217190886"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/aws-mcp/",
-  "version": "2.3.2",
+  "version": "2.3.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/aws-mcp",
-      "version": "2.3.2",
+      "version": "2.3.3",
       "transport": {
         "type": "stdio"
       }
