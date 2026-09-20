@@ -485,6 +485,12 @@ if (isEntryPoint) {
 
   const server = new McpServer({
     name: "@yawlabs/aws-mcp",
+    // The display name hosts and registries show. `name` stays the package id
+    // that clients match on; without a `title` the spec says to fall back to it,
+    // and "AWS MCP Server" -- what server.json used to carry -- is character for
+    // character AWS's own product name, so a registry listing both showed two
+    // different servers under one label.
+    title: "Yaw Labs AWS MCP",
     version,
   });
 

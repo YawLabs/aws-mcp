@@ -42,6 +42,9 @@ const SERVER_ENTRY = join(__dirname, "index.js");
 
 /** Root package.json -- `npm test` builds first, so this is what got bundled. */
 const PKG_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
+// Read rather than repeated, so the display name a registry publishes and the one
+// a live session reports cannot drift apart silently.
+const SERVER_JSON_TITLE = (createRequire(import.meta.url)("../server.json") as { title: string }).title;
 
 // Every wait in this file is bounded. A hung server is the exact defect these
 // tests exist to catch, so it has to fail with a diagnostic rather than sit
@@ -339,7 +342,7 @@ describe("spawned server — MCP handshake over stdio", () => {
       const initResult = init.result as {
         protocolVersion: string;
         capabilities: { tools?: unknown };
-        serverInfo: { name: string; version: string };
+        serverInfo: { name: string; version: string; title?: string };
       };
       assert.equal(initResult.serverInfo.name, "@yawlabs/aws-mcp");
       assert.equal(
@@ -347,6 +350,11 @@ describe("spawned server — MCP handshake over stdio", () => {
         PKG_VERSION,
         "the bundled __VERSION__ define drifted from package.json",
       );
+      // The display name reaches the wire. A host with no `title` falls back to
+      // `name`, so dropping it is invisible to every other assertion here, and
+      // it has to keep matching server.json's `title` for a registry listing and
+      // a live session to agree on what this server is called.
+      assert.equal(initResult.serverInfo.title, SERVER_JSON_TITLE);
       // The registration loop ran, so the server advertises the tools capability.
       assert.ok(initResult.capabilities.tools, "server did not advertise a tools capability");
 

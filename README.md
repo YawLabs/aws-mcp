@@ -350,6 +350,18 @@ Every call resolves a profile name first -- **explicit tool `profile` argument -
 
 **Exception -- static keys in your environment are not used.** Because a profile is always passed explicitly, botocore drops the environment credential provider from the chain, so `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` exported in your shell are never consulted. (Container credentials and IMDS are unaffected -- they sit later in the chain and are not profile-gated.) To use static keys, put them in a profile section of `~/.aws/credentials` and point `AWS_PROFILE` at it, rather than exporting them.
 
+### Behind a proxy or a private CA
+
+`aws_docs_search` and `aws_docs_read` fetch over HTTPS from this process, so they are the two tools a corporate gateway breaks. They now name the cause rather than blaming AWS's backend, and the fix is an `env` entry in your MCP config -- **not** an export in your shell, because both variables below are read when the process starts and your MCP client launches the server itself.
+
+| Variable | Purpose |
+|----------|---------|
+| `NODE_EXTRA_CA_CERTS` | Path to the PEM file holding your gateway's CA certificate, when TLS interception makes the fetch fail with a self-signed or unknown-issuer error. |
+| `NODE_USE_SYSTEM_CA=1` | Trust the operating system's certificate store instead of naming a file (Node 22.19+). |
+| `HTTPS_PROXY` / `https_proxy` | The proxy to fetch through. On Node this is **ignored** unless you also opt in with `NODE_USE_ENV_PROXY=1` or `--use-env-proxy` (Node 22.21+, also accepted inside `NODE_OPTIONS`); a request otherwise goes direct and a proxy-only network simply times out. Running on oam, the variable is honored with no opt-in. |
+
+The AWS CLI is a separate process with its own rules, so a `credential_process`, an SSO login or any `aws_call` behind the same gateway follows the [AWS CLI's own proxy configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-proxy.html) (`HTTP_PROXY` / `HTTPS_PROXY` and `AWS_CA_BUNDLE`) rather than the Node variables above. Those failures now carry their own remedy too.
+
 If a call omits `profile`, `aws_session_set` has not been called, neither `AWS_PROFILE` nor `AWS_DEFAULT_PROFILE` is set to a non-empty value, and neither `~/.aws/config` nor `~/.aws/credentials` defines a `default` profile, the CLI rejects `--profile default` with `ProfileNotFound`, which the tool reports as a `no_creds` error. Set `AWS_PROFILE` in your MCP config to your usual working profile.
 
 ## How the SSO login flow works

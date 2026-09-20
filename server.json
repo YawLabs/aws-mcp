@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/aws-mcp",
   "description": "AWS MCP server — call any AWS API from AI assistants, with first-class SSO re-login",
-  "title": "AWS MCP Server",
+  "title": "Yaw Labs AWS MCP",
   "repository": {
     "url": "https://github.com/YawLabs/aws-mcp",
     "source": "github",
