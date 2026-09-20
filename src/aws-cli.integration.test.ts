@@ -698,6 +698,96 @@ describe("runAwsCall — failure paths", () => {
   });
 });
 
+describe("spawn-hardening: the pinned child environment", () => {
+  it("pins the CLI settings this server parses, over hostile values in the caller's env", async () => {
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      ...fakeOpts("spawn-hardening_echo_env", {
+        // The shapes a user's ~/.aws/config or shell can produce, each of which
+        // breaks something this server reads: a non-default error format hides
+        // the text errors.ts anchors on, auto-prompt kills the call outright,
+        // and either encoding knob turned off corrupts non-ASCII output.
+        env: {
+          AWS_CLI_ERROR_FORMAT: "json",
+          AWS_CLI_AUTO_PROMPT: "on",
+          AWS_CLI_OUTPUT_ENCODING: "cp1252",
+          PYTHONUTF8: "0",
+          NoDefaultCurrentDirectoryInExePath: "0",
+        },
+      }),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { env } = r.data as { env: Record<string, unknown> };
+    assert.equal(env.AWS_CLI_ERROR_FORMAT, "enhanced");
+    assert.equal(env.AWS_CLI_AUTO_PROMPT, "off");
+    assert.equal(env.AWS_CLI_OUTPUT_ENCODING, "utf-8");
+    assert.equal(env.PYTHONUTF8, "1");
+    // win32 only: it stops the CLI's OWN children (session-manager-plugin, a
+    // bare-name credential_process) resolving out of the working directory.
+    assert.equal(
+      env.NoDefaultCurrentDirectoryInExePath,
+      process.platform === "win32" ? "1" : "0",
+      "the win32 pin must win on win32, and must not be invented elsewhere",
+    );
+  });
+
+  it("layers the pins over the caller's own environment rather than replacing it", async () => {
+    // The shape aws_multi_account passes: a full copy of process.env with the
+    // assumed-role credentials written in and every profile variable removed
+    // (tools/multi-account.ts credentialEnv), plus tools/lambda.ts's
+    // AWS_MAX_ATTEMPTS=1. Both have to survive the pins -- the credentials are
+    // the only identity such a call has, and the attempt cap is what keeps a
+    // Lambda from being invoked twice.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env",
+      AWS_ACCESS_KEY_ID: "ASIAAWSMCPSPAWNHARDENING",
+      AWS_SECRET_ACCESS_KEY: "aws-mcp-spawn-hardening-fake-secret",
+      AWS_SESSION_TOKEN: "aws-mcp-spawn-hardening-fake-token",
+      AWS_MAX_ATTEMPTS: "1",
+    };
+    delete env.AWS_PROFILE;
+    delete env.AWS_DEFAULT_PROFILE;
+
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      command: process.execPath,
+      prefixArgs: [FAKE_AWS],
+      timeoutMs: 30_000,
+      omitProfile: true,
+      env,
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv, env: childEnv } = r.data as { argv: string[]; env: Record<string, unknown> };
+    assert.equal(childEnv.credsPresent, true, "the caller's credentials must still reach the child");
+    assert.equal(childEnv.AWS_MAX_ATTEMPTS, "1", "PINNED_CLI_ENV must not take the single-attempt guarantee away");
+    assert.equal(childEnv.AWS_CLI_ERROR_FORMAT, "enhanced");
+    assert.equal(childEnv.PYTHONUTF8, "1");
+    assert.ok(!argv.includes("--profile"), "omitProfile still keeps the flag off argv");
+  });
+
+  it("classifies a rejected credential that the caller's error format would have hidden", async () => {
+    // The fake prints the classifiable ("enhanced") body only when it sees the
+    // pin, and the json body otherwise -- the precedence the real 2.34.3 shows.
+    // So this fails as `nonzero_exit` with no suggestion the moment the pin
+    // stops being passed, which is the failure users with `cli_error_format =
+    // json` in ~/.aws/config get today.
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      ...fakeOpts("spawn-hardening_error_format", { env: { AWS_CLI_ERROR_FORMAT: "json" } }),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "invalid_creds", `stderr was: ${r.rawStderr}`);
+    assert.match(r.error, /rejected by AWS/);
+  });
+});
+
 describe("runAwsCall — invalid_creds: credentials resolved and the service refused them", () => {
   // classifyAuthError has recognized this kind for a while, and errors.test.ts
   // covers the regexes in isolation -- but no stderr shape carrying one of

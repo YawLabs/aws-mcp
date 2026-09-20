@@ -24,6 +24,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
+import { awsChildEnv } from "./aws-spawn.js";
 import { killProc, procHasExited } from "./kill-proc.js";
 import { isValidProfileName } from "./session.js";
 
@@ -275,7 +276,12 @@ function probeDeviceCodeSupport(
     try {
       proc = spawn(command, [...prefixArgs, "--version"], {
         stdio: ["ignore", "pipe", "pipe"],
-        ...(env ? { env } : {}),
+        // Same pins as every other aws child (aws-spawn.ts). Not because
+        // `--version` needs them -- it answers exit 0 even with `cli_auto_prompt
+        // = on` in config, measured on 2.34.3 and 2.22.0 -- but because the
+        // probe exists to predict what the LOGIN spawn will do, and one helper
+        // for every child is what keeps the two environments from drifting.
+        env: awsChildEnv(env ?? process.env),
       });
     } catch {
       // Can't even spawn — let the login attempt itself report the missing
@@ -445,7 +451,11 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
     try {
       proc = spawn(command, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        ...(spawnEnv ? { env: spawnEnv } : {}),
+        // The pins matter most here: with `cli_auto_prompt = on` in the user's
+        // config the CLI wants a console before it does anything, so
+        // `aws sso login` exits without ever printing a URL and this tool has
+        // nothing to show. See aws-spawn.ts PINNED_CLI_ENV.
+        env: awsChildEnv(spawnEnv ?? process.env),
       });
     } catch (err) {
       resolve({

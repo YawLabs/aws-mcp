@@ -31,6 +31,29 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * The child-environment values aws-spawn.ts pins, as this process actually
+ * received them, for the `spawn-hardening_*` scenarios that exist to prove
+ * runAwsCall and sso.ts pass them down. `null` rather than absent for an unset
+ * one, so a missing pin reads as `null` in the assertion instead of vanishing
+ * from the JSON.
+ *
+ * `credsPresent` is here because aws_multi_account hands its per-account
+ * credentials to the same `env` the pins are layered over: the pins winning is
+ * only half the contract, the caller's own variables surviving is the other.
+ */
+function spawnHardeningPinnedEnv(): Record<string, unknown> {
+  return {
+    AWS_CLI_ERROR_FORMAT: process.env.AWS_CLI_ERROR_FORMAT ?? null,
+    AWS_CLI_AUTO_PROMPT: process.env.AWS_CLI_AUTO_PROMPT ?? null,
+    AWS_CLI_OUTPUT_ENCODING: process.env.AWS_CLI_OUTPUT_ENCODING ?? null,
+    PYTHONUTF8: process.env.PYTHONUTF8 ?? null,
+    NoDefaultCurrentDirectoryInExePath: process.env.NoDefaultCurrentDirectoryInExePath ?? null,
+    AWS_MAX_ATTEMPTS: process.env.AWS_MAX_ATTEMPTS ?? null,
+    credsPresent: "AWS_ACCESS_KEY_ID" in process.env,
+  };
+}
+
+/**
  * Write `chunk` to stdout, wait until it has been handed to the OS, then create
  * the file named by AWS_MCP_FAKE_READY_OUT (when set).
  *
@@ -126,6 +149,12 @@ function writeStderrWithPlatformEol(text: string): void {
  *                                  append, not overwrite, because the whole
  *                                  point is counting repeats. Same side-channel
  *                                  idea as AWS_MCP_FAKE_ARGV_OUT.
+ *   AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT  append one JSON line per spawn with
+ *                                  the pinned child-env values this process
+ *                                  received. The version probe and the login
+ *                                  spawn are two different spawns in sso.ts, so
+ *                                  a test that wants both needs a file both can
+ *                                  append to; `phase` says which wrote a line.
  */
 async function handleVersionProbe(): Promise<boolean> {
   if (process.argv[2] !== "--version") return false;
@@ -134,6 +163,12 @@ async function handleVersionProbe(): Promise<boolean> {
   if (countPath) {
     const fs = await import("node:fs");
     fs.appendFileSync(countPath, "1");
+  }
+
+  const envPath = process.env.AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT;
+  if (envPath) {
+    const fs = await import("node:fs");
+    fs.appendFileSync(envPath, `${JSON.stringify({ phase: "version", ...spawnHardeningPinnedEnv() })}\n`);
   }
 
   const version = process.env.AWS_MCP_FAKE_CLI_VERSION ?? "2.34.3";
@@ -568,6 +603,65 @@ async function main(): Promise<void> {
       process.stdout.write(Buffer.concat([Buffer.from('{"name":"'), fourByteChar.slice(0, 2)]));
       await sleep(50);
       process.stdout.write(Buffer.concat([fourByteChar.slice(2), Buffer.from('"}\n')]));
+      process.exit(0);
+      return;
+    }
+
+    case "spawn-hardening_echo_env": {
+      // What the child env actually looked like, for the tests that prove the
+      // pins arrive and that the caller's own variables survive them. argv and
+      // execPath ride along because the resolution tests need to know WHICH
+      // binary ran, and execPath is the only honest answer to that.
+      process.stdout.write(
+        `${JSON.stringify({ argv: process.argv.slice(2), execPath: process.execPath, env: spawnHardeningPinnedEnv() })}\n`,
+      );
+      const envPath = process.env.AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT;
+      if (envPath) {
+        const fs = await import("node:fs");
+        fs.appendFileSync(envPath, `${JSON.stringify({ phase: "call", ...spawnHardeningPinnedEnv() })}\n`);
+      }
+      process.exit(0);
+      return;
+    }
+
+    case "spawn-hardening_error_format": {
+      // Both bodies are verbatim captures from aws-cli 2.34.3 answering one 403
+      // InvalidClientTokenId from a loopback stub, with the CLI's own newline
+      // (CRLF on Windows, LF elsewhere -- hence os.EOL). The only difference
+      // between them is `cli_error_format`, which a user sets in ~/.aws/config
+      // and AWS's own guide suggests setting to json for scripting.
+      //
+      // Branching on AWS_CLI_ERROR_FORMAT models the precedence measured on
+      // 2.34.3: the environment beats the config file. So this scenario prints
+      // the classifiable body only while runAwsCall passes the pin -- remove the
+      // pin and the integration test sees the json body and a bare
+      // nonzero_exit, which is exactly what those users get today.
+      const eol = (await import("node:os")).EOL;
+      const enhanced =
+        `${eol}aws: [ERROR]: An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: ` +
+        `The security token included in the request is invalid.${eol}${eol}Additional error details:${eol}Type: Sender${eol}`;
+      const asJson =
+        `{${eol}    "Type": "Sender",${eol}    "Code": "InvalidClientTokenId",${eol}` +
+        `    "Message": "The security token included in the request is invalid."${eol}}${eol}`;
+      process.stderr.write(process.env.AWS_CLI_ERROR_FORMAT === "enhanced" ? enhanced : asJson);
+      // 254 is what both CLIs exited with for a service error (measured).
+      process.exit(254);
+      return;
+    }
+
+    case "spawn-hardening_sso_echo_env": {
+      // `happy`, plus a line on the side channel. sso.ts spawns twice per login
+      // (version probe, then the login itself) and the probe is handled long
+      // before this switch, so a file both can append to is the only way one
+      // test sees both environments.
+      const envPath = process.env.AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT;
+      if (envPath) {
+        const fs = await import("node:fs");
+        fs.appendFileSync(envPath, `${JSON.stringify({ phase: "login", ...spawnHardeningPinnedEnv() })}\n`);
+      }
+      process.stdout.write(HAPPY_URL_CODE_BANNER);
+      await sleep(200);
+      process.stdout.write("Successfully logged into Start URL: https://d-test.awsapps.com/start\n");
       process.exit(0);
       return;
     }

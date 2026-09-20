@@ -11,10 +11,16 @@
  * that begins `file://` or `fileb://` is refused unless the caller minted it
  * itself, because the CLI would replace such a value with the contents of that
  * local file before signing the request (see isParamFileUri).
+ *
+ * Every child runs with the CLI settings this server depends on pinned in its
+ * environment (aws-spawn.ts PINNED_CLI_ENV): the error format the classifier
+ * reads, auto-prompt off, and UTF-8 output. Those are settings a user can put
+ * in ~/.aws/config that break this server rather than their own terminal.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { awsChildEnv } from "./aws-spawn.js";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { KILL_ESCALATION_MS, killProc, procHasExited } from "./kill-proc.js";
 import {
@@ -239,6 +245,12 @@ interface AwsCallOptions {
    * assumed-role credentials this way, so the credentials live for the lifetime
    * of one subprocess instead of being written into the shared credentials
    * file.
+   *
+   * The pinned CLI settings (aws-spawn.ts PINNED_CLI_ENV) are layered on top of
+   * whatever is passed here and cannot be overridden from it -- by design: they
+   * exist because those settings change the output this module parses. Anything
+   * else set here survives, which is what keeps aws_multi_account's credentials
+   * and tools/lambda.ts's AWS_MAX_ATTEMPTS=1 reaching the child.
    */
   env?: NodeJS.ProcessEnv;
   /**
@@ -578,7 +590,12 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     try {
       proc = spawn(command, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        ...(opts.env ? { env: opts.env } : {}),
+        // `env` is always passed now, because the pins have to be there whether
+        // or not the caller brought an environment of its own. awsChildEnv
+        // layers them over a copy of `opts.env ?? process.env`, so the
+        // REPLACE-the-parent semantics AwsCallOptions.env documents are
+        // unchanged for everything else in it.
+        env: awsChildEnv(opts.env ?? process.env),
       });
     } catch (err) {
       resolve({
@@ -703,10 +720,9 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         settle({
           ok: false,
           kind,
-          // Conditional spread, the same form the spawn call above uses for
-          // `...(opts.env ? { env: opts.env } : {})`: omit the key entirely
-          // rather than emitting `suggestion: undefined` on the auth-class
-          // branches, which have no suggestion to give.
+          // Conditional spread: omit the key entirely rather than emitting
+          // `suggestion: undefined` on the auth-class branches, which have no
+          // suggestion to give.
           ...(suggestion !== undefined ? { suggestion } : {}),
           error: errorMsg,
           command: displayCommand,
