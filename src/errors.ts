@@ -182,8 +182,58 @@ const STD_ERROR_RE =
   /An error occurred \(([^)]+)\) when calling the (\S+) operation(?: \(reached max retries: (\d+)\))?:\s*([\s\S]*?)(?:\r?\n\r?\n|$)/;
 // "User: arn:aws:iam::123:user/foo is not authorized to perform: lambda:CreateFunction"
 const NOT_AUTHORIZED_RE = /User:\s*(\S+)\s*is not authorized to perform:\s*(\S+)/i;
+
+// The CLI's own argparse rejection of a service, operation or subcommand it does
+// not know -- usually one newer than the installed CLI, or a misspelling. Three
+// dests: `command` (service), `operation`, `subcommand` (waiters, `s3`,
+// `configure`). Unanchored on purpose; every shape below was captured from a real
+// CLI driven against a dead loopback endpoint, which argparse rejects before any
+// request is sent (exit 252):
+//
+//   2.34.0+ enhanced error format, the default:
+//     "aws: [ERROR]: An error occurred (ParamValidation): argument operation: Found invalid choice 'cancel-jobs'"
+//   2.34.0+ with cli_error_format=legacy, or with a --profile the CLI cannot find:
+//     "aws: [ERROR]: argument operation: Found invalid choice 'cancel-jobs'"
+//   2.34.0+ json / yaml / text / table formats: the same phrase inside `Message`
+//   2.22.0 (pre-2.34, no error formats):
+//     "aws.exe: error: argument operation: Invalid choice, valid choices are:" + the list
+//
+// The enhanced wrapper carries no "when calling the X operation" tail, so
+// STD_ERROR_RE cannot claim it and this branch still sees it -- errors.test.ts
+// pins that both ways. 2.22.0 names no choice at all on the service form (it
+// prints a ~17 KB service list instead), hence the second alternative with no
+// capture.
+const INVALID_CHOICE_RE =
+  /argument (command|operation|subcommand): (?:Found invalid choice '([^'\r\n]+)'|Invalid choice, valid choices are:)/;
+// argparse's dest name -> the word the caller would recognize. Only the three
+// keys above can reach it; the fallback exists because Map.get is nullable.
+const INVALID_CHOICE_NOUN: ReadonlyMap<string, string> = new Map([
+  ["command", "service"],
+  ["operation", "operation"],
+  ["subcommand", "subcommand"],
+]);
+
 // "Could not connect to the endpoint URL: \"https://lambda.us-east-9.amazonaws.com/\""
 const BAD_ENDPOINT_RE = /Could not connect to the endpoint URL[:\s]+"?([^"\s]+)"?/i;
+// The two enterprise-network failures on the CLI path, straight from botocore's
+// own fmt strings (awscli/botocore/exceptions.py), raised from
+// httpsession.py's send():
+//   - SSLError.fmt = 'SSL validation failed for {endpoint_url} {error}', where
+//     endpoint_url is the request URL (unquoted) and {error} is urllib3's, e.g.
+//     "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get
+//     local issuer certificate".
+//   - ProxyConnectionError.fmt = 'Failed to connect to proxy URL: "{proxy_url}"',
+//     and botocore passes it through mask_proxy_url first, so any user:password@
+//     in the value is already "***:***@" by the time it reaches us. The proxy URL
+//     itself comes from the environment and only from there: endpoint.py's
+//     _get_proxies returns get_environ_proxies(url), over a comment saying a
+//     config file COULD be supported, and the profile carries only
+//     proxy_ca_bundle / proxy_client_cert / proxy_use_forwarding_for_https.
+// Neither had a remedy, so the CLI half of the same failure docs.ts's
+// describeFetchFailure explains for the in-process fetch path said nothing. The
+// endpoint quotes are optional for the same reason BAD_ENDPOINT_RE's are.
+const SSL_VALIDATION_RE = /SSL validation failed for\s+"?([^"\s]+)"?/i;
+const PROXY_CONNECT_RE = /Failed to connect to proxy URL[:\s]+"?([^"\s]+)"?/i;
 // "Parameter validation failed: Missing required parameter ..."
 const PARAM_VALIDATION_RE = /Parameter validation failed/i;
 
@@ -293,11 +343,49 @@ export function parseAwsError(stderr: string): ParsedAwsError {
     };
   }
 
+  // See INVALID_CHOICE_RE. Runs only after STD_ERROR_RE failed, so a real AWS
+  // message that merely contains the phrase keeps its code-based suggestion.
+  // No `code` or `operation` is set: argparse exits before a request is signed,
+  // so there is no AWS error code to report and nothing reached an operation.
+  const invalidChoice = INVALID_CHOICE_RE.exec(trimmed);
+  if (invalidChoice) {
+    const noun = INVALID_CHOICE_NOUN.get(invalidChoice[1]) ?? "command";
+    const which = invalidChoice[2] ? `no ${noun} named '${invalidChoice[2]}'` : `no ${noun} by that name`;
+    // Spelling first: a model's mistyped operation is at least as common as an
+    // old CLI, and the README promises new AWS operations are reachable "the
+    // moment your local aws CLI knows them" -- this is what it says when it
+    // does not. The `aws update` caveat is real: update.py's
+    // _SUPPORTED_SOURCES is ('exe', 'script-exe', 'update-exe'), so a
+    // package-manager or source install raises UpdateError.
+    return {
+      message: trimmed,
+      suggestion: `The installed aws CLI has ${which}. Check the spelling; if it is newer than your CLI, upgrade the CLI (\`aws update\` on 2.36.0+ for installer installs, otherwise the AWS CLI installer or your package manager).`,
+    };
+  }
+
   const endpointMatch = BAD_ENDPOINT_RE.exec(trimmed);
   if (endpointMatch) {
     return {
       message: trimmed,
       suggestion: `Could not reach endpoint ${endpointMatch[1]}. Check the region spelling and network connectivity.`,
+    };
+  }
+
+  // See SSL_VALIDATION_RE / PROXY_CONNECT_RE. Both sit here, past the endpoint
+  // branch, because they are the same class of answer -- "this did not fail at
+  // AWS" -- and neither text can also match BAD_ENDPOINT_RE.
+  const sslMatch = SSL_VALIDATION_RE.exec(trimmed);
+  if (sslMatch) {
+    return {
+      message: trimmed,
+      suggestion: `TLS verification failed reaching ${sslMatch[1]}, which on a corporate network means a TLS-inspecting gateway or a private CA rather than a problem at AWS. Point the CLI at the trusted bundle: set AWS_CA_BUNDLE in this server's MCP-config \`env\` block -- the aws subprocess inherits this server's environment, so exporting it in your own shell does not reach a server your MCP client launched -- or set \`ca_bundle\` in the profile, which needs no environment at all. Do not disable verification.`,
+    };
+  }
+  const proxyMatch = PROXY_CONNECT_RE.exec(trimmed);
+  if (proxyMatch) {
+    return {
+      message: trimmed,
+      suggestion: `The proxy the aws CLI was told to use (${proxyMatch[1]}) refused the connection or could not be reached, so it is the proxy, not AWS, that did not answer. Check that value and NO_PROXY in this server's MCP-config \`env\` block: botocore takes the proxy URL from the environment only, and the aws subprocess inherits this server's environment, so exporting them in your own shell does not reach a server your MCP client launched.`,
     };
   }
 

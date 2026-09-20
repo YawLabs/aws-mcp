@@ -98,6 +98,60 @@ describe(`aws_call parse-failure hint -- installed AWS CLI${detected?.ok ? ` (${
     assert.match(r.suggestion ?? "", /aws_logs_tail/);
   });
 
+  // --- the invalid-choice remedy (parseAwsError's INVALID_CHOICE_RE) ---
+  //
+  // Same reason as the cases above, one file up the stack: the unit tests replay
+  // captured argparse text, and only a real CLI notices AWS rewording it. All
+  // three names below are misspellings of real ones, so no future release can
+  // turn them valid and quietly stop exercising this path -- the remedy's other
+  // half is "check the spelling", and this is that case. The newer-than-your-CLI
+  // case has byte-identical stderr apart from the name: measured on this machine
+  // on 2026-09-20 with `batch cancel-jobs` (Batch bulk cancel arrived in CLI
+  // 2.36.44) against 2.34.3 and against the extracted 2.22.0, which prints the
+  // pre-2.34 "Invalid choice, valid choices are:" wording instead.
+
+  it("tells a call with an unknown OPERATION that the CLI does not have it", async () => {
+    const r = await call({
+      service: "batch",
+      operation: "cancel-jobsx",
+      profile: "default",
+      region: "us-east-1",
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.suggestion ?? "", /The installed aws CLI has no operation /, `CLI stderr was: ${r.rawBody}`);
+    assert.match(r.suggestion ?? "", /Check the spelling/);
+    assert.match(r.suggestion ?? "", /aws update/);
+    assert.ok((r.error ?? "").endsWith(`\n\nSuggestion: ${r.suggestion}`));
+  });
+
+  it("calls argparse's `command` dest a SERVICE, which is what the caller passed", async () => {
+    // 2.22.0 prints no name on this line (a ~17 KB service list instead), so the
+    // assertion stops at the noun rather than the name.
+    const r = await call({
+      service: "batchx",
+      operation: "cancel-job",
+      profile: "default",
+      region: "us-east-1",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.suggestion ?? "", /The installed aws CLI has no service /, `CLI stderr was: ${r.rawBody}`);
+  });
+
+  it("covers the `subcommand` dest too, which is how waiters reject", async () => {
+    // New waiters arrive with new CLIs, and `s3` and `configure` reject on this
+    // same dest -- so a pattern that only knew `command` and `operation` would
+    // miss a whole family.
+    const r = await call({
+      service: "ec2",
+      operation: "wait instance-runningx",
+      profile: "default",
+      region: "us-east-1",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.suggestion ?? "", /The installed aws CLI has no subcommand /, `CLI stderr was: ${r.rawBody}`);
+  });
+
   it("says nothing on a botocore validation failure, which already has its own remedy", async () => {
     // head-object WITH one of its two members: this one gets past argparse and
     // fails inside botocore, where parseAwsError's "Fix parameter shape" applies.

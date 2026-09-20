@@ -426,6 +426,30 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "readme-positioning_cli_invalid_choice": {
+      // Verbatim stderr from real aws-cli 2.34.3 for
+      //   aws batch cancel-jobs --output json --profile <one that exists>
+      //       --region us-east-1 --cli-input-json {...}
+      // against a dead loopback endpoint: argparse rejects the operation before
+      // anything is sent. `cancel-jobs` is real -- Batch added it in CLI 2.36.44
+      // -- so this is exactly the README's "reachable the moment your local aws
+      // CLI knows them" claim failing on a CLI that does not know it yet.
+      //
+      // The profile has to EXIST for this shape: with a --profile the CLI cannot
+      // find, 2.34.3 drops the "An error occurred (ParamValidation): " wrapper
+      // and prints the legacy form, which is not what users see. Capture:
+      // plans/readme-positioning_rv_234_op_enhanced.err.
+      writeStderrWithPlatformEol(
+        "\naws: [ERROR]: An error occurred (ParamValidation): argument operation: Found invalid choice 'cancel-jobs'\n\n" +
+          "Maybe you meant:\n\n  * cancel-job\n\n" +
+          "usage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\n" +
+          "To see help text, you can run:\n\n" +
+          "  aws help\n  aws <command> help\n  aws <command> <subcommand> help\n",
+      );
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
     case "call_fail_stdout_only": {
       // Nonzero exit with output on stdout and a deliberately EMPTY stderr.
       // Forces the `?? rawStdout` half of the aws_call handler's

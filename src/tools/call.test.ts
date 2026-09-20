@@ -292,6 +292,32 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     assert.match(r.rawBody ?? "", /partial-output-on-stdout/);
   });
 
+  it("tells the caller to upgrade the CLI when it does not know the operation", async () => {
+    // The other half of the README's "reachable the moment your local `aws` CLI
+    // knows them" promise: `batch cancel-jobs` arrived in CLI 2.36.44, and on an
+    // older CLI argparse rejects it (exit 252) with text that reads like a typo.
+    // The remedy comes from parseAwsError, not cliArgParseHint -- which is why
+    // `suggestion` being set here also proves the two never stack.
+    process.env.AWS_MCP_FAKE_SCENARIO = "readme-positioning_cli_invalid_choice";
+    const r = (await tool.handler({
+      service: "batch",
+      operation: "cancel-jobs",
+      params: { jobIds: ["j-1"] },
+    })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string; rawBody?: string };
+    assert.equal(r.ok, false);
+    // A parse failure is still a nonzero exit: the stable enum does not move.
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.suggestion ?? "", /^The installed aws CLI has no operation named 'cancel-jobs'\./);
+    assert.match(r.suggestion ?? "", /aws update/);
+    assert.ok(
+      (r.error ?? "").endsWith(`\n\nSuggestion: ${r.suggestion}`),
+      `error must carry the suggestion too, got: ${r.error}`,
+    );
+    // The CLI's own text, including its did-you-mean list, stays for diagnosis.
+    assert.match(r.error ?? "", /Found invalid choice 'cancel-jobs'/);
+    assert.match(r.rawBody ?? "", /Maybe you meant/);
+  });
+
   // --- bad_input short-circuit (runAwsCall returns before spawning) ---
 
   it("returns ok:false with undefined rawBody when validation fails before any subprocess", async () => {
