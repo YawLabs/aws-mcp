@@ -229,6 +229,17 @@ export const REAL_CLI_CAPTURES = {
   ]),
 
   /**
+   * An ordinary API answer, not a model gap: FilterLogEvents refused by IAM.
+   * Exit 254 on 2.34.3, and errors.ts reads the principal and the action out of
+   * this text. The scenario that serves it exists to prove the startFromHead
+   * fallback does NOT fire for a failure the service really returned.
+   */
+  accessDeniedStderr: captured([
+    "",
+    "aws: [ERROR]: An error occurred (AccessDeniedException) when calling the FilterLogEvents operation: User: arn:aws:iam::123456789012:user/dev is not authorized to perform: logs:FilterLogEvents on resource: arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn:log-stream: because no identity-based policy allows the logs:FilterLogEvents action",
+  ]),
+
+  /**
    * `aws logs tail /stub/basic --format json --since 1h --output json` on
    * 2.34.3: 639 bytes, exit 0 -- what aws_logs_tail wrapped until 2.4.0. Not
    * NDJSON and never was: `<iso-timestamp> <stream> <message>` header lines, a
@@ -394,6 +405,7 @@ export type LogsTailScenario =
   | "logs-tail_ignored_bulk"
   | "logs-tail_jsonfmt_bulk"
   | "logs-tail_echo_argv"
+  | "logs-tail_api_error"
   | "logs-tail_real_tail_text";
 
 /**
@@ -472,6 +484,10 @@ export function runLogsTailScenario(
       // The payload is what such a test reads, out of the argv log above; the
       // handler still needs a well-formed answer to get past its parser.
       return { stdout: `${JSON.stringify({ total: 0, events: [] }, null, 4)}\n`, stderr: "", exitCode: 0 };
+    case "logs-tail_api_error":
+      // A real answer from the service. The handler must report it at once: a
+      // whole-window retry would cost another CLI start and fail the same way.
+      return { stdout: "", stderr: REAL_CLI_CAPTURES.accessDeniedStderr, exitCode: 254 };
     case "logs-tail_real_tail_text":
       return { stdout: REAL_CLI_CAPTURES.tailFormatJsonStdout, stderr: "", exitCode: 0 };
   }

@@ -1227,6 +1227,7 @@ async function main(): Promise<void> {
     case "logs-tail_ignored_bulk":
     case "logs-tail_jsonfmt_bulk":
     case "logs-tail_echo_argv":
+    case "logs-tail_api_error":
     case "logs-tail_real_tail_text": {
       // aws_logs_tail's FilterLogEvents scenarios. The datasets, the verbatim
       // real-CLI captures and the emulator live in logs-tail-fake.ts, which is

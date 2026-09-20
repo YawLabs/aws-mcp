@@ -416,6 +416,18 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
       "precondition: the scenario serves the real formatter's text",
     );
   });
+
+  it("does not mistake an ordinary API failure for a model gap", async () => {
+    // The fallback exists for one thing: a CLI whose model does not know
+    // startFromHead, which says so in its ParamValidation text. An AccessDenied is
+    // a real answer from the service, so it is reported at once -- a whole-window
+    // retry would cost another CLI start and fail the same way.
+    const r = await tail("logs-tail_api_error");
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.rawBody ?? "", /AccessDeniedException/);
+    assert.equal(invocations().length, 1, "ONE CLI call, no fallback");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -757,9 +769,9 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
 
 describe("aws_logs_tail handler -- errorKind / suggestion forwarding", () => {
   // logs.ts has exactly ONE errorKind-forwarding return: aws_logs_tail's CLI
-  // failure arm. Both scenarios below are argv-independent, so `aws logs tail`'s
-  // positional-group-name argv reaches the same fake branch aws_call does --
-  // this pins the FORWARDING, not the classifier.
+  // failure arm. Both scenarios below are argv-independent, so the
+  // filter-log-events argv reaches the same fake branch aws_call does -- this pins
+  // the FORWARDING, not the classifier.
 
   it("forwards nonzero_exit plus the parsed suggestion, which stays embedded in error too", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
@@ -786,5 +798,17 @@ describe("aws_logs_tail handler -- errorKind / suggestion forwarding", () => {
     // parseAwsError never runs -- the two fields are independent.
     assert.equal(r.suggestion, undefined);
     assert.match(r.error ?? "", /SSO session expired/);
+  });
+
+  it("carries the classifier's own remedy for a CloudWatch Logs IAM refusal", async () => {
+    // Verbatim 2.34.3 stderr for FilterLogEvents refused by IAM (exit 254), where
+    // errors.ts can name the principal and the action -- a better remedy than the
+    // generic one above, on the exact text this tool's calls produce.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_api_error";
+    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", region: "us-east-1" });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.suggestion ?? "", /lacks logs:FilterLogEvents/);
+    assert.match(r.rawBody ?? "", /AccessDeniedException/);
   });
 });
