@@ -414,9 +414,15 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 
 `npm test` runs both unit tests and integration tests. The integration suites
 spawn a local `fake-aws` subprocess that stubs the AWS CLI -- no AWS credentials
-or network access required. The only tests that need real AWS credentials are
-the live tests gated behind the `AWS_MCP_LIVE_TESTS` environment variable, which
-are skipped in a standard `npm test` run.
+or network access required. Suites named `*.realcli.test.ts` check the fake
+against the real thing: they drive the AWS CLI v2 on your `PATH` against an
+in-process endpoint on 127.0.0.1, with throwaway keys and every other address
+routed to a dead proxy, so nothing leaves the machine. The ones that need only a
+few CLI starts run on every `npm test` and skip themselves when no CLI v2 is
+installed; the ones that wait out real timeouts and retries also need
+`AWS_MCP_REAL_CLI_TESTS=1`, which `release.sh` sets. The only tests that need
+real AWS credentials are the live tests gated behind the `AWS_MCP_LIVE_TESTS`
+environment variable, which are skipped in a standard `npm test` run.
 
 ## License
 
