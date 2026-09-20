@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { AwsCallResult } from "../aws-cli.js";
 import { _resetSession } from "../session.js";
 import {
+  CURSOR_MAX_LEN,
   extractProgressFields,
   isValidIdentifier,
   isValidOpaqueToken,
@@ -14,6 +15,7 @@ import {
   TERMINAL_STATUSES,
   TYPE_NAME_RE,
   validateCursorToken,
+  validateOpaqueToken,
 } from "./resource.js";
 import type { ToolContext } from "./tool.js";
 
@@ -105,6 +107,18 @@ describe("isValidIdentifier", () => {
     assert.equal(isValidIdentifier("has\nnewline"), false);
     assert.equal(isValidIdentifier("has\ttab"), false);
   });
+
+  it("rejects the paramfile prefixes the CLI would expand, and nothing wider", () => {
+    // These predicates are documented as argv-safety checks and cited as such
+    // from script.ts, so "valid" has to mean the CLI will send the value rather
+    // than a local file's contents. The true cases are what the CLI passes
+    // through literally -- an identifier may legitimately contain "file".
+    assert.equal(isValidIdentifier("file://~/.aws/credentials"), false);
+    assert.equal(isValidIdentifier("fileb://x"), false);
+    assert.ok(isValidIdentifier("FILE://x"));
+    assert.ok(isValidIdentifier("my-file-bucket"));
+    assert.ok(isValidIdentifier("key1:value1|key2:value2"));
+  });
 });
 
 describe("isValidOpaqueToken", () => {
@@ -123,20 +137,50 @@ describe("isValidOpaqueToken", () => {
     assert.equal(isValidOpaqueToken("-token"), false);
     assert.equal(isValidOpaqueToken("bad\x01"), false);
   });
+
+  it("rejects the paramfile prefixes", () => {
+    assert.equal(isValidOpaqueToken("file://x"), false);
+    assert.equal(isValidOpaqueToken("fileb://x"), false);
+    assert.ok(isValidOpaqueToken("FILE://x"));
+  });
+});
+
+describe("validateOpaqueToken", () => {
+  it("names the field and the paramfile reason, not the shape rules", () => {
+    // A `file://` token fails for a different reason than a malformed one, and
+    // "must be 1-128 chars" would send the reader looking for a length problem.
+    assert.match(validateOpaqueToken("file://x", "clientToken") ?? "", /^Invalid clientToken: must not start with/);
+    assert.match(validateOpaqueToken("file://x", "clientToken") ?? "", /contents of a local file/);
+    assert.match(validateOpaqueToken("fileb://x", "requestToken") ?? "", /^Invalid requestToken: must not start with/);
+  });
+
+  it("still reports the shape rules for an ordinary bad token", () => {
+    assert.match(validateOpaqueToken("-evil", "clientToken") ?? "", /Must be 1-128 chars/);
+  });
 });
 
 describe("validateCursorToken", () => {
   // Pagination cursors are NOT RequestToken/ClientToken: AWS documents
-  // ListResources NextToken at up to 2048 chars, and real ones are base64
-  // blobs well past 128. Validating them with the 128-char opaque-token
-  // guard rejected page 2 of every list on entirely expected input.
+  // ListResources NextToken (HandlerNextToken) at up to 4096 chars, and the
+  // CLI wraps a raw token as base64 JSON for --starting-token, which turns a
+  // 4096-char token into 5,484. Validating them with the 128-char opaque-token
+  // guard rejected page 2 of every list on entirely expected input, and 2048
+  // was the same failure one limit higher.
   it("accepts a cursor longer than the 128-char opaque-token cap", () => {
     assert.equal(validateCursorToken("a".repeat(600), "nextToken"), null);
     assert.equal(validateCursorToken("a".repeat(2048), "nextToken"), null);
   });
 
-  it("still rejects over-2048, empty, leading-hyphen, and control chars", () => {
-    assert.match(validateCursorToken("a".repeat(2049), "nextToken") ?? "", /Invalid nextToken/);
+  it("accepts the documented 4096-char NextToken, its wrapped form, and the 8192 boundary", () => {
+    assert.equal(validateCursorToken("a".repeat(2049), "nextToken"), null, "the old 2048 cap is gone");
+    assert.equal(validateCursorToken("a".repeat(4096), "nextToken"), null, "AWS's documented maximum");
+    assert.equal(validateCursorToken("a".repeat(5484), "startingToken"), null, "4096 wrapped as base64 JSON");
+    assert.equal(validateCursorToken("a".repeat(CURSOR_MAX_LEN), "nextToken"), null);
+  });
+
+  it("still rejects over-8192, empty, leading-hyphen, and control chars", () => {
+    assert.match(validateCursorToken("a".repeat(CURSOR_MAX_LEN + 1), "nextToken") ?? "", /Invalid nextToken/);
+    assert.match(validateCursorToken("a".repeat(CURSOR_MAX_LEN + 1), "nextToken") ?? "", /1-8192/);
     assert.match(validateCursorToken("", "nextToken") ?? "", /Invalid nextToken/);
     assert.match(validateCursorToken("-bad", "nextToken") ?? "", /Invalid nextToken/);
     assert.match(validateCursorToken("bad\x01", "nextToken") ?? "", /Invalid nextToken/);
@@ -144,6 +188,14 @@ describe("validateCursorToken", () => {
 
   it("names the field it was given", () => {
     assert.match(validateCursorToken("-bad", "startingToken") ?? "", /Invalid startingToken/);
+  });
+
+  it("rejects a paramfile cursor with the field named", () => {
+    assert.match(validateCursorToken("file://x", "nextToken") ?? "", /^Invalid nextToken: must not start with/);
+    assert.match(
+      validateCursorToken("fileb://x", "startingToken") ?? "",
+      /^Invalid startingToken: must not start with/,
+    );
   });
 });
 

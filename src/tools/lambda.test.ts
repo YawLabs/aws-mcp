@@ -16,13 +16,13 @@
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
-import { lambdaTools } from "./lambda.js";
+import { invokeChildEnv, invokeTimeouts, lambdaTools } from "./lambda.js";
 
 const tool = lambdaTools.find((t) => t.name === "aws_lambda_invoke");
 if (!tool) throw new Error("lambdaTools missing aws_lambda_invoke");
@@ -30,14 +30,39 @@ if (!tool) throw new Error("lambdaTools missing aws_lambda_invoke");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
+// A private temp root for this process, set before anything calls the handler.
+//
+// node --test runs each test FILE in its own process, in PARALLEL, and this file
+// and lambda.realcli.test.ts both drive lambda.ts's
+// mkdtempSync(join(tmpdir(), "aws-mcp-lambda-")) -- so a scan of the machine
+// temp dir sees the other process's scratch dirs appear and vanish mid-assertion.
+// With AWS_MCP_REAL_CLI_TESTS=1 (release.sh's test step) that failed 2 runs in 3
+// here, reported as "aws_lambda_invoke leaks a temp directory". os.tmpdir()
+// re-reads TEMP/TMP (win32) / TMPDIR (POSIX) on every call, so pointing them at
+// a private root makes both the handler's dirs and the scan below process-local.
+// The root's own prefix deliberately does NOT start with "aws-mcp-lambda-".
+const TMP_ROOT = mkdtempSync(join(tmpdir(), "aws-mcp-lambdatests-"));
+const TMP_SNAPSHOT = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+process.env.TEMP = TMP_ROOT;
+process.env.TMP = TMP_ROOT;
+process.env.TMPDIR = TMP_ROOT;
+
+after(() => {
+  for (const [key, value] of Object.entries(TMP_SNAPSHOT)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(TMP_ROOT, { recursive: true, force: true });
+});
+
 /**
  * The handler's own scratch directories, by the prefix mkdtempSync is given.
  *
  * Used as a before/after set comparison rather than a bare count so an
  * unrelated leftover from a previous run cannot turn into a false failure. Safe
- * against interference from sibling test FILES because nothing else in the
- * suite creates this prefix, and node:test runs the subtests within one file
- * sequentially.
+ * against interference from sibling test FILES because the scan is confined to
+ * this process's private temp root (above), and node:test runs the subtests
+ * within one file sequentially.
  */
 function lambdaTmpDirs(): string[] {
   return readdirSync(tmpdir())
@@ -54,7 +79,14 @@ type InvokeData = {
   logTail?: string;
   payloadTruncated?: boolean;
 };
-type InvokeResult = { ok: boolean; data?: InvokeData; error?: string; errorKind?: string; rawBody?: string };
+type InvokeResult = {
+  ok: boolean;
+  data?: InvokeData;
+  error?: string;
+  errorKind?: string;
+  rawBody?: string;
+  suggestion?: string;
+};
 
 let counter = 0;
 
@@ -130,9 +162,79 @@ describe("aws_lambda_invoke — declared annotations", () => {
   });
 });
 
+describe("aws_lambda_invoke — invoke timers and child environment (pure)", () => {
+  // Both helpers are exported for exactly this: the relationship between the
+  // three timers, and which spelling of AWS_MAX_ATTEMPTS wins, are the fix for a
+  // function being invoked three times. Pinning them here costs nothing, where
+  // driving the same ground through real timers costs minutes.
+
+  it("gives the CLI 10s more than the caller asked for, and keeps the kill 5s behind that", () => {
+    assert.deepEqual(invokeTimeouts(undefined), { waitS: 60, readTimeoutS: 70, spawnTimeoutMs: 75_000 });
+    assert.deepEqual(invokeTimeouts(900_000), { waitS: 900, readTimeoutS: 910, spawnTimeoutMs: 915_000 });
+    // Sub-second values round UP, so readTimeoutS can never be 0: to the CLI,
+    // `--cli-read-timeout 0` means block forever, which would leave our kill as
+    // the only bound and lose the URL the CLI's message carries.
+    assert.deepEqual(invokeTimeouts(300), { waitS: 1, readTimeoutS: 11, spawnTimeoutMs: 16_000 });
+  });
+
+  it("clamps to Lambda's 15-minute synchronous ceiling, the value that overflowed a Node timer included", () => {
+    for (const ms of [3_600_000, 3_000_000_000]) {
+      const t = invokeTimeouts(ms);
+      assert.equal(t.waitS, 900, `${ms} was not clamped`);
+      assert.equal(t.readTimeoutS, 910);
+      assert.equal(t.spawnTimeoutMs, 915_000);
+      // Not only honesty about what Lambda will do: Node fires a setTimeout
+      // longer than 2^31-1 ms after 1 ms instead, so an unclamped 3e9 timed the
+      // call out immediately.
+      assert.ok(t.spawnTimeoutMs < 2_147_483_647);
+    }
+  });
+
+  it("falls back to the default for a value the input schema would have refused", () => {
+    // Defense in depth, like the handler's own validation: the MCP layer rejects
+    // these, an in-process caller does not.
+    for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.deepEqual(invokeTimeouts(bad), { waitS: 60, readTimeoutS: 70, spawnTimeoutMs: 75_000 }, `${bad}`);
+    }
+  });
+
+  it("sets AWS_MAX_ATTEMPTS=1 and drops every other spelling of it", () => {
+    // Windows env names are case-insensitive but a JS object's keys are not, and
+    // the runtimes disagree about which duplicate a child sees: Node hands over
+    // the upper-case one, oam the last key in the object. Deleting the variants
+    // is what makes "the invoke is sent once" hold on both.
+    const base: NodeJS.ProcessEnv = {
+      PATH: "p",
+      aws_max_attempts: "5",
+      Aws_Max_Attempts: "7",
+      AWS_MAX_ATTEMPTS: "9",
+    };
+    assert.deepEqual(invokeChildEnv(base), { PATH: "p", AWS_MAX_ATTEMPTS: "1" });
+    // The input is left alone: the caller hands in process.env itself.
+    assert.deepEqual(base, { PATH: "p", aws_max_attempts: "5", Aws_Max_Attempts: "7", AWS_MAX_ATTEMPTS: "9" });
+  });
+});
+
 describe("aws_lambda_invoke — input validation (no subprocess)", () => {
   // These reject before any spawn, so they need no fake wiring at all. That is
   // itself part of the contract: a bad functionName must never reach argv.
+  //
+  // Hazard rule, the same one paginate.test.ts and resource.integration.test.ts
+  // follow: pin a command that cannot exist, so a regression in any validator
+  // below fails to SPAWN instead of invoking Lambda under the developer's own
+  // profile. Without it runAwsCall falls back to the bare name `aws`
+  // (`opts.command ?? envCommand ?? "aws"`) and resolves it on PATH -- verified:
+  // a validation-passing input from this describe's ambient environment reached
+  // the installed CLI. Only `file://` and `fileb://` values have a second line
+  // of defence in runAwsCall; a name past the length cap, or a qualifier with
+  // `/` or `:`, has none.
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary__";
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+  });
 
   it("rejects a missing functionName", async () => {
     const r = (await tool.handler({})) as InvokeResult;
@@ -149,10 +251,13 @@ describe("aws_lambda_invoke — input validation (no subprocess)", () => {
     assert.match(r.error ?? "", /Invalid functionName/);
   });
 
-  it("rejects a functionName past the 170-char ARN maximum", async () => {
-    const r = (await tool.handler({ functionName: "a".repeat(171) })) as InvokeResult;
+  it("rejects a functionName past the 256-char Invoke maximum", async () => {
+    // 257, not 171: the accepting half of this bound is at the fake (see the
+    // maxima test in the result-shaping suite), and the pin above is what keeps
+    // a regression here from spawning anything.
+    const r = (await tool.handler({ functionName: "a".repeat(257) })) as InvokeResult;
     assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /170-char maximum/);
+    assert.match(r.error ?? "", /256-char maximum/);
   });
 
   it("rejects a qualifier that would pose as a flag", async () => {
@@ -170,6 +275,19 @@ describe("aws_lambda_invoke — input validation (no subprocess)", () => {
       const r = (await tool.handler({ functionName: "fn", qualifier })) as InvokeResult;
       assert.equal(r.ok, false, `accepted a ${qualifier.length}-char qualifier`);
       assert.match(r.error ?? "", /must be 1-128 characters/);
+      assert.equal(r.errorKind, undefined);
+    }
+  });
+
+  it("rejects a qualifier that leads with a dot or could become a paramfile reference", async () => {
+    // `.` is in the charset now, for $LATEST.PUBLISHED -- but only inside the
+    // value. `:` and `/` stay out precisely so a qualifier can never spell
+    // `file://`: the CLI would replace it with the contents of that local file
+    // (verified), and a qualifier is a value a prompt can reach.
+    for (const qualifier of [".x", ".", "file://x", "fileb://x", "a/b", "a:b"]) {
+      const r = (await tool.handler({ functionName: "fn", qualifier })) as InvokeResult;
+      assert.equal(r.ok, false, `accepted the qualifier ${JSON.stringify(qualifier)}`);
+      assert.match(r.error ?? "", /Invalid qualifier/);
       assert.equal(r.errorKind, undefined);
     }
   });
@@ -235,6 +353,11 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
     assert.equal(r.errorKind, "nonzero_exit");
     assert.match(r.error ?? "", /ResourceNotFoundException/);
     assert.match(r.rawBody ?? "", /Function not found/);
+    // AWS_MAX_ATTEMPTS=1 makes the CLI write "(reached max retries: 0)" on every
+    // Lambda service error, which used to defeat the classifier's pattern and
+    // cost the most common Lambda mistake there is its remedy. The fake prints
+    // that captured shape, so this is what holds errors.ts to it.
+    assert.match(r.suggestion ?? "", /Verify the resource identifier/);
   });
 
   it("maps an empty outfile to a null payload", async () => {
@@ -319,8 +442,8 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
       qualifier: "a".repeat(128),
     })) as InvokeResult;
     assert.equal(maxQualifier.ok, true, `rejected a 128-char qualifier: ${maxQualifier.error}`);
-    const maxName = (await tool.handler({ functionName: "a".repeat(170) })) as InvokeResult;
-    assert.equal(maxName.ok, true, `rejected a 170-char functionName: ${maxName.error}`);
+    const maxName = (await tool.handler({ functionName: "a".repeat(256) })) as InvokeResult;
+    assert.equal(maxName.ok, true, `rejected a 256-char functionName: ${maxName.error}`);
   });
 });
 
@@ -348,6 +471,7 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
   function readEcho(): {
     argv: string[];
     payloadFile: string | null;
+    env: { AWS_MAX_ATTEMPTS: string | null };
     dirMode: number | null;
     outfileMode: number | null;
     payloadFileMode: number | null;
@@ -392,6 +516,17 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     assert.equal(payloadFile, JSON.stringify({ hello: "world" }));
   });
 
+  it("accepts $LATEST.PUBLISHED and puts it on argv verbatim", async () => {
+    // Wired at the fake because this qualifier now PASSES validation: an unwired
+    // call would spawn the real `aws`. It is what an unqualified invoke resolves
+    // to on Lambda Managed Instances, and the pattern used to refuse it over the
+    // dot alone.
+    const r = (await tool.handler({ functionName: "my-fn", qualifier: "$LATEST.PUBLISHED" })) as InvokeResult;
+    assert.equal(r.ok, true, `rejected $LATEST.PUBLISHED: ${r.error}`);
+    const { argv } = readEcho();
+    assert.equal(argv[argv.indexOf("--qualifier") + 1], "$LATEST.PUBLISHED");
+  });
+
   it("omits --payload entirely when no payload was given", async () => {
     await tool.handler({ functionName: "my-fn" });
     const { argv, payloadFile } = readEcho();
@@ -434,6 +569,43 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     assert.equal(payloadFileMode, 0o600, `expected payload file 0600, got ${payloadFileMode?.toString(8)}`);
   });
 
+  it("gives the CLI a --cli-read-timeout derived from timeoutMs, ahead of the outfile", async () => {
+    // Without this flag the CLI's own 60s socket read timeout bounded the wait,
+    // and its retry logic then RE-SENT the Invoke -- three runs of the function
+    // for one tool call. The value is the caller's wait plus 10s of slack.
+    const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+    assert.equal(r.ok, true);
+    const { argv } = readEcho();
+    const flagIdx = argv.indexOf("--cli-read-timeout");
+    assert.ok(flagIdx > 0, "--cli-read-timeout is on argv");
+    assert.equal(argv[flagIdx + 1], "70", "default 60s wait + 10s slack");
+    // The outfile positional has to stay last in extraFlags, directly before the
+    // --output runAwsCall appends, so the new flag goes in front of it.
+    assert.ok(flagIdx < argv.indexOf("--output") - 1, "the flag sits before the outfile positional");
+  });
+
+  it("scales the read timeout with timeoutMs", async () => {
+    await tool.handler({ functionName: "my-fn", timeoutMs: 120_000 });
+    const { argv } = readEcho();
+    assert.equal(argv[argv.indexOf("--cli-read-timeout") + 1], "130");
+  });
+
+  it("runs the CLI with AWS_MAX_ATTEMPTS=1 even when the parent environment says otherwise", async () => {
+    // The env var beats a `max_attempts` in the caller's profile, and this proves
+    // the handler's own copy beats whatever the server process inherited -- an
+    // operator shell exporting 10 must not turn one invoke into ten runs.
+    const prior = process.env.AWS_MAX_ATTEMPTS;
+    process.env.AWS_MAX_ATTEMPTS = "10";
+    try {
+      const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+      assert.equal(r.ok, true);
+    } finally {
+      if (prior === undefined) delete process.env.AWS_MAX_ATTEMPTS;
+      else process.env.AWS_MAX_ATTEMPTS = prior;
+    }
+    assert.equal(readEcho().env.AWS_MAX_ATTEMPTS, "1");
+  });
+
   it("keeps the payload out of the command string returned to the model", async () => {
     const r = (await tool.handler({
       functionName: "my-fn",
@@ -456,6 +628,7 @@ describe("aws_lambda_invoke — temp files are cleaned up on every path", () => 
     delete process.env.AWS_MCP_TEST_AWS_COMMAND;
     delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
     delete process.env.AWS_MCP_FAKE_SCENARIO;
+    delete process.env.AWS_MCP_TEST_LAMBDA_SPAWN_TIMEOUT_MS;
     _resetSession();
   });
 
@@ -480,11 +653,22 @@ describe("aws_lambda_invoke — temp files are cleaned up on every path", () => 
     // timeout branch is what settles the call. runAwsCall RESOLVES its envelope
     // rather than rejecting, so the handler's finally block still runs -- that
     // is the property under test.
+    //
+    // timeoutMs no longer bounds the spawn: it bounds the FUNCTION, and the kill
+    // sits 15s behind it, so a hang here would take 16s. The test-only override
+    // is what keeps this case fast (and is the same knob the real-CLI suite uses
+    // in the opposite direction, to guarantee the CLI reports first).
     process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_hang";
+    process.env.AWS_MCP_TEST_LAMBDA_SPAWN_TIMEOUT_MS = "300";
     const before = lambdaTmpDirs();
     const r = (await tool.handler({ functionName: "my-fn", timeoutMs: 300 })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "timeout");
+    // A kill leaves nothing to read the URL out of, so the message must claim
+    // neither "sent" nor "not sent" -- while still saying the one thing that is
+    // certain, which is what makes a retry decision possible at all.
+    assert.match(r.error ?? "", /may or may not have been sent/);
+    assert.match(r.error ?? "", /not sent more than once/);
     assert.deepEqual(lambdaTmpDirs(), before);
   });
 
@@ -529,6 +713,89 @@ describe("aws_lambda_invoke — temp files are cleaned up on every path", () => 
       assert.match(r.error ?? "", pattern);
       assert.deepEqual(lambdaTmpDirs(), before);
     }
+  });
+});
+
+describe("aws_lambda_invoke — a failed invoke says whether it went out", () => {
+  // Every scenario here prints stderr captured from aws-cli 2.34.3 under
+  // AWS_MAX_ATTEMPTS=1, and each fake refuses (exit 2) to run without that
+  // variable set -- so these cases also prove the handler sets it. They are the
+  // regression tests for the two claims a model acts on: whether the function may
+  // have run, and whether retrying is safe.
+
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    _resetSession();
+  });
+
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    _resetSession();
+  });
+
+  it("remaps a read timeout on the INVOKE url to timeout, and says the function may still be running", async () => {
+    // The CLI exits 255 on its own read timeout, so before this the caller got
+    // `nonzero_exit` and a bare "Read timeout on endpoint URL" -- the same shape
+    // whether the function ran or not.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_read_timeout";
+    const before = lambdaTmpDirs();
+    const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "timeout", "no answer in time is a timeout whichever clock reported it");
+    assert.match(r.error ?? "", /sent once and not retried/);
+    assert.match(r.error ?? "", /may still be running/);
+    // The README invariant for `suggestion`: also at the end of `error`, because
+    // toMcpResult does not render the field separately.
+    assert.ok(r.suggestion);
+    assert.ok(r.error?.endsWith(`Suggestion: ${r.suggestion}`), "the suggestion is repeated at the end of error");
+    assert.match(r.suggestion ?? "", /aws_logs_tail/);
+    // The CLI's own text is kept for diagnosis rather than replaced by ours.
+    assert.match(r.rawBody ?? "", /Read timeout on endpoint URL/);
+    assert.deepEqual(lambdaTmpDirs(), before, "the scratch dir is still cleaned up on this path");
+  });
+
+  it("reports a read timeout on a CREDENTIAL endpoint as not invoked, naming the endpoint", async () => {
+    // The main finding of this fix's review: --cli-read-timeout also bounds the
+    // CLI's credential calls, so a hung STS endpoint for a role_arn profile
+    // produces the identical sentence with ZERO Invoke requests. Calling that
+    // "the function may still be running" would stop a model retrying a call that
+    // never ran.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_sts_read_timeout";
+    const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "timeout");
+    assert.match(r.error ?? "", /was not invoked/);
+    assert.match(r.error ?? "", /sts\.us-east-1/, "the unanswered endpoint is named");
+    assert.doesNotMatch(r.error ?? "", /may still be running/);
+    assert.match(r.suggestion ?? "", /Retrying is safe/);
+  });
+
+  it("surfaces a throttle on the first failure, with the backoff remedy intact", async () => {
+    // Deliberate behavior change: the CLI used to re-send a 429 silently, which
+    // was safe for a throttle but is the same switch that re-sent invokes that
+    // HAD reached the function. The remedy has to survive the
+    // "(reached max retries: 0)" infix AWS_MAX_ATTEMPTS=1 adds.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_throttled";
+    const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.error ?? "", /TooManyRequestsException/);
+    assert.match(r.suggestion ?? "", /Reduce request rate/);
+  });
+
+  it("surfaces a dropped connection with the check-before-retrying remedy", async () => {
+    // Sent three times on the CLI's defaults, and every re-send of an invoke
+    // that reached Lambda is another run. The remedy comes from errors.ts, which
+    // had no pattern for any transport failure before.
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_connection_closed";
+    const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.error ?? "", /Connection was closed/);
+    assert.match(r.suggestion ?? "", /may or may not have taken effect/);
   });
 });
 

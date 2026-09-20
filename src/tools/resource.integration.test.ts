@@ -629,6 +629,51 @@ describe("resource verbs -- initial ccapiCall failure (ccapiFailure + rawBodyOf)
     assert.equal(r.errorKind, undefined);
     assert.equal(r.suggestion, undefined);
   });
+
+  // The two paramfile handler cases. Both pin a command that cannot exist, per
+  // the hazard rule: a regression in the validators would otherwise spawn the
+  // DEVELOPER's real aws under their real profile and hand their credentials
+  // file to AWS as the identifier. The path does not exist either, so even a
+  // spawn that somehow happened would read nothing.
+  const withNoBinary = (): void => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = "__no_such_binary__";
+    _resetSession();
+  };
+  const clearNoBinary = (): void => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    _resetSession();
+  };
+
+  it("leaves errorKind UNSET when aws_resource_status rejects a file:// requestToken", async () => {
+    withNoBinary();
+    try {
+      const r = await statusRes.handler({ requestToken: "file://fileuri-definitely-missing" });
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /must not start with 'file:\/\//);
+      // Same contract as the leading-hyphen reject above: the tool's own input
+      // validation classifies nothing, so an ABSENT errorKind is the answer.
+      assert.equal(r.errorKind, undefined);
+      assert.equal(r.suggestion, undefined);
+    } finally {
+      clearNoBinary();
+    }
+  });
+
+  it("leaves errorKind UNSET when aws_resource_get rejects a file:// identifier", async () => {
+    withNoBinary();
+    try {
+      const r = await getRes.handler({
+        typeName: "AWS::S3::Bucket",
+        identifier: "file://fileuri-definitely-missing",
+      });
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /^Invalid identifier: must not start with 'file:\/\//);
+      assert.equal(r.errorKind, undefined);
+      assert.equal(r.suggestion, undefined);
+    } finally {
+      clearNoBinary();
+    }
+  });
 });
 
 describe("propertiesRaw survives an unparseable CCAPI Properties string", () => {

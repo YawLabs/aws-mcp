@@ -376,10 +376,55 @@ if (duplicateToolNames.length > 0) {
   );
 }
 
+/**
+ * Ask Windows to stop searching the current directory when it resolves a bare
+ * executable name, unless the host already asked.
+ *
+ * Without `NoDefaultCurrentDirectoryInExePath`, Windows looks in the process's
+ * current directory BEFORE `PATH`, so an `aws.exe` sitting in whatever
+ * directory the host started this server in -- often the open project -- runs
+ * instead of the AWS CLI, with the caller's AWS environment. Measured through
+ * the shipped `runAwsCall` on Node 22.22.2: a planted copy of node.exe named
+ * `aws.exe` ran; oam 0.16.2 never searched the working directory. Claude Code
+ * sets the variable for itself, but hosts on the MCP SDK's default stdio
+ * transport commonly pass only a short list of variables that does not include
+ * it, and start the server in their own working directory.
+ *
+ * Setting it at run time is enough, and it is enough for the `aws` children
+ * too: Windows evaluates the setting in the PARENT at spawn time, so a child
+ * given an explicit `env` that omits the variable is still covered (verified on
+ * Node 22.22.2 -- the planted binary ran with the variable deleted and the real
+ * CLI ran once it was assigned). The CLI's own helpers inherit the variable
+ * through the environment, so a planted `session-manager-plugin.exe` no longer
+ * resolves from the working directory either.
+ *
+ * `env` and `platform` are parameters so the unit tests can drive both branches
+ * on any host. The existing-value check upper-cases every key rather than
+ * reading one spelling: a plain object is case-sensitive where win32's own
+ * `process.env` is not, and a host may have set any casing.
+ *
+ * 2.4.0's absolute-path resolver makes this redundant for the calls this server
+ * makes itself. It stays as defense in depth, and because it also covers the
+ * bare names the CLI resolves.
+ */
+export function hardenWindowsExeSearch(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform !== "win32") return;
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === "NODEFAULTCURRENTDIRECTORYINEXEPATH") return;
+  }
+  env.NoDefaultCurrentDirectoryInExePath = "1";
+}
+
 // Only bootstrap the stdio server when run as the bin entry point. When the
 // module is imported (e.g. by index.test.js for toMcpResult/errorToMcpResult),
 // skip connecting a transport and printing the ready line.
 if (isEntryPoint) {
+  // First, before any tool can spawn anything.
+  hardenWindowsExeSearch();
+
   const server = new McpServer({
     name: "@yawlabs/aws-mcp",
     version,

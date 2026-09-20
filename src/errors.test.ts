@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { classifyAuthError, parseAwsError } from "./errors.js";
+import { classifyAuthError, parseAwsError, READ_TIMEOUT_RE } from "./errors.js";
 
 describe("classifyAuthError — message text only, err.name is not consulted", () => {
   // The classifier used to have three branches keyed on AWS SDK error CLASS
@@ -404,6 +404,109 @@ describe("parseAwsError -- standard CLI shape", () => {
   });
 });
 
+describe("parseAwsError -- retry-exhausted and CRLF-terminated CLI messages", () => {
+  // Every string in this describe is a VERBATIM capture from a real AWS CLI
+  // driven through runAwsCall against a loopback stub -- not a hand-written
+  // approximation -- because both defects here are about characters the fake
+  // CLI never emitted: the " (reached max retries: N)" infix botocore adds once
+  // it stops retrying, and the CRLF the Windows CLI writes before its
+  // "Additional error details:" block.
+
+  // Stub answering 400 Throttling, three requests each. The first two are the
+  // same failure on the two CLIs (2.34.3 wraps it in its enhanced format,
+  // 2.22.0 in the legacy one); the third is what AWS_MAX_ATTEMPTS=1 produces,
+  // where botocore marks MaxAttemptsReached on the very first failure.
+  const RETRY_EXHAUSTED_CAPTURES: { label: string; stderr: string; retries: number }[] = [
+    {
+      label: "2.34.3, enhanced error format",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (Throttling) when calling the GetCallerIdentity operation (reached max retries: 2): Rate exceeded\r\n\r\nAdditional error details:\r\nType: Sender\r\n",
+      retries: 2,
+    },
+    {
+      label: "2.22.0, legacy error format",
+      stderr:
+        "\r\nAn error occurred (Throttling) when calling the GetCallerIdentity operation (reached max retries: 2): Rate exceeded\r\n",
+      retries: 2,
+    },
+    {
+      label: "AWS_MAX_ATTEMPTS=1, so zero retries",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (Throttling) when calling the GetCallerIdentity operation (reached max retries: 0): Rate exceeded\r\n",
+      retries: 0,
+    },
+  ];
+
+  it("pulls code, operation and the retry count out of every captured retry-exhausted throttle", () => {
+    for (const { label, stderr, retries } of RETRY_EXHAUSTED_CAPTURES) {
+      const r = parseAwsError(stderr);
+      assert.equal(r.code, "Throttling", label);
+      assert.equal(r.operation, "GetCallerIdentity", label);
+      assert.equal(r.retries, retries, label);
+      // The message stops at the blank line, CRLF or not -- the enhanced
+      // capture's "Additional error details:" block must not be in it.
+      assert.equal(r.message, "Rate exceeded", label);
+      assert.match(r.suggestion ?? "", /retry with backoff/, label);
+    }
+  });
+
+  it("says how many times the CLI had already retried, and says nothing when it had not", () => {
+    const [enhanced, legacy, zero] = RETRY_EXHAUSTED_CAPTURES.map((c) => parseAwsError(c.stderr));
+    assert.match(enhanced.suggestion ?? "", /already retried 2 times/);
+    assert.match(legacy.suggestion ?? "", /already retried 2 times/);
+    // Not "0 times", and not "1 time" either: with nothing retried the clause
+    // is absent, so the suggestion is byte-identical to the pre-2.3.3 one.
+    assert.equal(zero.suggestion, "Reduce request rate or retry with backoff.");
+  });
+
+  it("uses the singular for a single retry", () => {
+    const r = parseAwsError(
+      "An error occurred (TooManyRequestsException) when calling the Invoke operation (reached max retries: 1): Rate Exceeded.",
+    );
+    assert.equal(r.retries, 1);
+    assert.match(r.suggestion ?? "", /already retried 1 time\./);
+  });
+
+  it("leaves retries absent when the CLI did not report any", () => {
+    // The infix is optional, so a plain message must still parse -- and must
+    // not pick up a retry count from prose inside the message.
+    const r = parseAwsError(
+      "An error occurred (Throttling) when calling the GetCallerIdentity operation: Rate exceeded (reached max retries: 9)",
+    );
+    assert.equal(r.retries, undefined);
+    assert.equal(r.suggestion, "Reduce request rate or retry with backoff.");
+  });
+
+  it("stops a CRLF-terminated message before the CLI's 'Additional error details' block", () => {
+    // Captured from 2.34.3 with a stub answering 403 InvalidClientTokenId.
+    // Latent before 2.3.3 (only `suggestion` was consumed), but the parsed
+    // message is what a caller reads once anything surfaces it.
+    const r = parseAwsError(
+      "\r\naws: [ERROR]: An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: The security token included in the request is invalid.\r\n\r\nAdditional error details:\r\nType: Sender\r\n",
+    );
+    assert.equal(r.code, "InvalidClientTokenId");
+    assert.equal(r.message, "The security token included in the request is invalid.");
+  });
+
+  it("keeps the not-found remedy on the Lambda error AWS_MAX_ATTEMPTS=1 reshapes", () => {
+    // Verbatim from lambda-invoke-probe2.out.ndjson, record `notfound_max1`
+    // (aws-cli 2.34.3, `aws lambda invoke` with AWS_MAX_ATTEMPTS=1 against a
+    // stub answering ResourceNotFoundException). aws_lambda_invoke sets that
+    // variable so an invoke is sent at most once, which makes the CLI print
+    // "(reached max retries: 0)" on EVERY Lambda service error -- so without
+    // the infix in the pattern this suggestion would go missing on the most
+    // common Lambda mistake there is.
+    const r = parseAwsError(
+      "\r\naws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the Invoke operation (reached max retries: 0): Function not found: arn:aws:lambda:us-east-1:123456789012:function:notfound\r\n\r\nAdditional error details:\r\nType: User\r\n",
+    );
+    assert.equal(r.code, "ResourceNotFoundException");
+    assert.equal(r.operation, "Invoke");
+    assert.equal(r.retries, 0);
+    assert.equal(r.message, "Function not found: arn:aws:lambda:us-east-1:123456789012:function:notfound");
+    assert.match(r.suggestion ?? "", /Verify the resource identifier and region/);
+  });
+});
+
 describe("parseAwsError -- not-authorized text OUTSIDE the standard wrapper", () => {
   // NOT_AUTHORIZED_RE only ever ran against the message captured INSIDE "An
   // error occurred (...) when calling ...". The same sentence also arrives
@@ -471,5 +574,71 @@ describe("parseAwsError -- non-standard shapes", () => {
 
   it("returns empty object for empty stderr", () => {
     assert.deepEqual(parseAwsError(""), {});
+  });
+});
+
+describe("parseAwsError -- transport failures", () => {
+  // Every sample is a verbatim capture from a real AWS CLI driven against a
+  // loopback stub (`lambda-invoke-probe2.out.ndjson`,
+  // `lambda-invoke-rv2-probe.out.ndjson`), in both prefix styles: 2.34.3 writes
+  // "aws: [ERROR]: " ahead of the sentence and 2.22.0 writes it bare. None of
+  // these three had a remedy before, which is how a 60-second Lambda invoke came
+  // back with nothing to act on.
+
+  it("gives a read timeout a remedy that does not claim the request was or was not re-sent", () => {
+    for (const stderr of [
+      '\r\naws: [ERROR]: Read timeout on endpoint URL: "http://127.0.0.1:28763/2015-03-31/functions/slow-6000/invocations"\r\n',
+      '\r\nRead timeout on endpoint URL: "http://127.0.0.1:28841/2015-03-31/functions/slow-4000/invocations?Qualifier=PROD"\r\n',
+    ]) {
+      const r = parseAwsError(stderr);
+      assert.match(r.suggestion ?? "", /socket read timeout/);
+      // Generic on purpose: aws_call and every other tool reach this with the
+      // CLI's retries still ON, so only aws_lambda_invoke -- which turns them off
+      // and reads the URL itself -- may say "sent once".
+      assert.match(r.suggestion ?? "", /may already have re-sent it/);
+      assert.match(r.suggestion ?? "", /check before retrying/);
+      // There is no "An error occurred (Code)" wrapper on a transport failure.
+      assert.equal(r.code, undefined);
+      assert.equal(r.operation, undefined);
+      assert.equal(r.message, stderr.trim());
+    }
+  });
+
+  it("gives a connect timeout the network / proxy / region remedy", () => {
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: Connect timeout on endpoint URL: "http://192.0.2.1:9/2015-03-31/functions/ok/invocations"\r\n',
+    );
+    assert.match(r.suggestion ?? "", /Could not open a connection/);
+    assert.match(r.suggestion ?? "", /HTTPS_PROXY/);
+    assert.equal(r.code, undefined);
+  });
+
+  it("gives a dropped connection the may-or-may-not-have-taken-effect remedy", () => {
+    // Note the trailing "." after the quoted URL: it is in the real message, so
+    // the pattern must not expect the URL to end the line.
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: Connection was closed before we received a valid response from endpoint URL: "http://127.0.0.1:28763/2015-03-31/functions/reset/invocations".\r\n',
+    );
+    assert.match(r.suggestion ?? "", /may or may not have taken effect/);
+    assert.match(r.suggestion ?? "", /NAT gateway, firewall or proxy/);
+  });
+
+  it("does not fire on prose that merely mentions a read timeout", () => {
+    // The patterns are botocore's fmt strings, not keywords -- the whole point of
+    // anchoring on "on endpoint URL:" rather than on "read timeout".
+    const r = parseAwsError("a read timeout happened in my app");
+    assert.equal(r.suggestion, undefined);
+    assert.equal(r.message, "a read timeout happened in my app");
+  });
+
+  it("exports READ_TIMEOUT_RE with the whole line, so a caller can read the URL out of it", () => {
+    // What aws_lambda_invoke tells "the invoke was sent" from "a credential call
+    // never answered" with: this STS capture (`sts_hang_rt3`) came with ZERO
+    // Invoke requests, and the URL is the only thing that says so.
+    const m = READ_TIMEOUT_RE.exec('\r\naws: [ERROR]: Read timeout on endpoint URL: "http://127.0.0.1:28842/"\r\n');
+    assert.ok(m);
+    assert.ok(m[0].includes("http://127.0.0.1:28842/"), `matched line was ${JSON.stringify(m?.[0])}`);
+    // One line only: a multi-line blob must not let the match run past it.
+    assert.ok(!m[0].includes("\r"));
   });
 });

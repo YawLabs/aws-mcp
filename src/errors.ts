@@ -151,19 +151,60 @@ interface ParsedAwsError {
   operation?: string;
   message?: string;
   suggestion?: string;
+  // How many times the CLI had already retried before it gave up, when its
+  // message says so. RETRIES, not attempts: 0 means the first attempt was also
+  // the last. Only the throttling suggestion reads it.
+  retries?: number;
 }
 
 // `An error occurred (Code) when calling the Operation operation: Message`
-// -- the standard botocore / aws CLI shape. We bound the gap with `[\s\S]*?`
-// non-greedy so the regex can't run away on a multi-line stderr blob that
-// happens to contain another "An error occurred" later (rare; defensive).
-const STD_ERROR_RE = /An error occurred \(([^)]+)\) when calling the (\S+) operation:\s*([\s\S]*?)(?:\n\n|$)/;
+// -- the standard botocore / aws CLI shape, with two variations that both
+// defeated the earlier pattern (each reproduced against a loopback stub on
+// aws-cli 2.34.3 and 2.22.0):
+//
+//   - Once botocore stops retrying it marks the error MaxAttemptsReached, and
+//     its MSG_TEMPLATE then inserts " (reached max retries: N)" between the
+//     operation name and the colon. Requiring `operation:` immediately meant
+//     no match at all, so every retry-exhausted error -- throttling and 5xx,
+//     the cases the backoff suggestion was written for -- lost its code,
+//     operation and suggestion. The infix appears on the FIRST failure too
+//     when max_attempts is 1 (`AWS_MAX_ATTEMPTS=1`, which aws_lambda_invoke
+//     sets), and then N is 0.
+//   - The terminator accepts CRLF. On Windows the CLI separates the message
+//     from its "Additional error details:" block with "\r\n\r\n", which
+//     contains no "\n\n", so the captured message used to run on into that
+//     block.
+//
+// We bound the gap with `[\s\S]*?` non-greedy so the regex can't run away on a
+// multi-line stderr blob that happens to contain another "An error occurred"
+// later (rare; defensive).
+const STD_ERROR_RE =
+  /An error occurred \(([^)]+)\) when calling the (\S+) operation(?: \(reached max retries: (\d+)\))?:\s*([\s\S]*?)(?:\r?\n\r?\n|$)/;
 // "User: arn:aws:iam::123:user/foo is not authorized to perform: lambda:CreateFunction"
 const NOT_AUTHORIZED_RE = /User:\s*(\S+)\s*is not authorized to perform:\s*(\S+)/i;
 // "Could not connect to the endpoint URL: \"https://lambda.us-east-9.amazonaws.com/\""
 const BAD_ENDPOINT_RE = /Could not connect to the endpoint URL[:\s]+"?([^"\s]+)"?/i;
 // "Parameter validation failed: Missing required parameter ..."
 const PARAM_VALIDATION_RE = /Parameter validation failed/i;
+
+// The three transport failures, straight from botocore's own fmt strings
+// (botocore/exceptions.py): ReadTimeoutError, ConnectTimeoutError and
+// ConnectionClosedError. None of them had a remedy before, which is how a
+// 60-second Lambda invoke came back with no code, no suggestion and nothing to
+// act on.
+//
+// Unanchored because the prefix is not stable across CLIs: 2.34.3 writes
+// "aws: [ERROR]: Read timeout on endpoint URL: ..." and 2.22.0 writes the bare
+// sentence (both captured against a loopback stub).
+//
+// READ_TIMEOUT_RE takes the rest of the LINE, and is exported for that reason:
+// the message carries the full request URL, which is the only thing in it that
+// says whether the request that went unanswered was the invoke or one of the
+// CLI's own credential calls. aws_lambda_invoke reads it to decide what it can
+// honestly tell the caller.
+export const READ_TIMEOUT_RE = /Read timeout on endpoint URL:[^\r\n]*/;
+const CONNECT_TIMEOUT_RE = /Connect timeout on endpoint URL:[^\r\n]*/;
+const CONNECTION_CLOSED_RE = /Connection was closed before we received a valid response from endpoint URL/;
 
 /**
  * Best-effort structured extraction of an AWS CLI stderr blob. Returns
@@ -179,8 +220,10 @@ export function parseAwsError(stderr: string): ParsedAwsError {
   if (m) {
     const code = m[1];
     const operation = m[2];
-    const message = m[3].trim();
+    const retries = m[3] === undefined ? undefined : Number(m[3]);
+    const message = m[4].trim();
     const out: ParsedAwsError = { code, operation, message };
+    if (retries !== undefined) out.retries = retries;
     const naMatch = NOT_AUTHORIZED_RE.exec(message);
     if (naMatch) {
       out.suggestion = `Check IAM permissions: principal ${naMatch[1]} lacks ${naMatch[2]}.`;
@@ -198,7 +241,14 @@ export function parseAwsError(stderr: string): ParsedAwsError {
       code === "SlowDown" ||
       code === "ProvisionedThroughputExceededException"
     ) {
-      out.suggestion = "Reduce request rate or retry with backoff.";
+      // How many retries the CLI already spent matters to the remedy: "retry
+      // with backoff" after the CLI itself backed off twice means wait longer
+      // than a bare first-failure throttle does.
+      const alreadyRetried =
+        retries !== undefined && retries > 0
+          ? ` The AWS CLI had already retried ${retries} time${retries === 1 ? "" : "s"}.`
+          : "";
+      out.suggestion = `Reduce request rate or retry with backoff.${alreadyRetried}`;
     } else if (
       code === "ResourceNotFoundException" ||
       code === "NoSuchBucket" ||
@@ -248,6 +298,35 @@ export function parseAwsError(stderr: string): ParsedAwsError {
     return {
       message: trimmed,
       suggestion: `Could not reach endpoint ${endpointMatch[1]}. Check the region spelling and network connectivity.`,
+    };
+  }
+
+  // Transport failures. Deliberately GENERIC about retry safety, even though
+  // botocore's own wording is precise about when the request left: aws_call and
+  // every other tool reach these with the CLI's retries still ON, so "the
+  // connection was never opened, nothing ran" is false whenever an earlier
+  // attempt did open one. Only aws_lambda_invoke, which runs with
+  // AWS_MAX_ATTEMPTS=1 and reads the URL out of READ_TIMEOUT_RE, makes a
+  // sent/not-sent claim -- and it builds its own message.
+  if (READ_TIMEOUT_RE.test(trimmed)) {
+    return {
+      message: trimmed,
+      suggestion:
+        "The request was sent but no response arrived within the AWS CLI's socket read timeout (60s unless the call set another), and with default retry settings the CLI may already have re-sent it. An operation that changes state may have taken effect -- check before retrying.",
+    };
+  }
+  if (CONNECT_TIMEOUT_RE.test(trimmed)) {
+    return {
+      message: trimmed,
+      suggestion:
+        "Could not open a connection to the endpoint in time. Check network access, any proxy (HTTPS_PROXY / NO_PROXY) and the region, then retry.",
+    };
+  }
+  if (CONNECTION_CLOSED_RE.test(trimmed)) {
+    return {
+      message: trimmed,
+      suggestion:
+        "The connection dropped after the request was sent and before a response arrived, so the operation may or may not have taken effect -- check before retrying anything that changes state. A NAT gateway, firewall or proxy that drops idle connections is a common cause on long requests.",
     };
   }
 

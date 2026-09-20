@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
-import { allTools, buildToolContext, errorToMcpResult, findDuplicateToolNames, toMcpResult } from "./index.js";
+import {
+  allTools,
+  buildToolContext,
+  errorToMcpResult,
+  findDuplicateToolNames,
+  hardenWindowsExeSearch,
+  toMcpResult,
+} from "./index.js";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
@@ -402,6 +409,82 @@ describe("findDuplicateToolNames", () => {
 
   it("agrees with the live registry (which must be collision-free)", () => {
     assert.deepEqual(findDuplicateToolNames(allTools), []);
+  });
+});
+
+describe("hardenWindowsExeSearch", () => {
+  // Every case drives an explicit env object and platform rather than the real
+  // process.env, so the win32 branch is covered on any host AND the real
+  // process is never mutated by the suite. On win32 process.env is
+  // case-insensitive; a plain object is not, which is why the existing-value
+  // check upper-cases every key instead of reading one spelling.
+  const VAR = "NoDefaultCurrentDirectoryInExePath";
+
+  it("sets the variable on win32 when the host has not", () => {
+    const env: NodeJS.ProcessEnv = { PATH: "C:\\Windows\\System32" };
+
+    hardenWindowsExeSearch(env, "win32");
+
+    assert.equal(env[VAR], "1");
+    assert.deepEqual(Object.keys(env), ["PATH", VAR], "one key added, PATH untouched");
+  });
+
+  for (const key of [VAR, "NODEFAULTCURRENTDIRECTORYINEXEPATH", "nodefaultcurrentdirectoryinexepath"]) {
+    it(`leaves an existing value alone, spelled ${key}`, () => {
+      // A host that set it to "0" keeps that answer. Windows reads this variable
+      // for presence, not truth: "0", "false" and an empty value disable the
+      // working-directory search exactly as "1" does (measured on Node 22.22.2),
+      // so leaving the host's value alone is still fail-safe. The value is never
+      // re-spelled into a second key, which on a case-sensitive object would
+      // leave both.
+      const env: NodeJS.ProcessEnv = { [key]: "0" };
+
+      hardenWindowsExeSearch(env, "win32");
+
+      assert.deepEqual(env, { [key]: "0" });
+    });
+  }
+
+  it("leaves an empty existing value alone — present is present", () => {
+    // An empty value still disables the search -- and on win32 process.env an
+    // empty assignment keeps the key rather than deleting it -- so re-setting it
+    // would overrule the host for no gain. The rule is "no key upper-cases to
+    // it".
+    const env: NodeJS.ProcessEnv = { [VAR]: "" };
+
+    hardenWindowsExeSearch(env, "win32");
+
+    assert.deepEqual(env, { [VAR]: "" });
+  });
+
+  it("is a no-op off win32 — POSIX has no such variable", () => {
+    // The 2.4.0 resolver is what covers an empty or relative PATH entry on
+    // macOS and Linux; setting a Windows-only variable there would be noise in
+    // every child's environment.
+    for (const platform of ["linux", "darwin"] as const) {
+      const env: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
+
+      hardenWindowsExeSearch(env, platform);
+
+      assert.deepEqual(env, { PATH: "/usr/bin" }, `${platform} must not gain the variable`);
+    }
+  });
+
+  it("defaults to this process's env and platform", () => {
+    // The call site in index.ts passes nothing, so the defaults are the shipped
+    // behavior. Assert against the real platform rather than a fixed answer so
+    // the case is honest on every developer box.
+    const before = process.env[VAR];
+    try {
+      delete process.env[VAR];
+
+      hardenWindowsExeSearch();
+
+      assert.equal(process.env[VAR], process.platform === "win32" ? "1" : undefined);
+    } finally {
+      if (before === undefined) delete process.env[VAR];
+      else process.env[VAR] = before;
+    }
   });
 });
 

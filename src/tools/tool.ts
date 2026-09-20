@@ -34,10 +34,11 @@ export interface ToolResult {
    * AWS error code, carried structurally so a caller does not have to split it
    * back out of `error`.
    *
-   * NOT rendered by toMcpResult, deliberately. Its only producer -- runAwsCall's
-   * nonzero_exit branch -- already appends "\n\nSuggestion: <text>" to the
-   * message it builds, so rendering the field too would print the same sentence
-   * twice: the defect v2.0.1 fixed for rawBody. Its consumers are in-process
+   * NOT rendered by toMcpResult, deliberately. Its producers -- runAwsCall's
+   * nonzero_exit branch and aws_lambda_invoke's timeout remap -- both already
+   * append "\n\nSuggestion: <text>" to the message they build, so rendering the
+   * field too would print the same sentence twice: the defect v2.0.1 fixed for
+   * rawBody. Its consumers are in-process
    * ones -- the aws_script bridge attaches it to the Error it throws, so a
    * script can branch on it. A future handler that sets `suggestion` WITHOUT
    * also putting it in `error` would not surface it to the model at all; put it

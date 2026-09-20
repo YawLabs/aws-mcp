@@ -5,6 +5,8 @@ import { syncBuiltinESMExports } from "node:module";
 import { afterEach, describe, it, mock } from "node:test";
 import {
   _resetParseTestPrefixArgsDedupe,
+  isParamFileUri,
+  paramFileUriMessage,
   parseTestPrefixArgs,
   redactDisplayArgs,
   runAwsCall,
@@ -45,6 +47,56 @@ describe("SAFE_NAME_RE", () => {
 
   it("rejects empty string", () => {
     assert.doesNotMatch("", SAFE_NAME_RE);
+  });
+});
+
+describe("isParamFileUri", () => {
+  // The predicate is the CLI's own `str.startswith`, no wider. Both halves
+  // matter: too narrow and a value gets exfiltrated, too wide and the server
+  // refuses input that reaches AWS as itself while claiming the CLI would read
+  // a file. The false list below is exactly what 2.34.3 and 2.22.0 sent
+  // literally to a loopback stub.
+
+  it("matches the two prefixes the CLI expands, whatever follows", () => {
+    for (const value of [
+      "file://x",
+      "fileb://x",
+      "file://",
+      "file://~/.aws/credentials",
+      "file://$HOME/.aws/credentials",
+      "file://%USERPROFILE%/.aws/credentials",
+      "fileb://C:\\Users\\me\\.aws\\credentials",
+    ]) {
+      assert.equal(isParamFileUri(value), true, `expected ${JSON.stringify(value)} to match`);
+    }
+  });
+
+  it("does not match near misses the CLI passes through literally", () => {
+    for (const value of [
+      "FILE://x", // the match is case-sensitive
+      "File://x",
+      "FILEB://x",
+      " file://x", // and whitespace-free: a leading space survives argv
+      "\tfile://x",
+      '"file://x"', // a quoted filter pattern means the literal text
+      "file:/x", // one slash is not the prefix
+      "xfile://x",
+      "my-file-bucket",
+      "arn:aws:s3:::file-logs",
+      "https://sqs.us-east-1.amazonaws.com/123456789012/q", // a real CCAPI identifier
+      "key1:value1|key2:value2",
+      "",
+    ]) {
+      assert.equal(isParamFileUri(value), false, `expected ${JSON.stringify(value)} not to match`);
+    }
+  });
+});
+
+describe("paramFileUriMessage", () => {
+  it("names the field and says what the CLI would do", () => {
+    const msg = paramFileUriMessage("identifier");
+    assert.match(msg, /^Invalid identifier: must not start with 'file:\/\/'/);
+    assert.match(msg, /contents of a local file/);
   });
 });
 
@@ -154,6 +206,163 @@ describe("runAwsCall — input validation (no spawn)", () => {
     // it is not bad_input from the length check.
     if (!r.ok) {
       assert.notEqual(r.kind, "bad_input", "2048-char query must not be rejected by the length cap");
+    }
+  });
+
+  // The paramfile backstop. Every case below pins a command that cannot exist
+  // AND a path that does not: a regression in the guard then shows up as
+  // spawn_failure rather than sending the developer's own credentials file to
+  // real AWS through their own profile.
+  const NO_BINARY = "__no_such_binary__";
+  const MISSING = "fileuri-definitely-missing";
+
+  it("refuses a file:// extraFlags value and names the flag it belongs to", async () => {
+    const r = await runAwsCall({
+      service: "cloudcontrol",
+      operation: "get-resource",
+      extraFlags: ["--type-name", "AWS::S3::Bucket", "--identifier", `file://${MISSING}`],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /the value of --identifier/);
+    assert.match(r.error, /file:\/\//);
+  });
+
+  it("refuses the fileb:// form the same way", async () => {
+    const r = await runAwsCall({
+      service: "cloudcontrol",
+      operation: "get-resource",
+      extraFlags: ["--type-name", "AWS::S3::Bucket", "--identifier", `fileb://${MISSING}`],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /the value of --identifier/);
+  });
+
+  it("refuses the combined --flag=file:// spelling, which the CLI expands the same way", async () => {
+    // One argv entry, not two: the CLI runs its paramfile loader on the segment
+    // after the first `=`, so this spelling reaches the endpoint as the file's
+    // contents (verified on 2.34.3 against a loopback stub). No shipped tool
+    // builds it -- the scan covers it so the first one that does is guarded.
+    const r = await runAwsCall({
+      service: "cloudcontrol",
+      operation: "get-resource",
+      extraFlags: ["--type-name", "AWS::S3::Bucket", `--identifier=file://${MISSING}`],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /the value of --identifier/);
+    // The preview is the value the CLI would read, not the whole entry.
+    assert.match(r.error, /Refusing 'file:\/\//);
+  });
+
+  it("lets the CLI's near misses through in the combined spelling too", async () => {
+    // Same reason as the separate-entry near misses below: the loader's match on
+    // the post-`=` segment is its own `str.startswith`, so these travel as
+    // themselves (verified against the stub -- no file was read for either).
+    for (const entry of [`--identifier=FILE://${MISSING}`, `--identifier=file:/${MISSING}`]) {
+      const r = await runAwsCall({
+        service: "cloudcontrol",
+        operation: "get-resource",
+        extraFlags: ["--type-name", "AWS::S3::Bucket", entry],
+        command: NO_BINARY,
+      });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "spawn_failure", `${JSON.stringify(entry)} must not be refused by the paramfile guard`);
+    }
+  });
+
+  it("refuses a positional file:// entry, with no flag to name", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      extraFlags: [`file://${MISSING}`, "--format", "json"],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /a command-line argument/);
+  });
+
+  it("closes aws_logs_tail's filterPattern, which has no field-level reject of its own", async () => {
+    // logs.ts passes filterPattern as an extraFlags entry, so until that tool
+    // moves it into --cli-input-json this backstop is the whole defense for it.
+    const r = await runAwsCall({
+      service: "logs",
+      operation: "tail",
+      extraFlags: ["my-group", "--filter-pattern", `file://${MISSING}`],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /the value of --filter-pattern/);
+  });
+
+  it("exempts a trusted value by its exact string and keeps guarding the rest of the call", async () => {
+    // The exemption is a value list, not a whole-call switch: lambda's own
+    // --payload path passes, a caller-supplied --qualifier does not.
+    const r = await runAwsCall({
+      service: "lambda",
+      operation: "invoke",
+      extraFlags: ["--payload", "fileb://a", "--qualifier", "file://b"],
+      trustedParamFileArgs: ["fileb://a"],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /the value of --qualifier/);
+  });
+
+  it("lets a trusted value through the guard", async () => {
+    const r = await runAwsCall({
+      service: "lambda",
+      operation: "invoke",
+      extraFlags: ["--payload", "fileb://a"],
+      trustedParamFileArgs: ["fileb://a"],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "spawn_failure", "the value cleared the guard and the pinned command failed to spawn");
+  });
+
+  it("exempts a trusted combined entry, listed the way the caller built it", async () => {
+    // A caller that mints `--payload=fileb://<temp>` as one entry lists that
+    // whole string, so the exemption has to be checked against the entry as well
+    // as the value inside it.
+    const r = await runAwsCall({
+      service: "lambda",
+      operation: "invoke",
+      extraFlags: ["--payload=fileb://a"],
+      trustedParamFileArgs: ["--payload=fileb://a"],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "spawn_failure", "the entry cleared the guard and the pinned command failed to spawn");
+  });
+
+  it("lets the CLI's near misses through, because the CLI sends them as themselves", async () => {
+    for (const value of ["FILE://x", " file://x", "file:/x"]) {
+      const r = await runAwsCall({
+        service: "cloudcontrol",
+        operation: "get-resource",
+        extraFlags: ["--type-name", "AWS::S3::Bucket", "--identifier", value],
+        command: NO_BINARY,
+      });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "spawn_failure", `${JSON.stringify(value)} must not be refused by the paramfile guard`);
     }
   });
 });
