@@ -10,6 +10,7 @@ import {
   logUnhandledRejection,
   toMcpResult,
 } from "./index.js";
+import { HOST_TEXT_CAP_BYTES } from "./server-instructions.js";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
@@ -426,6 +427,36 @@ describe("tool registry snapshot", () => {
       }
       seen.set(t.name, i);
     }
+  });
+});
+
+/**
+ * The host text budget. `allTools` here comes from ./index.js -- the esbuild
+ * bundle that ships -- so this measures the descriptions a real host receives,
+ * not a pre-build copy of them.
+ *
+ * A description over the cap is not cosmetic: Claude Code cuts it from the END
+ * and tells nobody (see HOST_TEXT_CAP_BYTES for the measurement), so what
+ * disappears first is whatever was written last. The widest description here is
+ * aws_logs_query's, at 1,981 of 2,048 bytes, and the last things it says are the
+ * ones a caller most needs: that a timed-out or cancelled Insights query is
+ * NEVER stopped (it keeps running and hands back a `queryId` instead of rows),
+ * and that aws_logs_tail is cheaper for plain recent lines -- with the BILLING
+ * paragraph just ahead of them. Nothing was checking that.
+ */
+describe("host text budgets -- Claude Code truncates a tool description at 2 KB", () => {
+  it("every tool description fits HOST_TEXT_CAP_BYTES", () => {
+    const offenders = allTools
+      .map((tool) => ({ name: tool.name, bytes: Buffer.byteLength(tool.description, "utf8") }))
+      .filter((t) => t.bytes > HOST_TEXT_CAP_BYTES)
+      .map((t) => `${t.name}: ${t.bytes} bytes (${t.bytes - HOST_TEXT_CAP_BYTES} over)`);
+
+    assert.deepEqual(
+      offenders,
+      [],
+      "a description past the cap is silently cut from the END before the model ever sees it -- " +
+        "trim it, or move what matters to the front",
+    );
   });
 });
 

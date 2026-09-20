@@ -33,6 +33,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { allTools } from "./index.js";
+import { HOST_TEXT_CAP_BYTES } from "./server-instructions.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -372,6 +373,14 @@ describe("spawned server — MCP handshake over stdio", () => {
       for (const tool of tools) {
         assert.ok(tool.description, `tool '${tool.name}' has no description`);
         assert.equal(typeof tool.inputSchema, "object", `tool '${tool.name}' has no inputSchema object`);
+        // And it fits the host's text cap ON THE WIRE. index.test.ts holds the
+        // registry to the same bound; this is the byte count a host actually
+        // reads, after the SDK has serialized it.
+        const descriptionBytes = Buffer.byteLength(tool.description ?? "", "utf8");
+        assert.ok(
+          descriptionBytes <= HOST_TEXT_CAP_BYTES,
+          `tool '${tool.name}' sends ${descriptionBytes} bytes of description, past the ${HOST_TEXT_CAP_BYTES}-byte host cap -- a host cuts the END of it`,
+        );
       }
     });
   });
