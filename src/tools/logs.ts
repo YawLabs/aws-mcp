@@ -352,8 +352,9 @@ export interface TailEvent {
  *
  * Strict on purpose, and the strictness IS the regression pin: the parser this
  * replaces turned the CLI's pretty-printed tail TEXT into `ok: true` with the
- * whole blob as `events`, which is how a tool shipped for four minor versions
- * without ever returning a structured event against a real CLI. Empty stdout
+ * whole blob as `events`, which is how a tool shipped from 0.2.0, its first
+ * release, to 2.3.4 without ever returning a structured event against a real
+ * CLI. Empty stdout
  * (null), a string, a bare array and a wrong-typed `total` all return null, and
  * the handler reports that as a failure rather than guessing.
  *
@@ -909,7 +910,7 @@ function terminalQueryFailure(status: string | null, queryId: string, attempts: 
 export const logsTools: readonly Tool[] = [
   {
     name: "aws_logs_tail",
-    description: `Fetch the newest CloudWatch Logs events for one log group over the last \`since\` (default 10m), via FilterLogEvents ('aws logs filter-log-events'). Returns events oldest first as {timestamp (ISO 8601 UTC), logStreamName, message (verbatim)}. At most \`maxEvents\` come back (default ${DEFAULT_MAX_EVENTS}, max ${MAX_MAX_EVENTS}); when the window held more, the OLDEST are dropped and \`truncated\` is true. On AWS CLI ${START_FROM_HEAD_MIN_CLI}+ the read goes newest-first and stops once it has enough, so a busy group costs a page or two -- and a truncated result reports \`totalEvents: null\` because the rest was never read. Older CLIs read the whole window (exact \`totalEvents\`); narrow \`since\` or add \`filterPattern\` if a wide window times out. \`logGroupName\` takes a bare name or a log-group ARN in the call's region; an ARN is sent as logGroupIdentifier, so a source-account ARN works from a cross-account monitoring account (AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+). Does not stream: call again for newer events. eventId and ingestionTime are omitted -- use aws_call for them.`,
+    description: `Fetch the newest CloudWatch Logs events for one log group over the last \`since\` (default 10m), via FilterLogEvents ('aws logs filter-log-events'). Returns events oldest first as {timestamp (ISO 8601 UTC), logStreamName, message (verbatim)}; any of the three is null on an event that arrived without it, which is kept rather than dropped. At most \`maxEvents\` come back (default ${DEFAULT_MAX_EVENTS}, max ${MAX_MAX_EVENTS}); when the window held more, the OLDEST are dropped and \`truncated\` is true. On AWS CLI ${START_FROM_HEAD_MIN_CLI}+ the read goes newest-first and stops once it has enough, so a busy group costs a page or two -- and a truncated result reports \`totalEvents: null\` because the rest was never read. Older CLIs read the whole window (exact \`totalEvents\`); narrow \`since\` or add \`filterPattern\` if a wide window times out. \`logGroupName\` takes a bare name or a log-group ARN in the call's region; an ARN is sent as logGroupIdentifier, so a source-account ARN works from a cross-account monitoring account (AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+). Does not stream: call again for newer events. eventId and ingestionTime are omitted -- use aws_call for them.`,
     annotations: {
       title: "Fetch recent CloudWatch Logs events for a log group",
       readOnlyHint: true,

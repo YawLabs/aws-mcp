@@ -3,9 +3,9 @@
  * CloudWatch Logs endpoint inside the test process.
  *
  * This is the step that would have caught the defect 2.4.0 fixes. The tool shipped
- * parsing `aws logs tail --format json` as NDJSON for four minor versions because
- * the fake CLI was the only CLI the suite ever ran, and the fake had been told the
- * wrong format. So: the same handler, the same datasets, the REAL binary -- and for
+ * parsing `aws logs tail --format json` as NDJSON from 0.2.0, its first release, to
+ * 2.3.4 because the fake CLI was the only CLI the suite ever ran, and the fake had
+ * been told the wrong format. So: the same handler, the same datasets, the REAL binary -- and for
  * four of the cases an assertion that the fake gives the identical answer, which is
  * what makes the fake trustworthy for the fast tests.
  *
