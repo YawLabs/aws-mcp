@@ -264,6 +264,53 @@ function isAbsoluteFor(value: string, platform: NodeJS.Platform): boolean {
  * median 0.56), against a CLI start of hundreds of milliseconds, and an uncached
  * walk cannot go stale after an install or an `aws update`.
  */
+// Warn once per distinct misspelling, so a misconfigured host does not put a
+// line on stderr for every aws call.
+const warnedMiscasedOverride = new Set<string>();
+
+/** Test-only: clear the dedupe set so each case sees a fresh "first warn fires"
+ *  state. Underscore prefix = exported for tests, not for production callers. */
+export function _resetMiscasedOverrideWarnings(): void {
+  warnedMiscasedOverride.clear();
+}
+
+/**
+ * Say something when the override was SPELLED wrong on a case-sensitive platform.
+ *
+ * `envLookup` case-folds only on win32, which is correct -- it is what spawn
+ * itself would do, and POSIX environments really are case-sensitive. The cost is
+ * that `aws_mcp_aws_cli=/usr/local/bin/aws` on Linux is not "the override set
+ * wrong", it is "no override at all": the PATH walk answers instead and returns
+ * ok, so the operator sees a working server running a DIFFERENT binary than the
+ * one they configured. Measured: resolveAwsCommand with {aws_mcp_aws_cli: <a real
+ * 0755 aws>, PATH: <a dir holding another aws>} returned source "path".
+ *
+ * That defeats this variable's whole design, which is to fail loudly rather than
+ * fall back to PATH -- it picks which binary handles the user's credentials. So
+ * a near-miss gets one stderr line naming both spellings. It is not promoted to
+ * an error: the variable is genuinely unset as far as the platform is concerned,
+ * and refusing to run over an unrelated variable that happens to case-fold would
+ * be worse than saying so. win32 is unaffected, because there the lookup finds it.
+ */
+function warnIfOverrideMiscased(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): void {
+  if (platform === "win32") return;
+  const wanted = AWS_CLI_OVERRIDE_ENV.toUpperCase();
+  for (const key of Object.keys(env)) {
+    if (key === AWS_CLI_OVERRIDE_ENV || key.toUpperCase() !== wanted) continue;
+    const value = env[key];
+    if (value === undefined || value.trim() === "") continue;
+    if (warnedMiscasedOverride.has(key)) return;
+    warnedMiscasedOverride.add(key);
+    console.warn(
+      `[aws-mcp] Found '${key}' in this server's environment, which is NOT read: ` +
+        `environment variables are case-sensitive on ${platform}, so the name must be exactly ` +
+        `'${AWS_CLI_OVERRIDE_ENV}'. Ignoring it and searching PATH instead -- which may run a ` +
+        `different aws than you configured. Rename it to '${AWS_CLI_OVERRIDE_ENV}'.`,
+    );
+    return;
+  }
+}
+
 export function resolveAwsCommand(opts: {
   explicit?: string;
   env?: NodeJS.ProcessEnv;
@@ -287,6 +334,10 @@ export function resolveAwsCommand(opts: {
   if (overrideRaw !== undefined && overrideRaw !== "") {
     return resolveOverride(unquote(overrideRaw), platform, probe);
   }
+  // Nothing under the exact name. On a case-sensitive platform that may be a
+  // misspelling rather than an absence, and silently walking PATH instead is how
+  // an operator ends up running a different CLI than they configured.
+  warnIfOverrideMiscased(env, platform);
 
   return resolveFromPath(env, platform, probe);
 }
@@ -311,6 +362,31 @@ function resolveOverride(value: string, platform: NodeJS.Platform, probe: PathPr
     return {
       ok: false,
       error: `${AWS_CLI_OVERRIDE_ENV} must point at an .exe (aws.exe for a standard install); a .cmd or .bat shim cannot be started without a shell.`,
+    };
+  }
+  // And the mirror image: a Windows CLI named from a POSIX process. That is the
+  // WSL case, and it is a trap rather than a configuration -- interop really does
+  // execute /mnt/c/.../aws.exe, and it passes every check here (isAbsoluteFor
+  // accepts the path, the win32-only .exe rule above is skipped, and DrvFs reports
+  // 0777 so X_OK is granted), so it half-works and then fails where it is least
+  // obvious. This server is a POSIX process: it mints /tmp/aws-mcp-input-*/params.json
+  // and passes file:///tmp/..., and aws_lambda_invoke hands the CLI a POSIX outfile
+  // path. A Windows CLI resolves both against the current DRIVE, so params over the
+  // inline cap cannot be read and an invoke response is written where nothing looks
+  // for it. Refusing is the same contract as the rule above: this variable picks
+  // which binary handles the user's credentials, so it fails loudly rather than
+  // running something that works until it doesn't. The override is the only way a
+  // Windows executable can be reached on POSIX -- the PATH walk looks for a file
+  // named `aws`, never `aws.exe`.
+  if (platform !== "win32" && /\.exe$/i.test(value)) {
+    return {
+      ok: false,
+      error:
+        `${AWS_CLI_OVERRIDE_ENV} points at a Windows executable ('${value}') but this server runs on ${platform}. ` +
+        "Under WSL that binary does start, and then resolves the POSIX paths this server passes -- the " +
+        "--cli-input-json temp file used for params over the inline cap, and aws_lambda_invoke's outfile -- " +
+        `against the current drive, so those calls fail or write where nothing reads. Install the ${platform} ` +
+        "build of the AWS CLI and point this at that.",
     };
   }
   const stat = probe(value);
