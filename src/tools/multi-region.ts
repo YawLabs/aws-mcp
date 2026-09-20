@@ -216,9 +216,9 @@ export const multiRegionTools: readonly Tool[] = [
       // Same reasoning as aws_call (see call.ts), and strictly more so: this
       // runs the caller's chosen operation across up to MAX_REGIONS regions,
       // MAX_CONCURRENCY at a time, so a destructive one is destructive N times
-      // in parallel. destructiveHint
-      // MUST stay true -- `false` asserts "only additive updates", which this
-      // cannot promise, and it suppresses the host's confirmation prompt.
+      // in parallel. destructiveHint MUST stay true -- `false` asserts "only
+      // additive updates", which this cannot promise, and it suppresses the
+      // host's confirmation prompt.
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,
