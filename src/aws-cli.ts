@@ -290,14 +290,6 @@ interface AwsCallOptions {
    * that argv too, `--qualifier` included.
    */
   trustedParamFileArgs?: readonly string[];
-  // Set when the operation emits NEWLINE-DELIMITED JSON rather than one JSON
-  // document -- `aws logs tail --format json` is the only such op today.
-  //
-  // Load-bearing for the malformed_json check below, not just documentation.
-  // NDJSON opens with `{` and fails a whole-blob JSON.parse, which is exactly
-  // the signature that check uses to catch a truncated payload. Without this
-  // flag a perfectly complete multi-event log tail is reported as truncated.
-  ndjson?: boolean;
   // Test-injection knobs, mirrored from startSsoLogin. Not exposed via MCP.
   command?: string;
   prefixArgs?: string[];
@@ -369,9 +361,8 @@ interface AwsCallSuccess {
    * Parsed JSON value on a successful `--output json` run, OR a raw trimmed
    * string when the CLI emits non-JSON stdout despite `--output json` (e.g.
    * `--query` expressions that extract a scalar string/number return the value
-   * without JSON quoting), or the raw NDJSON blob when the caller passed
-   * `ndjson: true`. Otherwise only genuinely scalar-looking stdout takes the
-   * string branch -- text that opens with `{` or `[` and fails to parse is a
+   * without JSON quoting). Otherwise only genuinely scalar-looking stdout takes
+   * the string branch -- text that opens with `{` or `[` and fails to parse is a
    * truncated payload and settles as a `malformed_json` FAILURE, not a
    * success. Callers must type-guard before assuming a structured
    * object: `typeof data === "string"` vs `typeof data === "object"`.
@@ -967,12 +958,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           //     and the truncation disappears silently.
           //
           // The first character separates them: no scalar starts with { or [.
-          //
-          // (c) NDJSON, when the caller declared it: every line is its own JSON
-          //     document, so the blob opens with `{` and cannot parse as a
-          //     whole. That is the format working correctly, not a truncation,
-          //     so it takes the string branch and the caller splits the lines.
-          if (!opts.ndjson && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
+          if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
             const detail = err instanceof Error ? err.message : String(err);
             settle({
               ok: false,
