@@ -17,9 +17,11 @@
  * The write itself loops until every byte lands (see writeAllSync) -- a SHORT
  * write doesn't throw, so without the loop the rename would publish a
  * truncated file through the very path that exists to prevent one.
- * The tmp file is opened with mode 0o600 (a no-op on Windows), so the
- * credentials file inherits those permissions through the rename -- matching
- * the AWS CLI's own behavior. If anything between the open and the rename
+ * The tmp file is opened with mode 0o600 and fchmod-ed to it before any byte
+ * is written (a no-op on Windows; on oam the open mode alone does not stick --
+ * see upsertProfile), so the credentials file inherits those permissions
+ * through the rename -- matching the AWS CLI's own behavior. If anything
+ * between the open and the rename
  * throws, the tmp file is unlinked: it holds all three plaintext credentials
  * under a name (`<path>.tmp-<pid>-<uuid>`) that no other cleanup path and no
  * human would ever think to look for.
@@ -33,8 +35,19 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fchmodSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { assertPrivateMode } from "./private-file.js";
 
 interface AssumedCredentials {
   aws_access_key_id: string;
@@ -356,10 +369,24 @@ function writeAllSync(fd: number, text: string): void {
 
 /**
  * Read, modify, and atomically rewrite a credentials file. Creates the file
- * if it doesn't exist. The tmp file is opened 0o600, and renameSync replaces
- * the destination inode, so the resulting credentials file is 0o600 on Unix
- * without a follow-up chmod (open's mode is only ever narrowed by umask, never
- * widened).
+ * if it doesn't exist. The tmp file is opened 0o600 and fchmod-ed to 0o600
+ * before a credential byte is written, and renameSync replaces the destination
+ * inode, so the resulting credentials file is 0o600 on Unix -- VERIFIED rather
+ * than assumed, because a filesystem may accept the fchmod and ignore it (see
+ * private-file.ts). On such a mount the write is refused instead.
+ *
+ * The fchmod is not redundant belt-and-braces: open's mode argument is honoured
+ * by node (and only ever narrowed by umask, never widened) but DROPPED by oam,
+ * which bin/aws-mcp.mjs picks by default -- measured 2026-09-20 on WIN32/ARM64,
+ * oam 0.16.2: a file opened 0o400 comes back writable where node marks it
+ * read-only. On POSIX the same divergence WOULD leave this file at the umask
+ * default, with an access key, a secret key and a session token in a
+ * world-readable `~/.aws/credentials` -- ASSERTED, not measured: oam publishes no
+ * linux-arm64 build and there is no Mac here, so no POSIX oam measurement exists
+ * anywhere. Note also that a Windows mode argument can only toggle
+ * FILE_ATTRIBUTE_READONLY, so that particular row does not transfer cleanly; the
+ * `flag: "wx"` row does, being flag-string parsing above the OS layer. fchmodSync itself both runtimes honour. It goes on the fd rather than the
+ * path so there is no moment where the file holds credentials at a wider mode.
  *
  * Returns `{ existed: true }` when the profile was already present and its
  * managed keys were overwritten in place, so callers can warn about it.
@@ -385,6 +412,24 @@ export async function upsertProfile(
     const fd = openSync(tmpPath, "w", 0o600);
     try {
       try {
+        // Before writeAllSync, so the credentials never exist on disk at a mode
+        // open(2) set and oam ignored. See the note on this function.
+        fchmodSync(fd, 0o600);
+        // And VERIFY it, before any credential byte exists. fchmod succeeding is
+        // not the same as the mode being set: on a filesystem with no inode mode
+        // it returns success and changes nothing, which would leave all three
+        // plaintext credentials in a world-readable AND world-writable file with
+        // nothing able to detect it. Reachable through a documented, advertised
+        // variable -- AWS_SHARED_CREDENTIALS_FILE pointed at a Windows-side
+        // ~/.aws so a WSL distro and its Windows host share one credentials file.
+        // Measured 0777 there against the real upsertProfile. Throwing here hands
+        // control to the catch below, which unlinks the tmp file, so nothing is
+        // stranded and nothing secret was written.
+        assertPrivateMode(
+          fd,
+          tmpPath,
+          "Point AWS_SHARED_CREDENTIALS_FILE at a path on a native filesystem, or unset it to use ~/.aws/credentials.",
+        );
         // Loops on the byte count: a partial write must not be renamed over
         // the real credentials file. See writeAllSync.
         writeAllSync(fd, nextText);

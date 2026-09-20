@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -792,6 +792,91 @@ describe("startSsoLogin — CLI version probe", () => {
       assert.match(wait.rawOutput ?? "", /--use-device-code/, "version line past the cap should be dropped");
     } finally {
       rmSync(huge.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("spawn-hardening: sso spawns", () => {
+  it("pins the CLI settings on both the version probe and the login spawn", async () => {
+    // The two are separate spawns in sso.ts and each had its own `env` handling,
+    // so each needs its own evidence. One append-only file collects both, with
+    // `phase` naming the writer: the probe is answered before the fake's
+    // scenario switch is reached, and the login goes through it.
+    _clearCliVersionCache();
+    const dir = mkdtempSync(join(tmpdir(), "aws-mcp-spawn-hardening-"));
+    const envPath = join(dir, "pinned-env.jsonl");
+    const base = fakeOpts("spawn-hardening_sso_echo_env", 10_000);
+    try {
+      const start = await startSsoLogin("spawn-hardening-prof", {
+        ...base,
+        env: {
+          ...base.env,
+          AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT: envPath,
+          // Hostile values, as a user's config or shell would leave them.
+          AWS_CLI_AUTO_PROMPT: "on",
+          AWS_CLI_ERROR_FORMAT: "json",
+          PYTHONUTF8: "0",
+        },
+      });
+      assert.equal(start.ok, true, start.ok ? "" : `login did not start: ${start.error}`);
+      const lines = readFileSync(envPath, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const phases = lines.map((l) => l.phase);
+      assert.deepEqual(phases, ["version", "login"], `expected one line per spawn, got ${JSON.stringify(phases)}`);
+      for (const line of lines) {
+        // auto-prompt is the one that matters most here: with `cli_auto_prompt =
+        // on` the CLI wants a console before it does anything, so `aws sso
+        // login` exits without ever printing a URL (measured on 2.34.3 and
+        // 2.22.0) and this tool has nothing to show.
+        assert.equal(line.AWS_CLI_AUTO_PROMPT, "off", `${line.phase} spawn missed the auto-prompt pin`);
+        assert.equal(line.AWS_CLI_ERROR_FORMAT, "enhanced", `${line.phase} spawn missed the error-format pin`);
+        assert.equal(line.AWS_CLI_OUTPUT_ENCODING, "utf-8", `${line.phase} spawn missed the encoding pin`);
+        assert.equal(line.PYTHONUTF8, "1", `${line.phase} spawn missed the UTF-8 mode pin`);
+        if (process.platform === "win32") {
+          assert.equal(line.NoDefaultCurrentDirectoryInExePath, "1", `${line.phase} spawn missed the win32 pin`);
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an unfindable CLI by naming the override, not by blaming PATH", async () => {
+    // Before the shared resolver, sso.ts spawned the bare name `aws` and read no
+    // override. It answered FAST -- both spawns raise ENOENT in a few ms (measured
+    // 2 ms for `aws --version` and 1 ms for `aws sso login` on this box with PATH
+    // pointing at an empty directory), because probeDeviceCodeSupport and
+    // doStartSsoLogin each resolve from their own 'error' handler rather than
+    // waiting out a timeout. What it got wrong was the WORDING: `Failed to run
+    // 'aws': spawn aws ENOENT. Is the AWS CLI installed and on PATH?`, a PATH hint
+    // on the one host whose actual fix is AWS_MCP_AWS_CLI -- which did not apply to
+    // logins at all. The two message assertions below are the guard; neither
+    // matches that old string.
+    //
+    // No clock assertion: it would pass either way, so it buys no coverage and
+    // costs a wall-clock flake surface. urlWaitMs stays as the hang bound (it
+    // tightens the 15 s default), and versionProbeTimeoutMs is left at its 2 s
+    // default so a reverted short-circuit stalls briefly rather than for 30 s.
+    _clearCliVersionCache();
+    const empty = mkdtempSync(join(tmpdir(), "aws-mcp-sso-nopath-"));
+    const saved = process.env.NoDefaultCurrentDirectoryInExePath;
+    try {
+      delete process.env.NoDefaultCurrentDirectoryInExePath;
+      const result = await startSsoLogin("no-cli-prof", {
+        // No `command`: this is the production path through the resolver.
+        env: { ...process.env, PATH: empty, AWS_MCP_AWS_CLI: undefined },
+        urlWaitMs: 10_000,
+      });
+      assert.equal(result.ok, false);
+      if (result.ok) return;
+      assert.match(result.error, /AWS_MCP_AWS_CLI/, "the message has to name the override");
+      assert.match(result.error, /Could not find the AWS CLI/);
+    } finally {
+      if (saved === undefined) delete process.env.NoDefaultCurrentDirectoryInExePath;
+      else process.env.NoDefaultCurrentDirectoryInExePath = saved;
+      rmSync(empty, { recursive: true, force: true });
     }
   });
 });

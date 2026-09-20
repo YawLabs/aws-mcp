@@ -533,6 +533,21 @@ describe("shellQuoteArg", () => {
     assert.equal(shellQuoteArg("a>b"), "'a>b'");
   });
 
+  it("quotes a %VAR% rather than leaving it bare for cmd.exe to expand", () => {
+    // '%' used to be in SHELL_SAFE_ARG_RE, so %PATH% was emitted unquoted. It is
+    // inert in POSIX shells and PowerShell, but cmd.exe and a .bat file expand it:
+    // measured, a bare %PATH% in a batch file arrived as one empty token and argc
+    // dropped by one. Quoting cannot make the string safe for cmd.exe, but it
+    // keeps the value readable as text instead of disappearing where it is read.
+    assert.equal(shellQuoteArg("%PATH%"), "'%PATH%'");
+    assert.equal(shellQuoteArg("%USERPROFILE%.aws", "win32"), "'%USERPROFILE%.aws'");
+    // The rest of the safe set is unchanged -- this must not start quoting
+    // ordinary tokens.
+    for (const safe of ["us-east-1", "org:account:role", "user@company.com", "a.b,c+d=e", "--cli-input-json"]) {
+      assert.equal(shellQuoteArg(safe), safe);
+    }
+  });
+
   it("quotes JMESPath expressions, which are full of shell-active characters", () => {
     assert.equal(shellQuoteArg("Buckets[].Name"), "'Buckets[].Name'");
     assert.equal(
@@ -544,9 +559,41 @@ describe("shellQuoteArg", () => {
   it("escapes an embedded single quote with the POSIX close-escape-reopen idiom", () => {
     // Inside single quotes a POSIX shell expands nothing and there is no
     // escape character, so the only way to include one is to close, emit an
-    // escaped quote, and reopen.
-    assert.equal(shellQuoteArg("it's"), `'it'\\''s'`);
-    assert.equal(shellQuoteArg("'"), `''\\'''`);
+    // escaped quote, and reopen. Platform passed explicitly so both dialects are
+    // asserted from either host -- there is no Mac here and only one Windows box,
+    // so a default-platform assertion would test exactly one of the two branches.
+    assert.equal(shellQuoteArg("it's", "linux"), `'it'\\''s'`);
+    assert.equal(shellQuoteArg("'", "linux"), `''\\'''`);
+    assert.equal(shellQuoteArg("it's", "darwin"), `'it'\\''s'`);
+  });
+
+  it("doubles an embedded single quote on win32, because PowerShell EXECUTES the POSIX idiom", () => {
+    // The POSIX form is not merely wrong in PowerShell. Measured on win32/arm64,
+    // PowerShell 5.1: a --query value of  x'; echo PWNED #  emitted as the POSIX
+    // close-escape-reopen form tokenised into separate words, the ';' ended the
+    // statement, and PWNED was PRINTED. PowerShell's own escape is to double the
+    // quote, so that is what a Windows host emits.
+    assert.equal(shellQuoteArg("it's", "win32"), `'it''s'`);
+    assert.equal(shellQuoteArg("'", "win32"), `''''`);
+
+    // The regression that matters: whatever the value, the win32 form must never
+    // contain the backslash-quote sequence PowerShell breaks out of.
+    for (const value of ["it's", "'", "x'; echo PWNED #", "a'b'c", `x' & echo PWNED`, `'; rm -rf / #`]) {
+      const quoted = shellQuoteArg(value, "win32");
+      assert.doesNotMatch(quoted, /\\'/, `win32 quoting of ${JSON.stringify(value)} must not emit \\' -- ${quoted}`);
+      // And it stays one PowerShell string: an even number of quotes, opening and
+      // closing included, is what makes the doubled form parse as a single token.
+      assert.equal((quoted.match(/'/g) ?? []).length % 2, 0, `unbalanced quotes in ${quoted}`);
+    }
+  });
+
+  it("is inert in bash even when it quoted for PowerShell", () => {
+    // A Windows host's string pasted into Git Bash gets a WRONG value, not a
+    // running command: 'a''b' is concatenation in POSIX, so the quote simply
+    // disappears. Wrong-but-inert is the trade this makes deliberately.
+    const quoted = shellQuoteArg("x'; echo PWNED #", "win32");
+    assert.doesNotMatch(quoted, /\\/, "no backslashes, so bash has nothing to escape out of");
+    assert.ok(quoted.startsWith("'") && quoted.endsWith("'"), quoted);
   });
 
   it("quotes an empty argv entry so it stays visible", () => {
@@ -676,6 +723,17 @@ describe("redactDisplayArgs -- CCAPI payload flags (regression)", () => {
 });
 
 describe("runAwsCall — a child killed by a signal exits with code === null", () => {
+  // Bypass command resolution with the explicit-command seam resolveAwsCommand
+  // documents ("verbatim, no checks: these are in-process test seams"). spawn is
+  // mocked here so the value is never executed -- but resolution runs BEFORE the
+  // spawn, so without this the suite depends on an aws being findable on PATH and
+  // settles spawn_failure ("Could not find the AWS CLI") on any machine without
+  // one. That is a normal state for a contributor running unit tests, and it is
+  // new in 2.4.0: before the resolver landed, the mocked spawn was reached
+  // directly. Measured in WSL Ubuntu (linux/arm64, no aws installed), where these
+  // two were the only failures in the entire compiled suite.
+  const STUB_COMMAND = "aws-mcp-signal-kill-stub";
+
   // Every other failure test in this suite carries a NUMERIC exit code (255 or
   // 1), so the nonzero_exit fallback message -- which interpolates `code` --
   // had only ever rendered with a number. A child killed by a signal reaches
@@ -737,7 +795,7 @@ describe("runAwsCall — a child killed by a signal exits with code === null", (
 
   it("settles nonzero_exit with exitCode null rather than treating the kill as success", async () => {
     const r = await withMockedSpawn(signalKilledSpawn(""), () =>
-      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000 }),
+      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000, command: STUB_COMMAND }),
     );
     assert.equal(r.ok, false, "a signal-killed child must not settle as a successful call");
     if (r.ok) return;
@@ -758,7 +816,7 @@ describe("runAwsCall — a child killed by a signal exits with code === null", (
     // so a signal death that managed to emit something keeps the real text --
     // the half of the branch that never renders "code null" at all.
     const r = await withMockedSpawn(signalKilledSpawn("Killed\n"), () =>
-      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000 }),
+      runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000, command: STUB_COMMAND }),
     );
     assert.equal(r.ok, false);
     if (r.ok) return;

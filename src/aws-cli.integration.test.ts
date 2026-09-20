@@ -5,13 +5,14 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { runAwsCall } from "./aws-cli.js";
+import { INLINE_CLI_INPUT_JSON_MAX_CHARS, runAwsCall } from "./aws-cli.js";
 import { _resetSession, setProfile, setRegion } from "./session.js";
+import { tmpdirIgnoresModes } from "./testing/tmpdir-modes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "testing", "fake-aws.js");
@@ -695,6 +696,403 @@ describe("runAwsCall — failure paths", () => {
     // Belt-and-suspenders: explicitly assert no replacement characters in the
     // raw stdout. A naive .toString() per chunk would leave U+FFFD here.
     assert.ok(!r.rawStdout.includes("�"), "rawStdout must not contain U+FFFD replacement chars");
+  });
+});
+
+describe("spawn-hardening: the pinned child environment", () => {
+  it("pins the CLI settings this server parses, over hostile values in the caller's env", async () => {
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      ...fakeOpts("spawn-hardening_echo_env", {
+        // The shapes a user's ~/.aws/config or shell can produce, each of which
+        // breaks something this server reads: a non-default error format hides
+        // the text errors.ts anchors on, auto-prompt kills the call outright,
+        // and either encoding knob turned off corrupts non-ASCII output.
+        env: {
+          AWS_CLI_ERROR_FORMAT: "json",
+          AWS_CLI_AUTO_PROMPT: "on",
+          AWS_CLI_OUTPUT_ENCODING: "cp1252",
+          PYTHONUTF8: "0",
+          NoDefaultCurrentDirectoryInExePath: "0",
+        },
+      }),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { env } = r.data as { env: Record<string, unknown> };
+    assert.equal(env.AWS_CLI_ERROR_FORMAT, "enhanced");
+    assert.equal(env.AWS_CLI_AUTO_PROMPT, "off");
+    assert.equal(env.AWS_CLI_OUTPUT_ENCODING, "utf-8");
+    assert.equal(env.PYTHONUTF8, "1");
+    // win32 only: it stops the CLI's OWN children (session-manager-plugin, a
+    // bare-name credential_process) resolving out of the working directory.
+    assert.equal(
+      env.NoDefaultCurrentDirectoryInExePath,
+      process.platform === "win32" ? "1" : "0",
+      "the win32 pin must win on win32, and must not be invented elsewhere",
+    );
+  });
+
+  it("layers the pins over the caller's own environment rather than replacing it", async () => {
+    // The shape aws_multi_account passes: a full copy of process.env with the
+    // assumed-role credentials written in and every profile variable removed
+    // (tools/multi-account.ts credentialEnv), plus tools/lambda.ts's
+    // AWS_MAX_ATTEMPTS=1. Both have to survive the pins -- the credentials are
+    // the only identity such a call has, and the attempt cap is what keeps a
+    // Lambda from being invoked twice.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env",
+      AWS_ACCESS_KEY_ID: "ASIAAWSMCPSPAWNHARDENING",
+      AWS_SECRET_ACCESS_KEY: "aws-mcp-spawn-hardening-fake-secret",
+      AWS_SESSION_TOKEN: "aws-mcp-spawn-hardening-fake-token",
+      AWS_MAX_ATTEMPTS: "1",
+    };
+    delete env.AWS_PROFILE;
+    delete env.AWS_DEFAULT_PROFILE;
+
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      command: process.execPath,
+      prefixArgs: [FAKE_AWS],
+      timeoutMs: 30_000,
+      omitProfile: true,
+      env,
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv, env: childEnv } = r.data as { argv: string[]; env: Record<string, unknown> };
+    assert.equal(childEnv.credsPresent, true, "the caller's credentials must still reach the child");
+    assert.equal(childEnv.AWS_MAX_ATTEMPTS, "1", "PINNED_CLI_ENV must not take the single-attempt guarantee away");
+    assert.equal(childEnv.AWS_CLI_ERROR_FORMAT, "enhanced");
+    assert.equal(childEnv.PYTHONUTF8, "1");
+    assert.ok(!argv.includes("--profile"), "omitProfile still keeps the flag off argv");
+  });
+
+  it("classifies a rejected credential that the caller's error format would have hidden", async () => {
+    // The fake prints the classifiable ("enhanced") body only when it sees the
+    // pin, and the json body otherwise -- the precedence the real 2.34.3 shows.
+    // So this fails as `nonzero_exit` with no suggestion the moment the pin
+    // stops being passed, which is the failure users with `cli_error_format =
+    // json` in ~/.aws/config get today.
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      ...fakeOpts("spawn-hardening_error_format", { env: { AWS_CLI_ERROR_FORMAT: "json" } }),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "invalid_creds", `stderr was: ${r.rawStderr}`);
+    assert.match(r.error, /rejected by AWS/);
+  });
+});
+
+describe("spawn-hardening: --cli-binary-format on calls that carry params", () => {
+  it("pins base64 once, right before --cli-input-json, leaving the output/profile/region block contiguous", async () => {
+    const r = await runAwsCall({
+      service: "kms",
+      operation: "encrypt",
+      params: { KeyId: "alias/k", Plaintext: "aGVsbG8=" },
+      profile: "prod",
+      region: "eu-west-1",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    assert.equal(argv.filter((a) => a === "--cli-binary-format").length, 1, "exactly once");
+    const at = argv.indexOf("--cli-binary-format");
+    assert.equal(argv[at + 1], "base64");
+    assert.equal(at, argv.indexOf("--cli-input-json") - 2, "immediately before the payload");
+    // The block several fake scenarios and lambdaOutfileFromArgv index into has
+    // to stay exactly as it was.
+    const out = argv.indexOf("--output");
+    assert.deepEqual(argv.slice(out, out + 6), ["--output", "json", "--profile", "prod", "--region", "eu-west-1"]);
+  });
+
+  it("leaves a call without params alone, so AWS CLI v1 and every no-params call are untouched", async () => {
+    // v1 has no --cli-binary-format at all, so pinning it on every call would
+    // turn "unsupported but mostly working" into "nothing works".
+    const r = await runAwsCall({
+      service: "sts",
+      operation: "get-caller-identity",
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    const { argv } = r.data as { argv: string[] };
+    assert.ok(!argv.includes("--cli-binary-format"));
+  });
+});
+
+describe("spawn-hardening: params too long for a command line", () => {
+  // café-日本-😀: a cp1252 character, a CJK one and an astral one, which is what
+  // caught the first attempt at this -- a plain UTF-8 temp file reached the
+  // endpoint as cafÃ©-æ—¥æœ¬-ðŸ˜€ because the CLI reads a file:// param in the
+  // locale code page.
+  const UNICODE_VALUE = "café-日本-😀";
+
+  it("passes small params inline, exactly as before", async () => {
+    const r = await runAwsCall({
+      service: "dynamodb",
+      operation: "put-item",
+      params: { TableName: "t", Item: { pk: { S: UNICODE_VALUE } } },
+      ...fakeOpts("spawn-hardening_read_input_file"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    const data = r.data as { viaFile: boolean; binaryFormat: string | null; params: { Item: { pk: { S: string } } } };
+    assert.equal(data.viaFile, false);
+    assert.equal(data.params.Item.pk.S, UNICODE_VALUE);
+    assert.equal(data.binaryFormat, "base64", "the blob pin rides with the inline payload");
+  });
+
+  it("sends params over the inline cap through a private ASCII-only temp file, and removes it", async () => {
+    // 51,200 bytes is a real CloudFormation template body, so this size is not a
+    // synthetic edge: before the temp file it was unsendable on Windows, with an
+    // error blaming PATH.
+    const params = { TableName: "t", Item: { pk: { S: UNICODE_VALUE }, blob: { S: "x".repeat(12_000) } } };
+    const json = JSON.stringify(params);
+    assert.ok(json.length > INLINE_CLI_INPUT_JSON_MAX_CHARS, "the test payload must exceed the inline cap");
+
+    const r = await runAwsCall({
+      service: "dynamodb",
+      operation: "put-item",
+      params,
+      ...fakeOpts("spawn-hardening_read_input_file"),
+    });
+
+    // On a filesystem that ignores chmod, the call is SUPPOSED to refuse: this
+    // payload can hold credentials or a SecureString, and the 0600 the privacy
+    // rests on is unavailable there. Asserting the refusal rather than skipping
+    // means the guard has real coverage on exactly the machines that need it,
+    // and a contributor whose TMPDIR points into a Windows drive sees a green
+    // suite describing the behaviour instead of a red one they have to diagnose.
+    if (tmpdirIgnoresModes()) {
+      assert.equal(r.ok, false, "a mode-ignoring temp dir must not yield a successful private-file call");
+      if (r.ok) return;
+      assert.equal(r.kind, "spawn_failure");
+      assert.match(r.error, /does not honour file modes/);
+      assert.match(r.error, /TMPDIR/, "the message has to name the variable the operator can change");
+      return;
+    }
+
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    const data = r.data as {
+      viaFile: boolean;
+      path: string;
+      asciiOnly: boolean;
+      mode: number | null;
+      binaryFormat: string | null;
+      params: typeof params;
+    };
+    assert.equal(data.viaFile, true, "a payload this size must not be on the command line");
+    assert.equal(data.binaryFormat, "base64", "and it rides with the file transport too");
+    assert.equal(data.asciiOnly, true, "the file has to be ASCII-only or the CLI decodes it in the code page");
+    assert.deepEqual(data.params, params, "and it still has to parse back to exactly what was asked for");
+    if (process.platform !== "win32") assert.equal(data.mode, 0o600);
+    // Gone by the time the promise settles -- the CLI read it at startup.
+    assert.equal(existsSync(dirname(data.path)), false, "the temp directory must not outlive the call");
+    // The display string is the inline form either way, so no temp path leaks
+    // into `command` and the redaction stub still reports the payload's length.
+    assert.ok(!r.command.includes("file://"), r.command);
+    assert.ok(r.command.includes(`<redacted len=${json.length}>`), r.command);
+  });
+
+  it("calls an argv value that still will not fit bad_input, naming the flag", async () => {
+    // Only extraFlags can reach this now: CCAPI passes its payloads as dedicated
+    // flags rather than through --cli-input-json. 40,000 chars throws
+    // ENAMETOOLONG synchronously on Windows (measured); Linux caps a single
+    // argument at 131,072, so it needs more.
+    const size = process.platform === "win32" ? 40_000 : 3 * 1024 * 1024;
+    const r = await runAwsCall({
+      service: "cloudcontrol",
+      operation: "create-resource",
+      extraFlags: ["--desired-state", "x".repeat(size)],
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, false, r.ok ? "the OS accepted an argv this long; raise `size`" : "");
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input", `error was: ${r.error}`);
+    assert.match(r.error, /too large to pass to the AWS CLI/);
+    assert.match(r.error, /--desired-state/, "the message has to name which value is too long");
+    assert.doesNotMatch(r.error, /on PATH/, "the old message sent readers to debug a PATH that was fine");
+  });
+
+  it("does not time out at once when timeoutMs is above a 32-bit timer", async () => {
+    // node stores a timer delay in a signed 32-bit int: 2**31 + 1000 warns
+    // (TimeoutOverflowWarning) and fires after 1 ms, so this call used to come
+    // back as a timeout immediately. Measured on node 22.22.2.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_json_success", { timeoutMs: 2 ** 31 + 1000 }),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+  });
+});
+
+describe("spawn-hardening: which binary runs", () => {
+  /**
+   * A directory holding an `aws.exe` (win32) or `aws` (POSIX) that is really
+   * this Node -- a hard link where the filesystem allows one, a copy otherwise
+   * -- so spawning it with the fake's path as argv[1] behaves like the fake CLI.
+   * That is what makes "which binary did we run" observable: the fake echoes
+   * process.execPath back.
+   */
+  function plantNode(prefix: string): { dir: string; binary: string } {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const binary = join(dir, process.platform === "win32" ? "aws.exe" : "aws");
+    try {
+      linkSync(process.execPath, binary);
+    } catch {
+      copyFileSync(process.execPath, binary);
+      if (process.platform !== "win32") chmodSync(binary, 0o755);
+    }
+    return { dir, binary };
+  }
+
+  /**
+   * Run `fn` with the two environment variables that would otherwise decide the
+   * spawn for us removed, and put them back afterwards:
+   *   - NoDefaultCurrentDirectoryInExePath, because libuv reads it from the
+   *     PARENT's environment and this harness runs with it set, so leaving it in
+   *     place would let a reverted bare spawn pass the planted-cwd test;
+   *   - AWS_MCP_TEST_AWS_COMMAND, because it is an explicit command and would
+   *     skip resolution entirely.
+   */
+  async function withoutSpawnOverrides(fn: () => Promise<void>): Promise<void> {
+    const saved = {
+      noDefault: process.env.NoDefaultCurrentDirectoryInExePath,
+      testCommand: process.env.AWS_MCP_TEST_AWS_COMMAND,
+    };
+    delete process.env.NoDefaultCurrentDirectoryInExePath;
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    try {
+      await fn();
+    } finally {
+      if (saved.noDefault === undefined) delete process.env.NoDefaultCurrentDirectoryInExePath;
+      else process.env.NoDefaultCurrentDirectoryInExePath = saved.noDefault;
+      if (saved.testCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+      else process.env.AWS_MCP_TEST_AWS_COMMAND = saved.testCommand;
+    }
+  }
+
+  it("runs the aws on PATH, not one planted in the working directory", async () => {
+    // The regression test for the planting vector: on Windows a bare
+    // spawn("aws") searches the working directory before PATH, and that
+    // directory belongs to the MCP host. Reproduced on Node 22.22.2 before the
+    // resolver landed -- the planted binary ran and its made-up JSON came back
+    // as a successful aws_call. Kept on every platform: POSIX has the same shape
+    // through an empty or "." PATH entry, and the assertion is the same.
+    const plant = plantNode("aws-mcp-plant-");
+    const legit = plantNode("aws-mcp-legit-");
+    const cwd = process.cwd();
+    try {
+      await withoutSpawnOverrides(async () => {
+        process.chdir(plant.dir);
+        const r = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          prefixArgs: [FAKE_AWS],
+          timeoutMs: 30_000,
+          // undefined counts as unset. Without this the case is not hermetic:
+          // an ambient AWS_MCP_AWS_CLI is an explicit command, so the resolver
+          // honours it ahead of the PATH planted here and the operator's real
+          // CLI runs with FAKE_AWS as argv[1].
+          env: {
+            ...process.env,
+            PATH: legit.dir,
+            AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env",
+            AWS_MCP_AWS_CLI: undefined,
+          },
+        });
+        assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+        if (!r.ok) return;
+        const { execPath } = r.data as { execPath: string };
+        assert.equal(execPath, legit.binary, "the binary that ran must be the one on PATH");
+        assert.notEqual(execPath, plant.binary);
+      });
+    } finally {
+      process.chdir(cwd);
+      rmSync(plant.dir, { recursive: true, force: true });
+      rmSync(legit.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("spawns nothing and says how to fix it when no CLI can be found", async () => {
+    const empty = mkdtempSync(join(tmpdir(), "aws-mcp-nopath-"));
+    try {
+      await withoutSpawnOverrides(async () => {
+        const r = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          // undefined counts as unset, so this also covers a machine where the
+          // developer really has the override set.
+          env: { ...process.env, PATH: empty, AWS_MCP_AWS_CLI: undefined },
+        });
+        assert.equal(r.ok, false);
+        if (r.ok) return;
+        assert.equal(r.kind, "spawn_failure");
+        assert.match(r.error, /AWS_MCP_AWS_CLI/, "the message has to name the override");
+        assert.match(r.error, /working directory is never searched/);
+        // The envelope, not the clock: the resolver failed before any argv was
+        // assembled, so there is no invocation to show. A bare-name fallback would
+        // have spawned something and put its display string here. This file's own
+        // budgets (fakeOpts, FLUSH_BEFORE_TIMEOUT_BUDGETS_MS) document multi-second
+        // scheduler stalls under a parallel `node --test`, so a wall-clock bound on
+        // "nothing ran" would go red on a build where resolution worked perfectly.
+        assert.equal(r.command, undefined, "a resolver failure assembles no invocation, so nothing was spawned");
+      });
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  it("honors AWS_MCP_AWS_CLI, and refuses an unusable one instead of falling back", async () => {
+    const override = plantNode("aws-mcp-override-");
+    const onPath = plantNode("aws-mcp-onpath-");
+    try {
+      await withoutSpawnOverrides(async () => {
+        const ok = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          prefixArgs: [FAKE_AWS],
+          timeoutMs: 30_000,
+          env: {
+            ...process.env,
+            PATH: onPath.dir,
+            AWS_MCP_AWS_CLI: override.binary,
+            AWS_MCP_FAKE_SCENARIO: "spawn-hardening_echo_env",
+          },
+        });
+        assert.equal(ok.ok, true, ok.ok ? "" : `${ok.kind}: ${ok.error}`);
+        if (!ok.ok) return;
+        assert.equal((ok.data as { execPath: string }).execPath, override.binary, "the override beats PATH");
+        // The absolute path is not what the reader needs to see; `aws` is.
+        assert.match(ok.command, /^aws /);
+
+        // A relative value is the shape a user most easily gets wrong, and the
+        // whole point of the loud failure is that it does NOT quietly run the
+        // perfectly good CLI sitting on PATH instead.
+        const bad = await runAwsCall({
+          service: "sts",
+          operation: "get-caller-identity",
+          prefixArgs: [FAKE_AWS],
+          env: { ...process.env, PATH: onPath.dir, AWS_MCP_AWS_CLI: "relative/aws" },
+        });
+        assert.equal(bad.ok, false);
+        if (bad.ok) return;
+        assert.equal(bad.kind, "spawn_failure");
+        assert.match(bad.error, /AWS_MCP_AWS_CLI must be an absolute path/);
+      });
+    } finally {
+      rmSync(override.dir, { recursive: true, force: true });
+      rmSync(onPath.dir, { recursive: true, force: true });
+    }
   });
 });
 

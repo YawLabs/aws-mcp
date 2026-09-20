@@ -1,24 +1,36 @@
 /**
- * Subprocess integration for aws_logs_tail. Exercises the argv construction
- * and NDJSON parsing by routing runAwsCall at the fake aws binary via the
- * same test-injection knobs the other integration tests use.
+ * Subprocess integration for aws_logs_tail: the handler driven end to end against
+ * the fake CLI, one `logs-tail_*` scenario per CLI era.
  *
- * Two wiring styles live here, both pointed at the same fake binary. The
- * runAwsCall-direct suites pass command/prefixArgs/env per call, which is how
- * the argv-construction cases assert flags the handler has no knob for. The
- * handler-level suites instead rely on the AWS_MCP_TEST_AWS_COMMAND /
- * AWS_MCP_TEST_AWS_PREFIX_ARGS pair set in before(), so the handler's own
- * runAwsCall spawns the fake.
+ * The scenarios answer like the real `aws logs filter-log-events` -- verbatim
+ * captures, or an emulator whose every rule was measured against a real CLI
+ * (src/testing/logs-tail-fake.ts) -- so these cases pin the handler's own
+ * behavior: which read mode it chose, how many CLI calls that cost, what the
+ * payload carried, and which end of a busy window came back. The argv side
+ * channel (AWS_MCP_FAKE_LOGS_TAIL_ARGV_LOG) is how the call count and the payload
+ * are read, because `command` redacts the payload.
+ *
+ * Handler-level wiring only: AWS_MCP_TEST_AWS_COMMAND / AWS_MCP_TEST_AWS_PREFIX_ARGS
+ * are set in before(), so the handler's own runAwsCall spawns the fake. The
+ * runAwsCall-direct argv tests this file used to carry pinned `aws logs tail`'s
+ * positional argv, which no longer exists; logs.realcli.test.ts drives the real
+ * CLI instead.
  */
 
 import assert from "node:assert/strict";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { after, afterEach, before, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { runAwsCall } from "../aws-cli.js";
-import { DEFAULT_MAX_EVENTS, logsTools, MAX_MAX_EVENTS, parseLogsJsonOutput } from "./logs.js";
+import { REAL_CLI_CAPTURES } from "../testing/logs-tail-fake.js";
+import {
+  _resetLogsTailCliModelCache,
+  DEFAULT_MAX_EVENTS,
+  LOG_GROUP_IDENTIFIER_MIN_CLI,
+  logsTools,
+  MAX_MAX_EVENTS,
+} from "./logs.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
@@ -47,281 +59,377 @@ afterEach(() => {
   delete process.env.AWS_MCP_FAKE_SCENARIO;
 });
 
-function fakeOpts(scenario: string) {
-  return {
-    command: process.execPath,
-    prefixArgs: [FAKE_AWS],
-    env: { ...process.env, AWS_MCP_FAKE_SCENARIO: scenario },
-  };
-}
-
-describe("aws_logs_tail — argv construction (via runAwsCall + fake)", () => {
-  it("places log group name as first positional after 'tail'", async () => {
-    const r = await runAwsCall({
-      service: "logs",
-      operation: "tail",
-      extraFlags: ["/aws/lambda/my-fn", "--format", "json", "--since", "15m"],
-      ...fakeOpts("call_echo_args"),
-    });
-    assert.equal(r.ok, true);
-    if (!r.ok) return;
-    const { argv } = r.data as { argv: string[] };
-    const tailIdx = argv.indexOf("tail");
-    assert.equal(argv[tailIdx + 1], "/aws/lambda/my-fn");
-    const formatIdx = argv.indexOf("--format");
-    assert.equal(argv[formatIdx + 1], "json");
-    const sinceIdx = argv.indexOf("--since");
-    assert.equal(argv[sinceIdx + 1], "15m");
-  });
-
-  it("passes --filter-pattern and --log-stream-names as separate argv entries", async () => {
-    const r = await runAwsCall({
-      service: "logs",
-      operation: "tail",
-      extraFlags: [
-        "/aws/lambda/my-fn",
-        "--format",
-        "json",
-        "--since",
-        "10m",
-        "--filter-pattern",
-        "ERROR",
-        "--log-stream-names",
-        "stream-a",
-        "stream-b",
-      ],
-      ...fakeOpts("call_echo_args"),
-    });
-    assert.equal(r.ok, true);
-    if (!r.ok) return;
-    const { argv } = r.data as { argv: string[] };
-    const fIdx = argv.indexOf("--filter-pattern");
-    assert.equal(argv[fIdx + 1], "ERROR");
-    const sIdx = argv.indexOf("--log-stream-names");
-    assert.equal(argv[sIdx + 1], "stream-a");
-    assert.equal(argv[sIdx + 2], "stream-b");
-  });
-});
-
-describe("aws_logs_tail — NDJSON output end-to-end", () => {
-  it("parses per-line JSON events into an array", async () => {
-    const r = await runAwsCall({
-      service: "logs",
-      operation: "tail",
-      extraFlags: ["/aws/lambda/my-fn", "--format", "json"],
-      // Mirrors the real call in logs.ts. NDJSON opens with `{` and cannot
-      // parse as one document, which is indistinguishable from a truncated
-      // payload unless the caller says so -- hence the explicit flag.
-      ndjson: true,
-      ...fakeOpts("logs_tail_ndjson"),
-    });
-    assert.equal(r.ok, true);
-    if (!r.ok) return;
-    // runAwsCall returns the raw string since NDJSON isn't a valid JSON
-    // document on its own. The handler then runs parseLogsJsonOutput on it.
-    const events = parseLogsJsonOutput(r.data);
-    assert.ok(Array.isArray(events));
-    assert.equal(events.length, 3);
-    assert.equal((events[0] as { message: string }).message, "hello");
-    assert.equal((events[2] as { logStreamName: string }).logStreamName, "s2");
-  });
-
-  it("treats the same bytes as a truncated payload when ndjson is NOT declared", async () => {
-    // The other half of the contract above. runAwsCall cannot tell complete
-    // NDJSON from a truncated JSON document by inspection -- both open with
-    // `{` and fail a whole-blob parse -- so an undeclared caller gets the
-    // conservative answer. This is why the flag exists rather than the check
-    // simply special-casing newlines.
-    const r = await runAwsCall({
-      service: "logs",
-      operation: "tail",
-      extraFlags: ["/aws/lambda/my-fn", "--format", "json"],
-      ...fakeOpts("logs_tail_ndjson"),
-    });
-    assert.equal(r.ok, false);
-    if (r.ok) return;
-    assert.equal(r.kind, "malformed_json");
-    assert.match(r.rawStdout ?? "", /hello/, "raw stdout is preserved for diagnosis");
-  });
-
-  it("returns an empty array when the window produced no events", async () => {
-    const r = await runAwsCall({
-      service: "logs",
-      operation: "tail",
-      extraFlags: ["/aws/lambda/my-fn", "--format", "json"],
-      ...fakeOpts("logs_tail_empty"),
-    });
-    assert.equal(r.ok, true);
-    if (!r.ok) return;
-    // runAwsCall returns null when stdout is empty (no JSON to parse).
-    const events = parseLogsJsonOutput(r.data ?? "");
-    assert.ok(Array.isArray(events));
-    assert.equal(events.length, 0);
-  });
-});
-
 const handlerTool = logsTools.find((t) => t.name === "aws_logs_tail");
 if (!handlerTool) throw new Error("logsTools missing aws_logs_tail");
 
-describe("aws_logs_tail handler — malformed NDJSON fallback", () => {
-  it("surfaces eventCount=null and the raw blob when a line fails to parse", async () => {
-    // The fake-aws scenario logs_tail_ndjson_malformed emits three lines where
-    // the middle line is not valid JSON (see the logs_tail_ndjson_malformed scenario in fake-aws.ts). The handler
-    // runs parseLogsJsonOutput on the raw stdout, which gives up on the bad
-    // line and returns the unparsed string. The handler then sets
-    // eventCount=null (because events is a string, not an array) and surfaces
-    // the raw blob under `events` for diagnosis.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_malformed";
-    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn" });
-    assert.equal(r.ok, true);
-    const data = r.data as { eventCount: number | null; events: unknown };
-    assert.equal(data.eventCount, null, "eventCount must be null when NDJSON contains an unparseable line");
-    assert.equal(typeof data.events, "string", "events must be the raw string fallback for diagnosis");
-    assert.ok((data.events as string).includes("this-line-is-not-json"), "raw blob should contain the offending line");
-  });
+/** One line per CLI invocation the fake saw, in order. */
+interface FakeInvocation {
+  argv: string[];
+  params: Record<string, unknown> | null;
+}
 
-  it("reports totalEvents:null and truncated:false alongside eventCount:null", async () => {
-    // The honest-null decision: on the raw-blob path nothing was counted, so
-    // neither count is a number and nothing was dropped. Pinned so a later
-    // refactor cannot quietly report totalEvents: 0 here.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_malformed";
-    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn" });
-    assert.equal(r.ok, true);
-    const data = r.data as { eventCount: number | null; totalEvents: number | null; truncated: boolean };
-    assert.equal(data.eventCount, null);
-    assert.equal(data.totalEvents, null);
-    assert.equal(data.truncated, false);
-  });
-});
+describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () => {
+  // Every case here passes an explicit region so a developer shell carrying
+  // AWS_REGION cannot change what an ARN case asserts.
+  const REGION = "us-east-1";
+  const ARN = `arn:aws:logs:${REGION}:123456789012:log-group:/aws/lambda/my-fn`;
+  let argvLogDir: string;
+  let argvLog: string;
 
-describe("aws_logs_tail handler — maxEvents cap", () => {
-  // logs_tail_ndjson_bulk emits 1200 events oldest-first, each message tagged
-  // with its index ("event-0" .. "event-1199"), which is the only thing that
-  // makes last-N distinguishable from first-N.
   const msg = (e: unknown) => (e as { message: string }).message;
 
-  it("defaults to the newest DEFAULT_MAX_EVENTS and reports the full total", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
-    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn" });
-    assert.equal(r.ok, true);
-    const data = r.data as { eventCount: number; totalEvents: number; truncated: boolean; events: unknown[] };
-    assert.equal(data.eventCount, DEFAULT_MAX_EVENTS);
-    assert.equal(data.totalEvents, 1200);
-    assert.equal(data.truncated, true);
-    assert.equal(data.events.length, DEFAULT_MAX_EVENTS);
-    // Load-bearing: the NEWEST events survived, not the oldest.
-    assert.equal(msg(data.events[0]), `event-${1200 - DEFAULT_MAX_EVENTS}`);
-    assert.equal(msg(data.events[DEFAULT_MAX_EVENTS - 1]), "event-1199");
-  });
-
-  it("an explicit maxEvents keeps exactly that many, still oldest-first within the slice", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
-    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 10 });
-    assert.equal(r.ok, true);
-    const data = r.data as { eventCount: number; totalEvents: number; truncated: boolean; events: unknown[] };
-    assert.equal(data.eventCount, 10);
-    assert.equal(data.totalEvents, 1200);
-    assert.equal(data.truncated, true);
-    // Order WITHIN the slice is unchanged, so a caller reading the last element
-    // as "most recent" behaves exactly as it did before the cap existed.
-    for (let idx = 0; idx < 10; idx++) {
-      assert.equal(msg(data.events[idx]), `event-${1190 + idx}`);
+  /** The fake's per-invocation log for the call that just ran. */
+  const invocations = (): FakeInvocation[] => {
+    let raw: string;
+    try {
+      raw = readFileSync(argvLog, "utf8");
+    } catch {
+      return [];
     }
+    return raw
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as FakeInvocation);
+  };
+
+  const tail = async (scenario: string, input: Record<string, unknown> = {}) => {
+    process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+    return await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", region: REGION, ...input });
+  };
+
+  before(() => {
+    argvLogDir = mkdtempSync(join(tmpdir(), "logs-tail-argv-"));
+  });
+  after(() => {
+    delete process.env.AWS_MCP_FAKE_LOGS_TAIL_ARGV_LOG;
+    rmSync(argvLogDir, { recursive: true, force: true });
   });
 
-  it("leaves a window under the cap untouched and reports truncated:false", async () => {
-    // The no-regression case for every existing caller whose windows are small:
-    // identical apart from the two new fields.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson";
-    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn" });
-    assert.equal(r.ok, true);
-    const data = r.data as { eventCount: number; totalEvents: number; truncated: boolean; events: unknown[] };
-    assert.equal(data.eventCount, 3);
-    assert.equal(data.totalEvents, 3);
+  beforeEach(() => {
+    // A fresh log per test, and a fresh capability cache: the "this CLI has no
+    // startFromHead" flag lives for the process, and a test that inherited it from
+    // the previous one would assert against the wrong read mode.
+    counter += 1;
+    argvLog = join(argvLogDir, `argv-${counter}.jsonl`);
+    process.env.AWS_MCP_FAKE_LOGS_TAIL_ARGV_LOG = argvLog;
+    _resetLogsTailCliModelCache();
+  });
+
+  // --- a CLI that has startFromHead (AWS CLI 2.35.8+) ---------------------------
+
+  it("reads newest-first in ONE call and returns structured events", async () => {
+    const r = await tail("logs-tail_current_basic");
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    const data = r.data as {
+      logGroupName: string;
+      logGroupIdentifier: string | null;
+      eventCount: number;
+      totalEvents: number | null;
+      truncated: boolean;
+      events: Array<{ timestamp: string | null; logStreamName: string | null; message: string | null }>;
+    };
+    assert.equal(data.eventCount, 6);
+    assert.equal(data.totalEvents, 6);
     assert.equal(data.truncated, false);
-    assert.equal(data.events.length, 3);
+    assert.equal(data.logGroupName, "/aws/lambda/my-fn");
+    assert.equal(data.logGroupIdentifier, null, "a bare-name call sends no identifier");
+    // Structured events, oldest first -- the thing this tool never returned against
+    // a real CLI before 2.4.0.
+    assert.equal(data.events.length, 6);
+    assert.equal(data.events[0].timestamp, "2026-09-19T10:00:00.000Z");
+    assert.equal(data.events[0].message, "START RequestId: 11-22 Version: $LATEST\n");
+    assert.equal(data.events[3].logStreamName, "my stream/2026");
+
+    const calls = invocations();
+    assert.equal(calls.length, 1, "a current CLI pays for no rejected call");
+    const argv = calls[0].argv;
+    assert.ok(argv.includes("filter-log-events"), "the operation is filter-log-events, not tail");
+    assert.equal(argv[argv.indexOf("--page-size") + 1], String(DEFAULT_MAX_EVENTS + 1));
+    assert.equal(argv[argv.indexOf("--max-items") + 1], String(DEFAULT_MAX_EVENTS + 1), "one sentinel event");
+    assert.match(
+      argv[argv.indexOf("--query") + 1],
+      /^\{total: length\(events \|\| `\[\]`\), events: \(events \|\| `\[\]`\)\[\]\./,
+    );
+    assert.deepEqual(calls[0].params, {
+      logGroupName: "/aws/lambda/my-fn",
+      startTime: (calls[0].params as { startTime: number }).startTime,
+      startFromHead: false,
+    });
+  });
+
+  it("keeps the NEWEST maxEvents of a busy window and reports totalEvents:null", async () => {
+    const r = await tail("logs-tail_current_bulk");
+    assert.equal(r.ok, true);
+    const data = r.data as { eventCount: number; totalEvents: number | null; truncated: boolean; events: unknown[] };
+    assert.equal(data.eventCount, DEFAULT_MAX_EVENTS);
+    assert.equal(data.truncated, true);
+    assert.equal(data.totalEvents, null, "the read stopped early, so the window's size is unknown");
+    assert.equal(msg(data.events[0]), `event-${1200 - DEFAULT_MAX_EVENTS}`);
+    assert.equal(msg(data.events[DEFAULT_MAX_EVENTS - 1]), "event-1199", "oldest-first within the slice");
+  });
+
+  it("honors an explicit maxEvents", async () => {
+    const r = await tail("logs-tail_current_bulk", { maxEvents: 10 });
+    assert.equal(r.ok, true);
+    const data = r.data as { eventCount: number; events: unknown[] };
+    assert.equal(data.eventCount, 10);
+    for (let idx = 0; idx < 10; idx++) assert.equal(msg(data.events[idx]), `event-${1190 + idx}`);
+    assert.equal(invocations()[0].argv[invocations()[0].argv.indexOf("--max-items") + 1], "11");
+  });
+
+  it("treats exactly maxEvents as a complete window and flips one below it", async () => {
+    // An off-by-one to `>=` would report truncated on a window that came back whole
+    // -- and tell the caller to narrow a `since` that needed no narrowing.
+    const exact = await tail("logs-tail_current_bulk", { maxEvents: 1200 });
+    assert.equal(exact.ok, true);
+    const exactData = exact.data as {
+      eventCount: number;
+      totalEvents: number | null;
+      truncated: boolean;
+      events: unknown[];
+    };
+    assert.equal(exactData.eventCount, 1200);
+    assert.equal(exactData.totalEvents, 1200, "nothing was left unread");
+    assert.equal(exactData.truncated, false);
+    assert.equal(msg(exactData.events[0]), "event-0");
+
+    const one = await tail("logs-tail_current_bulk", { maxEvents: 1199 });
+    assert.equal(one.ok, true);
+    const oneData = one.data as {
+      eventCount: number;
+      totalEvents: number | null;
+      truncated: boolean;
+      events: unknown[];
+    };
+    assert.equal(oneData.eventCount, 1199);
+    assert.equal(oneData.truncated, true);
+    assert.equal(oneData.totalEvents, null);
+    assert.equal(msg(oneData.events[0]), "event-1", "the single OLDEST event is the one dropped");
   });
 
   it("clamps an out-of-range maxEvents from a direct (non-schema) caller", async () => {
-    // Handler calls bypass Zod, which is why the Math.min(Math.max(1, ...))
-    // clamp exists. Both directions.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
-    const low = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 0 });
+    const low = await tail("logs-tail_current_bulk", { maxEvents: 0 });
     assert.equal(low.ok, true);
     const lowData = low.data as { eventCount: number; events: unknown[] };
     assert.equal(lowData.eventCount, 1, "0 clamps up to 1");
     assert.equal(msg(lowData.events[0]), "event-1199", "and it is the newest event that survives");
 
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
-    const high = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 999_999 });
+    const high = await tail("logs-tail_current_bulk", { maxEvents: 999_999 });
     assert.equal(high.ok, true);
     const highData = high.data as { eventCount: number; truncated: boolean };
     assert.equal(highData.eventCount, 1200, `clamps down to ${MAX_MAX_EVENTS}, which exceeds the window`);
     assert.equal(highData.truncated, false);
+    // --page-size is capped at FilterLogEvents' own EventsLimit maximum, so the
+    // clamped 10,000 asks for 10,000 and not 10,001.
+    const argv = invocations().at(-1)?.argv ?? [];
+    assert.equal(argv[argv.indexOf("--page-size") + 1], String(MAX_MAX_EVENTS));
+    assert.equal(argv[argv.indexOf("--max-items") + 1], String(MAX_MAX_EVENTS + 1));
   });
 
-  it("treats EXACTLY maxEvents as a complete window and flips one below it (1200 in, 1199 out)", async () => {
-    // The cases above straddle the boundary widely (3 vs 500, 1200 vs 10000,
-    // 1200 vs 500 and vs 10), so an off-by-one flip to `>=` survives all of
-    // them: it would report truncated:true on a window that came back complete
-    // -- telling the caller to narrow a `since` that did not need narrowing --
-    // and slice(-1200) is a no-op that hides it from the event assertions.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
-    const exact = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 1200 });
-    assert.equal(exact.ok, true);
-    const exactData = exact.data as {
+  it("never sends an empty logStreamNames or logStreamNamePrefix", async () => {
+    // botocore refuses both before any request, so sending them would break calls
+    // that work today. The emulator exits 2 if either reaches the payload.
+    for (const input of [{ logStreamNames: [] }, { logStreamNamePrefix: "" }]) {
+      const r = await tail("logs-tail_current_empty", input);
+      assert.equal(r.ok, true, `${JSON.stringify(input)} must still be a valid call: ${r.error ?? ""}`);
+      const params = invocations().at(-1)?.params ?? {};
+      assert.equal("logStreamNames" in params, false);
+      assert.equal("logStreamNamePrefix" in params, false);
+    }
+  });
+
+  it("keeps every caller value inside --cli-input-json, out of argv", async () => {
+    // The F15 closure for this tool: the CLI expands an argv value starting with
+    // `file://` into that file's contents, and a read-only tool must never do that.
+    // Inside the payload the same string is sent literally.
+    const filterPattern = "file://~/.aws/credentials";
+    const r = await tail("logs-tail_current_empty", { filterPattern, logStreamNamePrefix: "2026/09/" });
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    const call = invocations().at(-1);
+    assert.ok(call);
+    assert.equal(call.argv.includes(filterPattern), false, "the pattern is not its own argv entry");
+    assert.equal(call.argv.includes("2026/09/"), false);
+    assert.equal(call.argv.includes("--filter-pattern"), false, "nor is the flag it used to ride on");
+    assert.equal(call.params?.filterPattern, filterPattern, "it travels in the payload, literally");
+    assert.equal(call.params?.logStreamNamePrefix, "2026/09/");
+  });
+
+  it("sends an ARN as logGroupIdentifier without the ':*' and echoes it back", async () => {
+    for (const input of [ARN, `${ARN}:*`]) {
+      const r = await tail("logs-tail_echo_argv", { logGroupName: input });
+      assert.equal(r.ok, true, `expected ${input} to be accepted: ${r.error ?? ""}`);
+      const data = r.data as { logGroupName: string; logGroupIdentifier: string | null };
+      assert.equal(data.logGroupName, "/aws/lambda/my-fn", "the envelope still echoes the bare name");
+      assert.equal(data.logGroupIdentifier, ARN, "and the identifier that was actually sent");
+      const call = invocations().at(-1);
+      assert.ok(call);
+      assert.equal(call.params?.logGroupIdentifier, ARN);
+      assert.equal("logGroupName" in (call.params ?? {}), false, "exactly one of the two is sent");
+      assert.equal(call.argv.includes(input), false, "the raw ARN is never an argv entry");
+    }
+  });
+
+  it("sends a bare name as logGroupName with no identifier", async () => {
+    const r = await tail("logs-tail_echo_argv");
+    assert.equal(r.ok, true);
+    assert.equal((r.data as { logGroupIdentifier: string | null }).logGroupIdentifier, null);
+    const params = invocations().at(-1)?.params ?? {};
+    assert.equal(params.logGroupName, "/aws/lambda/my-fn");
+    assert.equal("logGroupIdentifier" in params, false);
+  });
+
+  // --- a CLI that rejects startFromHead (before 2.35.8) ------------------------
+
+  it("falls back to a whole-window read and pins the rejection for the process", async () => {
+    const first = await tail("logs-tail_legacy_bulk");
+    assert.equal(first.ok, true, `handler failed: ${first.error ?? ""}`);
+    const data = first.data as {
       eventCount: number;
-      totalEvents: number;
+      totalEvents: number | null;
       truncated: boolean;
       events: unknown[];
     };
-    assert.equal(exactData.eventCount, 1200);
-    assert.equal(exactData.totalEvents, 1200);
-    assert.equal(exactData.truncated, false, "1200 of 1200 is a COMPLETE window");
-    assert.equal(msg(exactData.events[0]), "event-0", "nothing was sliced off the head");
+    assert.equal(data.eventCount, DEFAULT_MAX_EVENTS);
+    assert.equal(data.truncated, true);
+    assert.equal(data.totalEvents, 1200, "the whole window was read, so the count is exact");
+    assert.equal(msg(data.events[0]), `event-${1200 - DEFAULT_MAX_EVENTS}`);
+    assert.equal(msg(data.events[DEFAULT_MAX_EVENTS - 1]), "event-1199");
 
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_ndjson_bulk";
-    const one = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", maxEvents: 1199 });
-    assert.equal(one.ok, true);
-    const oneData = one.data as { eventCount: number; totalEvents: number; truncated: boolean; events: unknown[] };
-    assert.equal(oneData.eventCount, 1199);
-    assert.equal(oneData.totalEvents, 1200);
-    assert.equal(oneData.truncated, true);
-    assert.equal(msg(oneData.events[0]), "event-1", "the single OLDEST event is the one dropped");
+    const calls = invocations();
+    assert.equal(calls.length, 2, "one rejected newest-first attempt, then the whole window");
+    assert.equal(calls[0].params?.startFromHead, false);
+    assert.equal("startFromHead" in (calls[1].params ?? {}), false);
+    assert.equal(calls[1].argv.includes("--max-items"), false, "the whole-window read pages to the end");
+    assert.equal(calls[1].argv.includes("--page-size"), false);
+    assert.match(calls[1].argv[calls[1].argv.indexOf("--query") + 1], /\(events \|\| `\[\]`\)\[-500:\]/);
+
+    // The negative answer is cached, so a second call costs one invocation.
+    const second = await tail("logs-tail_legacy_bulk");
+    assert.equal(second.ok, true);
+    assert.equal(invocations().length, 3, "the second handler call made ONE invocation");
+    assert.equal("startFromHead" in (invocations()[2].params ?? {}), false);
+
+    // ...and the cache is per process, so a reset brings the detection back.
+    _resetLogsTailCliModelCache();
+    const third = await tail("logs-tail_legacy_bulk");
+    assert.equal(third.ok, true);
+    assert.equal(invocations().length, 5, "after a reset it detects again: two invocations");
   });
-});
 
-describe("aws_logs_tail handler — log-group ARN end to end", () => {
-  it("puts the ARN-extracted BARE NAME on the CLI and echoes it back as logGroupName", async () => {
-    // resolveLogGroupName is unit-tested, but nothing pinned what the handler
-    // actually SPAWNS for an ARN input. `aws logs tail` takes a bare group name
-    // as its first positional; handing it the ARN (or an ARN whose ':*' suffix
-    // survived) is a ResourceNotFound at runtime, and the echoed logGroupName
-    // would then disagree with the group that was really tailed.
-    //
-    // call_echo_args emits {"argv": [...]} as a single JSON line, so the
-    // handler's own NDJSON path parses it into events[0].argv -- no side
-    // channel needed.
-    for (const arn of [
-      "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
-      "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn:*",
-    ]) {
-      process.env.AWS_MCP_FAKE_SCENARIO = "call_echo_args";
-      const r = await handlerTool.handler({ logGroupName: arn, since: "5m" });
-      assert.equal(r.ok, true, `expected ${arn} to be accepted`);
-      const data = r.data as { logGroupName: string; since: string; events: unknown };
-      assert.equal(data.logGroupName, "/aws/lambda/my-fn", "the response must echo the RESOLVED bare name");
+  it("gets the boundaries right on the whole-window path too", async () => {
+    const exact = await tail("logs-tail_legacy_bulk", { maxEvents: 1200 });
+    assert.equal(exact.ok, true);
+    const exactData = exact.data as { totalEvents: number | null; truncated: boolean };
+    assert.equal(exactData.totalEvents, 1200);
+    assert.equal(exactData.truncated, false);
 
-      const events = data.events as Array<{ argv: string[] }>;
-      assert.ok(Array.isArray(events) && events.length === 1, "call_echo_args emits exactly one JSON line");
-      const argv = events[0].argv;
-      const tailIdx = argv.indexOf("tail");
-      assert.ok(tailIdx >= 0, "argv should contain the 'tail' operation");
-      assert.equal(argv[tailIdx + 1], "/aws/lambda/my-fn", "the first positional after 'tail' is the bare name");
-      assert.equal(argv.includes(arn), false, "the raw ARN must never reach the CLI");
-      const sinceIdx = argv.indexOf("--since");
-      assert.equal(argv[sinceIdx + 1], "5m");
-    }
+    _resetLogsTailCliModelCache();
+    const one = await tail("logs-tail_legacy_bulk", { maxEvents: 1199 });
+    assert.equal(one.ok, true);
+    const oneData = one.data as { eventCount: number; totalEvents: number | null; truncated: boolean };
+    assert.equal(oneData.eventCount, 1199);
+    assert.equal(oneData.totalEvents, 1200, "exact even when truncated, on this path");
+    assert.equal(oneData.truncated, true);
+  });
+
+  it("parses the bytes the real CLI printed for a whole-window read", async () => {
+    // logs-tail_legacy_basic answers with a verbatim 2.34.3 capture rather than the
+    // emulator, and refuses any call but the one it was captured from.
+    const r = await tail("logs-tail_legacy_basic");
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    const data = r.data as {
+      eventCount: number;
+      totalEvents: number | null;
+      events: Array<{ message: string | null }>;
+    };
+    assert.equal(data.eventCount, 6);
+    assert.equal(data.totalEvents, 6);
+    assert.equal(data.events[0].message, "START RequestId: 11-22 Version: $LATEST\n");
+    assert.equal(data.events[1].message, '{"level":"error","msg":"boom","ctx":{"id":7}}');
+  });
+
+  it("falls back when the rejection arrives in the CLI's JSON error format", async () => {
+    // AWS_CLI_ERROR_FORMAT=enhanced is pinned in every child environment, so this
+    // is the CLI that ignores the pin. The detector reads the parameter name
+    // through the escaped quotes.
+    const r = await tail("logs-tail_jsonfmt_bulk");
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    assert.equal((r.data as { totalEvents: number | null }).totalEvents, 1200);
+    assert.equal(invocations().length, 2);
+  });
+
+  it("refuses ARN input on a CLI that cannot address a group by ARN", async () => {
+    const r = await tail("logs-tail_ancient_basic", { logGroupName: ARN });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", new RegExp(`AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI.replaceAll(".", "\\.")}\\+`));
+    assert.match(r.error ?? "", /Pass the bare name '\/aws\/lambda\/my-fn'/);
+    assert.match(r.error ?? "", /123456789012/, "the ARN's account, which the bare name would NOT read");
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(r.suggestion, undefined, "parseAwsError's 'fix the parameter shape' is wrong advice here");
+    assert.equal(invocations().length, 1, "no point retrying: nothing was sent and nothing else can be");
+  });
+
+  it("still serves a bare name on that same CLI, after one rejected attempt", async () => {
+    const r = await tail("logs-tail_ancient_basic");
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    assert.equal((r.data as { eventCount: number }).eventCount, 6);
+    assert.equal(invocations().length, 2);
+  });
+
+  // --- an endpoint that IGNORES startFromHead (moto, LocalStack) ---------------
+
+  it("re-reads the whole window when the endpoint ignored startFromHead", async () => {
+    // Without the orientation check this returned the OLDEST events labelled as the
+    // newest, with truncated:true -- a silently wrong answer.
+    const r = await tail("logs-tail_ignored_bulk");
+    assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
+    const data = r.data as { eventCount: number; totalEvents: number | null; truncated: boolean; events: unknown[] };
+    assert.equal(data.eventCount, DEFAULT_MAX_EVENTS);
+    assert.equal(data.truncated, true);
+    assert.equal(data.totalEvents, 1200);
+    assert.equal(msg(data.events[0]), `event-${1200 - DEFAULT_MAX_EVENTS}`, "the NEWEST end of the window");
+    assert.equal(msg(data.events[DEFAULT_MAX_EVENTS - 1]), "event-1199");
+
+    const calls = invocations();
+    assert.equal(calls.length, 2, "the newest-first read, then the whole window");
+    assert.equal(calls[0].params?.startFromHead, false);
+    assert.equal("startFromHead" in (calls[1].params ?? {}), false);
+
+    // NOT cached: the CLI supports the member, this endpoint does not, and
+    // endpoints differ by region and profile.
+    const second = await tail("logs-tail_ignored_bulk");
+    assert.equal(second.ok, true);
+    assert.equal(invocations().length, 4, "the second handler call tries newest-first again");
+  });
+
+  // --- the parser's strictness -------------------------------------------------
+
+  it("refuses the text 'aws logs tail --format json' prints instead of guessing", async () => {
+    // The regression pin for the defect 2.4.0 fixes: this text used to come back as
+    // ok:true with the whole blob as `events`, eventCount and totalEvents null, and
+    // maxEvents silently unapplied.
+    const r = await tail("logs-tail_real_tail_text");
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /exited 0 but printed something other than the \{total, events\} document/);
+    assert.match(r.error ?? "", /Refusing to guess/);
+    assert.equal(r.errorKind, undefined, "the CLI exited 0, so nothing classified this");
+    assert.match(r.rawBody ?? "", /fake-stream a message that LOOKS like a tail header/);
+    assert.ok(
+      REAL_CLI_CAPTURES.tailFormatJsonStdout.startsWith("2026-09-19T10:00:00+00:00 "),
+      "precondition: the scenario serves the real formatter's text",
+    );
+  });
+
+  it("does not mistake an ordinary API failure for a model gap", async () => {
+    // The fallback exists for one thing: a CLI whose model does not know
+    // startFromHead, which says so in its ParamValidation text. An AccessDenied is
+    // a real answer from the service, so it is reported at once -- a whole-window
+    // retry would cost another CLI start and fail the same way.
+    const r = await tail("logs-tail_api_error");
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.rawBody ?? "", /AccessDeniedException/);
+    assert.equal(invocations().length, 1, "ONE CLI call, no fallback");
   });
 });
 
@@ -664,9 +772,9 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
 
 describe("aws_logs_tail handler -- errorKind / suggestion forwarding", () => {
   // logs.ts has exactly ONE errorKind-forwarding return: aws_logs_tail's CLI
-  // failure arm. Both scenarios below are argv-independent, so `aws logs tail`'s
-  // positional-group-name argv reaches the same fake branch aws_call does --
-  // this pins the FORWARDING, not the classifier.
+  // failure arm. Both scenarios below are argv-independent, so the
+  // filter-log-events argv reaches the same fake branch aws_call does -- this pins
+  // the FORWARDING, not the classifier.
 
   it("forwards nonzero_exit plus the parsed suggestion, which stays embedded in error too", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "call_access_denied";
@@ -693,5 +801,17 @@ describe("aws_logs_tail handler -- errorKind / suggestion forwarding", () => {
     // parseAwsError never runs -- the two fields are independent.
     assert.equal(r.suggestion, undefined);
     assert.match(r.error ?? "", /SSO session expired/);
+  });
+
+  it("carries the classifier's own remedy for a CloudWatch Logs IAM refusal", async () => {
+    // Verbatim 2.34.3 stderr for FilterLogEvents refused by IAM (exit 254), where
+    // errors.ts can name the principal and the action -- a better remedy than the
+    // generic one above, on the exact text this tool's calls produce.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_api_error";
+    const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", region: "us-east-1" });
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.match(r.suggestion ?? "", /lacks logs:FilterLogEvents/);
+    assert.match(r.rawBody ?? "", /AccessDeniedException/);
   });
 });

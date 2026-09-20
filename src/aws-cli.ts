@@ -11,12 +11,26 @@
  * that begins `file://` or `fileb://` is refused unless the caller minted it
  * itself, because the CLI would replace such a value with the contents of that
  * local file before signing the request (see isParamFileUri).
+ *
+ * Every child runs with the CLI settings this server depends on pinned in its
+ * environment (aws-spawn.ts PINNED_CLI_ENV): the error format the classifier
+ * reads, auto-prompt off, and UTF-8 output. Those are settings a user can put
+ * in ~/.aws/config that break this server rather than their own terminal. The
+ * binary itself is resolved to an absolute path from the child environment's
+ * PATH, or from AWS_MCP_AWS_CLI, and never from the working directory -- which
+ * belongs to the MCP host, not to us. A call that carries params also pins
+ * --cli-binary-format base64, the one such setting with no environment variable.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { closeSync, fchmodSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { awsChildEnv, isCliSafeFilePath, resolveAwsCommand } from "./aws-spawn.js";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { KILL_ESCALATION_MS, killProc, procHasExited } from "./kill-proc.js";
+import { assertPrivateMode } from "./private-file.js";
 import {
   getProfile,
   getRegion,
@@ -27,6 +41,31 @@ import {
 } from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * Ceiling on timeoutMs, because node stores a timer delay in a signed 32-bit
+ * int. A larger delay does not wait longer -- node warns
+ * (`TimeoutOverflowWarning: ... does not fit into a 32-bit signed integer.
+ * Timeout duration was set to 1.`) and fires the timer after 1 ms, so asking for
+ * 30 days timed the call out at once. Measured on node 22.22.2 with
+ * `setTimeout(fn, 2 ** 31 + 1000)`.
+ *
+ * 2,147,483,647 ms is about 24.8 days, so clamping costs no caller anything real.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Params longer than this travel in a temp file rather than on the command line.
+ *
+ * Well under both OS limits -- Windows caps a whole command line at 32,767
+ * characters and Linux one argument at 131,072 (both measured; a 40,000-character
+ * argv entry throws ENAMETOOLONG synchronously here on node 22.22.2) -- because
+ * the params JSON is not the only thing on the line, and a value just under the
+ * cap would fail depending on how long the profile and region happen to be.
+ * Everything below the threshold stays inline, which keeps `command` strings,
+ * the fake CLI's argv parsing and 59 existing test references unchanged.
+ */
+export const INLINE_CLI_INPUT_JSON_MAX_CHARS = 8_192;
+const CLI_INPUT_TEMP_PREFIX = "aws-mcp-input-";
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
 // Cap the stderr we surface as an error message to avoid flooding the MCP
 // response. Full stderr still lands in rawStderr for diagnosis.
@@ -140,7 +179,13 @@ export function redactDisplayArgs(args: readonly string[]): string[] {
 
 // Characters that need no quoting in a POSIX shell word. Deliberately
 // conservative: anything outside this set gets single-quoted.
-const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+// '%' is deliberately NOT in this set. It is inert in every POSIX shell and in
+// PowerShell, but cmd.exe and a .bat file expand %VAR% -- measured: a display
+// string carrying a bare %PATH% arrived as one empty token in a batch file, argc
+// dropped by one. Quoting it does not make the string safe for cmd.exe (nothing
+// does -- see shellQuoteArg), but a quoted %VAR% at least survives as text
+// everywhere else instead of vanishing where it is read.
+const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@+=:,./-]+$/;
 
 /**
  * Quote one argv entry for a POSIX shell, so displayCommand is something the
@@ -156,17 +201,77 @@ const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
  *
  * Single-quoting is the safe form: inside single quotes a POSIX shell expands
  * nothing. An embedded single quote closes, escapes, and reopens ('\'').
- * cmd.exe and PowerShell quote differently, so this is still a display string
- * rather than a universal one -- but it is now correct wherever `aws` is
- * normally driven from.
+ * cmd.exe and PowerShell quote differently, so this is a display string rather
+ * than a universal one. Precisely: it is correct in a POSIX shell and, on
+ * Windows, in PowerShell. It is NOT correct in cmd.exe, where `&`, `|` and a
+ * newline are live regardless of quoting (measured 0 of 24 probes correct), nor
+ * in Git Bash on Windows, where the doubled-quote form this emits reads as
+ * concatenation and the quotes are silently dropped. A value carrying a single
+ * quote is the only one affected there -- `Buckets[?Name=='prod'].Name` is the
+ * realistic case, and it degrades to invalid JMESPath rather than to something
+ * that runs. Making the string universal is not possible by quoting; a separate
+ * argv array is the fix, and is deliberately left for its own release.
  *
  * Exported for direct unit coverage: the quoting rules are the security
  * boundary here, so they get asserted head-on rather than only through a
  * spawned call.
  */
-export function shellQuoteArg(arg: string): string {
+export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.platform): string {
   if (SHELL_SAFE_ARG_RE.test(arg)) return arg;
+  // The POSIX idiom for an embedded single quote -- close, escape, reopen --
+  // is not merely wrong in PowerShell, it EXECUTES. PowerShell reads '...' as
+  // literal text the way POSIX does, but has no backslash escape inside it, so
+  // the emitted form tokenises as a string, a stray backslash, an empty string,
+  // then bare words: a ';' in the value ends the statement, whatever follows it
+  // RUNS, and a '#' comments out the dangling quote that would otherwise be a
+  // parse error. Measured on win32/arm64, PowerShell 5.1: a --query value of
+  // x'; echo PWNED # printed PWNED. The other 24 probes all arrived byte-identical,
+  // so this is specifically about values containing a single quote.
+  //
+  // So quote for the shell the READER is in. On Windows that is PowerShell,
+  // which escapes a single quote by doubling it. That form is also inert in
+  // bash -- 'a''b' is concatenation -- so a Git Bash paste yields a wrong value
+  // rather than a running command, and wrong-but-inert beats correct-but-armed.
+  if (platform === "win32") return `'${arg.replace(/'/g, "''")}'`;
   return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Re-encode a JSON string so every byte is ASCII, with non-ASCII characters as
+ * `\uXXXX` escapes.
+ *
+ * For the params temp file, because the CLI reads a `file://` param file as TEXT
+ * in the locale's preferred encoding (`awscli/compat.py` `compat_open` ->
+ * `getpreferredencoding`), which on Windows is the ANSI code page, not UTF-8.
+ * Measured against a loopback stub on 2.34.3 and 2.22.0: a UTF-8 file holding
+ * `café-日本-😀` reached the endpoint as `cafÃ©-æ—¥æœ¬-ðŸ˜€` with exit 0 --
+ * silent corruption -- while the same payload written with `\u` escapes arrived
+ * exactly. Escaping needs no environment variable to be right, which is why it
+ * is kept even though PYTHONUTF8=1 makes an older CLI read the file as UTF-8.
+ *
+ * Surrogate halves are escaped individually, which is valid JSON and parses back
+ * to the same astral character. Only the inside of a JSON string can hold a
+ * non-ASCII character, so this never touches the structure.
+ */
+export function toAsciiJson(json: string): string {
+  return json.replace(/[\u007f-￿]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/**
+ * The longest entry in an assembled argv, and the flag that carries it, for the
+ * "too long for the command line" message. A value has a flag when the entry
+ * before it starts with `--`; a positional (lambda's outfile, say) does not.
+ */
+function longestArgvValue(args: readonly string[]): { flag: string; length: number } {
+  let at = 0;
+  for (let i = 1; i < args.length; i++) {
+    if (args[i].length > args[at].length) at = i;
+  }
+  const previous = at > 0 ? args[at - 1] : undefined;
+  return {
+    flag: previous?.startsWith("--") ? previous : "an argument",
+    length: args.length === 0 ? 0 : args[at].length,
+  };
 }
 
 export function truncateForErrorMsg(text: string): string {
@@ -214,14 +319,6 @@ interface AwsCallOptions {
    * that argv too, `--qualifier` included.
    */
   trustedParamFileArgs?: readonly string[];
-  // Set when the operation emits NEWLINE-DELIMITED JSON rather than one JSON
-  // document -- `aws logs tail --format json` is the only such op today.
-  //
-  // Load-bearing for the malformed_json check below, not just documentation.
-  // NDJSON opens with `{` and fails a whole-blob JSON.parse, which is exactly
-  // the signature that check uses to catch a truncated payload. Without this
-  // flag a perfectly complete multi-event log tail is reported as truncated.
-  ndjson?: boolean;
   // Test-injection knobs, mirrored from startSsoLogin. Not exposed via MCP.
   command?: string;
   prefixArgs?: string[];
@@ -239,6 +336,12 @@ interface AwsCallOptions {
    * assumed-role credentials this way, so the credentials live for the lifetime
    * of one subprocess instead of being written into the shared credentials
    * file.
+   *
+   * The pinned CLI settings (aws-spawn.ts PINNED_CLI_ENV) are layered on top of
+   * whatever is passed here and cannot be overridden from it -- by design: they
+   * exist because those settings change the output this module parses. Anything
+   * else set here survives, which is what keeps aws_multi_account's credentials
+   * and tools/lambda.ts's AWS_MAX_ATTEMPTS=1 reaching the child.
    */
   env?: NodeJS.ProcessEnv;
   /**
@@ -287,9 +390,8 @@ interface AwsCallSuccess {
    * Parsed JSON value on a successful `--output json` run, OR a raw trimmed
    * string when the CLI emits non-JSON stdout despite `--output json` (e.g.
    * `--query` expressions that extract a scalar string/number return the value
-   * without JSON quoting), or the raw NDJSON blob when the caller passed
-   * `ndjson: true`. Otherwise only genuinely scalar-looking stdout takes the
-   * string branch -- text that opens with `{` or `[` and fails to parse is a
+   * without JSON quoting). Otherwise only genuinely scalar-looking stdout takes
+   * the string branch -- text that opens with `{` or `[` and fails to parse is a
    * truncated payload and settles as a `malformed_json` FAILURE, not a
    * success. Callers must type-guard before assuming a structured
    * object: `typeof data === "string"` vs `typeof data === "object"`.
@@ -510,7 +612,25 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     });
   }
   const outputFormat = opts.outputFormat ?? "json";
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // Clamped, not rejected: a caller asking for more than 24.8 days wants "do not
+  // time this out", and the clamp gives it -- where the raw value gave the
+  // opposite (see MAX_TIMEOUT_MS).
+  const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+
+  // The --query length check, hoisted out of the argv block below so it runs
+  // BEFORE the binary is resolved: an over-long JMESPath expression is the
+  // caller's bad_input whether or not this machine has an AWS CLI, and
+  // reporting it as spawn_failure would send the reader after the wrong thing.
+  // Same empty-query rule as the push below -- a whitespace-only query is not
+  // passed and so is not measured.
+  const query = opts.query !== undefined && opts.query.trim().length > 0 ? opts.query : undefined;
+  if (query !== undefined && query.length > 2048) {
+    return Promise.resolve({
+      ok: false,
+      kind: "bad_input",
+      error: `query expression too long (${query.length} chars; max 2048). Simplify the JMESPath expression.`,
+    });
+  }
 
   // Test-only override path: handler-level tests (e.g. tools/paginate.test.ts)
   // can't pass command/prefixArgs through the MCP-level handler signature, so
@@ -524,8 +644,24 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   const envCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
   const envPrefixArgsRaw = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
   const envPrefixArgs = parseTestPrefixArgs(envPrefixArgsRaw);
-  const command = opts.command ?? envCommand ?? "aws";
   const prefixArgs = opts.prefixArgs ?? envPrefixArgs ?? [];
+
+  // WHICH binary runs, resolved to an absolute path -- never the bare name
+  // `aws`. On Windows a bare spawn searches the process's working directory
+  // before PATH (libuv's search_path, unless the host set
+  // NoDefaultCurrentDirectoryInExePath, which not every MCP host does), and on
+  // POSIX an empty or `.` PATH entry means the working directory to execvp --
+  // and that directory belongs to the MCP host, typically the user's open
+  // project. See aws-spawn.ts resolveAwsCommand, which also reads the
+  // AWS_MCP_AWS_CLI override.
+  const resolution = resolveAwsCommand({ explicit: opts.command ?? envCommand, env: opts.env ?? process.env });
+  if (!resolution.ok) {
+    // No `command` in the envelope: nothing was assembled and nothing ran, so
+    // there is no invocation to show -- the same shape as every other failure
+    // this function returns before the spawn.
+    return Promise.resolve({ ok: false, kind: "spawn_failure", error: resolution.error });
+  }
+  const command = resolution.command;
 
   const args: string[] = [
     ...prefixArgs,
@@ -543,48 +679,210 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     "--region",
     region,
   ];
-  if (opts.query !== undefined && opts.query.trim().length > 0) {
-    if (opts.query.length > 2048) {
-      return Promise.resolve({
-        ok: false,
-        kind: "bad_input",
-        error: `query expression too long (${opts.query.length} chars; max 2048). Simplify the JMESPath expression.`,
-      });
+  if (query !== undefined) {
+    args.push("--query", query);
+  }
+  // The temp directory holding this call's params file, when one was needed.
+  // Removed in settle() -- the CLI reads the file while it starts up, long before
+  // it exits -- and on the synchronous-throw path below.
+  let inputDir: string | null = null;
+  const removeInputDir = (): void => {
+    if (inputDir === null) return;
+    try {
+      rmSync(inputDir, { recursive: true, force: true });
+    } catch {
+      // Best effort. A server killed hard between the write and the settle can
+      // leave one 0600 params.json in the user's temp dir; tools/lambda.ts has
+      // the same exposure for its payload file.
     }
-    args.push("--query", opts.query);
-  }
+    inputDir = null;
+  };
+
+  // Set when the params went to a file: the argv index of the `file://` value and
+  // the inline JSON to show there instead, so `command` reads the same whichever
+  // transport carried the payload and the redaction stub keeps reporting the
+  // payload's length rather than a temp path's.
+  let paramsDisplay: { index: number; inline: string } | null = null;
   if (opts.params !== undefined && Object.keys(opts.params).length > 0) {
-    args.push("--cli-input-json", JSON.stringify(opts.params));
+    const json = JSON.stringify(opts.params);
+    // The one CLI setting that cannot be pinned through the environment:
+    // `cli_binary_format` is config-only, and with the common
+    // `raw-in-base64-out` value the CLI base64-encodes a blob parameter AGAIN.
+    // Measured on 2.34.3 and 2.22.0 against a loopback stub: `dynamodb put-item`
+    // with `B: "aGVsbG8="` put `YUdWc2JHOD0=` on the wire, so AWS stored the
+    // base64 text instead of the bytes, silently. Both CLIs accept the flag (it
+    // exists in every 2.x) and the flag beats the config.
+    //
+    // Only on calls that CARRY params, and immediately before --cli-input-json,
+    // for three reasons: a blob can only arrive inside that payload (extraFlags
+    // carry CCAPI JSON strings, pagination tokens and lambda's fileb://, which is
+    // raw regardless); AWS CLI v1 has no such global option, so pinning it on
+    // every call would turn "unsupported but mostly working" into "nothing
+    // works"; and here it leaves the contiguous `--output F --profile P --region
+    // R` block that fake-aws and lambdaOutfileFromArgv index into alone.
+    args.push("--cli-binary-format", "base64");
+    if (json.length <= INLINE_CLI_INPUT_JSON_MAX_CHARS) {
+      args.push("--cli-input-json", json);
+    } else {
+      // Above the threshold the payload cannot ride on the command line at all
+      // on Windows, and the failure used to be `spawn ENAMETOOLONG. Is the AWS
+      // CLI installed and on PATH?` -- a message about a PATH that was fine. A
+      // CloudFormation template body (up to 51,200 bytes), a Step Functions
+      // definition or an SSM document all reach this size legitimately.
+      const dir = tmpdir();
+      if (!isCliSafeFilePath(dir)) {
+        // Checked before writing, so the caller hears about TMP/TEMP rather than
+        // a CLI error about a path it never wrote: the CLI runs
+        // expandvars(expanduser()) on a file:// path (awscli/paramfile.py).
+        return Promise.resolve({
+          ok: false,
+          kind: "bad_input",
+          error:
+            `The request params are ${json.length} characters, so they must travel in a temp file, but the temp ` +
+            `directory (${dir}) contains '$' or '%' or starts with '~', which the AWS CLI expands in a file:// path. ` +
+            `Point TMP/TEMP (Windows) or TMPDIR at a plain directory.`,
+        });
+      }
+      let paramsFile: string;
+      try {
+        inputDir = mkdtempSync(join(dir, CLI_INPUT_TEMP_PREFIX));
+        paramsFile = join(inputDir, "params.json");
+        // The payload can hold credentials or a SecureString value, so this file
+        // is created exclusively and made private -- and both have to be spelled
+        // out this way to hold on the runtime the package actually ships on.
+        //
+        // Exclusivity comes from open(2)'s O_EXCL via `openSync(..., "wx")`,
+        // which node 22.22.2 and oam 0.16.2 both honour. writeFileSync's `flag`
+        // option does NOT reach oam: measured 2026-09-20 on Windows, a second
+        // `writeFileSync(path, ..., {flag: "wx"})` over an existing file
+        // SUCCEEDED there and the readback returned the second payload, where
+        // node raises EEXIST. bin/aws-mcp.mjs defaults AWS_MCP_RUNTIME=auto, so
+        // oam is the runtime whenever one is found.
+        //
+        // The creation mode is dropped on oam too -- a file opened 0o400 comes
+        // back writable there, where node marks it read-only, and writeFileSync's
+        // `mode` goes the same way -- so the 0600 this file's privacy is
+        // documented on is only real if chmod sets it, which oam does honour
+        // (fchmodSync included).
+        // That makes the mode on the FILE the part this code can guarantee on both
+        // runtimes; the containing directory is the other half, and there the
+        // split is by platform, as lambda.ts documents for its own temp files:
+        // Windows os.tmpdir() is the per-user %TEMP%, already ACL'd, while on
+        // POSIX it rests on mkdtemp(3)'s 0700 -- which oam reimplements (its names
+        // are a nanosecond clock value, not node's six random characters) and this
+        // Windows host cannot check.
+        //
+        // Every failure here is reported: the catch below turns it into
+        // spawn_failure and removes the directory, so an EEXIST from a name a
+        // local user got to first stops the call instead of writing through it.
+        const fd = openSync(paramsFile, "wx", 0o600);
+        try {
+          // On the fd, before the payload exists, so there is no window in which
+          // the file holds the params at a wider mode.
+          fchmodSync(fd, 0o600);
+          // Then CHECK it, before the payload exists. A filesystem is allowed to
+          // ignore a chmod and report success, and one this server actually runs
+          // on does: measured on WSL Ubuntu (linux/arm64, Node 22.23.2), with
+          // TMPDIR on a Windows drive (/mnt/c, v9fs/DrvFs), mkdtemp returns 0777,
+          // the exclusive create returns 0777, and fchmodSync(fd, 0o600) succeeds
+          // while changing nothing -- so every word of the guarantee above was
+          // false and nothing could tell. That configuration is one people choose
+          // deliberately, to share a scratch directory between the Windows and WSL
+          // halves of one machine. World-WRITABLE is the worse half: the CLI opens
+          // this path after we have closed it, so another local user can swap the
+          // payload in between.
+          //
+          // Failing here means the params are never written at all, which is the
+          // right end for a file documented to hold credentials or a SecureString.
+          // POSIX only: on Windows chmod moves nothing but the read-only bit and
+          // the mode reads back 0666 whatever we ask for (measured, win32/arm64) --
+          // privacy there rests on the per-user %TEMP% ACL, as above.
+          assertPrivateMode(fd, paramsFile, "Point TMPDIR, TMP or TEMP at a native filesystem such as /tmp.");
+          writeSync(fd, toAsciiJson(json));
+        } finally {
+          closeSync(fd);
+        }
+      } catch (err) {
+        removeInputDir();
+        return Promise.resolve({
+          ok: false,
+          kind: "spawn_failure",
+          error: `Could not write the request params to a temp file: ${err instanceof Error ? err.message : String(err)}.`,
+        });
+      }
+      args.push("--cli-input-json", `file://${paramsFile}`);
+      paramsDisplay = { index: args.length - 1, inline: json };
+    }
   }
+
+  const displayArgs =
+    paramsDisplay === null ? args : args.map((value, i) => (i === paramsDisplay.index ? paramsDisplay.inline : value));
 
   // Display string for logging / the MCP response, shell-quoted per entry so
   // it survives a paste into a POSIX shell. The real invocation still uses the
   // argv array above (no shell involved), so the quoting here is purely about
   // what the caller SEES -- and the caller is a model that will paste it.
-  const displayCommand = [command, ...redactDisplayArgs(args)].map(shellQuoteArg).join(" ");
+  // `resolution.display`, not `command`: for a resolved or overridden binary
+  // that is the literal `aws`, because the absolute path is noise to the reader
+  // (and, for the override, the operator's own file layout). A test seam's
+  // command still shows itself.
+  // Arrow, not a bare function reference: .map passes the index as the second
+  // argument, which shellQuoteArg would now read as the platform.
+  const displayCommand = [resolution.display, ...redactDisplayArgs(displayArgs)]
+    .map((entry) => shellQuoteArg(entry))
+    .join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;
-    // This catch is near-unreachable and stays deliberately. ENOENT -- the
-    // failure that actually happens (no `aws` on PATH) -- arrives async on the
-    // 'error' event below, not here; spawn only throws synchronously on
-    // argument-shape errors (ERR_INVALID_ARG_TYPE and friends), which the
-    // validation above already rules out for every production path.
+    // This catch is reachable, which the comment here used to deny. Node throws
+    // synchronously for every spawn errno except EACCES, EAGAIN, EMFILE, ENFILE
+    // and ENOENT -- so an argv too long for the OS lands here: measured
+    // ENAMETOOLONG for a 40,000-character argv entry on Windows (node 22.22.2)
+    // and E2BIG for a 131,072-character one on Linux. A `.cmd` path gives EINVAL
+    // the same way. ENOENT, the failure that actually happens when no CLI is
+    // there, still arrives async on the 'error' event below.
     //
-    // What it buys: a throw inside a Promise executor REJECTS the promise. Every
-    // caller of runAwsCall consumes an AwsCallResult envelope and none of them
-    // wrap the call in try/catch, so without this the one exotic case would
-    // bypass the envelope entirely and surface as an unhandled rejection.
+    // It also buys the envelope: a throw inside a Promise executor REJECTS the
+    // promise, and every caller of runAwsCall consumes an AwsCallResult without
+    // try/catch, so without this the exotic cases would surface as unhandled
+    // rejections instead.
     try {
       proc = spawn(command, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        ...(opts.env ? { env: opts.env } : {}),
+        // `env` is always passed now, because the pins have to be there whether
+        // or not the caller brought an environment of its own. awsChildEnv
+        // layers them over a copy of `opts.env ?? process.env`, so the
+        // REPLACE-the-parent semantics AwsCallOptions.env documents are
+        // unchanged for everything else in it.
+        env: awsChildEnv(opts.env ?? process.env),
       });
     } catch (err) {
+      removeInputDir();
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENAMETOOLONG" || code === "E2BIG") {
+        // bad_input, not spawn_failure: the caller's own value is what does not
+        // fit, and runAwsCall already answers an over-long --query the same way.
+        // After the params temp file above, only an extraFlags payload (a large
+        // CCAPI --desired-state or --patch-document) can still get here.
+        const longest = longestArgvValue(args);
+        resolve({
+          ok: false,
+          kind: "bad_input",
+          error:
+            `The request is too large to pass to the AWS CLI on its command line (spawn ${code}): the longest value ` +
+            `is ${longest.flag} at ${longest.length} characters. Windows caps a whole command line at 32,767 ` +
+            `characters and Linux caps one argument at 131,072. Params over ${INLINE_CLI_INPUT_JSON_MAX_CHARS} ` +
+            `characters already travel in a temp file -- shrink or split this value.`,
+          command: displayCommand,
+        });
+        return;
+      }
       resolve({
         ok: false,
         kind: "spawn_failure",
-        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}. Is the AWS CLI installed and on PATH?`,
+        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}.${
+          code === "ENOENT" ? " Is the AWS CLI installed and on PATH?" : ""
+        }`,
         command: displayCommand,
       });
       return;
@@ -621,6 +919,11 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         clearTimeout(graceHandle);
         graceHandle = null;
       }
+      // Also the single place the params temp file goes away. Safe here rather
+      // than at 'exit': the CLI reads a file:// param while it starts up, and
+      // every settle path is either past the child's death or a timeout that has
+      // already killed it.
+      removeInputDir();
       resolve(result);
     };
 
@@ -703,10 +1006,9 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         settle({
           ok: false,
           kind,
-          // Conditional spread, the same form the spawn call above uses for
-          // `...(opts.env ? { env: opts.env } : {})`: omit the key entirely
-          // rather than emitting `suggestion: undefined` on the auth-class
-          // branches, which have no suggestion to give.
+          // Conditional spread: omit the key entirely rather than emitting
+          // `suggestion: undefined` on the auth-class branches, which have no
+          // suggestion to give.
           ...(suggestion !== undefined ? { suggestion } : {}),
           error: errorMsg,
           command: displayCommand,
@@ -740,12 +1042,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           //     and the truncation disappears silently.
           //
           // The first character separates them: no scalar starts with { or [.
-          //
-          // (c) NDJSON, when the caller declared it: every line is its own JSON
-          //     document, so the blob opens with `{` and cannot parse as a
-          //     whole. That is the format working correctly, not a truncation,
-          //     so it takes the string branch and the caller splits the lines.
-          if (!opts.ndjson && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
+          if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
             const detail = err instanceof Error ? err.message : String(err);
             settle({
               ok: false,
@@ -850,10 +1147,16 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     });
 
     proc.on("error", (err) => {
+      // The PATH hint only where PATH could be the answer. ENOENT after a
+      // successful resolution means the file went away between the stat and the
+      // spawn, or a test seam named a binary that does not exist; any other
+      // errno (EACCES, EINVAL for a script shim) is not about PATH at all, and
+      // the old unconditional sentence sent readers to check one that was fine.
+      const enoent = (err as NodeJS.ErrnoException).code === "ENOENT";
       settle({
         ok: false,
         kind: "spawn_failure",
-        error: `Failed to run '${command}': ${err.message}. Is the AWS CLI installed and on PATH?`,
+        error: `Failed to run '${command}': ${err.message}.${enoent ? " Is the AWS CLI installed and on PATH?" : ""}`,
         command: displayCommand,
       });
     });

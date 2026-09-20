@@ -1,19 +1,46 @@
 import { z } from "zod";
-import { type AwsCallFailureKind, type AwsCallResult, runAwsCall } from "../aws-cli.js";
+import {
+  type AwsCallFailure,
+  type AwsCallFailureKind,
+  type AwsCallResult,
+  runAwsCall,
+  truncateForErrorMsg,
+} from "../aws-cli.js";
 import { getProfile, getRegion } from "../session.js";
 import { sleepUnlessAborted } from "./resource.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
- * `aws logs tail` is a high-level CLI wrapper, not a raw API op. Its flags
- * use kebab-case (--since, --filter-pattern) instead of --cli-input-json
- * PascalCase, so we build argv explicitly via runAwsCall's extraFlags.
+ * aws_logs_tail calls the FilterLogEvents API through `aws logs filter-log-events`
+ * -- the same API `aws logs tail` calls, without its formatter in the way.
  *
- * Safety: every flag value we append was either a fixed literal ("--format"),
- * a Zod-validated enum, or a number we stringified. User-supplied free text
- * (filterPattern, logStreamNames) goes in as individual argv entries and
- * doesn't pass through a shell -- argv injection is blocked the same way
- * runAwsCall blocks it for API params.
+ * Why not `aws logs tail --format json`, which this tool wrapped until 2.4.0: that
+ * flag selects a PRETTY-PRINT formatter (awscli customizations/logs/tail.py,
+ * byte-identical from 2.34.3 to v2 head), not NDJSON. It writes
+ * `<iso-timestamp> <stream> <message>` per event and re-indents a message that is
+ * entirely JSON across several lines, so the text cannot be split back into
+ * events: a message beginning with a timestamp reads as a new event, a stream name
+ * with a space cannot be told from the message after it, continuation lines carry
+ * no prefix, and a JSON message has been re-serialized. `tail` also has no
+ * newest-first and no limit, so it always drained the whole window.
+ *
+ * How a read works now. Every caller value travels INSIDE --cli-input-json, in
+ * the API's own camelCase, where the CLI passes it through literally -- so no
+ * caller value is an argv entry whose `file://` prefix the CLI would expand. A
+ * fixed --query projects `{total, events[].{timestamp, logStreamName, message}}`,
+ * which bounds stdout. There are two read modes (TailReadMode): newest-first,
+ * which sends FilterLogEvents' `startFromHead: false` and stops after maxEvents,
+ * and a whole-window read for CLIs that reject that member -- recognized from the
+ * rejection itself (detectFleModelGaps) -- or endpoints that accept it and page
+ * ascending anyway (fetchIgnoredStartFromHead). Page size goes through --page-size
+ * and never through the payload: `limit` or `nextToken` in --cli-input-json turns
+ * the CLI's own pagination off and makes the call fail. An EMPTY logStreamNames or
+ * logStreamNamePrefix is never sent either -- botocore refuses both before the
+ * request.
+ *
+ * Safety: the remaining argv values this file builds are a fixed literal
+ * (--page-size, --max-items) or a number it stringified, and runAwsCall refuses a
+ * `file://` extraFlags value from any tool as a backstop.
  */
 
 /**
@@ -21,7 +48,10 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
  *
  * `aws logs tail --since` is where the vocabulary comes from: lowercase units
  * only -- the CLI rejects uppercase (15M, 2H, ...), so accepting them at the
- * schema level would Zod-OK an input the CLI then errors on. metrics.ts mirrors
+ * schema level would have Zod-OK'd an input the CLI then errored on. aws_logs_tail
+ * now resolves the window itself and sends an epoch-millisecond startTime, so
+ * nothing downstream parses these strings any more; the vocabulary is kept
+ * unchanged so an existing input still means what it meant. metrics.ts mirrors
  * the same shorthand so an agent learns it once, and IMPORTS these rather than
  * re-declaring them: the pattern used to exist byte-identically in both files,
  * which is the drift risk multi-region.ts already removed by centralizing its
@@ -49,13 +79,14 @@ function relativeTimeMs(input: string): number | null {
   return num * ms;
 }
 
-// `aws logs tail` drains FilterLogEvents internally -- it keeps paging until the
-// requested window is exhausted. Nothing stops a wide window early: the 60s
-// timeout and the 5MB stdout cap both fire AFTER those API calls are spent, and
-// both surface as an ERROR, so the caller pays for the whole scan and gets
-// nothing back. The schema shape alone accepts '520w' (a 10-year scan), so bound
-// the window here. 30 days comfortably covers the documented vocabulary ('1w',
-// '3d') while rejecting the fat-fingered case.
+// A window this tool cannot pay for. The newest-first read stops after maxEvents,
+// but a filterPattern that rarely matches still pages back through everything,
+// and the whole-window read (old CLIs, endpoints that ignore startFromHead) always
+// does -- and the 60s timeout and the 5MB stdout cap both fire AFTER those API
+// calls are spent, so the caller pays for the scan and gets an error. The schema
+// shape alone accepts '520w' (a 10-year scan), so bound the window here. 30 days
+// comfortably covers the documented vocabulary ('1w', '3d') while rejecting the
+// fat-fingered case.
 const MAX_SINCE_MS = 30 * 24 * 60 * 60 * 1000;
 
 // --- moved verbatim from metrics.ts, see the note left in its place there ---
@@ -103,21 +134,20 @@ export function resolveTime(input: string, now: number): Date | null {
   return t;
 }
 
-// `aws logs tail` streams every event in the window and nothing between the CLI
-// and the caller counts them: a quiet group returns a handful, a busy one
-// returns tens of thousands, and the whole set was serialized into a single MCP
-// response. Bound what the caller receives. 500 sits just above the "a few
-// hundred events" this tool's own description already names as the point where
-// a window gets unwieldy, and at a typical 200-400 bytes per JSON event it puts
-// a full response in the low hundreds of KB. The ceiling is the 10,000
-// aws_paginate already allows for one page -- the same "the caller explicitly
-// asked for a lot" bound, one number across the two tools that return lists.
+// A busy group returns tens of thousands of events in an hour, and nothing between
+// the API and the caller counts them. Bound what the caller receives. 500 sits just
+// above the "a few hundred events" this tool's own description names as the point
+// where a window gets unwieldy, and at a typical 200-400 bytes per JSON event it
+// puts a full response in the low hundreds of KB. The ceiling is the 10,000
+// aws_paginate already allows for one page -- the same "the caller explicitly asked
+// for a lot" bound, one number across the two tools that return lists.
 //
-// This bounds the RESPONSE, not memory and not the scan. runAwsCall has already
-// captured the CLI's entire stdout (up to its own 5 MB cap, past which the call
-// fails as output_too_large and never reaches this file) and parseLogsJsonOutput
-// has already parsed every line before the cap applies. Narrowing `since` or
-// adding a `filterPattern` remains the only way to make the CALL cheaper.
+// What the cap bounds depends on the read mode. On a CLI that has FilterLogEvents'
+// startFromHead (START_FROM_HEAD_MIN_CLI) it bounds the SCAN too: the read asks for
+// maxEvents + 1 events newest-first and stops. On any CLI the --query slice bounds
+// stdout, so even a whole-window read of a busy hour no longer trips runAwsCall's
+// 5 MB cap -- but it still spends every FilterLogEvents call, so narrowing `since`
+// or adding a `filterPattern` is what makes that CALL cheaper.
 const DEFAULT_MAX_EVENTS = 500;
 const MAX_MAX_EVENTS = 10_000;
 
@@ -128,15 +158,19 @@ const LOG_GROUP_RE = /^[.A-Za-z0-9_/#][.\-_/#A-Za-z0-9]{0,511}$/;
 // A log-group ARN -- 'arn:aws:logs:<region>:<account>:log-group:<name>', with
 // the optional ':*' suffix the console's copy button and IAM policies carry.
 // LOG_GROUP_RE (correctly) rejects ':', so a pasted ARN used to bounce with a
-// shape error even though the group it names is perfectly valid. Capture the
-// name so the handler can hand the CLI the bare positional it actually wants.
+// shape error even though the group it names is perfectly valid. Capture group 1
+// is the name: aws_logs_query reads it through resolveLogGroupName below, and
+// aws_logs_tail reads the whole ARN through parseLogGroupArn.
 const LOG_GROUP_ARN_RE = /^arn:[a-z0-9-]{1,32}:logs:[a-z0-9-]{1,32}:[0-9]{12}:log-group:([^:*\s]{1,512})(?::\*)?$/;
 
 /**
- * Resolve a caller-supplied log group to the bare name `aws logs tail` takes as
- * its positional argument. Accepts either a bare group name or a log-group ARN;
- * returns null when neither shape validates (the extracted ARN name is held to
- * the same LOG_GROUP_RE argv-safety contract as a directly-supplied name).
+ * Resolve a caller-supplied log group to a bare group NAME, discarding an ARN's
+ * account and region. Accepts either a bare group name or a log-group ARN; returns
+ * null when neither shape validates (the extracted ARN name is held to the same
+ * LOG_GROUP_RE argv-safety contract as a directly-supplied name).
+ *
+ * aws_logs_query's path, which sends bare names. aws_logs_tail uses
+ * parseLogGroupArn instead, so an ARN there addresses the group it actually names.
  */
 function resolveLogGroupName(input: string): string | null {
   const arn = input.match(LOG_GROUP_ARN_RE);
@@ -168,38 +202,339 @@ export function isValidLogStreamName(name: string): boolean {
 }
 
 /**
- * `aws logs tail --format json` emits NDJSON (one event per line), not a
- * single JSON array. Normalize to an array regardless of how many events
- * landed:
- *
- *   - null / undefined / empty string -> []
- *   - already-parsed array           -> returned as-is
- *   - already-parsed single object   -> [object]  (runAwsCall's JSON.parse
- *                                                   will succeed when there's
- *                                                   exactly one event)
- *   - NDJSON string                  -> split lines, parse each, return array
- *   - any line fails to parse        -> return the raw string unchanged, as a
- *                                       diagnosis signal; callers render it as
- *                                       eventCount=null to flag the failure
+ * The AWS CLI releases that decide which FilterLogEvents members can be sent.
+ * Message text only -- nothing here is ever compared against a version, because
+ * the CLI's own rejection is the ground truth (see detectFleModelGaps).
  */
-function parseLogsJsonOutput(raw: unknown): unknown[] | string {
-  if (raw === null || raw === undefined) return [];
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === "object") return [raw];
-  if (typeof raw !== "string") return [raw];
+export const START_FROM_HEAD_MIN_CLI = "2.35.8";
+export const LOG_GROUP_IDENTIFIER_MIN_CLI = "2.9.15";
 
-  const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return [];
+// FilterLogEvents' EventsLimit maximum, and so the ceiling on --page-size.
+const FLE_MAX_PAGE_SIZE = 10_000;
 
-  const events: unknown[] = [];
-  for (const line of lines) {
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-      return raw; // one bad line: give up and return the unparsed blob
-    }
+export interface LogGroupArnParts {
+  partition: string;
+  region: string;
+  account: string;
+  name: string;
+  /** The ARN as FilterLogEvents wants it: no trailing ':*'. */
+  identifier: string;
+}
+
+/**
+ * Split a log-group ARN into the parts the request needs, or null when the input
+ * is not one (a bare name included).
+ *
+ * Built on the UNCHANGED LOG_GROUP_ARN_RE plus split(':'), deliberately: the
+ * regex's capture group 1 is the group name, aws_logs_query resolves its own
+ * input through resolveLogGroupName, and a named-group rewrite would have moved
+ * that capture index under the other tool's feet. The name is held to the same
+ * LOG_GROUP_RE contract as a directly supplied one, so a hostile name inside a
+ * well-formed ARN is still not an ARN here.
+ */
+export function parseLogGroupArn(input: string): LogGroupArnParts | null {
+  const m = input.match(LOG_GROUP_ARN_RE);
+  if (!m) return null;
+  const name = m[1];
+  if (!LOG_GROUP_RE.test(name)) return null;
+  // Positions are fixed by the regex, which rejects ':' inside the name.
+  const parts = input.split(":");
+  const [, partition, , region, account] = parts;
+  return {
+    partition,
+    region,
+    account,
+    name,
+    identifier: `arn:${partition}:logs:${region}:${account}:log-group:${name}`,
+  };
+}
+
+/**
+ * How one read asks the service for the window.
+ *
+ * `newest-first` sends `startFromHead: false` and stops after maxEvents + 1
+ * events; `full-window` sends no such member and reads every page, which is what
+ * a CLI older than START_FROM_HEAD_MIN_CLI -- or an endpoint that ignores the
+ * member -- leaves as the only correct option.
+ */
+export type TailReadMode = "newest-first" | "full-window";
+
+/**
+ * The --query projection, which does three jobs: it bounds stdout (a
+ * 2,000-event window measured 780 KB unprojected, 130 KB through the
+ * whole-window form), it drops eventId, ingestionTime and the deprecated
+ * searchedLogStreams, and its `total` keeps the window's real size on the
+ * full-window path even though `events` carries only the newest maxEvents.
+ *
+ * `total` counts what the CLI FETCHED, which is the whole window on the
+ * full-window path and at most maxEvents + 1 on the newest-first one (measured:
+ * an 8-event window with `--max-items 4` answers `total: 4`). Both forms stay
+ * around 130 characters (130 and 135), far below runAwsCall's 2,048-character
+ * --query cap.
+ *
+ * `events || `[]`` in BOTH members, because a reply that omits `events`
+ * otherwise fails the whole call: JMESPath's length() raises on a null operand,
+ * so `length(events)` printed `In function length(), invalid type for value:
+ * None` and exit 255 -- measured on 2.34.3 and 2.22.0 against a loopback stub
+ * answering `{"searchedLogStreams": []}`. Real CloudWatch Logs and moto both
+ * send `events: []`, so the reachable population is a compatible endpoint
+ * behind AWS_ENDPOINT_URL, but the projection is ours and an empty window is
+ * the one case this tool always got right. Defaulting `total` alone is not
+ * enough: a slice of null yields null rather than erroring, so `events` came
+ * back `null` (exit 0) and parseTailOutput's deliberate strictness then
+ * reported it as stdout that was not the document asked for.
+ */
+export function buildTailQuery(mode: TailReadMode, maxEvents: number): string {
+  const slice = mode === "newest-first" ? "" : `-${maxEvents}:`;
+  return `{total: length(events || \`[]\`), events: (events || \`[]\`)[${slice}].{timestamp: timestamp, logStreamName: logStreamName, message: message}}`;
+}
+
+/**
+ * The --cli-input-json payload. Every caller-supplied value travels in here,
+ * where the CLI passes it through literally -- the reason filterPattern is no
+ * longer an argv entry the CLI's paramfile loader would expand.
+ *
+ * What is deliberately absent, each verified on aws-cli 2.34.3 and 2.22.0
+ * against a loopback stub:
+ *   - `limit` and `nextToken`: either one turns the CLI's own pagination off
+ *     (awscli customizations/paginate.py
+ *     check_should_enable_pagination_call_parameters), and with --max-items the
+ *     PaginationConfig then leaks into the request and the call dies with
+ *     `Unknown parameter in input: "PaginationConfig"`. Page size goes through
+ *     --page-size only.
+ *   - an EMPTY `logStreamNames` or `logStreamNamePrefix`: botocore refuses both
+ *     client-side (`Invalid length for parameter logStreamNames, value: 0, valid
+ *     min length: 1`, exit 252, nothing sent), and the schema accepts `[]` and
+ *     `""`, so sending them would break calls that work today. An empty
+ *     `filterPattern` IS accepted by botocore, and is omitted too, for parity
+ *     with the truthiness check the handler has always applied.
+ *   - `endTime`, `interleaved` (deprecated and assumed true since 2019) and
+ *     `unmask`: the tool exposes no input for any of them.
+ */
+export function buildTailParams(o: {
+  logGroupName: string;
+  logGroupIdentifier: string | null;
+  startTime: number;
+  filterPattern?: string;
+  logStreamNames?: string[];
+  logStreamNamePrefix?: string;
+  newestFirst: boolean;
+}): Record<string, unknown> {
+  const params: Record<string, unknown> = o.logGroupIdentifier
+    ? { logGroupIdentifier: o.logGroupIdentifier }
+    : { logGroupName: o.logGroupName };
+  params.startTime = o.startTime;
+  if (o.filterPattern) params.filterPattern = o.filterPattern;
+  if (o.logStreamNames && o.logStreamNames.length > 0) params.logStreamNames = o.logStreamNames;
+  if (o.logStreamNamePrefix) params.logStreamNamePrefix = o.logStreamNamePrefix;
+  if (o.newestFirst) params.startFromHead = false;
+  return params;
+}
+
+/** One event as the --query projection delivers it, before the ISO conversion. */
+interface RawTailEvent {
+  timestampMs: number | null;
+  logStreamName: string | null;
+  message: string | null;
+}
+
+/** One event as the caller receives it. */
+export interface TailEvent {
+  /** ISO 8601 UTC with milliseconds, or null when AWS sent no usable timestamp. */
+  timestamp: string | null;
+  logStreamName: string | null;
+  message: string | null;
+}
+
+/**
+ * Read the `{total, events}` document the projection asks for, or null when
+ * stdout was anything else.
+ *
+ * Strict on purpose, and the strictness IS the regression pin: the parser this
+ * replaces turned the CLI's pretty-printed tail TEXT into `ok: true` with the
+ * whole blob as `events`, which is how a tool shipped from 0.2.0, its first
+ * release, to 2.3.4 without ever returning a structured event against a real
+ * CLI. Empty stdout
+ * (null), a string, a bare array and a wrong-typed `total` all return null, and
+ * the handler reports that as a failure rather than guessing.
+ *
+ * Elements missing a member map to null rather than being dropped: a caller
+ * counting events must see the same number the service returned.
+ */
+export function parseTailOutput(raw: unknown): { total: number; events: RawTailEvent[] } | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const doc = raw as { total?: unknown; events?: unknown };
+  if (typeof doc.total !== "number" || !Number.isInteger(doc.total) || doc.total < 0) return null;
+  if (!Array.isArray(doc.events)) return null;
+  const events = doc.events.map((e): RawTailEvent => {
+    const event = typeof e === "object" && e !== null ? (e as Record<string, unknown>) : {};
+    return {
+      timestampMs: typeof event.timestamp === "number" ? event.timestamp : null,
+      logStreamName: typeof event.logStreamName === "string" ? event.logStreamName : null,
+      message: typeof event.message === "string" ? event.message : null,
+    };
+  });
+  return { total: doc.total, events };
+}
+
+// botocore reports a member its model does not know, and a required member that
+// is missing, in these two shapes. The optional backslash covers the CLI's JSON
+// error format, where the parameter name arrives as \"startFromHead\": this
+// server pins AWS_CLI_ERROR_FORMAT=enhanced in every child environment and the
+// variable beats the user's config, so a CLI that honours the pin cannot print
+// that form -- tolerating it is what keeps the detector working on one that does
+// not. Both forms were captured on 2.34.3, along with 2.22.0's, which prints the
+// validation lines with no `aws: [ERROR]: An error occurred (ParamValidation):`
+// header at all; the detector never reads that header.
+const FLE_UNKNOWN_PARAM_RE = /Unknown parameter in input: \\?"(\w+)\\?"/g;
+const FLE_MISSING_PARAM_RE = /Missing required parameter in input: \\?"(\w+)\\?"/g;
+
+/**
+ * Which FilterLogEvents members this CLI's model does not have, read from the
+ * rejection it printed.
+ *
+ * botocore validates against the model the binary loaded and sends NOTHING when a
+ * member is unknown (exit 252, zero requests, measured on both local CLIs), so
+ * this is ground truth about the installed CLI rather than a version guess -- and
+ * it handles a custom or unparseable version string, which a probe would not. A
+ * missing `logGroupName` means the model predates the optional-name change
+ * (2.9.15), which is the same era as not knowing `logGroupIdentifier` at all.
+ *
+ * `Invalid type for parameter startFromHead` and `Invalid length for parameter
+ * logStreamNames` are NOT gaps: the member exists and the value was wrong.
+ */
+export function detectFleModelGaps(stderr: string): { startFromHead: boolean; logGroupIdentifier: boolean } {
+  const unknown = new Set<string>();
+  for (const m of stderr.matchAll(FLE_UNKNOWN_PARAM_RE)) unknown.add(m[1]);
+  const missing = new Set<string>();
+  for (const m of stderr.matchAll(FLE_MISSING_PARAM_RE)) missing.add(m[1]);
+  return {
+    startFromHead: unknown.has("startFromHead"),
+    logGroupIdentifier: unknown.has("logGroupIdentifier") || missing.has("logGroupName"),
+  };
+}
+
+/**
+ * Set once a CLI has rejected `startFromHead`, so the rest of the process reads
+ * the whole window directly instead of paying for a rejected call first.
+ *
+ * Only the NEGATIVE answer is cached: a current CLI never pays for detection, and
+ * a CLI upgraded mid-session is picked up on the next server start. The cost on an
+ * old CLI is one extra CLI start, once per process.
+ */
+let startFromHeadUnsupported = false;
+
+/** Test-only seam, same convention as sso.ts's _clearCliVersionCache. */
+export function _resetLogsTailCliModelCache(): void {
+  startFromHeadUnsupported = false;
+}
+
+/**
+ * True when a newest-first fetch came back OLDEST-first and the kept end is
+ * therefore the wrong one.
+ *
+ * moto's FilterLogEvents never reads `startFromHead` (its handler reads
+ * logGroupName, logStreamNames, startTime, filterPattern, interleaved, endTime,
+ * limit and nextToken), so LocalStack ignores it too, as can a partition or proxy
+ * that lags the member. The CLI still sends it, so without this check the handler
+ * would keep the OLDEST maxEvents, reverse them, and present them as the newest
+ * window with truncated: true -- a silently wrong answer. Reproduced through
+ * runAwsCall against a moto-shaped stub: a newest-first read for 3 events
+ * returned event-0..event-3.
+ *
+ * Only an ascending fetch that was also TRUNCATED is wrong: when the whole window
+ * arrived, the same events are the answer either way. Equal timestamps cannot be
+ * classified and count as newest-first, the real API's documented order.
+ */
+export function fetchIgnoredStartFromHead(events: readonly RawTailEvent[], maxEvents: number): boolean {
+  if (events.length < 2 || events.length <= maxEvents) return false;
+  return isAscending(events);
+}
+
+export interface TailWindow {
+  events: TailEvent[];
+  eventCount: number;
+  totalEvents: number | null;
+  truncated: boolean;
+}
+
+/**
+ * Turn one read's projected events into the window the caller gets: at most
+ * maxEvents events, oldest-first, keeping the NEWEST when the window held more.
+ *
+ * `totalEvents` is how many events the window held, and null when the read
+ * stopped early and so never learned that:
+ *   - newest-first: the fetch is descending and holds at most maxEvents + 1
+ *     events. More than maxEvents means the window held more, so truncated is
+ *     exact and totalEvents is null. The sentinel event is why NextToken is not
+ *     used for this -- FilterLogEvents documents that a partial or empty page
+ *     does not mean pagination is finished, so a token over-reports truncation.
+ *     An ascending, untruncated fetch (an endpoint that ignored the member) is
+ *     already oldest-first and is kept as it stands.
+ *   - full-window: the CLI read every page, so `total` is exact and the
+ *     projection already sliced the newest maxEvents; the slice here is
+ *     defensive.
+ *
+ * In newest-first mode a caller MUST run fetchIgnoredStartFromHead first and re-read
+ * the whole window when it answers true. This function cannot fix that case: an
+ * ascending fetch that was truncated holds the oldest events of the window, and no
+ * arrangement of them is the newest maxEvents.
+ */
+export function selectTailWindow(
+  parsed: { total: number; events: RawTailEvent[] },
+  maxEvents: number,
+  mode: TailReadMode,
+): TailWindow {
+  if (mode === "full-window") {
+    const kept = parsed.events.slice(-maxEvents);
+    return {
+      events: kept.map(toTailEvent),
+      eventCount: kept.length,
+      totalEvents: parsed.total,
+      truncated: parsed.total > maxEvents,
+    };
   }
-  return events;
+  const fetched = parsed.events;
+  const ascending = fetched.length >= 2 && isAscending(fetched);
+  const truncated = fetched.length > maxEvents;
+  // Descending fetches are reversed into the oldest-first order this tool has
+  // always returned; an ascending one already is oldest-first.
+  const kept = ascending ? fetched.slice(0, maxEvents) : fetched.slice(0, maxEvents).reverse();
+  return {
+    events: kept.map(toTailEvent),
+    eventCount: kept.length,
+    totalEvents: truncated ? null : fetched.length,
+    truncated,
+  };
+}
+
+function isAscending(events: readonly RawTailEvent[]): boolean {
+  const first = events[0].timestampMs;
+  const last = events[events.length - 1].timestampMs;
+  if (first === null || last === null) return false;
+  return first < last;
+}
+
+function toTailEvent(e: RawTailEvent): TailEvent {
+  return { timestamp: toIsoOrNull(e.timestampMs), logStreamName: e.logStreamName, message: e.message };
+}
+
+/**
+ * FilterLogEvents' Timestamp shape is a `long` of epoch milliseconds, so
+ * cli_timestamp_format never touches it and the conversion happens here. Anything
+ * Date cannot represent (±8.64e15 ms is its range) becomes null rather than
+ * "Invalid Date" or a thrown RangeError.
+ */
+function toIsoOrNull(ms: number | null): string | null {
+  if (ms === null || !Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return null;
+  return new Date(ms).toISOString();
+}
+
+/** What arrived instead of the document, for the refusing-to-guess message. */
+function describeShape(x: unknown): string {
+  if (x === null || x === undefined) return "empty output";
+  if (Array.isArray(x)) return "an array";
+  return typeof x;
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +910,7 @@ function terminalQueryFailure(status: string | null, queryId: string, attempts: 
 export const logsTools: readonly Tool[] = [
   {
     name: "aws_logs_tail",
-    description: `Tail CloudWatch Logs for a log group. Wraps 'aws logs tail' (not the raw FilterLogEvents API) so you get the same server-side time parsing and event-grouping the CLI uses. Returns recent events as JSON, oldest first. At most \`maxEvents\` events come back (default ${DEFAULT_MAX_EVENTS}, ceiling ${MAX_MAX_EVENTS}); when the window held more, the OLDEST are dropped so the newest survive, \`truncated\` is true, and \`totalEvents\` reports how many the window actually held. Does NOT stream -- run once to fetch the window, then call again with a later \`since\`. The cap bounds the RESPONSE, not the scan: 'aws logs tail' still drains the whole window server-side, so on a busy group narrow via \`filterPattern\` or a smaller \`since\` to make the call itself cheaper.`,
+    description: `Fetch the newest CloudWatch Logs events for one log group over the last \`since\` (default 10m), via FilterLogEvents ('aws logs filter-log-events'). Returns events oldest first as {timestamp (ISO 8601 UTC), logStreamName, message (verbatim)}; any of the three is null on an event that arrived without it, which is kept rather than dropped. At most \`maxEvents\` come back (default ${DEFAULT_MAX_EVENTS}, max ${MAX_MAX_EVENTS}); when the window held more, the OLDEST are dropped and \`truncated\` is true. On AWS CLI ${START_FROM_HEAD_MIN_CLI}+ the read goes newest-first and stops once it has enough, so a busy group costs a page or two -- and a truncated result reports \`totalEvents: null\` because the rest was never read. Older CLIs read the whole window (exact \`totalEvents\`); narrow \`since\` or add \`filterPattern\` if a wide window times out. \`logGroupName\` takes a bare name or a log-group ARN in the call's region; an ARN is sent as logGroupIdentifier, so a source-account ARN works from a cross-account monitoring account (AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+). Does not stream: call again for newer events. eventId and ingestionTime are omitted -- use aws_call for them.`,
     annotations: {
       title: "Fetch recent CloudWatch Logs events for a log group",
       readOnlyHint: true,
@@ -588,14 +923,14 @@ export const logsTools: readonly Tool[] = [
         .string()
         .min(1)
         .describe(
-          "Log group name, e.g. '/aws/lambda/my-fn' or '/aws/ecs/my-service' (no leading 'logs/'). A full log-group ARN ('arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn', with or without a trailing ':*') is also accepted -- the group name is extracted from it.",
+          `Log group name, e.g. '/aws/lambda/my-fn' or '/aws/ecs/my-service' (no leading 'logs/'). A full log-group ARN ('arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn', with or without a trailing ':*') is also accepted: it is sent as FilterLogEvents' logGroupIdentifier with the ':*' removed, so it reads the group in the ARN's own account. The ARN's region must match this call's region, and ARN input needs AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+.`,
         ),
       since: z
         .string()
         .regex(RELATIVE_TIME_RE, "since must match /^\\d+[smhdw]$/ (lowercase units only), e.g. '5m', '2h', '1d'")
         .optional()
         .describe(
-          `Window to tail: '<number><s|m|h|d|w>'. Default '10m'. Example: '30m', '1h', '3d'. Must be greater than zero and at most ${MAX_SINCE_MS / 86_400_000} days -- 'aws logs tail' drains the whole window server-side.`,
+          `Window to tail: '<number><s|m|h|d|w>'. Default '10m'. Example: '30m', '1h', '3d'. Must be greater than zero and at most ${MAX_SINCE_MS / 86_400_000} days.`,
         ),
       filterPattern: z
         .string()
@@ -618,7 +953,7 @@ export const logsTools: readonly Tool[] = [
         .max(MAX_MAX_EVENTS)
         .optional()
         .describe(
-          `Maximum events to return (1-${MAX_MAX_EVENTS}). Default ${DEFAULT_MAX_EVENTS}. Events are returned oldest-first; when the window held more than this, the OLDEST are dropped and the newest kept, with truncated=true and totalEvents naming the full count. Bounds the RESPONSE only -- 'aws logs tail' has already drained the whole window server-side by the time the cap applies, so narrow 'since' or add a 'filterPattern' to make the call itself cheaper.`,
+          `Maximum events to return (1-${MAX_MAX_EVENTS}). Default ${DEFAULT_MAX_EVENTS}. Events come back oldest-first; when the window held more than this, the OLDEST are dropped, the newest are kept and truncated=true. On AWS CLI ${START_FROM_HEAD_MIN_CLI}+ the read itself stops after this many events, so totalEvents is null when truncated is true; an older CLI scans the whole window and reports the exact totalEvents. Narrow 'since' or add a 'filterPattern' to make the call itself cheaper.`,
         ),
       profile: z.string().optional().describe("Override session profile for this call."),
       region: z.string().optional().describe("Override session region for this call."),
@@ -627,7 +962,9 @@ export const logsTools: readonly Tool[] = [
         .int()
         .positive()
         .optional()
-        .describe("Timeout in milliseconds. Default 60000 (60s). Raise for large windows."),
+        .describe(
+          "Timeout in milliseconds per aws CLI call (at most two per tool call). Default 60000 (60s). Raise for large windows.",
+        ),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const i = input as {
@@ -642,13 +979,29 @@ export const logsTools: readonly Tool[] = [
         timeoutMs?: number;
       };
 
-      // Accepts a bare name or a log-group ARN; everything downstream (argv,
-      // the echoed response field) uses the resolved bare name.
-      const logGroupName = resolveLogGroupName(i.logGroupName);
+      // Accepts a bare name or a log-group ARN. An ARN keeps its account: it is
+      // sent as logGroupIdentifier, and only the ECHOED logGroupName is the bare
+      // name. A bare name goes as logGroupName, which every CLI understands.
+      const arn = parseLogGroupArn(i.logGroupName);
+      const logGroupName = arn ? arn.name : resolveLogGroupName(i.logGroupName);
+      const logGroupIdentifier = arn ? arn.identifier : null;
       if (logGroupName === null) {
         return {
           ok: false,
           error: `Invalid logGroupName '${i.logGroupName}'. Pass a bare group name -- starting with alphanumeric/dot/slash/underscore/hash and containing only [.\\-_/#A-Za-z0-9] -- or a full log-group ARN like 'arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn' (an optional trailing ':*' is allowed).`,
+        };
+      }
+
+      // FilterLogEvents is regional: a logGroupIdentifier for another region is not
+      // read from the region the call runs in, it simply is not found there. The
+      // old code cut the ARN down to its name, so this silently read a same-named
+      // group in the caller's own region instead. Checked before any spawn, so
+      // errorKind stays absent -- nothing was classified.
+      const effectiveRegion = i.region ?? getRegion();
+      if (arn && arn.region !== effectiveRegion) {
+        return {
+          ok: false,
+          error: `logGroupName is a log-group ARN in region '${arn.region}', but this call runs in '${effectiveRegion}'${i.region === undefined ? " (the session/default region)" : ""}. FilterLogEvents is regional, so the ARN cannot be read from there. Pass region: '${arn.region}', or pass the bare name '${arn.name}' to read the same-named group in '${effectiveRegion}'.`,
         };
       }
 
@@ -673,7 +1026,7 @@ export const logsTools: readonly Tool[] = [
       if (sinceMs > MAX_SINCE_MS) {
         return {
           ok: false,
-          error: `since '${since}' asks for a ${Math.round(sinceMs / 86_400_000)}-day window; the maximum is ${MAX_SINCE_MS / 86_400_000} days. 'aws logs tail' drains the whole window server-side, so a request this wide spends every FilterLogEvents call and then fails on the 60s timeout or the 5 MB output cap instead of returning events. Narrow the window, or add a filterPattern and tail it in slices.`,
+          error: `since '${since}' asks for a ${Math.round(sinceMs / 86_400_000)}-day window; the maximum is ${MAX_SINCE_MS / 86_400_000} days. A window this wide spends FilterLogEvents call after call and then fails on the timeout instead of returning events. Narrow the window, or add a filterPattern and tail it in slices.`,
         };
       }
       if (i.logStreamNames && i.logStreamNamePrefix) {
@@ -703,13 +1056,12 @@ export const logsTools: readonly Tool[] = [
           error: `Invalid logStreamNamePrefix '${i.logStreamNamePrefix}'. Must be 1-512 chars, not start with '-', and contain no ':', '*', or control characters.`,
         };
       }
-      // Argv-injection defense for filterPattern: the value lands as its own
-      // argv entry after --filter-pattern, which CloudWatch consumes as the
-      // pattern itself (so a leading '-' is not actually exploitable here).
-      // The reject still matches the uniform leading-hyphen guard the
-      // file-level comment promises, and a real CloudWatch filter pattern
-      // never legitimately starts with '-' -- patterns either start with a
-      // quote, a literal word, or '[' for structured matching.
+      // filterPattern now travels inside --cli-input-json, where the CLI passes it
+      // through literally: neither a leading '-' nor a `file://` prefix is an argv
+      // concern for this tool any more. The guard stays so this release does not
+      // also change which inputs are ACCEPTED -- and a real CloudWatch filter
+      // pattern never legitimately starts with '-' (patterns start with a quote, a
+      // literal word, or '[' for structured matching).
       if (i.filterPattern?.startsWith("-")) {
         return {
           ok: false,
@@ -717,94 +1069,183 @@ export const logsTools: readonly Tool[] = [
         };
       }
 
-      // aws logs tail expects the log group name as a positional before any
-      // flags. We inject it as the first entry of extraFlags so runAwsCall
-      // places it between the operation ('tail') and --format/--since/etc.
-      // The leading-hyphen defense above blocks argv injection.
-      const extraFlags: string[] = [logGroupName, "--format", "json", "--since", since];
-      if (i.filterPattern) extraFlags.push("--filter-pattern", i.filterPattern);
-      if (i.logStreamNames && i.logStreamNames.length > 0) {
-        extraFlags.push("--log-stream-names", ...i.logStreamNames);
-      }
-      if (i.logStreamNamePrefix) {
-        extraFlags.push("--log-stream-name-prefix", i.logStreamNamePrefix);
-      }
+      // Defense-in-depth: the schema caps maxEvents at MAX_MAX_EVENTS, but direct
+      // (non-MCP) callers bypass schema validation -- clamp here for parity with
+      // the handler-level clamps in paginate.ts and docs.ts. Ahead of the call now,
+      // because the cap decides --page-size, --max-items and the --query slice.
+      const maxEvents = Math.min(Math.max(1, i.maxEvents ?? DEFAULT_MAX_EVENTS), MAX_MAX_EVENTS);
+      // Resolved once: two reads of the same window must not span two windows.
+      const startTime = Date.now() - sinceMs;
+      const params = (newestFirst: boolean): Record<string, unknown> =>
+        buildTailParams({
+          logGroupName,
+          logGroupIdentifier,
+          startTime,
+          filterPattern: i.filterPattern,
+          logStreamNames: i.logStreamNames,
+          logStreamNamePrefix: i.logStreamNamePrefix,
+          newestFirst,
+        });
 
-      // outputFormat:'json' causes runAwsCall to append '--output json' to
-      // the argv. 'aws logs tail' ignores '--output' entirely (it is a
-      // high-level command that always writes its own NDJSON; the standard
-      // '--output' flag has no effect). The flag is a no-op here, not a
-      // conflict -- the actual JSON shaping comes from '--format json' in
-      // extraFlags above.
-      const result = await runAwsCall({
-        service: "logs",
-        operation: "tail",
-        profile: i.profile,
-        region: i.region,
-        timeoutMs: i.timeoutMs,
-        outputFormat: "json",
-        // `aws logs tail --format json` emits one JSON object PER LINE, so the
-        // whole blob never parses as a single document. Declaring it here keeps
-        // runAwsCall's truncated-payload check from reading a complete multi-
-        // event tail as a corrupted one.
-        ndjson: true,
-        extraFlags,
-      });
+      /**
+       * One FilterLogEvents read. `--page-size` becomes the request's `limit` and
+       * `--max-items` stops the CLI's own paginator, so a newest-first read fetches
+       * maxEvents + 1 events -- the sentinel that makes `truncated` exact -- and
+       * nothing more.
+       */
+      const read = (mode: TailReadMode): Promise<AwsCallResult> =>
+        runAwsCall({
+          service: "logs",
+          operation: "filter-log-events",
+          profile: i.profile,
+          region: i.region,
+          timeoutMs: i.timeoutMs,
+          outputFormat: "json",
+          query: buildTailQuery(mode, maxEvents),
+          params: params(mode === "newest-first"),
+          extraFlags:
+            mode === "newest-first"
+              ? [
+                  "--page-size",
+                  String(Math.min(maxEvents + 1, FLE_MAX_PAGE_SIZE)),
+                  "--max-items",
+                  String(maxEvents + 1),
+                ]
+              : undefined,
+        });
 
-      if (!result.ok) {
+      // Why a whole-window read happened, for the timeout message: the CLI has no
+      // startFromHead, or the endpoint ignored it.
+      type FullWindowCause = "cli" | "endpoint" | null;
+
+      /** The two runAwsCall failure kinds whose own remedy does not fit this tool. */
+      const tailFailure = (failure: AwsCallFailure, mode: TailReadMode, cause: FullWindowCause): ToolResult => {
+        let error = failure.error;
+        if (failure.kind === "output_too_large") {
+          error = `The newest ${maxEvents} events alone passed the 5 MB output cap -- these log events are large. Lower maxEvents, or narrow with filterPattern or logStreamNames.`;
+        } else if (failure.kind === "timeout") {
+          // The caller's own timeoutMs, defaulting to runAwsCall's 60s.
+          const seconds = Math.round((i.timeoutMs ?? 60_000) / 1000);
+          if (mode === "full-window") {
+            const why =
+              cause === "endpoint"
+                ? "This endpoint ignored FilterLogEvents' startFromHead, so the whole window is read"
+                : `This AWS CLI rejects FilterLogEvents' startFromHead (added in AWS CLI ${START_FROM_HEAD_MIN_CLI}), so the whole window is read`;
+            error = `Timed out after ${seconds}s reading every event since '${since}'. ${why} before the newest ${maxEvents} can be picked. Narrow 'since', add a filterPattern, raise timeoutMs${cause === "endpoint" ? "" : `, or upgrade the AWS CLI to ${START_FROM_HEAD_MIN_CLI}+`}.`;
+          } else {
+            error = `Timed out after ${seconds}s before ${maxEvents} matching events were found reading newest-first. A filterPattern that rarely matches still pages back through the whole window; narrow 'since' or raise timeoutMs.`;
+          }
+        }
         // `||`, not `??`: rawStderr is "" (not nullish) on a nonzero exit with
         // empty stderr, and `??` would return that "" instead of falling back
         // to stdout. Same fix as call.ts and the resource.ts failure returns.
         return {
           ok: false,
-          error: result.error,
-          errorKind: result.kind,
-          suggestion: result.suggestion,
-          rawBody: result.rawStderr || result.rawStdout,
+          error,
+          errorKind: failure.kind,
+          suggestion: failure.suggestion,
+          rawBody: failure.rawStderr || failure.rawStdout,
         };
+      };
+
+      /**
+       * One read plus the two arms every read shares: a failure this tool reports as
+       * it stands, and stdout that is not the document the --query asked for. A
+       * `nonzero_exit` comes back UNMAPPED, because only the caller knows whether a
+       * rejected member means "read the window the other way" or "give up".
+       */
+      const attempt = async (
+        mode: TailReadMode,
+        cause: FullWindowCause,
+      ): Promise<
+        | { kind: "rejected"; failure: AwsCallFailure }
+        | { kind: "failed"; result: ToolResult }
+        | { kind: "read"; command: string; parsed: { total: number; events: RawTailEvent[] } }
+      > => {
+        const r = await read(mode);
+        if (!r.ok) {
+          if (r.kind === "nonzero_exit") return { kind: "rejected", failure: r };
+          return { kind: "failed", result: tailFailure(r, mode, cause) };
+        }
+        const parsed = parseTailOutput(r.data);
+        if (parsed === null) {
+          // No errorKind: the CLI exited 0, so nothing classified this. Precedent:
+          // aws_logs_query's no-queryId arm.
+          return {
+            kind: "failed",
+            result: {
+              ok: false,
+              error: `'aws logs filter-log-events' exited 0 but printed something other than the {total, events} document this tool's --query asks for (got ${describeShape(r.data)}). Refusing to guess at the format. Command: ${r.command}`,
+              rawBody: truncateForErrorMsg(r.rawStdout),
+            },
+          };
+        }
+        return { kind: "read", command: r.command, parsed };
+      };
+
+      let mode: TailReadMode = startFromHeadUnsupported ? "full-window" : "newest-first";
+      let cause: FullWindowCause = startFromHeadUnsupported ? "cli" : null;
+      let a = await attempt(mode, cause);
+
+      if (a.kind === "rejected") {
+        const gaps = detectFleModelGaps(a.failure.rawStderr ?? "");
+        if (gaps.startFromHead) startFromHeadUnsupported = true;
+        if (arn && gaps.logGroupIdentifier) {
+          // Gated on `arn` as well as on the gap: a bare-name call sends
+          // logGroupName and no identifier, so neither half of that gap can be
+          // about a group this call named -- and this message would then be
+          // nonsense. Such a failure is forwarded as it stands instead.
+          //
+          // No `suggestion`: parseAwsError's "Fix parameter shape" remedy for
+          // ParamValidation is the wrong advice when the shape is right and the CLI
+          // is old.
+          return {
+            ok: false,
+            error: `This AWS CLI predates addressing a log group by ARN: FilterLogEvents' logGroupIdentifier needs AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI}+, and nothing was sent. Pass the bare name '${logGroupName}' to read that group in the account profile '${i.profile ?? getProfile()}' resolves to -- which is not necessarily the ARN's account ${arn.account} -- or upgrade the AWS CLI.`,
+            errorKind: "nonzero_exit",
+            rawBody: a.failure.rawStderr || a.failure.rawStdout,
+          };
+        }
+        if (gaps.startFromHead && mode === "newest-first") {
+          mode = "full-window";
+          cause = "cli";
+          a = await attempt(mode, cause);
+        }
       }
-      // runAwsCall already tried JSON.parse on the whole stdout; for a single
-      // event that succeeds and data is an object, for multiple events it
-      // fails and data is the raw NDJSON string. parseLogsJsonOutput collapses
-      // both into an array (or a raw-string escape hatch when any line is
-      // malformed).
-      const parsed = parseLogsJsonOutput(result.data);
-      // Defense-in-depth: the schema caps maxEvents at MAX_MAX_EVENTS, but
-      // direct (non-MCP) callers bypass schema validation -- clamp here for
-      // parity with the handler-level clamps in paginate.ts and docs.ts.
-      const maxEvents = Math.min(Math.max(1, i.maxEvents ?? DEFAULT_MAX_EVENTS), MAX_MAX_EVENTS);
-      // Keep the NEWEST events, not the first N. `aws logs tail` emits
-      // oldest-first, and the question a tail answers is "what just happened",
-      // so the head of a busy window is the half furthest from the answer: the
-      // first 500 events of a 10,000-event hour describe the hour's start, not
-      // the failure the caller is looking at. Order WITHIN the returned slice is
-      // unchanged (still oldest-first), so a caller reading the last element as
-      // "most recent" behaves exactly as before.
-      //
-      // The malformed-NDJSON escape hatch is deliberately not capped: `parsed`
-      // is then the raw blob, there is nothing to count or slice, and clipping a
-      // diagnosis artifact is how one unparseable line becomes two. It stays
-      // bounded by runAwsCall's 5 MB stdout cap, as it was before.
-      const totalEvents = Array.isArray(parsed) ? parsed.length : null;
-      const truncated = totalEvents !== null && totalEvents > maxEvents;
-      const events = Array.isArray(parsed) && parsed.length > maxEvents ? parsed.slice(-maxEvents) : parsed;
-      // eventCount keeps the meaning it has had since 1.0 -- how many events are
-      // in `events` -- and totalEvents is how many the window held. They differ
-      // exactly when truncated is true, and both are null on the parse-failure
-      // path where `events` is the raw string rather than an array.
-      const eventCount = Array.isArray(events) ? events.length : null;
+      if (a.kind === "rejected") return tailFailure(a.failure, mode, cause);
+      if (a.kind === "failed") return a.result;
+
+      if (mode === "newest-first" && fetchIgnoredStartFromHead(a.parsed.events, maxEvents)) {
+        // The endpoint accepted startFromHead and paged ascending anyway, so the
+        // events in hand are the OLDEST of the window. Read the whole window
+        // instead. Not cached: the CLI supports the member, this endpoint does not,
+        // and endpoints differ by region and profile.
+        mode = "full-window";
+        cause = "endpoint";
+        const second = await attempt(mode, cause);
+        if (second.kind === "rejected") return tailFailure(second.failure, mode, cause);
+        if (second.kind === "failed") return second.result;
+        a = second;
+      }
+
+      const window = selectTailWindow(a.parsed, maxEvents, mode);
       return {
         ok: true,
         data: {
-          command: result.command,
-          // The RESOLVED group name, so an ARN-shaped input echoes back the
-          // name that was actually tailed (and matches `command`).
+          command: a.command,
+          // The bare group NAME, as it has always been echoed; logGroupIdentifier
+          // below says whether an ARN was sent, which `command` cannot show because
+          // it redacts the --cli-input-json payload.
           logGroupName,
+          logGroupIdentifier,
           since,
-          eventCount,
-          totalEvents,
-          truncated,
-          events,
+          // eventCount keeps the meaning it has had since 1.0 -- how many events are
+          // in `events` -- and totalEvents is how many the window held, or null when
+          // the read stopped before learning that.
+          eventCount: window.eventCount,
+          totalEvents: window.totalEvents,
+          truncated: window.truncated,
+          events: window.events,
         },
       };
     },
@@ -1158,7 +1599,6 @@ export {
   MAX_QUERY_LOG_GROUPS,
   MAX_QUERY_RANGE_MS,
   MAX_SINCE_MS,
-  parseLogsJsonOutput,
   RELATIVE_TIME_RE,
   RELATIVE_TIME_UNIT_MS,
   relativeTimeMs,

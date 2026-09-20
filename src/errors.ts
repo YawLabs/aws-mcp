@@ -272,6 +272,19 @@ export const READ_TIMEOUT_RE = /Read timeout on endpoint URL:[^\r\n]*/;
 const CONNECT_TIMEOUT_RE = /Connect timeout on endpoint URL:[^\r\n]*/;
 const CONNECTION_CLOSED_RE = /Connection was closed before we received a valid response from endpoint URL/;
 
+// The argument parser rejecting the `--cli-binary-format base64` that aws-cli.ts
+// pins on every call carrying params. Every AWS CLI 2.x has that global option
+// (since 2.0.0, re-verified on 2.22.0 and 2.34.3) and v1 has none of it -- v1's
+// global options are debug, endpoint-url, no-verify-ssl, no-paginate, output,
+// query, profile, region, version, color, no-sign-request, ca-bundle,
+// cli-read-timeout, cli-connect-timeout and v2-debug (its own
+// awscli/data/cli.json, 1.46.1). So the pattern cannot fire on a supported CLI,
+// and without it the model is handed "Unknown options: --cli-binary-format,
+// base64" with nothing to act on. The flag name is the whole anchor: the joining
+// comma and the spacing differ between the clidriver and the hand-written
+// commands.
+const CLI_V1_UNKNOWN_BINARY_FORMAT_RE = /Unknown options:[^\r\n]*--cli-binary-format/;
+
 /**
  * Best-effort structured extraction of an AWS CLI stderr blob. Returns
  * { code?, operation?, message?, suggestion? }; missing fields are absent.
@@ -440,6 +453,14 @@ export function parseAwsError(stderr: string): ParsedAwsError {
     return {
       message: trimmed,
       suggestion: "Fix parameter shape: check casing, required fields, and types against the API schema.",
+    };
+  }
+
+  if (CLI_V1_UNKNOWN_BINARY_FORMAT_RE.test(trimmed)) {
+    return {
+      message: trimmed,
+      suggestion:
+        "This looks like AWS CLI v1, which aws-mcp does not support (it has no --cli-binary-format). Install AWS CLI v2.",
     };
   }
 

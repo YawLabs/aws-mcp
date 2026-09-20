@@ -5,7 +5,17 @@ import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
+import { modeHonouringTmpBase } from "../testing/tmpdir-modes.js";
 import { buildMetricDataQueries, metricsTools, pickAutoPeriodSeconds, resolveTime } from "./metrics.js";
+
+// Two cases here send ~100 queries, which is past the inline cap, so the payload
+// rides the private params temp file -- and runAwsCall takes that directory from
+// os.tmpdir(). On a filesystem that ignores chmod the write is refused by design
+// (see private-file.ts), which would fail these cases for a reason that has
+// nothing to do with metrics. node:test runs each file in its own process, so
+// pointing TMPDIR at a base that honours modes is contained to this file.
+const PRIVATE_TMP_BASE = modeHonouringTmpBase();
+if (PRIVATE_TMP_BASE !== null) process.env.TMPDIR = PRIVATE_TMP_BASE;
 
 const tool = metricsTools.find((t) => t.name === "aws_metrics_query");
 if (!tool) throw new Error("metricsTools missing aws_metrics_query");

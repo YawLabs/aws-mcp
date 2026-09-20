@@ -31,6 +31,29 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * The child-environment values aws-spawn.ts pins, as this process actually
+ * received them, for the `spawn-hardening_*` scenarios that exist to prove
+ * runAwsCall and sso.ts pass them down. `null` rather than absent for an unset
+ * one, so a missing pin reads as `null` in the assertion instead of vanishing
+ * from the JSON.
+ *
+ * `credsPresent` is here because aws_multi_account hands its per-account
+ * credentials to the same `env` the pins are layered over: the pins winning is
+ * only half the contract, the caller's own variables surviving is the other.
+ */
+function spawnHardeningPinnedEnv(): Record<string, unknown> {
+  return {
+    AWS_CLI_ERROR_FORMAT: process.env.AWS_CLI_ERROR_FORMAT ?? null,
+    AWS_CLI_AUTO_PROMPT: process.env.AWS_CLI_AUTO_PROMPT ?? null,
+    AWS_CLI_OUTPUT_ENCODING: process.env.AWS_CLI_OUTPUT_ENCODING ?? null,
+    PYTHONUTF8: process.env.PYTHONUTF8 ?? null,
+    NoDefaultCurrentDirectoryInExePath: process.env.NoDefaultCurrentDirectoryInExePath ?? null,
+    AWS_MAX_ATTEMPTS: process.env.AWS_MAX_ATTEMPTS ?? null,
+    credsPresent: "AWS_ACCESS_KEY_ID" in process.env,
+  };
+}
+
+/**
  * Write `chunk` to stdout, wait until it has been handed to the OS, then create
  * the file named by AWS_MCP_FAKE_READY_OUT (when set).
  *
@@ -126,6 +149,12 @@ function writeStderrWithPlatformEol(text: string): void {
  *                                  append, not overwrite, because the whole
  *                                  point is counting repeats. Same side-channel
  *                                  idea as AWS_MCP_FAKE_ARGV_OUT.
+ *   AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT  append one JSON line per spawn with
+ *                                  the pinned child-env values this process
+ *                                  received. The version probe and the login
+ *                                  spawn are two different spawns in sso.ts, so
+ *                                  a test that wants both needs a file both can
+ *                                  append to; `phase` says which wrote a line.
  */
 async function handleVersionProbe(): Promise<boolean> {
   if (process.argv[2] !== "--version") return false;
@@ -134,6 +163,12 @@ async function handleVersionProbe(): Promise<boolean> {
   if (countPath) {
     const fs = await import("node:fs");
     fs.appendFileSync(countPath, "1");
+  }
+
+  const envPath = process.env.AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT;
+  if (envPath) {
+    const fs = await import("node:fs");
+    fs.appendFileSync(envPath, `${JSON.stringify({ phase: "version", ...spawnHardeningPinnedEnv() })}\n`);
   }
 
   const version = process.env.AWS_MCP_FAKE_CLI_VERSION ?? "2.34.3";
@@ -512,9 +547,21 @@ async function main(): Promise<void> {
       // speed or CI load. The earlier 1 MB-chunks-with-10ms-sleeps version was
       // timing-coupled -- it only passed because the parent read fast enough to
       // kill mid-stream before all 8 MB were written and before the test
-      // timeout. This burst makes the cap deterministic.
+      // timeout. The burst makes the cap independent of reader speed.
+      //
+      // The EXIT is the part that has to be careful, and the reason this case
+      // used to pass on Windows and silently pass for the wrong reason on
+      // Linux. Fall out of main() rather than process.exit(0), for
+      // handleVersionProbe's reason above: a multi-megabyte write to a pipe
+      // cannot complete in one tick, and on POSIX stdout-to-a-pipe is
+      // asynchronous, so exiting in the same breath discards whatever libuv
+      // has not flushed. Measured with this exact 6 MB burst: exit-immediately
+      // delivered 146176 of 6291456 bytes on linux/arm64 (Node 22.23.2) and
+      // all 6291456 on win32/arm64 (Node 22.22.2), where stdio pipes are
+      // blocking. So the cap fired on Windows while the same case came back a
+      // successful ~143 KB call on Linux. The parent kills us mid-stream once
+      // the cap trips; if it does not, the flush finishes and Node exits 0.
       process.stdout.write("x".repeat(6 * 1024 * 1024));
-      process.exit(0);
       return;
     }
 
@@ -568,6 +615,103 @@ async function main(): Promise<void> {
       process.stdout.write(Buffer.concat([Buffer.from('{"name":"'), fourByteChar.slice(0, 2)]));
       await sleep(50);
       process.stdout.write(Buffer.concat([fourByteChar.slice(2), Buffer.from('"}\n')]));
+      process.exit(0);
+      return;
+    }
+
+    case "spawn-hardening_echo_env": {
+      // What the child env actually looked like, for the tests that prove the
+      // pins arrive and that the caller's own variables survive them. argv and
+      // execPath ride along because the resolution tests need to know WHICH
+      // binary ran, and execPath is the only honest answer to that.
+      process.stdout.write(
+        `${JSON.stringify({ argv: process.argv.slice(2), execPath: process.execPath, env: spawnHardeningPinnedEnv() })}\n`,
+      );
+      const envPath = process.env.AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT;
+      if (envPath) {
+        const fs = await import("node:fs");
+        fs.appendFileSync(envPath, `${JSON.stringify({ phase: "call", ...spawnHardeningPinnedEnv() })}\n`);
+      }
+      process.exit(0);
+      return;
+    }
+
+    case "spawn-hardening_read_input_file": {
+      // Answers "how did the params arrive, and did they survive the trip" for
+      // both transports: inline argv, or the private temp file runAwsCall writes
+      // above INLINE_CLI_INPUT_JSON_MAX_CHARS. readCliInputJson is the shared
+      // reader, so this scenario cannot drift from the other consumers of the
+      // same argv.
+      const { readCliInputJson } = await import("./cli-input.js");
+      const payload = readCliInputJson(process.argv.slice(2));
+      if (payload === null) {
+        process.stderr.write("fake-aws: spawn-hardening_read_input_file needs a --cli-input-json value\n");
+        process.exit(2);
+      }
+      const binaryFormatIdx = process.argv.indexOf("--cli-binary-format");
+      let mode: number | null = null;
+      if (payload.path !== null && process.platform !== "win32") {
+        // POSIX only: on Windows the mode bits say nothing (the directory's ACL
+        // is what makes the file private), and node reports 0o666 whatever we ask
+        // for.
+        const fs = await import("node:fs");
+        mode = fs.statSync(payload.path).mode & 0o777;
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          viaFile: payload.source !== "inline",
+          path: payload.path,
+          // The real CLI decodes a file:// param in the locale code page, so the
+          // bytes being ASCII is what makes the round trip exact. Asserted here
+          // rather than assumed.
+          asciiOnly: payload.bytes === null ? null : payload.bytes.every((b) => b < 0x80),
+          mode,
+          binaryFormat: binaryFormatIdx === -1 ? null : (process.argv[binaryFormatIdx + 1] ?? null),
+          params: payload.params,
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "spawn-hardening_error_format": {
+      // Both bodies are verbatim captures from aws-cli 2.34.3 answering one 403
+      // InvalidClientTokenId from a loopback stub, with the CLI's own newline
+      // (CRLF on Windows, LF elsewhere -- hence os.EOL). The only difference
+      // between them is `cli_error_format`, which a user sets in ~/.aws/config
+      // and AWS's own guide suggests setting to json for scripting.
+      //
+      // Branching on AWS_CLI_ERROR_FORMAT models the precedence measured on
+      // 2.34.3: the environment beats the config file. So this scenario prints
+      // the classifiable body only while runAwsCall passes the pin -- remove the
+      // pin and the integration test sees the json body and a bare
+      // nonzero_exit, which is exactly what those users get today.
+      const eol = (await import("node:os")).EOL;
+      const enhanced =
+        `${eol}aws: [ERROR]: An error occurred (InvalidClientTokenId) when calling the GetCallerIdentity operation: ` +
+        `The security token included in the request is invalid.${eol}${eol}Additional error details:${eol}Type: Sender${eol}`;
+      const asJson =
+        `{${eol}    "Type": "Sender",${eol}    "Code": "InvalidClientTokenId",${eol}` +
+        `    "Message": "The security token included in the request is invalid."${eol}}${eol}`;
+      process.stderr.write(process.env.AWS_CLI_ERROR_FORMAT === "enhanced" ? enhanced : asJson);
+      // 254 is what both CLIs exited with for a service error (measured).
+      process.exit(254);
+      return;
+    }
+
+    case "spawn-hardening_sso_echo_env": {
+      // `happy`, plus a line on the side channel. sso.ts spawns twice per login
+      // (version probe, then the login itself) and the probe is handled long
+      // before this switch, so a file both can append to is the only way one
+      // test sees both environments.
+      const envPath = process.env.AWS_MCP_FAKE_SPAWN_HARDENING_ENV_OUT;
+      if (envPath) {
+        const fs = await import("node:fs");
+        fs.appendFileSync(envPath, `${JSON.stringify({ phase: "login", ...spawnHardeningPinnedEnv() })}\n`);
+      }
+      process.stdout.write(HAPPY_URL_CODE_BANNER);
+      await sleep(200);
+      process.stdout.write("Successfully logged into Start URL: https://d-test.awsapps.com/start\n");
       process.exit(0);
       return;
     }
@@ -1084,65 +1228,36 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "logs_tail_ndjson": {
-      // 'aws logs tail --format json' emits one JSON object per line.
-      process.stdout.write(
-        `${JSON.stringify({ timestamp: "2026-04-21T00:00:00Z", logStreamName: "s1", message: "hello" })}\n${JSON.stringify(
-          {
-            timestamp: "2026-04-21T00:00:01Z",
-            logStreamName: "s1",
-            message: "world",
-          },
-        )}\n${JSON.stringify({ timestamp: "2026-04-21T00:00:02Z", logStreamName: "s2", message: "ok" })}\n`,
-      );
-      process.exit(0);
-      return;
-    }
-
-    case "logs_tail_empty": {
-      // No events in the window -- empty stdout, exit 0.
-      process.exit(0);
-      return;
-    }
-
-    case "logs_tail_ndjson_malformed": {
-      // Multi-line NDJSON where ONE line is not valid JSON. The aws CLI
-      // normally never emits this, but a partially-flushed event, an injected
-      // CLI warning line, or a truncated final record can produce it.
-      // parseLogsJsonOutput in logs.ts gives up on the first un-parseable line
-      // and returns the RAW string unchanged; the handler then renders
-      // eventCount=null (since events is a string, not an array) while still
-      // surfacing the blob in `events` for diagnosis. First line is valid JSON,
-      // second line is garbage, third line is valid JSON -- so the failure is
-      // mid-stream, not at the very start.
-      process.stdout.write(
-        `${JSON.stringify({ timestamp: "2026-04-21T00:00:00Z", logStreamName: "s1", message: "hello" })}\n` +
-          "this-line-is-not-json\n" +
-          `${JSON.stringify({ timestamp: "2026-04-21T00:00:02Z", logStreamName: "s2", message: "ok" })}\n`,
-      );
-      process.exit(0);
-      return;
-    }
-
-    case "logs_tail_ndjson_bulk": {
-      // A busy window: more events than aws_logs_tail's default maxEvents cap,
-      // emitted OLDEST-FIRST the way `aws logs tail` does. Each message carries
-      // its index so a test can assert WHICH end of the window survived the cap
-      // -- "keep the newest" is the tool's contract, and first-N vs last-N is
-      // indistinguishable unless the events are individually identifiable.
-      // ~1200 events is ~110 KB in one write, far below the 5 MB stdout cap.
-      const bulkLines: string[] = [];
-      for (let i = 0; i < 1200; i++) {
-        bulkLines.push(
-          JSON.stringify({
-            timestamp: new Date(Date.UTC(2026, 3, 21, 0, 0, 0) + i * 1000).toISOString(),
-            logStreamName: "s1",
-            message: `event-${i}`,
-          }),
-        );
-      }
-      process.stdout.write(`${bulkLines.join("\n")}\n`);
-      process.exit(0);
+    case "logs-tail_current_basic":
+    case "logs-tail_current_bulk":
+    case "logs-tail_current_empty":
+    case "logs-tail_current_unicode":
+    case "logs-tail_legacy_basic":
+    case "logs-tail_legacy_bulk":
+    case "logs-tail_legacy_empty":
+    case "logs-tail_ancient_basic":
+    case "logs-tail_ignored_bulk":
+    case "logs-tail_jsonfmt_bulk":
+    case "logs-tail_echo_argv":
+    case "logs-tail_api_error":
+    case "logs-tail_real_tail_text": {
+      // aws_logs_tail's FilterLogEvents scenarios. The datasets, the verbatim
+      // real-CLI captures and the emulator live in logs-tail-fake.ts, which is
+      // imported lazily so no other scenario pays for a ~600-line module at
+      // startup. The names say which CLI model the call meets: `current` knows
+      // FilterLogEvents' startFromHead (AWS CLI 2.35.8+), `legacy` rejects it
+      // (2.9.15 through 2.35.7), `ancient` also rejects logGroupIdentifier
+      // (before 2.9.2); `ignored` is an endpoint that accepts startFromHead and
+      // pages ascending anyway (moto, LocalStack); `jsonfmt` prints the
+      // rejection in the CLI's JSON error format.
+      const { runLogsTailScenario } = await import("./logs-tail-fake.js");
+      const out = runLogsTailScenario(scenario, process.argv.slice(2), process.env);
+      if (out.stdout) process.stdout.write(out.stdout);
+      if (out.stderr) process.stderr.write(out.stderr);
+      // exitCode + return rather than process.exit(): a bulk window is ~100 KB
+      // on one stdout write, and exiting in the same breath truncates it. Same
+      // reason handleVersionProbe returns.
+      process.exitCode = out.exitCode;
       return;
     }
 
@@ -2650,8 +2765,9 @@ async function main(): Promise<void> {
       if (scenario === "macct_big_payload") {
         // ~2.75 MB per account: under the 5 MB PER-CALL stdout cap in
         // aws-cli.ts, but two of them cross the 5 MB AGGREGATE budget.
+        // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
+        // and exiting in the same breath truncates it on POSIX.
         process.stdout.write(`${JSON.stringify({ Account: account, Blob: "x".repeat(2_750_000) })}\n`);
-        process.exit(0);
         return;
       }
 
@@ -2847,8 +2963,9 @@ async function main(): Promise<void> {
         process.exit(255);
         return;
       }
+      // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
+      // and exiting in the same breath truncates it on POSIX.
       process.stdout.write(`${JSON.stringify({ Region: region, Blob: "x".repeat(2_750_000) })}\n`);
-      process.exit(0);
       return;
     }
 

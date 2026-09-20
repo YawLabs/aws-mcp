@@ -19,6 +19,7 @@ import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { profileExistsInText, upsertProfile, upsertProfileIntoText } from "./aws-credentials.js";
+import { modeHonouringTmpBase, tmpdirIgnoresModes } from "./testing/tmpdir-modes.js";
 
 const CREDS = {
   aws_access_key_id: "AKIA-NEW-1",
@@ -152,12 +153,59 @@ aws_access_key_id = PROD-KEY
   });
 });
 
-describe("upsertProfile — filesystem round-trip", () => {
+// Measured, not assumed: on a filesystem that ignores chmod, upsertProfile now
+// REFUSES to write rather than leave an access key, a secret key and a session
+// token in a world-readable and world-writable file. Every case in the
+// round-trip suite writes under os.tmpdir(), so on such a host the suite is
+// asserting a path the product deliberately no longer takes -- it is skipped
+// with the reason, and the refusal itself is asserted in the suite below it.
+const TMPDIR_IGNORES_MODES = tmpdirIgnoresModes();
+// Not os.tmpdir(): every suite below writes a REAL credentials file, and on a
+// filesystem that ignores chmod upsertProfile now refuses outright. Taking a base
+// that honours modes keeps these suites exercising the behaviour they are about
+// on a machine whose TMPDIR points into a Windows drive, instead of turning red
+// or being skipped. The refusal itself is asserted in its own suite, from
+// os.tmpdir() explicitly, so both halves stay covered.
+const PRIVATE_TMP_BASE = modeHonouringTmpBase() ?? tmpdir();
+
+describe("upsertProfile — a filesystem that cannot hold a private file", {
+  skip: TMPDIR_IGNORES_MODES
+    ? false
+    : "needs an os.tmpdir() that ignores chmod -- WSL with TMPDIR on a Windows drive, or a CIFS/FAT mount",
+}, () => {
+  it("refuses to write the credentials rather than exposing them", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "aws-mcp-creds-nomode-"));
+    const path = join(dir, "credentials");
+    try {
+      await assert.rejects(upsertProfile(path, "mcp-dev", CREDS), (err: Error) => {
+        assert.match(err.message, /does not honour file modes/);
+        assert.match(err.message, /AWS_SHARED_CREDENTIALS_FILE/, "the message must name the variable to change");
+        return true;
+      });
+      // Nothing secret may survive the refusal: no credentials file, and no
+      // stranded tmp file holding the plaintext either.
+      assert.equal(existsSync(path), false, "no credentials file may be created");
+      assert.deepEqual(
+        readdirSync(dir).filter((n) => n.startsWith("credentials.tmp-")),
+        [],
+        "the tmp file holding the plaintext must be unlinked",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("upsertProfile — filesystem round-trip", {
+  skip: TMPDIR_IGNORES_MODES
+    ? "os.tmpdir() ignores chmod, so upsertProfile correctly refuses to write there -- see the suite above"
+    : false,
+}, () => {
   let dir: string;
   let path: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "aws-mcp-creds-"));
+    dir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-creds-"));
     path = join(dir, "credentials");
   });
 
@@ -233,7 +281,7 @@ describe("upsertProfile — lock subsystem", () => {
   let path: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "aws-mcp-lock-"));
+    dir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-lock-"));
     path = join(dir, "credentials");
   });
 
@@ -376,7 +424,7 @@ describe("upsertProfile — a short write never lands a truncated credentials fi
   let path: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "aws-mcp-shortwrite-"));
+    dir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-shortwrite-"));
     path = join(dir, "credentials");
   });
 
@@ -551,7 +599,7 @@ describe("upsertProfile — concurrent cross-process writers are serialized", ()
   let path: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "aws-mcp-race-"));
+    dir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-race-"));
     path = join(dir, "credentials");
   });
 
@@ -573,7 +621,7 @@ describe("upsertProfile — concurrent cross-process writers are serialized", ()
    */
   function runConcurrentPair(profileA: string, profileB: string, trial: number): Promise<void> {
     const childScript = `
-      import { upsertProfile } from ${JSON.stringify(credsModuleUrl)};
+import { upsertProfile } from ${JSON.stringify(credsModuleUrl)};
       const filePath = process.env.RACE_PATH;
       const profile = process.env.RACE_PROFILE;
       const akid = process.env.RACE_AKID;
@@ -795,7 +843,7 @@ describe("upsertProfile — trailing-whitespace header, through the real file pa
   let path: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "aws-mcp-creds-ws-"));
+    dir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-creds-ws-"));
     path = join(dir, "credentials");
   });
 
@@ -856,7 +904,7 @@ describe("upsertProfile — existed flag through the real file path", () => {
   let path: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "aws-mcp-creds-existed-"));
+    dir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-creds-existed-"));
     path = join(dir, "credentials");
   });
 

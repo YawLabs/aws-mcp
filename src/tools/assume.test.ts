@@ -5,8 +5,15 @@ import { dirname, join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
+import { modeHonouringTmpBase } from "../testing/tmpdir-modes.js";
 import { assumeTools } from "./assume.js";
 import type { ToolContext } from "./tool.js";
+
+// Not os.tmpdir(): these cases write files whose 0600 is enforced, and on a
+// filesystem that ignores chmod the product now refuses outright (see
+// private-file.ts). A base that honours modes keeps them exercising the behaviour
+// they are about on a machine whose TMPDIR points into a Windows drive.
+const PRIVATE_TMP_BASE = modeHonouringTmpBase() ?? tmpdir();
 
 const tool = assumeTools.find((t) => t.name === "aws_assume_role");
 if (!tool) throw new Error("assumeTools missing aws_assume_role");
@@ -30,7 +37,7 @@ before(() => {
   // Redirect homedir() so upsertProfile writes into a throwaway tempdir
   // instead of the real ~/.aws/credentials. os.homedir() honors $HOME on
   // Unix and $USERPROFILE on Windows; setting both keeps the test portable.
-  fakeHome = mkdtempSync(join(tmpdir(), "aws-mcp-assume-test-"));
+  fakeHome = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-assume-test-"));
   // upsertProfile expects the parent .aws directory to already exist (it
   // writes a sibling .tmp- file). Real installs always have it; tests get
   // a fresh tmpdir so we create the dir explicitly.
@@ -547,7 +554,11 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
 
     // Use an isolated HOME so the chmod cannot leak to other tests in this
     // file (the shared `fakeHome` in the before() block stays untouched).
-    const isolatedHome = mkdtempSync(join(tmpdir(), "aws-mcp-assume-eacces-"));
+    // PRIVATE_TMP_BASE, because this case's whole premise is a directory made
+    // UNWRITABLE with chmod -- which a filesystem that ignores chmod cannot give
+    // it. On such a mount the dir stays writable and the case fails on the
+    // private-mode guard instead of on the EACCES it is about.
+    const isolatedHome = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-assume-eacces-"));
     const awsDir = join(isolatedHome, ".aws");
     mkdirSync(awsDir, { recursive: true });
     const savedHome = process.env.HOME;
@@ -587,7 +598,7 @@ describe("aws_assume_role — credentials file location and overwrite warning", 
   let savedSharedFile: string | undefined;
 
   beforeEach(() => {
-    scratchDir = mkdtempSync(join(tmpdir(), "aws-mcp-assume-shared-"));
+    scratchDir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-assume-shared-"));
     savedSharedFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
   });
 
