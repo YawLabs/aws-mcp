@@ -65,4 +65,46 @@ describe("release metadata", () => {
     );
     assert.equal(pkg.mcpName, server.name, "package.json mcpName must equal server.json name");
   });
+
+  it("server.json declares AWS_PROFILE and AWS_REGION as optional, undefaulted inputs, each documented in the README", () => {
+    // Why they are declared at all: without them a Registry-driven install writes
+    // a config with no env block, so the first tool call runs `--profile default`
+    // and fails `no_creds`. An installer that reads this array can offer them.
+    //
+    // Why NEITHER carries a `default`: a pre-filled `default` profile recreates
+    // exactly that failure on a machine where no `[default]` exists, and a
+    // pre-filled region would outrank the user's own AWS_DEFAULT_REGION
+    // (session.ts's getRegion prefers AWS_REGION). An installer that writes an
+    // EMPTY string for a skipped optional variable is safe either way: getProfile
+    // and getRegion use `||`, so "" is treated as unset.
+    const server = readJson("server.json");
+    const packages = server.packages as Array<{ environmentVariables?: Array<Record<string, unknown>> }> | undefined;
+    const vars = packages?.[0]?.environmentVariables;
+    assert.ok(Array.isArray(vars), "server.json packages[0] must declare environmentVariables");
+    const names = (vars ?? []).map((v) => String(v.name));
+    for (const required of ["AWS_PROFILE", "AWS_REGION"]) {
+      assert.ok(names.includes(required), `server.json must declare ${required}; declares ${names.join(", ")}`);
+    }
+    // `includes`, not an exact set: a later deliberate addition should not have to
+    // edit this test. What every entry must NOT do is carry a default or demand a
+    // value.
+    for (const v of vars ?? []) {
+      assert.ok(
+        !Object.hasOwn(v, "default"),
+        `${String(v.name)} must not carry a default: a pre-filled profile recreates the no_creds failure and a pre-filled region outranks AWS_DEFAULT_REGION`,
+      );
+      assert.notEqual(v.isRequired, true, `${String(v.name)} must stay optional -- the server runs with neither set`);
+    }
+    // Anything the registry offers has to be explained where users read: the
+    // Environment table. The `m` flag is required -- without it `^` anchors to the
+    // whole file and this can never pass. README.md is LF (.gitattributes).
+    const readme = readFileSync(resolve(repoRoot, "README.md"), "utf-8");
+    for (const name of names) {
+      assert.match(
+        readme,
+        new RegExp(`^\\| \`${name}\``, "m"),
+        `README.md needs an Environment-table row for ${name}, which server.json tells installers to prompt for`,
+      );
+    }
+  });
 });

@@ -71,6 +71,37 @@ const PKCE_BANNER =
   "If you are unable to open the URL on this device, run this command again with the '--use-device-code' option.\n\n" +
   "https://oidc.us-east-1.amazonaws.com/authorize?response_type=code&client_id=fake&redirect_uri=http%3A%2F%2F127.0.0.1%3A51234%2Foauth%2Fcallback&code_challenge=fake&code_challenge_method=S256\n";
 
+/** The AWS CLI v2's exit code for an argument-parsing failure (argparser.py's
+ * `self.exit(252, ...)`); measured on 2.34.3 and 2.22.0 for every case in the
+ * new-tools capture matrix. Mirrors CLI_PARSE_EXIT_CODE in tools/call.ts. */
+const CLI_PARSE_EXIT = 252;
+
+/**
+ * Real 2.34.3 stderr for an argparse "required arguments" failure, with the
+ * required list as the only variable. Captured from
+ * `aws s3api get-object --cli-input-json '{"Bucket":"b","Key":"k"}'` and from
+ * the same command with no params; the usage block below the sentence is
+ * byte-identical in both.
+ */
+const ARGPARSE_REQUIRED_STDERR = (requiredList: string): string =>
+  `\naws: [ERROR]: An error occurred (ParamValidation): the following arguments are required: ${requiredList}\n\n` +
+  "usage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\n" +
+  "To see help text, you can run:\n\n" +
+  "  aws help\n  aws <command> help\n  aws <command> <subcommand> help\n";
+
+/**
+ * Write CLI stderr using the line ending the real CLI uses on THIS platform.
+ *
+ * The scenarios above emit bare LF, which is what the CLI writes on POSIX. On
+ * Windows the real 2.34.3 writes CRLF -- 9 CRLF and 0 bare LF in the
+ * get-object capture, re-measured while writing this. The classifier in
+ * tools/call.ts has to tolerate both, so the fake must be able to produce the
+ * one the developer's own platform would.
+ */
+function writeStderrWithPlatformEol(text: string): void {
+  process.stderr.write(process.platform === "win32" ? text.replace(/\n/g, "\r\n") : text);
+}
+
 /**
  * `aws --version` intercept, ahead of the scenario switch.
  *
@@ -337,6 +368,39 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "new-tools_argparse_required_bucket_key": {
+      // Verbatim stderr from real aws-cli 2.34.3 for
+      //   aws s3api get-object --cli-input-json '{"Bucket":"b","Key":"k"}'
+      // -- the CLI naming, as missing, the two values the caller DID supply in
+      // params. The point of the scenario is that `s3api head-object` with NO
+      // params emits these same bytes, so only the caller's own context can tell
+      // "this command can never run here" from "you forgot params".
+      writeStderrWithPlatformEol(ARGPARSE_REQUIRED_STDERR("--bucket, --key"));
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
+    case "new-tools_argparse_required_outfile": {
+      // Real 2.34.3 stderr for `aws s3api get-object` with NO params: the
+      // required list now includes the positional `outfile`, which is what
+      // proves the command is unreachable rather than under-supplied.
+      writeStderrWithPlatformEol(ARGPARSE_REQUIRED_STDERR("--bucket, --key, outfile"));
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
+    case "new-tools_unknown_cli_input_json": {
+      // Real 2.34.3 stderr for `aws logs tail g --cli-input-json '{"logGroupName":"g"}'`
+      // -- a hand-written (BasicCommand) command, which registers no
+      // --cli-input-json at all. `aws s3 ls` and `aws configure get` emit the
+      // same bytes.
+      writeStderrWithPlatformEol(
+        "\naws: [ERROR]: An error occurred (ParamValidation): Unknown options: --cli-input-json\n",
+      );
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
     case "call_sso_expired": {
       process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
       process.exit(255);
@@ -359,6 +423,30 @@ async function main(): Promise<void> {
         "An error occurred (ExpiredToken) when calling the ListBuckets operation: The provided token has expired.\n",
       );
       process.exit(255);
+      return;
+    }
+
+    case "readme-positioning_cli_invalid_choice": {
+      // Verbatim stderr from real aws-cli 2.34.3 for
+      //   aws batch cancel-jobs --output json --profile <one that exists>
+      //       --region us-east-1 --cli-input-json {...}
+      // against a dead loopback endpoint: argparse rejects the operation before
+      // anything is sent. `cancel-jobs` is real -- Batch added it in CLI 2.36.44
+      // -- so this is exactly the README's "reachable the moment your local aws
+      // CLI knows them" claim failing on a CLI that does not know it yet.
+      //
+      // The profile has to EXIST for this shape: with a --profile the CLI cannot
+      // find, 2.34.3 drops the "An error occurred (ParamValidation): " wrapper
+      // and prints the legacy form, which is not what users see. Capture:
+      // plans/readme-positioning_rv_234_op_enhanced.err.
+      writeStderrWithPlatformEol(
+        "\naws: [ERROR]: An error occurred (ParamValidation): argument operation: Found invalid choice 'cancel-jobs'\n\n" +
+          "Maybe you meant:\n\n  * cancel-job\n\n" +
+          "usage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\n" +
+          "To see help text, you can run:\n\n" +
+          "  aws help\n  aws <command> help\n  aws <command> <subcommand> help\n",
+      );
+      process.exit(CLI_PARSE_EXIT);
       return;
     }
 
@@ -1425,6 +1513,178 @@ async function main(): Promise<void> {
       return;
     }
 
+    // --- the 2026-07-30 SimulatePrincipalPolicy shape ---------------------------
+    // Every payload below was transcribed from a capture rendered by the real
+    // aws-cli/2.34.3 from XML written to the 2026-07-30 API reference, driven
+    // through a local loopback stub (iam-simulate planning, 2026-09-19). Replace
+    // them with scrubbed live captures once someone runs the four read-only
+    // simulate calls in iam-simulate.final.md section 5. The four fixtures above
+    // are all pre-change shape, which is why this bug reached a release.
+    //
+    // Where EvalResourceName reads "arn:${...}:..." below, the ${...} are IAM's
+    // OWN placeholders inside a plain string -- the ARN template it now returns
+    // for any action that has an ARN format. Nothing here is JS interpolation.
+    case "iam-simulate_rsr_split": {
+      // Two actions x three resources. s3:GetObject gets ONE EvaluationResult
+      // whose top-level EvalDecision is the most restrictive answer across all
+      // three buckets and whose EvalResourceName is the template -- the real
+      // per-resource answers (probe-a allowed, probe-b explicitDeny, probe-c
+      // implicitDeny with a missing tag key) are only in ResourceSpecificResults.
+      // s3:ListAllMyBuckets has no ARN format, so it comes back as '*' with no
+      // per-resource breakdown at all: the fallback path in one payload.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              // biome-ignore lint/suspicious/noTemplateCurlyInString: IAM's own ARN template in a plain string, not JS interpolation
+              EvalResourceName: "arn:${Partition}:s3:::${BucketName}/${KeyName}",
+              EvalDecision: "explicitDeny",
+              MatchedStatements: [
+                { SourcePolicyId: "ProbeAllowA", SourcePolicyType: "IAM Policy" },
+                { SourcePolicyId: "ProbeDenyB", SourcePolicyType: "IAM Policy" },
+              ],
+              MissingContextValues: ["aws:RequestTag/Project"],
+              OrganizationsDecisionDetail: { AllowedByOrganizations: true },
+              EvalDecisionDetails: {},
+              ResourceSpecificResults: [
+                {
+                  EvalResourceName: "arn:aws:s3:::probe-a/k",
+                  EvalResourceDecision: "allowed",
+                  MatchedStatements: [{ SourcePolicyId: "ProbeAllowA", SourcePolicyType: "IAM Policy" }],
+                  MissingContextValues: [],
+                },
+                {
+                  EvalResourceName: "arn:aws:s3:::probe-b/k",
+                  EvalResourceDecision: "explicitDeny",
+                  MatchedStatements: [{ SourcePolicyId: "ProbeDenyB", SourcePolicyType: "IAM Policy" }],
+                  MissingContextValues: [],
+                },
+                {
+                  EvalResourceName: "arn:aws:s3:::probe-c/k",
+                  EvalResourceDecision: "implicitDeny",
+                  MatchedStatements: [],
+                  MissingContextValues: ["aws:RequestTag/Project"],
+                },
+              ],
+            },
+            {
+              EvalActionName: "s3:ListAllMyBuckets",
+              EvalResourceName: "*",
+              EvalDecision: "allowed",
+              MatchedStatements: [{ SourcePolicyId: "AdministratorAccess", SourcePolicyType: "IAM Policy" }],
+              MissingContextValues: [],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam-simulate_scp_deny": {
+      // An SCP deny, which is the shape the description's "SCP statements never
+      // appear in matchedStatementIds" sentence is about: explicitDeny with
+      // MatchedStatements EMPTY, and the only tell is AllowedByOrganizations
+      // false. One per-resource entry repeats the deny against the real ARN.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "ec2:RunInstances",
+              // biome-ignore lint/suspicious/noTemplateCurlyInString: IAM's own ARN template in a plain string, not JS interpolation
+              EvalResourceName: "arn:${Partition}:ec2:${Region}:${Account}:instance/${InstanceId}",
+              EvalDecision: "explicitDeny",
+              MatchedStatements: [],
+              MissingContextValues: [],
+              OrganizationsDecisionDetail: { AllowedByOrganizations: false },
+              ResourceSpecificResults: [
+                {
+                  EvalResourceName: "arn:aws:ec2:eu-west-1:123456789012:instance/*",
+                  EvalResourceDecision: "explicitDeny",
+                  MatchedStatements: [],
+                  MissingContextValues: [],
+                },
+              ],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam-simulate_rsr_boundary": {
+      // ResourceSpecificResult carries its OWN PermissionsBoundaryDecisionDetail
+      // (it is in the model aws-cli 2.34.3 bundles, unlike a per-entry
+      // OrganizationsDecisionDetail, which that CLI silently drops). The two
+      // entries disagree with each other AND with the action-level aggregate, so
+      // a row that copied the parent's boundary verdict would be wrong on one.
+      // EvalDecisionDetails is present at both levels and stays dropped.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              // biome-ignore lint/suspicious/noTemplateCurlyInString: IAM's own ARN template in a plain string, not JS interpolation
+              EvalResourceName: "arn:${Partition}:s3:::${BucketName}/${KeyName}",
+              EvalDecision: "implicitDeny",
+              MatchedStatements: [{ SourcePolicyId: "Allow", SourcePolicyType: "IAM Policy" }],
+              MissingContextValues: [],
+              PermissionsBoundaryDecisionDetail: { AllowedByPermissionsBoundary: false },
+              EvalDecisionDetails: { "IAM Policy": "allowed", "Resource Policy": "implicitDeny" },
+              ResourceSpecificResults: [
+                {
+                  EvalResourceName: "arn:aws:s3:::x-a/k",
+                  EvalResourceDecision: "allowed",
+                  MatchedStatements: [{ SourcePolicyId: "Allow", SourcePolicyType: "IAM Policy" }],
+                  MissingContextValues: [],
+                  EvalDecisionDetails: { "IAM Policy": "allowed" },
+                  PermissionsBoundaryDecisionDetail: { AllowedByPermissionsBoundary: true },
+                },
+                {
+                  EvalResourceName: "arn:aws:s3:::x-b/k",
+                  EvalResourceDecision: "implicitDeny",
+                  MatchedStatements: [],
+                  MissingContextValues: [],
+                  PermissionsBoundaryDecisionDetail: { AllowedByPermissionsBoundary: false },
+                },
+              ],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
+    case "iam-simulate_nores_template": {
+      // DEFENSIVE, not observed: the API reference permits a result with the ARN
+      // template and NO ResourceSpecificResults at all, and it puts a '*'
+      // simulation's missing context keys on the top-level result. That is the
+      // combination that would leak the template into the commonest call shape
+      // ("can I do this at all?"), so the handler's resourcesOmitted wiring is
+      // pinned against it. Replace with the live L2 capture when section 5 runs:
+      // if AWS always sends a '*' entry instead, this becomes the belt to that
+      // braces.
+      process.stdout.write(
+        `${JSON.stringify({
+          EvaluationResults: [
+            {
+              EvalActionName: "s3:GetObject",
+              // biome-ignore lint/suspicious/noTemplateCurlyInString: IAM's own ARN template in a plain string, not JS interpolation
+              EvalResourceName: "arn:${Partition}:s3:::${BucketName}/${KeyName}",
+              EvalDecision: "implicitDeny",
+              MatchedStatements: [],
+              MissingContextValues: ["s3:ExistingObjectTag/env"],
+            },
+          ],
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     case "assume_role_success": {
       // Mimics `aws sts assume-role --output json` on a successful assume.
       // Mirrors the real CLI shape: Credentials, AssumedRoleUser, PackedPolicySize.
@@ -2230,61 +2490,74 @@ async function main(): Promise<void> {
     }
 
     case "obs2_iam_sim_truncated": {
-      // IAM paginates SimulatePrincipalPolicy with IsTruncated + Marker, and no
-      // other iam_simulate scenario emits either -- so hasMore:true and the
-      // echoed marker had never executed, only their false/null complements.
+      // IAM paginates SimulatePrincipalPolicy with IsTruncated + Marker, but the
+      // CLI FOLLOWS that itself, so what this scenario used to emit -- a
+      // truncated first page with IsTruncated:true and a Marker -- is a format
+      // the real CLI never prints. That is the aws_logs_tail lesson again: a
+      // fake that models the API instead of the CLI in front of it.
+      //
+      // Three pages, modeled on aws-cli/2.34.3 driven against a local
+      // three-page stub (iam-simulate planning, 2026-09-19):
+      //   first call (no Marker)  -> the CLI auto-paginates and prints the
+      //                              MERGED pages: all 3 results, and NEITHER
+      //                              IsTruncated nor Marker.
+      //   Marker = ...page2==     -> a Marker in the call parameters turns the
+      //                              CLI's auto-pagination off, so it prints that
+      //                              one raw page. This page is itself truncated:
+      //                              IsTruncated:true plus the next Marker.
+      //   any other Marker        -> the LAST page: IsTruncated:false, no Marker.
       //
       // Stateful by argv, the same way metrics_paginated is: parse the
-      // --cli-input-json payload and switch on whether it carries a Marker.
-      //   first call (no Marker)  -> a TRUNCATED page: one EvaluationResult
-      //                              plus IsTruncated:true and a Marker.
-      //   resume call (Marker set) -> the FINAL page: one EvaluationResult, no
-      //                              IsTruncated, no Marker.
-      // Parsing the payload rather than substring-matching '"Marker"' keeps a
-      // resource ARN or action name containing that literal from flipping the
-      // branch.
+      // --cli-input-json payload and read its Marker. Parsing the payload rather
+      // than substring-matching '"Marker"' keeps a resource ARN or action name
+      // containing that literal from flipping the branch.
+      const getObject = {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "arn:aws:s3:::my-bucket/*",
+        EvalDecision: "allowed",
+        MatchedStatements: [{ SourcePolicyId: "ReadOnlyAccess", SourcePolicyType: "IAM Policy" }],
+      };
+      const deleteObject = {
+        EvalActionName: "s3:DeleteObject",
+        EvalResourceName: "arn:aws:s3:::my-bucket/*",
+        EvalDecision: "explicitDeny",
+        MatchedStatements: [{ SourcePolicyId: "DenyDeletes", SourcePolicyType: "IAM Policy" }],
+      };
+      const putObject = {
+        EvalActionName: "s3:PutObject",
+        EvalResourceName: "arn:aws:s3:::my-bucket/*",
+        EvalDecision: "allowed",
+        MatchedStatements: [{ SourcePolicyId: "ReadWriteAccess", SourcePolicyType: "IAM Policy" }],
+      };
       const argv = process.argv.slice(2);
       const jsonIdx = argv.indexOf("--cli-input-json");
-      let isResume = false;
+      let marker: unknown;
       try {
         const parsed = JSON.parse(jsonIdx >= 0 ? argv[jsonIdx + 1] : "") as { Marker?: unknown };
-        isResume = parsed.Marker !== undefined;
+        marker = parsed.Marker;
       } catch {
         // Malformed JSON can't reach us from runAwsCall (it serializes the
-        // payload itself). Default to the first-page branch so a test fails
+        // payload itself). Default to the first-call branch so a test fails
         // loud rather than silently looking like a resume.
-        isResume = false;
+        marker = undefined;
       }
-      if (isResume) {
+      if (marker === undefined) {
+        process.stdout.write(`${JSON.stringify({ EvaluationResults: [getObject, deleteObject, putObject] })}\n`);
+        process.exit(0);
+        return;
+      }
+      if (marker === "obs2-iam-marker-page2==") {
         process.stdout.write(
           `${JSON.stringify({
-            EvaluationResults: [
-              {
-                EvalActionName: "s3:DeleteObject",
-                EvalResourceName: "arn:aws:s3:::my-bucket/*",
-                EvalDecision: "explicitDeny",
-                MatchedStatements: [{ SourcePolicyId: "DenyDeletes", SourcePolicyType: "IAM Policy" }],
-              },
-            ],
+            EvaluationResults: [deleteObject],
+            IsTruncated: true,
+            Marker: "obs2-iam-marker-page3==",
           })}\n`,
         );
         process.exit(0);
         return;
       }
-      process.stdout.write(
-        `${JSON.stringify({
-          EvaluationResults: [
-            {
-              EvalActionName: "s3:GetObject",
-              EvalResourceName: "arn:aws:s3:::my-bucket/*",
-              EvalDecision: "allowed",
-              MatchedStatements: [{ SourcePolicyId: "ReadOnlyAccess", SourcePolicyType: "IAM Policy" }],
-            },
-          ],
-          IsTruncated: true,
-          Marker: "obs2-iam-marker-page2==",
-        })}\n`,
-      );
+      process.stdout.write(`${JSON.stringify({ EvaluationResults: [putObject], IsTruncated: false })}\n`);
       process.exit(0);
       return;
     }

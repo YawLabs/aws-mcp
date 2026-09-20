@@ -1,12 +1,23 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it, mock } from "node:test";
 import {
+  CLI_S3API_INDEX_HTML,
+  JSV3_SHELL_HTML,
+  LAMBDA_LANDING_STUB_HTML,
+  POWERTOOLS_PAGE_HTML,
+  SWIFT_SHELL_HTML,
+} from "../testing/docs-fixtures.js";
+import {
   _resetParseSearchSchemaWarn,
   buildDocsTools,
+  classifyFinalDocsUrl,
   DOC_CACHE_MAX_ENTRIES,
+  describeFetchFailure,
+  detectUnrenderablePage,
   docsTools,
   docTerms,
   extractMainContent,
+  type FetchEnvFacts,
   htmlToMarkdown,
   isValidDocsUrl,
   LOW_RELEVANCE_OVERLAP,
@@ -14,12 +25,22 @@ import {
   paginateContent,
   parseSearchResults,
   queryTerms,
+  readFetchEnvFacts,
+  resolveDocsLink,
   scoreSearchResults,
 } from "./docs.js";
 
 const searchTool = docsTools.find((t) => t.name === "aws_docs_search");
 const readTool = docsTools.find((t) => t.name === "aws_docs_read");
 if (!searchTool || !readTool) throw new Error("docsTools missing aws_docs_search / aws_docs_read");
+
+/**
+ * What a machine with no proxy configured reports. Handler tests that drive a
+ * fetch failure pass this to buildDocsTools so the branch they assert is the one
+ * they get: the developer's own HTTPS_PROXY would otherwise earn the proxy
+ * remedy in place of it.
+ */
+const NO_PROXY_ENV: FetchEnvFacts = { proxyUrl: null, envProxyEnabled: false, oamVersion: null };
 
 /** Build a Response-like object good enough for the handlers under test. */
 function fakeResponse(opts: {
@@ -212,6 +233,419 @@ describe("isValidDocsUrl", () => {
   });
 });
 
+describe("classifyFinalDocsUrl", () => {
+  const D = "https://docs.aws.amazon.com";
+
+  it("accepts a page that landed on a page", () => {
+    assert.equal(
+      classifyFinalDocsUrl(`${D}/AmazonS3/latest/dev/Welcome.html`, `${D}/AmazonS3/latest/userguide/Welcome.html`),
+      "page",
+      "a real move 301s .html -> .html and must stay readable",
+    );
+  });
+
+  it("accepts the directory form of the index.html that was requested", () => {
+    // The regression: docs.aws.amazon.com answers every <path>/index.html with a
+    // 301 to <path>/, and one in six search results is such a URL.
+    assert.equal(
+      classifyFinalDocsUrl(`${D}/cli/latest/reference/s3api/index.html`, `${D}/cli/latest/reference/s3api/`),
+      "page",
+    );
+    assert.equal(
+      classifyFinalDocsUrl(
+        `${D}/powertools/typescript/latest/environment-variables/index.html`,
+        `${D}/powertools/typescript/latest/environment-variables/`,
+      ),
+      "page",
+    );
+  });
+
+  it("compares the index.html form case-insensitively", () => {
+    assert.equal(classifyFinalDocsUrl(`${D}/X/Index.HTML`, `${D}/X/`), "page");
+  });
+
+  it("calls a page that landed on some other directory a soft 404", () => {
+    // Not a 404: the site 302s a missing page to the guide's landing page, and a
+    // missing CLI command to that service's command index.
+    assert.equal(classifyFinalDocsUrl(`${D}/lambda/latest/dg/no-such.html`, `${D}/lambda/latest/dg/`), "soft_404");
+    assert.equal(
+      classifyFinalDocsUrl(`${D}/cli/latest/reference/s3api/no-such-cmd.html`, `${D}/cli/latest/reference/s3api/`),
+      "soft_404",
+    );
+  });
+
+  it("lets a directory request land on any docs directory", () => {
+    // A directory was never a claim about a particular page, so a directory
+    // landing cannot be "that page does not exist". (Directory input arrives in
+    // 2.4.0; the classifier is written for it now so it cannot mis-report then.)
+    assert.equal(classifyFinalDocsUrl(`${D}/lambda/latest/dg/`, `${D}/lambda/latest/dg/`), "page");
+    assert.equal(classifyFinalDocsUrl(`${D}/a/`, `${D}/b/`), "page");
+  });
+
+  it("accepts an explicit default port and rejects any other", () => {
+    assert.equal(classifyFinalDocsUrl(`${D}/x.html`, "https://docs.aws.amazon.com:443/x.html"), "page");
+    assert.equal(classifyFinalDocsUrl(`${D}/x.html`, "https://docs.aws.amazon.com:8443/x.html"), "off_allowlist");
+  });
+
+  it("keeps every 2.0.0 rejection", () => {
+    for (const final of [
+      "https://evil.example.com/landing.html",
+      "http://docs.aws.amazon.com/x.html",
+      "https://user:pass@docs.aws.amazon.com/x.html",
+      "https://docs.aws.amazon.com./x.html",
+      "https://docs.aws.amazon.com.evil.com/x.html",
+      `${D}/asset.pdf`,
+      "not a url at all",
+    ]) {
+      assert.equal(classifyFinalDocsUrl(`${D}/x.html`, final), "off_allowlist", final);
+    }
+  });
+
+  it("refuses a directory landing it cannot compare the request against", () => {
+    // An unparseable request URL fails closed rather than accepting the landing.
+    assert.equal(classifyFinalDocsUrl("not a url", `${D}/lambda/latest/dg/`), "off_allowlist");
+  });
+});
+
+describe("resolveDocsLink", () => {
+  const BASE = "https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html";
+
+  it("makes a relative docs .md target absolute and points it at the .html twin", () => {
+    // .html is the form aws_docs_read accepts, so the URL it returns is one a
+    // caller can pass straight back in.
+    assert.equal(
+      resolveDocsLink("create-bucket-overview.md", BASE),
+      "https://docs.aws.amazon.com/AmazonS3/latest/userguide/create-bucket-overview.html",
+    );
+  });
+
+  it("keeps a fragment and resolves a parent-relative target against a directory base", () => {
+    // The real link out of the s3api command index, whose base IS a directory:
+    // `../` off `/cli/latest/reference/s3api/` is the CLI reference root.
+    assert.equal(
+      resolveDocsLink("../index.html#cli-aws", "https://docs.aws.amazon.com/cli/latest/reference/s3api/"),
+      "https://docs.aws.amazon.com/cli/latest/reference/index.html#cli-aws",
+    );
+  });
+
+  it("leaves a fragment-only link, an empty target and a non-http scheme alone", () => {
+    assert.equal(resolveDocsLink("#frag", BASE), "#frag");
+    assert.equal(resolveDocsLink("", BASE), "");
+    assert.equal(resolveDocsLink("mailto:aws@example.com", BASE), "mailto:aws@example.com");
+    assert.equal(resolveDocsLink("javascript:void(0)", BASE), "javascript:void(0)");
+  });
+
+  it("does not rewrite .md on another host", () => {
+    assert.equal(resolveDocsLink("https://example.com/readme.md", BASE), "https://example.com/readme.md");
+  });
+});
+
+describe("detectUnrenderablePage", () => {
+  const LAMBDA_DG = "https://docs.aws.amazon.com/lambda/latest/dg/";
+
+  it("names the page a meta-refresh stub forwards to, as an absolute URL", () => {
+    const md = htmlToMarkdown(LAMBDA_LANDING_STUB_HTML);
+    const reason = detectUnrenderablePage(
+      LAMBDA_LANDING_STUB_HTML,
+      md,
+      "https://docs.aws.amazon.com/lambda/latest/dg/index.html",
+      LAMBDA_DG,
+    );
+    assert.match(reason ?? "", /only forwards the browser/);
+    assert.match(reason ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\/welcome\.html/);
+  });
+
+  it("resolves the refresh target against the FINAL url, not the requested one", () => {
+    // A page that moved guides lands in the new directory, and the stub's
+    // `URL=welcome.html` means THAT directory's welcome page. Resolving against
+    // the requested URL would name a page in the old, dead guide.
+    const reason = detectUnrenderablePage(
+      LAMBDA_LANDING_STUB_HTML,
+      "",
+      "https://docs.aws.amazon.com/AmazonS3/latest/dev/Foo.html",
+      "https://docs.aws.amazon.com/AmazonS3/latest/userguide/",
+    );
+    assert.match(reason ?? "", /AmazonS3\/latest\/userguide\/welcome\.html/);
+    // The requested URL is still echoed, but no target in the message points
+    // back into the guide that moved.
+    assert.doesNotMatch(reason ?? "", /forwards the browser to '[^']*latest\/dev\//);
+    assert.doesNotMatch(reason ?? "", /aws_docs_read on '[^']*latest\/dev\//);
+  });
+
+  it("does not offer a target the read tool would refuse", () => {
+    const html = '<html><head><meta http-equiv="refresh" content="0;URL=https://example.com/elsewhere"></head></html>';
+    const reason = detectUnrenderablePage(html, "", "https://docs.aws.amazon.com/x.html", LAMBDA_DG);
+    assert.match(reason ?? "", /not a readable AWS documentation page/);
+    assert.doesNotMatch(reason ?? "", /example\.com/);
+  });
+
+  it("explains a client-rendered shell, for both shapes that produce one", () => {
+    for (const html of [JSV3_SHELL_HTML, SWIFT_SHELL_HTML]) {
+      const reason = detectUnrenderablePage(
+        html,
+        htmlToMarkdown(html),
+        "https://docs.aws.amazon.com/x.html",
+        LAMBDA_DG,
+      );
+      assert.match(reason ?? "", /rendered in the browser by JavaScript/);
+    }
+  });
+
+  it("leaves a short real page alone", () => {
+    // No marker, so length alone never triggers it.
+    const md = "x".repeat(150);
+    assert.equal(detectUnrenderablePage("<html><body><main>short</main></body></html>", md, "u", "u"), null);
+  });
+
+  it("leaves a long page alone even when it carries a marker", () => {
+    // The length gate runs first: a real page that happens to ship a Next.js
+    // asset must not be refused.
+    const html = `<html><body><main><p>${"x".repeat(5000)}</p><script src="/_next/static/x.js"></script></main></body></html>`;
+    assert.equal(detectUnrenderablePage(html, htmlToMarkdown(html), "u", "u"), null);
+  });
+
+  it("reads a stub whose attributes are the other way round", () => {
+    // `content=` before `http-equiv=` is a shape the old tag-scan regex, which
+    // required that order, silently missed -- such a page came back as an empty
+    // success with no target named.
+    const html = '<html><head><meta content="0;URL=welcome.html" http-equiv="refresh"></head></html>';
+    assert.match(
+      detectUnrenderablePage(html, "", "https://docs.aws.amazon.com/x.html", LAMBDA_DG) ?? "",
+      /welcome\.html/,
+    );
+  });
+
+  it("stays linear on a body with a long run of unclosed <meta", () => {
+    // readBodyWithCap admits 5 MB, and a `<meta[^>]+...[^>]*content=` scan
+    // re-walks the rest of the document from every `<meta` once per following
+    // `http-equiv=` in a stretch carrying no `>`. Measured on 22.22.2: 5 KB of
+    // this body cost the old scan 186 ms, 16 KB 4.7 s, 26 KB 22 s -- synchronous
+    // CPU in a single-threaded stdio server, after the body has arrived, so
+    // FETCH_TIMEOUT_MS does not reach it and every other tool call queues behind
+    // it. Walking the parsed tags does the whole 5 MB in 62 ms.
+    const hostile = '<meta http-equiv="refresh" '.repeat(2400);
+    const started = performance.now();
+    assert.equal(detectUnrenderablePage(hostile, "", "u", "u"), null);
+    assert.ok(performance.now() - started < 5000, "the old scan needed minutes for this 64 KB body");
+  });
+
+  it("measures the text, not the link syntax", () => {
+    // The JS v3 shell's whole conversion is `[Skip to main content](#main)`: 29
+    // characters of markdown, 20 of text. Counting the markdown would let a
+    // shell whose skip-link URL is long enough pass as content.
+    const md = htmlToMarkdown(JSV3_SHELL_HTML);
+    assert.equal(md, "[Skip to main content](#main)");
+    assert.ok(md.length > 20, "precondition: the link syntax inflates the raw length");
+
+    // The same shell with a query string on the skip-link: 264 characters of
+    // markdown, still 20 of text. Both numbers sit on the useful side of the
+    // 200-character gate, so this is the case that holds the strip honest --
+    // without it the length gate returns null and the shell is served as its own
+    // content, the silent-empty-success the check exists to prevent. Derived
+    // through htmlToMarkdown like the cases above rather than hand-written, so
+    // the converter has to keep producing a link here.
+    const html = `<html><body><div id="__next"><a href="/AWSJavaScriptSDK/v3/latest/Package/x?q=${"y".repeat(200)}"><span>Skip to main content</span></a></div></body></html>`;
+    const long = htmlToMarkdown(html);
+    assert.ok(long.length >= 200, "precondition: the href pushes the raw markdown over the gate");
+    assert.match(detectUnrenderablePage(html, long, "u", "u") ?? "", /rendered in the browser by JavaScript/);
+  });
+});
+
+describe("describeFetchFailure", () => {
+  /** The shape Node's fetch really rejects with: the verdict lives in .cause. */
+  const fetchFailed = (message: string, code?: string): unknown =>
+    Object.assign(new TypeError("fetch failed"), {
+      cause: code === undefined ? new Error(message) : Object.assign(new Error(message), { code }),
+    });
+  /** The shape the AbortController timeout produces: a DOMException, no cause. */
+  const aborted = (): unknown => Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+
+  it("gives an untrusted certificate chain the private-CA remedy", () => {
+    // Reproduced on Node 22.22.2 against a local self-signed server: cause
+    // message "self-signed certificate", cause code DEPTH_ZERO_SELF_SIGNED_CERT.
+    const s = describeFetchFailure(fetchFailed("self-signed certificate", "DEPTH_ZERO_SELF_SIGNED_CERT"), NO_PROXY_ENV);
+    assert.match(s, /self-signed certificate \(DEPTH_ZERO_SELF_SIGNED_CERT\)/);
+    assert.match(s, /TLS-inspecting gateway or a private CA/);
+    assert.match(s, /NODE_EXTRA_CA_CERTS/);
+    assert.match(s, /NODE_USE_SYSTEM_CA=1/);
+    assert.match(s, /MCP-config `env` block/, "the variables are read at process start, not from the user's shell");
+  });
+
+  it("gives the same remedy to the sibling chain verdicts", () => {
+    for (const code of [
+      "SELF_SIGNED_CERT_IN_CHAIN",
+      "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+      "CERT_UNTRUSTED",
+    ]) {
+      assert.match(
+        describeFetchFailure(fetchFailed("unable to verify", code), NO_PROXY_ENV),
+        /NODE_EXTRA_CA_CERTS/,
+        code,
+      );
+    }
+  });
+
+  it("does not offer a CA to a verdict a CA cannot fix", () => {
+    // An expired certificate or a hostname mismatch is a real failure with a
+    // different cause; adding a CA would not change either.
+    const s = describeFetchFailure(fetchFailed("certificate has expired", "CERT_HAS_EXPIRED"), NO_PROXY_ENV);
+    assert.match(s, /certificate has expired \(CERT_HAS_EXPIRED\)/);
+    assert.doesNotMatch(s, /NODE_EXTRA_CA_CERTS/);
+  });
+
+  it("explains an uncoded transport failure under the oam runtime", () => {
+    // Measured on oam 0.16.2 against the same self-signed server: the identical
+    // condition Node codes as DEPTH_ZERO_SELF_SIGNED_CERT arrives with no code.
+    const s = describeFetchFailure(fetchFailed("error sending request for url (https://docs.aws.amazon.com/x.html)"), {
+      ...NO_PROXY_ENV,
+      envProxyEnabled: true,
+      oamVersion: "0.16.2",
+    });
+    assert.match(s, /oam runtime, which reports no failure code/);
+    assert.match(s, /NODE_EXTRA_CA_CERTS/);
+    assert.match(s, /HTTPS_PROXY/, "an unreachable proxy looks the same under oam");
+  });
+
+  it("says when Node is ignoring the HTTPS_PROXY that is set", () => {
+    // Verified on Node 22.22.2: with HTTPS_PROXY pointing at a dead port and
+    // NODE_USE_ENV_PROXY unset, the request went direct and returned 200 -- so
+    // on a proxy-only network it fails while the aws CLI, which reads
+    // HTTPS_PROXY itself, keeps working.
+    const s = describeFetchFailure(fetchFailed("connect ECONNREFUSED 10.1.2.3:443", "ECONNREFUSED"), {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: false,
+      oamVersion: null,
+    });
+    assert.match(s, /HTTPS_PROXY is set to 'http:\/\/proxy\.corp\.example:3128'/);
+    assert.match(s, /NODE_USE_ENV_PROXY=1/);
+    assert.match(s, /aws CLI/);
+  });
+
+  it("gives the ignored-proxy hint to a timeout too, which has no cause at all", () => {
+    // On a proxy-only network the likelier symptom is nothing answering until
+    // our own 30s abort, so the hint has to reach that branch as well.
+    const s = describeFetchFailure(aborted(), {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: false,
+      oamVersion: null,
+    });
+    assert.match(s, /NODE_USE_ENV_PROXY=1/);
+    assert.doesNotMatch(s, /Underlying failure/, "there is no cause on an abort -- do not invent one");
+  });
+
+  it("blames the proxy, not AWS, when the proxy is the one being used", () => {
+    const s = describeFetchFailure(fetchFailed("connect ECONNREFUSED 127.0.0.1:3128", "ECONNREFUSED"), {
+      proxyUrl: "http://127.0.0.1:3128",
+      envProxyEnabled: true,
+      oamVersion: null,
+    });
+    assert.match(s, /that proxy, not docs\.aws\.amazon\.com, that did not answer/);
+    assert.doesNotMatch(s, /NODE_USE_ENV_PROXY/);
+  });
+
+  it("redacts credentials out of the proxy URL and the cause message", () => {
+    const s = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED http://bob:hunter2@proxy.corp.example:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://bob:hunter2@proxy.corp.example:3128", envProxyEnabled: false, oamVersion: null },
+    );
+    assert.doesNotMatch(s, /hunter2/);
+    assert.match(s, /\/\/<redacted>@proxy\.corp\.example:3128/);
+  });
+
+  it("redacts a password containing '@', and a colonless token userinfo", () => {
+    // Node parses userinfo to the LAST '@' (22.22.2: `new URL` on the first URL
+    // below gives password "Pa%40ss"), so `Pa@ssw0rd` is a real password and
+    // `token@` is real auth. A class that stopped at the first '@' printed the
+    // tail, and one that demanded a ':' printed the token whole -- into the tool
+    // error the model reads back and the host logs. Both call sites are covered:
+    // the proxy URL goes through the remedy, the cause through its own call.
+    const withAt = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED http://svc:Pa@ssw0rd@proxy.corp.example:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://svc:Pa@ssw0rd@proxy.corp.example:3128", envProxyEnabled: true, oamVersion: null },
+    );
+    assert.doesNotMatch(withAt, /ssw0rd/);
+    const token = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED http://sup3rs3cr3t@proxy.corp.example:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://sup3rs3cr3t@proxy.corp.example:3128", envProxyEnabled: true, oamVersion: null },
+    );
+    assert.doesNotMatch(token, /sup3rs3cr3t/);
+    assert.match(token, /\/\/<redacted>@proxy\.corp\.example:3128/);
+  });
+
+  it("leaves a credential-free URL alone, fragment or query included", () => {
+    // `?` and `#` end the authority, so an '@' past either is page text, not a
+    // secret -- redacting there would mangle the URL the reader needs.
+    const s = describeFetchFailure(
+      fetchFailed("error sending request for url (https://docs.aws.amazon.com/x.html#a@b)"),
+      { proxyUrl: "http://proxy.corp.example:3128", envProxyEnabled: true, oamVersion: null },
+    );
+    assert.match(s, /docs\.aws\.amazon\.com\/x\.html#a@b/);
+    assert.doesNotMatch(s, /<redacted>/);
+  });
+
+  it("ignores a code that is not a non-empty string", () => {
+    // libuv errnos are numbers; printing one would put a bare "0" in the message.
+    const numeric = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("write EPIPE"), { code: 0 }),
+    });
+    const s = describeFetchFailure(numeric, NO_PROXY_ENV);
+    assert.match(s, /Underlying failure: write EPIPE\./);
+    assert.doesNotMatch(s, /\(0\)/);
+  });
+
+  it("adds nothing when there is nothing to add", () => {
+    assert.equal(describeFetchFailure(new Error("plain failure"), NO_PROXY_ENV), "");
+    assert.equal(describeFetchFailure(aborted(), NO_PROXY_ENV), "");
+    assert.equal(describeFetchFailure("a string, not an error", NO_PROXY_ENV), "");
+    assert.equal(describeFetchFailure(Object.assign(new TypeError("fetch failed"), { cause: null }), NO_PROXY_ENV), "");
+  });
+
+  it("reports an unrecognized cause without pretending to have a remedy", () => {
+    const s = describeFetchFailure(fetchFailed("socket hang up", "UND_ERR_SOCKET"), NO_PROXY_ENV);
+    assert.equal(s, " Underlying failure: socket hang up (UND_ERR_SOCKET).");
+  });
+});
+
+describe("readFetchEnvFacts", () => {
+  // The names and precedence the remedies above are built on. Every case passes a
+  // plain object, so nothing here touches process.env -- this is one long-lived
+  // stdio process and a leaked variable would change what a later test reports.
+  // Untested, a renamed variable or a swapped `??` left the suite green and gave
+  // a proxied user the opposite arm of the remedy: "this request went through the
+  // proxy" when Node in fact bypassed it, or the reverse.
+
+  it("prefers HTTPS_PROXY over https_proxy, and reports neither as null", () => {
+    assert.equal(
+      readFetchEnvFacts({ HTTPS_PROXY: "http://a:3128", https_proxy: "http://b:3128" }, {}).proxyUrl,
+      "http://a:3128",
+    );
+    assert.equal(readFetchEnvFacts({ https_proxy: "http://b:3128" }, {}).proxyUrl, "http://b:3128");
+    assert.equal(readFetchEnvFacts({}, {}).proxyUrl, null);
+  });
+
+  it("reads the opt-in from the variable or from NODE_OPTIONS", () => {
+    assert.equal(readFetchEnvFacts({ NODE_USE_ENV_PROXY: "1" }, {}).envProxyEnabled, true);
+    assert.equal(
+      readFetchEnvFacts({ NODE_OPTIONS: "--max-old-space-size=4096 --use-env-proxy" }, {}).envProxyEnabled,
+      true,
+    );
+    // The boundary the NODE_OPTIONS pattern is anchored for: a longer flag that
+    // merely starts with the same characters is a different flag.
+    assert.equal(readFetchEnvFacts({ NODE_OPTIONS: "--use-env-proxy-something" }, {}).envProxyEnabled, false);
+    // "1" exactly, which is what Node itself accepts.
+    assert.equal(readFetchEnvFacts({ NODE_USE_ENV_PROXY: "0" }, {}).envProxyEnabled, false);
+    assert.equal(readFetchEnvFacts({}, {}).envProxyEnabled, false);
+  });
+
+  it("treats the oam runtime as the opt-in, with no variable set at all", () => {
+    const facts = readFetchEnvFacts({}, { oam: "0.16.2" });
+    assert.equal(facts.oamVersion, "0.16.2");
+    assert.equal(facts.envProxyEnabled, true);
+    assert.equal(readFetchEnvFacts({}, {}).oamVersion, null);
+  });
+});
+
 describe("extractMainContent", () => {
   it("prefers #awsdocs-content", () => {
     const html = `<html><body><nav>NAV</nav><div id="awsdocs-content"><p>real content</p></div></body></html>`;
@@ -337,18 +771,41 @@ describe("aws_docs_search handler", () => {
     assert.match(r.error ?? "", /503/);
   });
 
-  it("surfaces a network failure", async () => {
+  it("surfaces the CAUSE of a network failure, and stops blaming the backend for it", async () => {
+    // The shape Node's fetch really produces: a bare `TypeError: fetch failed`
+    // with the verdict in err.cause. The old double here threw
+    // `new Error("ECONNREFUSED")` -- a shape fetch never produces -- so the
+    // suite passed while the handler reported nothing a reader could act on.
     const fetchImpl = (async () => {
-      throw new Error("ECONNREFUSED");
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("self-signed certificate"), { code: "DEPTH_ZERO_SELF_SIGNED_CERT" }),
+      });
     }) as unknown as typeof fetch;
-    const [search] = buildDocsTools(fetchImpl);
+    const [search] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /ECONNREFUSED/);
+    assert.match(r.error ?? "", /self-signed certificate \(DEPTH_ZERO_SELF_SIGNED_CERT\)/);
+    assert.match(r.error ?? "", /NODE_EXTRA_CA_CERTS/);
+    // The request never reached proxy.search.docs.aws.com, so the undocumented
+    // backend cannot be what went wrong.
+    assert.doesNotMatch(r.error ?? "", /may have changed/);
+  });
+
+  it("keeps the undocumented-backend sentence when the failure has no cause to read", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("something odd");
+    }) as unknown as typeof fetch;
+    // NO_PROXY_ENV, not the developer's: HTTPS_PROXY plus a rejection with no
+    // cause earns the proxy remedy, which REPLACES the sentence asserted here.
+    const [search] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
+    const r = await search.handler({ query: "x" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /something odd/);
+    assert.match(r.error ?? "", /undocumented and may have changed/);
   });
 
   it("reports a timeout distinctly from a generic failure", async () => {
-    const [search] = buildDocsTools(abortingFetch);
+    const [search] = buildDocsTools(abortingFetch, NO_PROXY_ENV);
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /timed out/);
@@ -435,7 +892,7 @@ describe("aws_docs_read handler", () => {
   });
 
   it("reports a fetch timeout distinctly", async () => {
-    const [, read] = buildDocsTools(abortingFetch);
+    const [, read] = buildDocsTools(abortingFetch, NO_PROXY_ENV);
     const r = await read.handler({ url: "https://docs.aws.amazon.com/x.html" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /timed out/);
@@ -531,6 +988,106 @@ describe("aws_docs_read handler", () => {
     const r = await read.handler({ url: "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html" });
     assert.equal(r.ok, true);
     assert.match((r.data as { content: string }).content, /localized/);
+  });
+
+  it("reads the index.html pages aws_docs_search returns", async () => {
+    // The 2.0.0 regression: the site 301s every <path>/index.html to <path>/,
+    // and the post-redirect check demanded a .html suffix -- so 16% of search
+    // results failed with an error that read like a blocked off-site redirect.
+    // Both fake `url` values are the real 301 targets (re-verified 2026-09-19).
+    for (const [requested, landed, body, expect] of [
+      [
+        "https://docs.aws.amazon.com/powertools/typescript/latest/environment-variables/index.html",
+        "https://docs.aws.amazon.com/powertools/typescript/latest/environment-variables/",
+        POWERTOOLS_PAGE_HTML,
+        /# Environment variables/,
+      ],
+      [
+        "https://docs.aws.amazon.com/cli/latest/reference/s3api/index.html",
+        "https://docs.aws.amazon.com/cli/latest/reference/s3api/",
+        CLI_S3API_INDEX_HTML,
+        /Available Commands/,
+      ],
+    ] as const) {
+      const fetchImpl = (async () => fakeResponse({ url: landed, text: body })) as unknown as typeof fetch;
+      const [, read] = buildDocsTools(fetchImpl);
+      const r = await read.handler({ url: requested, maxLength: 4000 });
+      assert.equal(r.ok, true, `${requested} must be readable: ${r.error}`);
+      assert.match((r.data as { content: string }).content, expect);
+    }
+  });
+
+  it("says a guessed page name does not exist instead of returning the guide landing page", async () => {
+    // docs.aws.amazon.com does not 404 a missing page inside a guide that
+    // exists: it 302s to the guide's landing page. Accepting that would answer
+    // the guess with the wrong page's content under the requested url.
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ url: "https://docs.aws.amazon.com/lambda/latest/dg/", text: LAMBDA_LANDING_STUB_HTML });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const url = "https://docs.aws.amazon.com/lambda/latest/dg/no-such-page-zz.html";
+    const r = await read.handler({ url });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /does not exist/);
+    assert.match(r.error ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\//);
+    // Slice 1 still refuses a URL ending in '/' as input, so the message must not
+    // tell the caller to read the landing page.
+    assert.doesNotMatch(r.error ?? "", /aws_docs_read on/);
+
+    assert.equal((await read.handler({ url })).ok, false);
+    assert.equal(fetchCount, 2, "a failure must not be cached");
+  });
+
+  it("says a guessed CLI command does not exist instead of returning the command index", async () => {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://docs.aws.amazon.com/cli/latest/reference/s3api/",
+        text: CLI_S3API_INDEX_HTML,
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({ url: "https://docs.aws.amazon.com/cli/latest/reference/s3api/no-such-cmd-zz.html" });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /does not exist/);
+    // The whole s3api command index would otherwise have come back as the
+    // content of a command that does not exist.
+    assert.doesNotMatch(r.error ?? "", /abort-multipart-upload/);
+  });
+
+  it("refuses a landing-page stub, naming the page it forwards to", async () => {
+    // lambda/latest/dg/index.html is a legitimate request that lands on the
+    // guide's directory: a page by the classifier, but a meta-refresh stub with
+    // nothing to read, which the redirect fix would otherwise return as an
+    // empty success.
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ url: "https://docs.aws.amazon.com/lambda/latest/dg/", text: LAMBDA_LANDING_STUB_HTML });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const url = "https://docs.aws.amazon.com/lambda/latest/dg/index.html";
+    const r = await read.handler({ url });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /only forwards the browser/);
+    assert.match(r.error ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\/welcome\.html/);
+
+    assert.equal((await read.handler({ url })).ok, false);
+    assert.equal(fetchCount, 2, "a thin conversion must not be cached");
+  });
+
+  it("refuses a client-rendered API reference shell", async () => {
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-s3/Variable/PutObject$/",
+        text: JSV3_SHELL_HTML,
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({
+      url: "https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-client-s3/Variable/PutObject$/index.html",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /rendered in the browser by JavaScript/);
   });
 
   it("serves but does not cache a conversion larger than the per-entry bound", async () => {

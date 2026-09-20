@@ -4,6 +4,7 @@ import { realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { types } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { assumeTools } from "./tools/assume.js";
@@ -66,7 +67,9 @@ interface HandlerExtra {
  * `sendNotification` is fire-and-forget: a progress update is advisory, and a
  * transport hiccup delivering one must never fail the tool call that is
  * otherwise succeeding. Rejections are swallowed deliberately -- an unhandled
- * one here would surface as an unhandled rejection and take the process down.
+ * one here would reach logUnhandledRejection as operator-stderr noise on every
+ * progress blip, and would take the process down in any embedding that does not
+ * install that handler.
  *
  * Exported for direct unit coverage; the registration loop it feeds sits behind
  * the entry-point check and so is unreachable from an `import`.
@@ -200,6 +203,54 @@ export function errorToMcpResult(err: unknown, toolName: string): McpResult {
     content: [{ type: "text" as const, text: `Error: ${message}` }],
     isError: true,
   };
+}
+
+/**
+ * Log an unhandled promise rejection to stderr and keep serving. Installed on
+ * the process in the entry-point block below.
+ *
+ * Without a handler, Node's default (`--unhandled-rejections=throw`) exits the
+ * process, and the rejection that reaches it is not an exotic one: an
+ * `aws_script` whose code calls `aws.call(...)` without awaiting it returns its
+ * own result first, the CLI call then fails (a service name typo, an unknown
+ * profile), and the rejection nobody awaited kills the server a beat AFTER the
+ * model was told the call succeeded. Every tool disappears from the session
+ * until the host restarts it. Measured over real MCP stdio on Node 22.22.2,
+ * both for a name that fails validation locally and for a real `aws` CLI
+ * failure (an unknown `--profile`): `tools/call aws_script` answers
+ * `{"result":"returned"}`, then the next `tools/list` gets no reply at all and
+ * the process has exited 1. With this handler both keep serving, on Node and
+ * under oam 0.16.1 / 0.16.2.
+ *
+ * Process-level rather than a fix in the aws_script bridge: the bridge can only
+ * mark its OWN promises handled, which still leaves a script's bare
+ * `Promise.reject()` fatal -- and the `void promise.finally(...)` in sso.ts's
+ * login dedupe, whose discarded derived promise re-rejects if
+ * `doStartSsoLogin` ever rejects. An availability bug this cheap to survive
+ * should cost a stderr line, not the session.
+ *
+ * `uncaughtException` deliberately gets NO equivalent. A synchronous throw that
+ * unwound to the top left the code that threw it part-way through its work, and
+ * a server that keeps answering from torn state is worse than one the host
+ * restarts. A rejected promise is the opposite: a value nobody read.
+ *
+ * Classified with `types.isNativeError` as well as `instanceof Error`, because
+ * the motivating reason fails the `instanceof` test. The aws_script bridge
+ * re-throws bridge failures as the script realm's own `Error` (`wrapForRealm` in
+ * tools/script.ts, `new fresh.Error(...)`), a different constructor from this
+ * realm's, so an `instanceof`-only check would fall through to
+ * `String(reason)` -- printing "Error: <message>" and no stack -- for exactly
+ * the case this handler exists for.
+ *
+ * Non-error reasons go through `String(reason)` and are never `inspect`ed, for
+ * the same reason errorToMcpResult logs message + stack only: a rejected
+ * AwsCallResult-shaped value would otherwise dump rawStdout / rawStderr into
+ * operator stderr.
+ */
+export function logUnhandledRejection(reason: unknown): void {
+  const err = types.isNativeError(reason) || reason instanceof Error ? reason : undefined;
+  console.error(`[aws-mcp] unhandled promise rejection (server kept running): ${err ? err.message : String(reason)}`);
+  if (typeof err?.stack === "string") console.error(err.stack);
 }
 
 // Injected at build time by esbuild; falls back to reading package.json for
@@ -425,8 +476,21 @@ if (isEntryPoint) {
   // First, before any tool can spawn anything.
   hardenWindowsExeSearch();
 
+  // Then the availability backstop, before a transport exists to accept the
+  // call that could leave a promise rejected. Installed here rather than at
+  // module load so importing this module never changes the host process's
+  // rejection semantics -- including the test runner's, which must keep
+  // failing on an unhandled rejection.
+  process.on("unhandledRejection", logUnhandledRejection);
+
   const server = new McpServer({
     name: "@yawlabs/aws-mcp",
+    // The display name hosts and registries show. `name` stays the package id
+    // that clients match on; without a `title` the spec says to fall back to it,
+    // and "AWS MCP Server" -- what server.json used to carry -- is character for
+    // character AWS's own product name, so a registry listing both showed two
+    // different servers under one label.
+    title: "Yaw Labs AWS MCP",
     version,
   });
 

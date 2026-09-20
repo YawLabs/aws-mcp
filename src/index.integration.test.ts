@@ -33,6 +33,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { allTools } from "./index.js";
+import { HOST_TEXT_CAP_BYTES } from "./server-instructions.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +42,9 @@ const SERVER_ENTRY = join(__dirname, "index.js");
 
 /** Root package.json -- `npm test` builds first, so this is what got bundled. */
 const PKG_VERSION = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
+// Read rather than repeated, so the display name a registry publishes and the one
+// a live session reports cannot drift apart silently.
+const SERVER_JSON_TITLE = (createRequire(import.meta.url)("../server.json") as { title: string }).title;
 
 // Every wait in this file is bounded. A hung server is the exact defect these
 // tests exist to catch, so it has to fail with a diagnostic rather than sit
@@ -271,14 +275,32 @@ class ServerProcess {
   }
 }
 
-/** Spawn, run the body, and reap unconditionally -- including on assertion failure. */
+/**
+ * Spawn, run the body, and reap unconditionally -- including on assertion failure.
+ *
+ * `expectUnhandledRejection` keeps a signal the entry point's
+ * `unhandledRejection` handler would otherwise swallow. Before that handler, a
+ * stray rejection anywhere in a spawned server killed the child and failed
+ * whatever test was talking to it; now it costs one stderr line, which no
+ * assertion would notice. So every case asserts the line is ABSENT unless it is
+ * the case deliberately provoking one.
+ */
 async function withServer<T>(
   fn: (server: ServerProcess) => Promise<T>,
-  opts: { entry?: string; argv?: string[]; env?: NodeJS.ProcessEnv } = {},
+  opts: {
+    entry?: string;
+    argv?: string[];
+    env?: NodeJS.ProcessEnv;
+    expectUnhandledRejection?: boolean;
+  } = {},
 ): Promise<T> {
   const server = new ServerProcess(opts.entry ?? SERVER_ENTRY, opts.argv ?? [], opts.env ?? childEnv());
   try {
-    return await fn(server);
+    const result = await fn(server);
+    if (!opts.expectUnhandledRejection) {
+      assert.doesNotMatch(server.stderr, /unhandled promise rejection/, server.diagnostics());
+    }
+    return result;
   } finally {
     await server.dispose();
   }
@@ -320,7 +342,7 @@ describe("spawned server — MCP handshake over stdio", () => {
       const initResult = init.result as {
         protocolVersion: string;
         capabilities: { tools?: unknown };
-        serverInfo: { name: string; version: string };
+        serverInfo: { name: string; version: string; title?: string };
       };
       assert.equal(initResult.serverInfo.name, "@yawlabs/aws-mcp");
       assert.equal(
@@ -328,6 +350,11 @@ describe("spawned server — MCP handshake over stdio", () => {
         PKG_VERSION,
         "the bundled __VERSION__ define drifted from package.json",
       );
+      // The display name reaches the wire. A host with no `title` falls back to
+      // `name`, so dropping it is invisible to every other assertion here, and
+      // it has to keep matching server.json's `title` for a registry listing and
+      // a live session to agree on what this server is called.
+      assert.equal(initResult.serverInfo.title, SERVER_JSON_TITLE);
       // The registration loop ran, so the server advertises the tools capability.
       assert.ok(initResult.capabilities.tools, "server did not advertise a tools capability");
 
@@ -354,6 +381,14 @@ describe("spawned server — MCP handshake over stdio", () => {
       for (const tool of tools) {
         assert.ok(tool.description, `tool '${tool.name}' has no description`);
         assert.equal(typeof tool.inputSchema, "object", `tool '${tool.name}' has no inputSchema object`);
+        // And it fits the host's text cap ON THE WIRE. index.test.ts holds the
+        // registry to the same bound; this is the byte count a host actually
+        // reads, after the SDK has serialized it.
+        const descriptionBytes = Buffer.byteLength(tool.description ?? "", "utf8");
+        assert.ok(
+          descriptionBytes <= HOST_TEXT_CAP_BYTES,
+          `tool '${tool.name}' sends ${descriptionBytes} bytes of description, past the ${HOST_TEXT_CAP_BYTES}-byte host cap -- a host cuts the END of it`,
+        );
       }
     });
   });
@@ -453,6 +488,48 @@ describe("spawned server — MCP handshake over stdio", () => {
       assert.equal(result.isError, true, "an ok:false handler result must surface as isError:true");
       assert.match(result.content[0].text, /^Error: Invalid region 'NOT A REGION'/);
     });
+  });
+
+  it("keeps serving after an aws_script leaves a rejected promise unhandled", async () => {
+    // The availability bug this asserts against, measured on v2.3.3 over this
+    // same stdio path: the script below returns 'returned' to the model, the
+    // un-awaited bridge call then rejects, Node's default
+    // --unhandled-rejections=throw exits the process 1, and the next request
+    // gets no answer at all -- every tool gone from the session, a beat after a
+    // call that reported success.
+    //
+    // No AWS CLI runs: 'Bad Name' fails aws-cli.ts's own service-name
+    // validation before anything is spawned, so the rejection is reached
+    // locally and nothing leaves the machine.
+    await withServer(
+      async (server) => {
+        await server.initialize();
+
+        const reply = await server.request("tools/call", {
+          name: "aws_script",
+          arguments: { code: "aws.call({ service: 'Bad Name', operation: 'x' }); return 'returned';" },
+        });
+        const result = toolResult(reply);
+        assert.equal(result.isError, undefined, "the script itself succeeded -- it never awaited the call");
+        assert.equal((JSON.parse(result.content[0].text) as { result?: unknown }).result, "returned");
+
+        // Anchored immediately after the colon, so this also pins the
+        // cross-realm classification: the bridge re-throws in the sandbox
+        // realm, and an `instanceof Error`-only logger would print
+        // "...: Error: Invalid service 'Bad Name'" here and fail.
+        await server.waitForStderr(/unhandled promise rejection \(server kept running\): Invalid service 'Bad Name'/);
+
+        // The point of the whole test: the server is still answering, with its
+        // full tool set, after the rejection that used to end the process.
+        const list = await server.request("tools/list");
+        assert.equal(list.error, undefined, `tools/list after the rejection failed: ${JSON.stringify(list.error)}`);
+        assert.equal((list.result as { tools: unknown[] }).tools.length, allTools.length);
+
+        const after = toolResult(await server.request("tools/call", { name: "aws_session_get", arguments: {} }));
+        assert.equal(after.isError, undefined, "a tool call after the rejection must still succeed");
+      },
+      { expectUnhandledRejection: true },
+    );
   });
 });
 

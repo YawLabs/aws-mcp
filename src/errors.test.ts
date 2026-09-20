@@ -544,6 +544,196 @@ describe("parseAwsError -- not-authorized text OUTSIDE the standard wrapper", ()
   });
 });
 
+describe("parseAwsError -- a service, operation or subcommand the installed CLI does not know", () => {
+  // README.md promises new AWS operations are reachable "the moment your local
+  // `aws` CLI knows them". When it does not, argparse rejects the command with
+  // exit 252 before anything is sent, and until now that came back with no
+  // suggestion at all -- nothing said the fix might be an upgrade rather than a
+  // typo. Every string below is a verbatim capture from a real CLI on Windows
+  // (hence CRLF) driven against a dead loopback endpoint, with an existing
+  // scratch profile and empty credentials: aws-cli 2.34.3 in its default
+  // (enhanced) error format, its legacy and json formats, and the extracted real
+  // 2.22.0, whose wording predates `Found invalid choice`.
+
+  const CASES: ReadonlyArray<{ what: string; stderr: string; expect: RegExp }> = [
+    {
+      // plans/readme-positioning_rv_234_op_enhanced.err -- `batch cancel-jobs`,
+      // the operation CLI 2.36.44 added, on 2.34.3. This is the format users see
+      // and the bytes the fake replays.
+      what: "2.34.3 enhanced, unknown operation",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (ParamValidation): argument operation: Found invalid choice 'cancel-jobs'\r\n\r\nMaybe you meant:\r\n\r\n  * cancel-job\r\n\r\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\r\nTo see help text, you can run:\r\n\r\n  aws help\r\n  aws <command> help\r\n  aws <command> <subcommand> help\r\n",
+      expect: /no operation named 'cancel-jobs'/,
+    },
+    {
+      // Same command with cli_error_format=legacy, rewritten to LF: the wrapper
+      // is gone, and this is also what 2.34.3 prints for a --profile it cannot
+      // find. LF is what the CLI writes on macOS and Linux.
+      what: "2.34.3 legacy, unknown operation, LF newlines",
+      stderr:
+        "\naws: [ERROR]: argument operation: Found invalid choice 'cancel-jobs'\n\nMaybe you meant:\n\n  * cancel-job\n\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\n",
+      expect: /no operation named 'cancel-jobs'/,
+    },
+    {
+      // plans/readme-positioning_rv_234_svc_enhanced.err -- argparse's `command`
+      // dest is the SERVICE, so the remedy has to say "service", not "command".
+      what: "2.34.3 enhanced, unknown service",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (ParamValidation): argument command: Found invalid choice 'lambda-microvms'\r\n\r\n\r\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\r\n",
+      expect: /no service named 'lambda-microvms'/,
+    },
+    {
+      // plans/readme-positioning_rv_234_sub_enhanced.err -- `ec2 wait
+      // instance-runningx`. Waiters, `s3` and `configure` all reject on the
+      // `subcommand` dest, and new waiters arrive with new CLIs.
+      what: "2.34.3 enhanced, unknown waiter",
+      stderr:
+        "\r\naws: [ERROR]: An error occurred (ParamValidation): argument subcommand: Found invalid choice 'instance-runningx'\r\n\r\nMaybe you meant:\r\n\r\n  * instance-running\r\n\r\n",
+      expect: /no subcommand named 'instance-runningx'/,
+    },
+    {
+      // plans/readme-positioning_rv_2220_op.err, excerpt. 2.22.0 prints the
+      // usage block FIRST, prefixes with the program name argparse was given
+      // (`aws.exe: error:` here, `aws: error:` when the same binary is resolved
+      // off PATH -- both measured), and names no
+      // choice on this line -- hence the "by that name" wording.
+      what: "2.22.0, unknown operation (no name on the line)",
+      stderr:
+        "\r\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\r\n\r\naws.exe: error: argument operation: Invalid choice, valid choices are:\r\n\r\ncancel-job                               | create-compute-environment              \r\ndescribe-job-queues                      | describe-jobs                           \r\n",
+      expect: /no operation by that name/,
+    },
+    {
+      // plans/readme-positioning_rv_234_op_json.err -- cli_error_format=json
+      // puts the phrase inside `Message` with literal \n escapes. The pattern is
+      // unanchored, so the remedy survives whatever error format the user set.
+      what: "2.34.3 json error format",
+      stderr:
+        '{\r\n    "Code": "ParamValidation",\r\n    "Message": "argument operation: Found invalid choice \'cancel-jobs\'\\n\\nMaybe you meant:\\n\\n  * cancel-job\\n"\r\n}\r\n',
+      expect: /no operation named 'cancel-jobs'/,
+    },
+  ];
+
+  for (const c of CASES) {
+    it(`suggests a spelling check and an upgrade -- ${c.what}`, () => {
+      const r = parseAwsError(c.stderr);
+      assert.match(r.suggestion ?? "", c.expect);
+      // Both halves of the remedy, in this order: spelling is at least as likely
+      // as an old CLI when a model picked the name.
+      assert.match(r.suggestion ?? "", /Check the spelling/);
+      assert.match(r.suggestion ?? "", /aws update/);
+      // argparse exits before a request is signed, so there is no AWS error code
+      // and nothing reached an operation.
+      assert.equal(r.code, undefined);
+      assert.equal(r.operation, undefined);
+      // The CLI's own text is preserved for diagnosis.
+      assert.equal(r.message, c.stderr.trim());
+    });
+  }
+
+  it("does not claim a real AWS error that happens to contain the phrase", () => {
+    // Guards the one-way coupling this branch has on STD_ERROR_RE: the enhanced
+    // "(ParamValidation)" wrapper has no "when calling the X operation" tail, so
+    // STD_ERROR_RE must keep requiring one. Widen it to accept a bare
+    // "(Code):" and a genuine service error like this loses its code-based
+    // remedy to the upgrade advice.
+    const r = parseAwsError(
+      "An error occurred (ValidationException) when calling the CreateThing operation: Invalid choice for Mode: argument operation: Found invalid choice 'x'",
+    );
+    assert.equal(r.code, "ValidationException");
+    assert.equal(r.operation, "CreateThing");
+    assert.match(r.suggestion ?? "", /API schema/);
+  });
+
+  it("does not read aws_call's own params payload back as a misspelled subcommand", () => {
+    // Verbatim 2.34.3, from `aws_call {service: "ec2", operation: "wait",
+    // params: {InstanceIds: ["i-1"]}}`: `ec2 wait` is a subcommand GROUP, whose
+    // parser registers no --cli-input-json, so argparse took the JSON value as
+    // the missing positional. Quoting that back told the caller the CLI has no
+    // subcommand named '{"InstanceIds":["i-1"]}' and to check its spelling or
+    // run `aws update`. Silence here is what lets cliArgParseHint answer it.
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: An error occurred (ParamValidation): argument subcommand: Found invalid choice \'{"InstanceIds":["i-1"]}\'\r\n\r\n\r\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\r\n',
+    );
+    assert.equal(r.suggestion, undefined);
+    assert.match(r.message ?? "", /\{"InstanceIds":\["i-1"\]\}/, "the CLI's own text is still preserved");
+  });
+
+  it("stays out of the way of the missing-arguments shape aws_call explains itself", () => {
+    // cliArgParseHint (tools/call.ts) only runs when parseAwsError found no
+    // remedy, so if this pattern claimed the required-arguments stderr the
+    // s3api get-object explanation would never be reached. Verbatim 2.34.3.
+    const r = parseAwsError(
+      "\r\naws: [ERROR]: An error occurred (ParamValidation): the following arguments are required: --bucket, --key\r\n",
+    );
+    assert.equal(r.suggestion, undefined);
+  });
+});
+
+describe("parseAwsError -- TLS and proxy failures on the CLI path", () => {
+  // The CLI half of what docs.ts's describeFetchFailure explains for the
+  // in-process fetch path: behind a TLS-inspecting gateway or an unreachable
+  // proxy, every shelling-out tool used to report botocore's sentence and no
+  // remedy, which reads like an AWS outage.
+  //
+  // Provenance, because it differs between the two. The proxy sentence is a
+  // verbatim capture: `sts get-caller-identity` on 2.34.3 with HTTPS_PROXY
+  // pointed at a dead loopback port printed
+  // `aws: [ERROR]: Failed to connect to proxy URL: "http://127.0.0.1:1"`. The
+  // TLS sentence is botocore's fmt string, read from the CLI's own bundled copy
+  // (awscli/botocore/exceptions.py: SSLError.fmt, raised in httpsession.py's
+  // send as `SSLError(endpoint_url=request.url, error=e)`) -- two attempts to
+  // force it locally against a self-signed loopback server on this ARM64 box
+  // came back as a read timeout instead, so it is asserted from the source
+  // string rather than from a capture. The "aws: [ERROR]: " prefix is 2.34.3's;
+  // 2.22.0 writes the sentence bare, which is why both patterns are unanchored.
+
+  it("names the TLS-inspection cause and where the CA bundle has to be set", () => {
+    const r = parseAwsError(
+      "\r\naws: [ERROR]: SSL validation failed for https://sts.us-east-1.amazonaws.com/ [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1006)\r\n",
+    );
+    assert.match(r.suggestion ?? "", /TLS verification failed reaching https:\/\/sts\.us-east-1\.amazonaws\.com\//);
+    assert.match(r.suggestion ?? "", /TLS-inspecting gateway or a private CA/);
+    assert.match(r.suggestion ?? "", /AWS_CA_BUNDLE/);
+    assert.match(r.suggestion ?? "", /ca_bundle/);
+    // The remedy must not offer the shortcut that turns verification off.
+    assert.match(r.suggestion ?? "", /Do not disable verification/);
+    assert.equal(r.code, undefined);
+    // botocore's own sentence is still there for diagnosis.
+    assert.match(r.message ?? "", /CERTIFICATE_VERIFY_FAILED/);
+  });
+
+  it("extracts the endpoint from the bare sentence older CLIs write", () => {
+    const r = parseAwsError("SSL validation failed for https://lambda.eu-west-1.amazonaws.com/ [SSL: WRONG_VERSION]");
+    assert.match(r.suggestion ?? "", /https:\/\/lambda\.eu-west-1\.amazonaws\.com\//);
+  });
+
+  it("blames the proxy, not AWS, when the proxy connection fails", () => {
+    // botocore runs the URL through mask_proxy_url before formatting, so any
+    // user:password@ is already "***:***@" when it reaches us.
+    const r = parseAwsError(
+      '\r\naws: [ERROR]: Failed to connect to proxy URL: "http://***:***@proxy.corp.example:8080"\r\n',
+    );
+    assert.match(r.suggestion ?? "", /http:\/\/\*\*\*:\*\*\*@proxy\.corp\.example:8080/);
+    assert.match(r.suggestion ?? "", /it is the proxy, not AWS, that did not answer/);
+    assert.match(r.suggestion ?? "", /NO_PROXY/);
+    assert.equal(r.code, undefined);
+  });
+
+  it("keeps the endpoint remedy for the unreachable-endpoint sentence", () => {
+    // BAD_ENDPOINT_RE runs first and neither new pattern can match its text --
+    // botocore raises EndpointConnectionError, SSLError and ProxyConnectionError
+    // from three different places with three different sentences.
+    const r = parseAwsError('Could not connect to the endpoint URL: "https://lambda.us-east-9.amazonaws.com/"');
+    assert.match(r.suggestion ?? "", /Check the region spelling/);
+  });
+
+  it("does not fire on prose that merely mentions SSL or a proxy", () => {
+    for (const noise of ["our ssl validation failed review is pending", "the proxy url is in the runbook"]) {
+      assert.equal(parseAwsError(noise).suggestion, undefined, noise);
+    }
+  });
+});
+
 describe("parseAwsError -- non-standard shapes", () => {
   it("flags bad endpoint with the URL extracted", () => {
     const r = parseAwsError('Could not connect to the endpoint URL: "https://lambda.us-east-9.amazonaws.com/"');

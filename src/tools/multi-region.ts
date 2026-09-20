@@ -21,11 +21,24 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 const DEFAULT_CONCURRENCY = 8;
 const MAX_CONCURRENCY = 32;
-const MAX_REGIONS = 32;
+/**
+ * The commercial partition has 34 regions (botocore's `partitions.json`, as
+ * shipped in aws-cli 2.34.3, excluding the `aws-global` pseudo-region), so the
+ * old cap of 32 refused a legitimate all-regions sweep: an account with every
+ * opt-in region enabled that piped `ec2 describe-regions` straight in got
+ * `Too many regions: 34 requested, max 32` and nothing else. 64 is roughly 2x
+ * headroom so the next launch does not re-break it, while still bounding the
+ * spawn count; an exact 34 would go stale. Response size is bounded separately
+ * by MAX_TOTAL_RESULT_BYTES and parallelism by MAX_CONCURRENCY, both unchanged.
+ *
+ * Exported so tests derive their over-cap inputs from it instead of hard-coding
+ * a count that silently stops being over the cap when this moves.
+ */
+export const MAX_REGIONS = 64;
 
 // Per-CALL output is capped (aws-cli.ts kills a subprocess whose stdout passes
-// 5 MB), but the BATCH had no ceiling of its own: 32 regions x 5 MB each is
-// 160 MB held in `results` and then JSON-serialized into a single MCP response.
+// 5 MB), but the BATCH had no ceiling of its own: 64 regions x 5 MB each is
+// 320 MB held in `results` and then JSON-serialized into a single MCP response.
 // Cap the aggregate at the same 5 MB one call is allowed. Entries are kept in
 // order and counted until the budget is spent; past it, an entry's `data` is
 // DROPPED (not string-truncated, which would emit unparseable JSON) and the
@@ -195,14 +208,17 @@ export const multiRegionTools: readonly Tool[] = [
   {
     name: "aws_multi_region",
     description:
-      "Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes `regions: string[]` instead of `region`. Returns an array of `{region, ok, data?, command?, error?, errorKind?}` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so `results.length` may be less than `regions.length`; use the returned `regionCount` for the actual count run. The whole batch is capped at 5 MB of results: if it would exceed that, later entries keep their status but lose `data` and are flagged `truncated: true`, with the affected regions listed in a top-level `truncatedRegions` -- re-run those regions individually or narrow with `query`/`params`. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.",
+      // Templated on the constants so the numbers the model is told cannot drift
+      // from the ones the schema and the handler enforce.
+      `Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes \`regions: string[]\` instead of \`region\`, up to ${MAX_REGIONS} per call with at most ${MAX_CONCURRENCY} in flight. Returns an array of \`{region, ok, data?, command?, error?, errorKind?}\` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so \`results.length\` may be less than \`regions.length\`; use the returned \`regionCount\` for the actual count run. The whole batch is capped at 5 MB of results: if it would exceed that, later entries keep their status but lose \`data\` and are flagged \`truncated: true\`, with the affected regions listed in a top-level \`truncatedRegions\` -- re-run those regions individually or narrow with \`query\`/\`params\`. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.`,
     annotations: {
       title: "Run an AWS operation across multiple regions in parallel",
       // Same reasoning as aws_call (see call.ts), and strictly more so: this
-      // runs the caller's chosen operation across up to 32 regions at once, so
-      // a destructive one is destructive N times in parallel. destructiveHint
-      // MUST stay true -- `false` asserts "only additive updates", which this
-      // cannot promise, and it suppresses the host's confirmation prompt.
+      // runs the caller's chosen operation across up to MAX_REGIONS regions,
+      // MAX_CONCURRENCY at a time, so a destructive one is destructive N times
+      // in parallel. destructiveHint MUST stay true -- `false` asserts "only
+      // additive updates", which this cannot promise, and it suppresses the
+      // host's confirmation prompt.
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,

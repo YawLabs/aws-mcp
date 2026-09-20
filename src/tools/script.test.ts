@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { MAX_REGIONS } from "./multi-region.js";
 import { paginateTools } from "./paginate.js";
 import { buildPaginateAll, runScript, type ScriptHandlers, scriptTools } from "./script.js";
 import type { Tool } from "./tool.js";
@@ -1275,14 +1276,38 @@ describe("script bridge schema validation (regression)", () => {
   // unwrap() calls tool.handler DIRECTLY. The MCP boundary validates via
   // server.tool(..., inputSchema.shape, ...) in index.ts, but that never runs
   // for a scripted call -- so before unwrap parsed, every cap living only in a
-  // Zod schema was unenforced here. Measured at the time:
-  // aws.multiRegion({regions: [...40]}) spawned all 40 CLI subprocesses despite
-  // .max(32), and aws.resource.list({maxResults: 5000}) sent --max-results 5000
-  // despite .max(100).
+  // Zod schema was unenforced here. Measured at the time, when the region cap
+  // was 32: aws.multiRegion({regions: [...40]}) spawned all 40 CLI subprocesses
+  // despite .max(32), and aws.resource.list({maxResults: 5000}) sent
+  // --max-results 5000 despite .max(100).
   //
   // These run against the DEFAULT handlers (no injected mocks) so the real
-  // unwrap runs. Every case fails validation before any spawn, so no fake-aws
-  // shim is needed.
+  // unwrap runs. Every case must fail validation BEFORE any spawn -- which is
+  // load-bearing, not incidental: these handlers spawn the real `aws` with the
+  // developer's own credentials, and the multiRegion case names real regions. So
+  // the over-cap counts derive from MAX_REGIONS rather than a literal (a literal
+  // 40 stopped being over the cap when F67 raised it to 64, which turned this
+  // case into 40 live AWS calls from `npm test`), and the command is pinned at a
+  // nonexistent binary so a future regression fails with ENOENT instead of
+  // reaching AWS.
+  let prevCommand: string | undefined;
+  let prevPrefixArgs: string | undefined;
+  before(() => {
+    prevCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
+    prevPrefixArgs = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    process.env.AWS_MCP_TEST_AWS_COMMAND = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "no-such-aws-binary-schema-validation",
+    );
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([]);
+  });
+  after(() => {
+    if (prevCommand === undefined) delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    else process.env.AWS_MCP_TEST_AWS_COMMAND = prevCommand;
+    if (prevPrefixArgs === undefined) delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    else process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = prevPrefixArgs;
+  });
+
   const cases: Array<[string, string, RegExp]> = [
     [
       "resource.list maxResults above .max(100)",
@@ -1290,8 +1315,8 @@ describe("script bridge schema validation (regression)", () => {
       /Invalid input for 'aws_resource_list'.*maxResults/s,
     ],
     [
-      "multiRegion region list above .max(32)",
-      `aws.multiRegion({service:'s3api', operation:'list-buckets', regions: Array.from({length:40},(_,n)=>'us-east-'+(n+1))})`,
+      "multiRegion region list above .max(MAX_REGIONS)",
+      `aws.multiRegion({service:'s3api', operation:'list-buckets', regions: Array.from({length:${MAX_REGIONS + 1}},(_,n)=>'us-east-'+(n+1))})`,
       /Invalid input for 'aws_multi_region'.*regions/s,
     ],
     [

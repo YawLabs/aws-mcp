@@ -32,6 +32,11 @@ const USER_AGENT = "@yawlabs/aws-mcp (https://github.com/YawLabs/aws-mcp)";
 // link we shouldn't be fetching.
 const DOCS_URL_RE = /^https:\/\/docs\.aws\.amazon\.com\/[^\s]*\.html(?:[?#][^\s]*)?$/i;
 
+// The same host and origin DOCS_URL_RE spells, for the checks that parse a URL
+// instead of matching it (classifyFinalDocsUrl, resolveDocsLink).
+const DOCS_HOSTNAME = "docs.aws.amazon.com";
+const DOCS_ORIGIN = `https://${DOCS_HOSTNAME}`;
+
 const DEFAULT_MAX_LENGTH = 5_000;
 const MAX_MAX_LENGTH = 1_000_000;
 const DEFAULT_SEARCH_LIMIT = 10;
@@ -45,6 +50,16 @@ const FETCH_TIMEOUT_MS = 30_000;
 // 5 MB mirrors aws-cli.ts's per-stream stdout cap so both ingress paths into
 // this process carry the same ceiling; real AWS doc pages are 10-800 KB.
 const MAX_DOC_HTML_BYTES = 5 * 1024 * 1024;
+
+// Gates the unrenderable-page check in detectUnrenderablePage and nothing else.
+// It is not a floor on what a read may return: a genuinely short page is served
+// as-is. Only a conversion this thin makes it worth looking at the raw HTML for
+// the markers of a page that has no server-rendered content at all. The two
+// real shapes measured on 2026-09-19 are far under it -- a guide landing stub
+// converts to 0 characters, the JS SDK v3 shell to `[Skip to main content]`
+// (20 characters of text) -- while the pages the redirect fix unblocks are far
+// over: 5,310 for the CLI's s3api command index, 2,848 for the Powertools page.
+const THIN_PAGE_CHARS = 200;
 
 // aws_docs_read is paginated: an agent reading a long page calls it N times
 // with different startIndex windows. Without a cache that's N full fetches +
@@ -141,6 +156,98 @@ export function parseSearchResults(json: unknown, limit: number): DocsSearchResu
 /** Match the read-side URL allowlist. Exposed for tests. */
 export function isValidDocsUrl(url: string): boolean {
   return DOCS_URL_RE.test(url);
+}
+
+/**
+ * Judge where a docs fetch actually LANDED. Three outcomes, because a docs-host
+ * redirect can mean two very different things.
+ *
+ * fetch follows redirects, so the check on the requested URL only vouches for
+ * the first hop and the landing URL has to be judged too. 2.0.0 judged it with
+ * DOCS_URL_RE, which demands a `.html` suffix -- and docs.aws.amazon.com answers
+ * every `<path>/index.html` with a 301 to `<path>/`. So the canonical form of a
+ * URL the site itself hands out came back "not an 'https://docs.aws.amazon.com/
+ * ...html' page", worded like a blocked off-site redirect. Re-verified live on
+ * 2026-09-19: the Powertools pages, the AWS CLI's own per-service command
+ * indexes (`cli/latest/reference/s3api/index.html`) and every guide landing
+ * page do exactly this, and one in six search results is such a URL.
+ *
+ * The 2.0.0 hardening is kept whole: the landing URL must still be https, on
+ * docs.aws.amazon.com, on the default port, with no credentials in it. Every
+ * final URL that check accepted is still accepted.
+ *
+ *   - `off_allowlist` -- anywhere outside that host, or a same-host landing that
+ *     is neither a page nor a directory (an asset, say).
+ *   - `page` -- a `.html` / `.md` landing; the directory form of the page that
+ *     was requested (`x/index.html` -> `x/`, compared case-insensitively); or
+ *     any docs directory when a directory is what was requested.
+ *   - `soft_404` -- a PAGE request that landed on some OTHER directory. The site
+ *     does not 404 a missing page inside a guide that exists: it 302s to the
+ *     guide's landing page, and a missing CLI command to that service's command
+ *     index. Accepting every same-host redirect, which is what an origin-only
+ *     check does, would answer a guessed page name with another page's content
+ *     echoed under the requested URL.
+ */
+export function classifyFinalDocsUrl(
+  requestedFetchUrl: string,
+  finalUrl: string,
+): "page" | "soft_404" | "off_allowlist" {
+  let final: URL;
+  try {
+    final = new URL(finalUrl);
+  } catch {
+    return "off_allowlist";
+  }
+  // `hostname` is already lowercased by the URL parser; `port` is "" when the
+  // URL carries the scheme's default, so an explicit :443 is a page and :8443
+  // is not.
+  if (
+    final.protocol !== "https:" ||
+    final.hostname !== DOCS_HOSTNAME ||
+    final.port !== "" ||
+    final.username !== "" ||
+    final.password !== ""
+  ) {
+    return "off_allowlist";
+  }
+  if (/\.(?:html|md)$/i.test(final.pathname)) return "page";
+  if (!final.pathname.endsWith("/")) return "off_allowlist";
+  // A directory landing: canonicalization or soft-404, decided by what was
+  // asked for. An unparseable request URL cannot be compared, so it fails
+  // closed rather than silently accepting the landing.
+  let requested: URL;
+  try {
+    requested = new URL(requestedFetchUrl);
+  } catch {
+    return "off_allowlist";
+  }
+  if (requested.pathname.endsWith("/")) return "page";
+  if (requested.pathname.toLowerCase() === `${final.pathname.toLowerCase()}index.html`) return "page";
+  return "soft_404";
+}
+
+/**
+ * Absolutize a link target found inside a docs page against the URL it came
+ * from, and point a docs-host `.md` target at its `.html` twin -- that twin is
+ * the form aws_docs_read accepts, so the URL this returns is one a caller can
+ * actually pass back in.
+ *
+ * Left alone: an empty target, a fragment-only link, and any non-http(s) scheme
+ * (`mailto:`, `javascript:`). A target that will not parse is returned unchanged
+ * rather than guessed at.
+ */
+export function resolveDocsLink(target: string, baseUrl: string): string {
+  if (target === "" || target.startsWith("#")) return target;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^https?:/i.test(target)) return target;
+  try {
+    const url = new URL(target, baseUrl);
+    if (url.origin === DOCS_ORIGIN && /\.md$/i.test(url.pathname)) {
+      url.pathname = `${url.pathname.slice(0, -".md".length)}.html`;
+    }
+    return url.href;
+  } catch {
+    return target;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -554,6 +661,78 @@ export function htmlToMarkdown(html: string): string {
   return md.replace(/\n{3,}/g, "\n\n").trim();
 }
 
+// The three markers of a page whose content is assembled in the browser: a
+// Next.js app (the JS SDK v3 reference, which ships both markers) and Swift
+// DocC, whose <noscript> is the only prose in the response.
+const CLIENT_RENDERED_RE = /\/_next\/static\/|<div id="__next"|requires JavaScript/i;
+
+/**
+ * The target of a `<meta http-equiv="refresh" content="0;URL=welcome.html">`,
+ * which is the whole body of a guide landing page, or null when there is none.
+ *
+ * Read off the parsed tags rather than matched on the raw HTML. A single
+ * `<meta[^>]+http-equiv=...[^>]*content=` scan re-walks the rest of the document
+ * from every `<meta` once per following `http-equiv=` in any stretch carrying no
+ * `>`, and MAX_DOC_HTML_BYTES lets 5 MB of such a stretch through: measured here
+ * on 22.22.2, 5 KB of it took 186 ms, 16 KB 4.7 s and 26 KB 22 s. Nothing
+ * interrupts that -- FETCH_TIMEOUT_MS bounds the fetch, and this is synchronous
+ * CPU in a single-threaded stdio server after the body has arrived, so every
+ * other tool call on the session queues behind it. The same 5 MB body walks the
+ * tags in 62 ms. The parse is paid only on a page already measured as thin, so
+ * the ordinary read still parses once.
+ *
+ * Case-insensitive on both, because the site writes the attribute lower-case and
+ * the parameter `URL=`. Reversed attribute order (`content=` before
+ * `http-equiv=`) now matches, which the tag scan silently missed.
+ */
+function findMetaRefreshTarget(html: string): string | null {
+  for (const meta of parseHtml(html).querySelectorAll("meta")) {
+    if (!/^refresh$/i.test((meta.getAttribute("http-equiv") ?? "").trim())) continue;
+    const url = /url=([^"'>\s;]+)/i.exec(meta.getAttribute("content") ?? "");
+    if (url) return url[1];
+  }
+  return null;
+}
+
+/**
+ * Name the reason a page converted to (almost) nothing, or null when the
+ * conversion is real content.
+ *
+ * Without this the redirect fix above would trade a loud, misleading failure for
+ * a silent empty success: the landing pages and client-rendered references it
+ * unblocks have no server-rendered content to extract. Measured live on
+ * 2026-09-19 -- `lambda/latest/dg/` converts to 0 characters, the JS SDK v3
+ * shell to `[Skip to main content](#main)`, a Swift DocC page to 0.
+ *
+ * Two gates, so a short real page is never touched: the conversion must be under
+ * THIN_PAGE_CHARS of text AND the HTML must carry an explicit marker.
+ */
+export function detectUnrenderablePage(
+  html: string,
+  markdown: string,
+  requestedUrl: string,
+  finalUrl: string,
+): string | null {
+  // Link syntax stripped before measuring, so a nav-only shell counts as the
+  // ~20 characters of text it really is rather than the 29 of its one link.
+  if (markdown.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1").trim().length >= THIN_PAGE_CHARS) return null;
+  const refresh = findMetaRefreshTarget(html);
+  if (refresh !== null) {
+    // Resolved against the FINAL url, which is where a browser would be when it
+    // reads the stub: a page that moved guides lands on the new directory, and
+    // its stub's `URL=welcome.html` means that directory's welcome page.
+    const target = resolveDocsLink(refresh, finalUrl);
+    if (isValidDocsUrl(target)) {
+      return `${requestedUrl} is a landing page with no content of its own -- it only forwards the browser to '${target}' (an HTML meta refresh). Call aws_docs_read on '${target}' instead.`;
+    }
+    return `${requestedUrl} is a landing page with no content of its own -- it only forwards the browser to another page (an HTML meta refresh) that is not a readable AWS documentation page. Use aws_docs_search to find the page you want.`;
+  }
+  if (CLIENT_RENDERED_RE.test(html)) {
+    return `${requestedUrl} is rendered in the browser by JavaScript -- the HTML the server returns is an empty application shell -- so aws_docs_read cannot extract its content. The AWS SDK for JavaScript v3 and Swift API references are built this way; read the service's API Reference page for the same operation instead, or re-query aws_docs_search with different terms.`;
+  }
+  return null;
+}
+
 interface PaginatedContent {
   content: string;
   startIndex: number;
@@ -610,6 +789,189 @@ async function fetchWithTimeout(
  */
 function isAbortError(err: unknown): boolean {
   return typeof err === "object" && err !== null && (err as { name?: unknown }).name === "AbortError";
+}
+
+/**
+ * OpenSSL verify verdicts for "I cannot trust this certificate chain". On a
+ * corporate network that is a TLS-inspecting gateway or a private CA, not
+ * anything wrong at AWS. DEPTH_ZERO_SELF_SIGNED_CERT was reproduced here against
+ * a local self-signed server on Node 22.22.2; the rest are the sibling verdicts
+ * for the same untrusted-chain condition and take the same remedy. An expired
+ * certificate or a hostname mismatch is deliberately NOT here: adding a CA does
+ * not fix either, and they fall through to the plain cause line.
+ */
+const TLS_TRUST_CODES = new Set([
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "CERT_UNTRUSTED",
+]);
+
+/**
+ * Nothing answered, or nothing resolved -- the shapes a blocked egress path
+ * produces. ECONNREFUSED and ENOTFOUND were reproduced here (a dead local port
+ * and an unresolvable host); UND_ERR_CONNECT_TIMEOUT is undici's own timeout for
+ * a TCP connect that never completes, which is what a silently dropping firewall
+ * looks like before our 30s abort fires.
+ */
+const CONNECT_FAILURE_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+/**
+ * oam's HTTP stack reports a transport failure with no code at all -- a
+ * self-signed certificate comes back as this message and nothing else (measured
+ * on oam 0.16.2). A refused proxy there DOES carry ECONNREFUSED, so an uncoded
+ * failure under oam points at the certificate first.
+ */
+const UNCODED_TRANSPORT_RE = /error sending request for url/i;
+
+/**
+ * How to trust a private CA. Both variables are read at process start, and both
+ * fixed the local self-signed case here -- NODE_EXTRA_CA_CERTS on Node 22.22.2
+ * and on oam 0.16.2. Version floors are from Node's own cli.md: NODE_USE_SYSTEM_CA
+ * landed in 22.19.0, and this package supports Node >= 22.
+ */
+const CA_TRUST_REMEDY =
+  "Point NODE_EXTRA_CA_CERTS at the PEM file holding that CA's certificate (or set NODE_USE_SYSTEM_CA=1, Node 22.19+, to trust the operating system's store) in this server's MCP-config `env` block -- both are read when the process starts, so exporting them in your own shell does not reach a server your MCP client launched.";
+
+/**
+ * The environment facts the remedies below depend on. Passed in by tests so no
+ * test has to mutate process.env: this is one long-lived stdio process, and a
+ * leaked variable would change what a later test's handler reports.
+ */
+export interface FetchEnvFacts {
+  /** HTTPS_PROXY / https_proxy, whichever is set. */
+  proxyUrl: string | null;
+  /** Whether this process actually uses proxyUrl (see readFetchEnvFacts). */
+  envProxyEnabled: boolean;
+  /** process.versions.oam, set only when the server runs under the oam runtime. */
+  oamVersion: string | null;
+}
+
+/**
+ * Read those facts off the environment.
+ *
+ * Both sources are parameters so a test can pin the variable NAMES and their
+ * precedence without mutating process.env: this is one long-lived stdio process,
+ * and a leaked variable would change what a later test's handler reports. Every
+ * arm went untested while they were read inline, so renaming NODE_USE_ENV_PROXY
+ * or swapping the `??` order kept the suite green and handed a proxied user the
+ * wrong half of the remedy.
+ */
+export function readFetchEnvFacts(
+  env: NodeJS.ProcessEnv = process.env,
+  // Cast because oam adds the key at runtime and Node's own type does not know
+  // it -- the same cast this read has always carried.
+  versions: { oam?: string } = process.versions as { oam?: string },
+): FetchEnvFacts {
+  // Node's fetch ignores HTTPS_PROXY unless it is opted into, by
+  // NODE_USE_ENV_PROXY=1 or the equivalent --use-env-proxy flag (both Node
+  // 22.21+, and NODE_OPTIONS accepts the flag -- all three verified on 22.22.2:
+  // with the opt-in a dead proxy failed the request, with NODE_USE_ENV_PROXY=0
+  // or unset the same request went direct and returned 200). oam honours the
+  // variable with no opt-in at all (verified on 0.16.2, same dead proxy).
+  const nodeOptions = env.NODE_OPTIONS ?? "";
+  return {
+    proxyUrl: env.HTTPS_PROXY ?? env.https_proxy ?? null,
+    envProxyEnabled:
+      env.NODE_USE_ENV_PROXY === "1" ||
+      /(?:^|\s)--use-env-proxy(?:\s|$)/.test(nodeOptions) ||
+      versions.oam !== undefined,
+    oamVersion: versions.oam ?? null,
+  };
+}
+
+/** Strip any `userinfo@` out of a URL in text we are about to report. */
+function redactUrlUserinfo(text: string): string {
+  // To the LAST `@` of the authority, with no `:` required. WHATWG userinfo runs
+  // to the final `@` -- verified on 22.22.2, `new URL("http://svc:Pa@ss@h:3128")`
+  // gives username "svc" and password "Pa%40ss" -- so an unencoded `@` in a
+  // password is a legitimate value, and a class that forbade `@` inside userinfo
+  // stopped at the first one and printed the tail into text the model reads. A
+  // colonless `token@proxy` carries a secret too, and needing the `:` missed it
+  // whole. `?` and `#` end the authority the way `/` does, so a docs URL whose
+  // query or fragment holds an `@` is left alone.
+  return text.replace(/\/\/[^/\s?#]*@/g, "//<redacted>@");
+}
+
+interface FetchFailureCause {
+  code: string | null;
+  message: string | null;
+}
+
+function readFetchFailureCause(err: unknown): FetchFailureCause {
+  const cause = typeof err === "object" && err !== null ? (err as { cause?: unknown }).cause : undefined;
+  if (typeof cause !== "object" || cause === null) return { code: null, message: null };
+  const rawCode = (cause as { code?: unknown }).code;
+  // A non-empty STRING only. undici and OpenSSL codes are strings; a numeric
+  // errno would print as a bare "0" that tells a reader nothing.
+  const code = typeof rawCode === "string" && rawCode.length > 0 ? rawCode : null;
+  const rawMessage = (cause as { message?: unknown }).message;
+  const trimmed = typeof rawMessage === "string" ? rawMessage.trim() : "";
+  return { code, message: trimmed.length > 0 ? redactUrlUserinfo(trimmed) : null };
+}
+
+function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): string | null {
+  if (cause.code !== null && TLS_TRUST_CODES.has(cause.code)) {
+    return `A certificate in the chain could not be verified, which on a corporate network means a TLS-inspecting gateway or a private CA rather than a problem at AWS. ${CA_TRUST_REMEDY}`;
+  }
+  if (
+    env.oamVersion !== null &&
+    cause.code === null &&
+    cause.message !== null &&
+    UNCODED_TRANSPORT_RE.test(cause.message)
+  ) {
+    return `This server is running under the oam runtime, which reports no failure code for a transport error. The usual cause is a certificate it does not trust. ${CA_TRUST_REMEDY} A proxy in HTTPS_PROXY that cannot be reached looks the same from here.`;
+  }
+  // A missing code covers the timeout branches, where the abort is all there is
+  // to read: a proxy-only network with the proxy ignored has nothing to connect
+  // to, so the request hangs until our own 30s abort.
+  const connectFailed = cause.code === null || CONNECT_FAILURE_CODES.has(cause.code);
+  if (env.proxyUrl !== null && connectFailed) {
+    const proxy = redactUrlUserinfo(env.proxyUrl);
+    if (!env.envProxyEnabled) {
+      return `HTTPS_PROXY is set to '${proxy}', but Node's fetch does not use it unless NODE_USE_ENV_PROXY=1 is set as well (Node 22.21+), so this request tried to reach docs.aws.amazon.com directly. Add NODE_USE_ENV_PROXY=1 to this server's MCP-config \`env\` block -- it is read when the process starts. The aws CLI the other tools shell out to reads HTTPS_PROXY on its own, which is why they can work while these two do not.`;
+    }
+    return `This request went through the proxy in HTTPS_PROXY ('${proxy}'), so it is that proxy, not docs.aws.amazon.com, that did not answer.`;
+  }
+  return null;
+}
+
+/**
+ * Say what actually failed under a rejected fetch, and what to do about it.
+ *
+ * Node's fetch rejects with a bare `TypeError: fetch failed` and puts the real
+ * verdict in `err.cause`, which nothing here read. So behind a TLS-inspecting
+ * gateway every docs call reported "fetch failed" and aws_docs_search went on to
+ * blame AWS's undocumented search backend for a request that never left the
+ * machine. Reproduced here on 2026-09-19: Node 22.22.2 against a local
+ * self-signed server gives cause code DEPTH_ZERO_SELF_SIGNED_CERT, and oam
+ * 0.16.2 gives the same condition with no code at all.
+ *
+ * Returns "" when there is nothing to add, and otherwise a string that starts
+ * with a space -- every caller appends it to a sentence that already ends in a
+ * period.
+ */
+export function describeFetchFailure(err: unknown, env: FetchEnvFacts = readFetchEnvFacts()): string {
+  const cause = readFetchFailureCause(err);
+  const parts: string[] = [];
+  if (cause.message !== null) {
+    parts.push(`Underlying failure: ${cause.message}${cause.code !== null ? ` (${cause.code})` : ""}.`);
+  } else if (cause.code !== null) {
+    parts.push(`Underlying failure: ${cause.code}.`);
+  }
+  const remedy = fetchFailureRemedy(cause, env);
+  if (remedy !== null) parts.push(remedy);
+  return parts.length > 0 ? ` ${parts.join(" ")}` : "";
 }
 
 /**
@@ -720,7 +1082,14 @@ export function makeDocCache(): DocCache {
   };
 }
 
-export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
+/**
+ * `envFacts` is for tests only, and left undefined it changes nothing: each
+ * fetch-failure site still reads the environment when it fails. Without it a
+ * handler test that drives a failure branch passes or fails on whether the
+ * DEVELOPER is behind a proxy, since HTTPS_PROXY plus a causeless rejection
+ * earns the proxy remedy in place of the sentence the test is asserting.
+ */
+export function buildDocsTools(fetchImpl: FetchImpl = fetch, envFacts?: FetchEnvFacts): readonly Tool[] {
   const docCache = makeDocCache();
   // One session per buildDocsTools() instance. Production calls
   // buildDocsTools once at module load, so the prod-server lifetime UUID
@@ -782,16 +1151,24 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             FETCH_TIMEOUT_MS,
           );
         } catch (err) {
+          // The cause (and any remedy it implies) comes first because it is what
+          // the reader can act on: a TLS or proxy failure never reached the
+          // backend, so blaming the backend's undocumented shape for it sends
+          // whoever is debugging in the wrong direction. That sentence is kept
+          // for the case where there is nothing else to say.
+          const why = describeFetchFailure(err, envFacts);
           if (isAbortError(err)) {
             return {
               ok: false,
-              error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (proxy.search.docs.aws.com) may be slow or unreachable.`,
+              error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (proxy.search.docs.aws.com) may be slow or unreachable.${why}`,
             };
           }
           const msg = err instanceof Error ? err.message : String(err);
           return {
             ok: false,
-            error: `AWS docs search request failed: ${msg}. The search backend (proxy.search.docs.aws.com) is undocumented and may have changed or be unreachable.`,
+            error: why
+              ? `AWS docs search request failed: ${msg}.${why}`
+              : `AWS docs search request failed: ${msg}. The search backend (proxy.search.docs.aws.com) is undocumented and may have changed or be unreachable.`,
           };
         }
         if (!response.ok) {
@@ -895,28 +1272,39 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
               FETCH_TIMEOUT_MS,
             );
           } catch (err) {
+            const why = describeFetchFailure(err, envFacts);
             if (isAbortError(err)) {
-              return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.` };
+              return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.${why}` };
             }
             const msg = err instanceof Error ? err.message : String(err);
-            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.` };
+            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.${why}` };
           }
           if (!response.ok) {
             return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
           }
           // fetch FOLLOWS redirects, so the isValidDocsUrl check on i.url above
-          // only vouches for the first hop. Re-check where we actually landed:
+          // only vouches for the first hop. Judge where we actually landed:
           // without this, an allowlisted docs URL that 302s off-domain gets
           // fetched and converted with nothing but the content-type gate
-          // between us and arbitrary third-party HTML.
+          // between us and arbitrary third-party HTML. A docs-host landing is
+          // then two more things -- the site's `index.html` -> `/` canonical
+          // form, which is fine, and its redirect-to-the-landing-page answer for
+          // a page that does not exist, which is not. See classifyFinalDocsUrl.
           // `response.url` is absent/empty on a Response-like object that
           // doesn't set it (test doubles); that means "no redirect
           // information", so fall back to the URL we already validated.
           const finalUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : i.url;
-          if (!isValidDocsUrl(finalUrl)) {
+          const landing = classifyFinalDocsUrl(i.url, finalUrl);
+          if (landing === "off_allowlist") {
             return {
               ok: false,
-              error: `${i.url} redirected to '${finalUrl}', which is not an 'https://docs.aws.amazon.com/...html' page. aws_docs_read only follows redirects that stay inside the AWS documentation allowlist.`,
+              error: `${i.url} redirected to '${finalUrl}', which is outside the AWS documentation allowlist (https://docs.aws.amazon.com pages). aws_docs_read only follows redirects that stay inside it.`,
+            };
+          }
+          if (landing === "soft_404") {
+            return {
+              ok: false,
+              error: `${i.url} does not exist: docs.aws.amazon.com redirected it to '${finalUrl}', the landing page of that guide or command group, which is how the site answers a request for a page it does not have at that path. Use aws_docs_search to find the page you want.`,
             };
           }
           // A 200 doesn't guarantee HTML -- a docs URL can redirect to a
@@ -942,6 +1330,10 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch): readonly Tool[] {
             };
           }
           markdown = htmlToMarkdown(body.html);
+          // Before the cache write, so nothing thin is stored and a retry after
+          // the page is fixed is not served the empty conversion for 5 minutes.
+          const unrenderable = detectUnrenderablePage(body.html, markdown, i.url, finalUrl);
+          if (unrenderable !== null) return { ok: false, error: unrenderable };
           // Only cache what the DOC_CACHE_MAX_ENTRIES footprint math assumes:
           // at most MAX_MAX_LENGTH of markdown per entry. An over-size page is
           // still served in full (paginateContent slices the whole string
