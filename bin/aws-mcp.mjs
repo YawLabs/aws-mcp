@@ -535,7 +535,14 @@ if (plan === "in-process") {
       await errSync(
         `aws-mcp: AWS_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
-          "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use AWS_MCP_RUNTIME=node.\n",
+          // Do not send someone to install a build that does not exist for their
+          // machine. oam publishes darwin arm64/x64, windows arm64/x64 and linux
+          // x64 -- there is no linux-arm64 asset, so on an arm64 Linux box (a Pi,
+          // an arm64 cloud instance, WSL on an ARM Windows host) discovery can
+          // never succeed and "install or update" is an impossible remedy.
+          (process.platform === "linux" && process.arch !== "x64"
+            ? `oam publishes no build for linux-${process.arch}, so there is nothing to install here: use AWS_MCP_RUNTIME=node, or set OAM_BIN=/path/to/oam if you built one yourself.\n`
+            : "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use AWS_MCP_RUNTIME=node.\n"),
       );
       process.exit(1);
     }

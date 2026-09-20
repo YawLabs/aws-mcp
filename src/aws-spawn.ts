@@ -186,6 +186,20 @@ export type PathProbe = (absPath: string) => { isFile: boolean; executable: bool
  * accessSync(X_OK) is granted for any readable file (measured on a plain .txt),
  * so it would answer yes for everything and mean nothing. Windows decides by
  * extension instead -- see the `.exe` rule below.
+ *
+ * What the POSIX check does and does not buy, stated so nothing downstream leans
+ * on more than it gives. On a native POSIX filesystem X_OK carries real
+ * information and rejects a non-executable file named `aws`. Under WSL it does
+ * not: DrvFs reports mode 0777 for every file it shows from a Windows drive, so
+ * X_OK is granted for a README, and the check cannot reject anything under
+ * /mnt. That is not a corner: a WSL process inherits the Windows PATH through
+ * interop -- measured at 67 entries here, 58 of them under /mnt/c -- so most of
+ * the PATH this resolver walks on WSL is a filesystem where the executable bit
+ * is a constant. Nothing here is unsafe today (no Windows PATH directory on this
+ * host holds an extensionless `aws`; a pip-installed AWS CLI v1 under MSYS2
+ * would leave exactly one), but the guarantee is "a regular file the OS claims
+ * is executable", not "a real executable", and the absolute-path walk plus the
+ * skip rules below are what actually keep the working directory out of it.
  */
 function fsProbe(platform: NodeJS.Platform): PathProbe {
   return (absPath) => {
