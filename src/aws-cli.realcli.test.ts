@@ -18,6 +18,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, linkSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -280,6 +281,35 @@ describe(`runAwsCall -- installed AWS CLI${detected?.ok ? ` (${detected.cli.vers
       if (r.ok) return;
       assert.equal(r.kind, "nonzero_exit");
       assert.match(r.error, /Unable to parse config file/i);
+
+      // On POSIX, assert the claim the product rests on rather than only the
+      // symptom: this failure is the platform's UTF-8 default, NOT the pin. The
+      // CLI is run directly here, with PYTHONUTF8 set exactly as the server sets
+      // it and then removed, over the same config file -- `configure list` parses
+      // config and opens no connection. Identical outcomes mean the pin costs
+      // nothing here, which is why it is safe to keep on every platform. (A bare
+      // platform skip would clear the red without ever asserting that.)
+      if (process.platform !== "win32" && detected?.ok) {
+        const cliPath = detected.cli.command;
+        // isolateAwsEnv has already pointed AWS_CONFIG_FILE at the fixture, so a
+        // copy of the current environment is the same config this call just used.
+        const base: NodeJS.ProcessEnv = { ...process.env };
+        const runConfigList = (pythonUtf8: string | undefined) => {
+          const env = { ...base };
+          if (pythonUtf8 === undefined) delete env.PYTHONUTF8;
+          else env.PYTHONUTF8 = pythonUtf8;
+          const out = spawnSync(cliPath, ["configure", "list"], { env, encoding: "utf8", timeout: 60_000 });
+          return { status: out.status, failedToParse: /Unable to parse config file/i.test(out.stderr ?? "") };
+        };
+        const withPin = runConfigList("1");
+        const withoutPin = runConfigList(undefined);
+        assert.equal(
+          withPin.failedToParse,
+          withoutPin.failedToParse,
+          `PYTHONUTF8 must not decide this on POSIX: with=${JSON.stringify(withPin)} without=${JSON.stringify(withoutPin)}`,
+        );
+        assert.equal(withPin.status, withoutPin.status, "and the exit status must match too");
+      }
     });
   });
 

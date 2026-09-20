@@ -250,12 +250,12 @@ For multi-region reads:
 ## Runtime
 
 This server runs on [oam.js](https://oamjs.org) and on Node, unmodified, and
-the launcher never serves on an oam older than **0.15.2**, and picks the newest
-oam binary it can find at or above that floor. Verified on oam 0.16.1 and
-0.16.2: full MCP handshake with all 28 tools, and the `aws_script` sandbox
-behavior described below.
+the launcher never serves on an oam older than **0.16.3**, and picks the newest
+oam binary it can find at or above that floor. Verified on oam 0.16.3: full MCP
+handshake with all 28 tools, and the `aws_script` sandbox behavior described
+below.
 
-**oam 0.15.2 is the minimum.** The launcher picks the newest oam it can find at
+**oam 0.16.3 is the minimum.** The launcher picks the newest oam it can find at
 or above it, never serves on an older one, and falls back to Node when there is
 none (`AWS_MCP_RUNTIME=oam` turns that into a hard error). A floor matters here:
 releases before 0.9.0 ran `child_process.execFile` arguments through a shell,
@@ -278,7 +278,7 @@ To run it under oam, point your MCP client's `command` at it:
 
 **Measure startup on your own hardware.** An MCP client cold-starts this server
 once per session, so startup is the cost that actually gets paid. The numbers
-below were taken with oam 0.8.2, long before the current 0.15.2 floor, and have
+below were taken with oam 0.8.2, long before the current 0.16.3 floor, and have
 not been re-run since, so do not read them as a current ranking. To a completed
 `initialize` + `tools/list` handshake, median of 10 warmed runs:
 
@@ -319,8 +319,10 @@ nominal.
 
 One behavioral difference worth knowing if you run `aws_script` under oam: Node
 honors `codeGeneration: { strings: false }` on the `node:vm` context, so `eval`
-and `Function` throw; oam does not, so they work. Re-measured against oam 0.15.2
-and still divergent, so treat it as a standing difference. The containment that
+and `Function` throw; oam does not, so they work. Re-measured against oam 0.16.3
+and still divergent -- inside the sandbox, `eval('1+1')` returns 2 and
+`Function('return 7')()` returns 7 under oam, while both raise `EvalError` under
+Node -- so treat it as a standing difference. The containment that
 matters is unaffected -- under oam, `Function('return this')()` yields a global
 whose `process` and `require` are both `undefined`, and `Function('return
 require')` throws -- so a script gains nothing it couldn't already do by writing
@@ -343,8 +345,8 @@ The launcher that the published `aws-mcp` command runs (`bin/aws-mcp.mjs`, which
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AWS_MCP_RUNTIME` | `auto` | `auto`: serve on the oam the launcher is already running under if that is 0.15.2 or newer; otherwise run on the newest oam binary it can find at 0.15.2 or newer (see `OAM_BIN`); otherwise on Node. An oam host older than 0.15.2 never serves the server itself -- it hands off to the newest usable oam, or to Node on `PATH`, or exits with an error when there is neither. An unusable `OAM_BIN` is always named on stderr; the other oam binaries that were passed over are named only when no usable oam is found. `oam`: the same, but exit with an error instead of falling back to Node. `node`: always Node -- in-process under `npx`, and handed off to Node on `PATH` when a client launches the command with `oam run`. Case-insensitive, and any other value behaves like `auto`. |
-| `OAM_BIN` | unset | Path to an oam binary to use in preference to discovery, when it is 0.15.2 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery. Discovery looks in the installed location (`%LOCALAPPDATA%\oam\bin` then `~/.oam/bin` on Windows, `~/.oam/bin` elsewhere) and on `PATH`, asks every oam it finds for its version, and uses the newest; on a tie the installed copy wins. On Windows only `oam.exe` counts; an `oam.cmd` / `oam.bat` shim is never run, and is named on stderr when no usable oam is found. Ignored under `AWS_MCP_RUNTIME=node` and when already running on oam 0.15.2+. |
+| `AWS_MCP_RUNTIME` | `auto` | `auto`: serve on the oam the launcher is already running under if that is 0.16.3 or newer; otherwise run on the newest oam binary it can find at 0.16.3 or newer (see `OAM_BIN`); otherwise on Node. An oam host older than 0.16.3 never serves the server itself -- it hands off to the newest usable oam, or to Node on `PATH`, or exits with an error when there is neither. An unusable `OAM_BIN` is always named on stderr; the other oam binaries that were passed over are named only when no usable oam is found. `oam`: the same, but exit with an error instead of falling back to Node. `node`: always Node -- in-process under `npx`, and handed off to Node on `PATH` when a client launches the command with `oam run`. Case-insensitive, and any other value behaves like `auto`. |
+| `OAM_BIN` | unset | Path to an oam binary to use in preference to discovery, when it is 0.16.3 or newer. If it does not exist, is older, or will not run, the launcher says so on stderr and carries on with discovery. Discovery looks in the installed location (`%LOCALAPPDATA%\oam\bin` then `~/.oam/bin` on Windows, `~/.oam/bin` elsewhere) and on `PATH`, asks every oam it finds for its version, and uses the newest; on a tie the installed copy wins. On Windows only `oam.exe` counts; an `oam.cmd` / `oam.bat` shim is never run, and is named on stderr when no usable oam is found. Ignored under `AWS_MCP_RUNTIME=node` and when already running on oam 0.16.3+. |
 
 **What the server sets on every `aws` call.** Each `aws` child process gets these, overriding your shell and `~/.aws/config`, because each one changes output this server parses: `AWS_CLI_ERROR_FORMAT=enhanced` (CLI 2.34.0's `json`/`yaml`/`text`/`table` error formats remove the `An error occurred (Code)` text that `errorKind` classification reads), `AWS_CLI_AUTO_PROMPT=off` (auto-prompt wants a console and fails every call from an MCP host, `aws sso login` included), `AWS_CLI_OUTPUT_ENCODING=utf-8` and `PYTHONUTF8=1` (on Windows the CLI otherwise writes the ANSI code page and fails on any character outside it), and on Windows `NoDefaultCurrentDirectoryInExePath=1` (so the CLI's own helpers, such as `session-manager-plugin`, are never run from the working directory). These are environment variables rather than flags, so an older 2.x CLI that does not know one simply ignores it. One side effect, and it is **Windows-only**: on CLIs older than 2.25.0, `PYTHONUTF8=1` also makes the CLI read `~/.aws/config` and `~/.aws/credentials` as UTF-8, so a non-ASCII character saved there in a legacy Windows code page stops parsing -- re-save the file as UTF-8, or update the CLI. On macOS and Linux the pin costs nothing here, because there is no ANSI code page to switch away from: measured on linux/arm64 with aws-cli 2.36.49, a cp1252 byte in `~/.aws/config` fails to parse identically with `PYTHONUTF8` unset, `=0` and `=1`, and under `LC_ALL=C` and `LC_ALL=POSIX`, while the same character encoded as UTF-8 parses in all of them. Calls that carry `params` also pass `--cli-binary-format base64`, so blob-typed params are always base64 whatever your config says. Left to your config on purpose: retry mode and max attempts, `cli_timestamp_format` (config-only in the CLI; `wire` returns epoch numbers instead of ISO strings), `cli_history`, and endpoint, proxy and CA settings.
 
@@ -398,7 +400,7 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 - **Tool annotations** -- `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. These signal to MCP hosts how to gate calls; flipping them silently would break host UIs. Note the direction of the guarantee: an annotation may be tightened (made more cautious) in a patch release when it was previously understating what a tool can do -- v2.0.1 set `destructiveHint: true` on `aws_call`, `aws_multi_region` and `aws_resource_update` for exactly that reason. It will not be *loosened* outside a major. If your host suppresses confirmation prompts based on these, treat `aws_call` and `aws_multi_region` as able to invoke any AWS API the caller's IAM identity permits, including deletes.
 - **Required input fields** -- the required fields per tool will not change shape or be removed. New *optional* fields may be added.
 - **Success envelope shape per tool** -- the `data` object on `{ok: true, data}` responses, specifically:
-  - `aws_call` -> `{command, result}`
+  - `aws_call` -> `{command, commandArgv, result}`
   - `aws_paginate` -> `{command, result, nextToken, hasMore}`
   - `aws_multi_region` -> `{service, operation, regionCount, okCount, errorCount, results: [{region, ok, data?, command?, error?, errorKind?, truncated?}]}` (the aggregate response is capped; entries past the budget keep their `region`/`ok` but drop `data` and are flagged `truncated: true`. Error entries are never dropped, and `okCount`/`errorCount` are computed before capping, so they always describe what the calls did rather than what survived the cap.)
   - `aws_multi_account` -> `{service, operation, roleName, accountCount, okCount, errorCount, results: [{accountId, ok, data?, command?, error?, errorKind?, truncated?}]}` plus `truncated`, `truncatedAccounts` and `maxTotalResultBytes` when the 5 MB aggregate cap fired. Mirrors `aws_multi_region` field for field with `accountId` in place of `region`, including that `okCount`/`errorCount` are computed BEFORE capping so they describe what the calls did rather than what survived. Duplicate account IDs collapse, so `results.length` may be under `accounts.length`; use `accountCount`. Credentials are never written to `~/.aws/credentials` and never appear in `command`, `error` or `rawBody`.
@@ -435,7 +437,9 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 - **Error message wording.** Strings like "SSO session expired for profile 'X'. Call aws_login_start..." may be retuned for clarity. Anchor on `errorKind` or the structured envelope, not on regex-matching `error` text.
 - **`suggestion` wording** -- the one-line remedy derived from a recognized AWS error code. Whether a suggestion is present tracks the error code, but the sentence itself may be retuned; branch on `errorKind`, not on this text. It is duplicated at the end of `error`, so a caller reading both must not print it twice.
 - **`rawBody`** content -- raw stderr/stdout from the underlying `aws` CLI for diagnostic purposes. Format follows whatever the CLI emits in your installed version.
-- **`command`** strings -- the human-readable command shown alongside results. Argv ordering and the exact redaction-stub format (`<redacted len=N>`) may shift. It is quoted for the shell of the host the server runs on: a POSIX shell, or PowerShell on Windows. It is **not** correct in `cmd.exe`, where `&`, `|` and a newline are live whatever the quoting, nor in Git Bash on Windows, where a value containing a single quote loses its quotes and arrives wrong (`Buckets[?Name=='prod'].Name` is the realistic case; it becomes invalid JMESPath rather than anything that runs). Treat it as something to read, and re-quote it yourself before pasting it into a different shell than the server's host.
+- **`command`** strings -- the human-readable command shown alongside results. Argv ordering and the exact redaction-stub format (`<redacted len=N>`) may shift. It is quoted for the shell of the host the server runs on: a POSIX shell, or PowerShell on Windows. It is **not** correct in `cmd.exe`, where `&`, `|` and a newline are live whatever the quoting, nor in Git Bash on Windows, where a value containing a single quote loses its quotes and arrives wrong (`Buckets[?Name=='prod'].Name` is the realistic case; it becomes invalid JMESPath rather than anything that runs).
+
+  **Use `commandArgv` instead of parsing `command`.** Every envelope that carries `command` also carries `commandArgv`: the same call as an array of exact, unquoted tokens -- entry 0 the binary as displayed, then one entry per argument -- redacted identically, because the string is rendered *from* the array. It is what the server actually spawns (no shell is involved at any point), so there is nothing to unpick and nothing that can be re-interpreted by a shell you did not expect. Re-quote it for your own shell if you need to run it; the string form is a convenience for reading, and the array is the contract.
 - **Tool *descriptions*** -- the prose surfaced to the model. Tightening these is non-breaking.
 
 **Deprecation policy:** breaking a stable shape requires a major bump. A deprecation lands first in a minor (the old shape continues to work and the new shape becomes available alongside it), with a removal scheduled for the next major. Both the deprecation and the removal show up in `CHANGELOG.md`.
