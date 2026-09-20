@@ -23,7 +23,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -718,10 +718,43 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       try {
         inputDir = mkdtempSync(join(dir, CLI_INPUT_TEMP_PREFIX));
         paramsFile = join(inputDir, "params.json");
-        // 0600 and `wx`: the payload can hold credentials or a SecureString
-        // value, and it lives in a directory mkdtemp created for this call alone
-        // (0700 on POSIX, the per-user %TEMP% ACL on Windows).
-        writeFileSync(paramsFile, toAsciiJson(json), { mode: 0o600, flag: "wx" });
+        // The payload can hold credentials or a SecureString value, so this file
+        // is created exclusively and made private -- and both have to be spelled
+        // out this way to hold on the runtime the package actually ships on.
+        //
+        // Exclusivity comes from open(2)'s O_EXCL via `openSync(..., "wx")`,
+        // which node 22.22.2 and oam 0.16.2 both honour. writeFileSync's `flag`
+        // option does NOT reach oam: measured 2026-09-20, a second
+        // `writeFileSync(path, ..., {flag: "wx"})` over an existing file
+        // SUCCEEDED there and the readback returned the second payload, where
+        // node raises EEXIST. bin/aws-mcp.mjs defaults AWS_MCP_RUNTIME=auto, so
+        // oam is the runtime whenever one is found.
+        //
+        // The creation mode is dropped on oam too -- a file opened 0o400 comes
+        // back writable there, where node marks it read-only, and writeFileSync's
+        // `mode` goes the same way -- so the 0600 this file's privacy is
+        // documented on is only real if chmod sets it, which oam does honour
+        // (fchmodSync included).
+        // That makes the mode on the FILE the part this code can guarantee on both
+        // runtimes; the containing directory is the other half, and there the
+        // split is by platform, as lambda.ts documents for its own temp files:
+        // Windows os.tmpdir() is the per-user %TEMP%, already ACL'd, while on
+        // POSIX it rests on mkdtemp(3)'s 0700 -- which oam reimplements (its names
+        // are a nanosecond clock value, not node's six random characters) and this
+        // Windows host cannot check.
+        //
+        // Every failure here is reported: the catch below turns it into
+        // spawn_failure and removes the directory, so an EEXIST from a name a
+        // local user got to first stops the call instead of writing through it.
+        const fd = openSync(paramsFile, "wx", 0o600);
+        try {
+          // On the fd, before the payload exists, so there is no window in which
+          // the file holds the params at a wider mode.
+          fchmodSync(fd, 0o600);
+          writeSync(fd, toAsciiJson(json));
+        } finally {
+          closeSync(fd);
+        }
       } catch (err) {
         removeInputDir();
         return Promise.resolve({

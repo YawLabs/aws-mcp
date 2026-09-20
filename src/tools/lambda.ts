@@ -70,7 +70,7 @@
  *     scripting is a separate change to tools/script.ts.
  */
 
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -497,8 +497,15 @@ export const lambdaTools: readonly Tool[] = [
         //
         // On a failed invoke the CLI writes nothing and this stays a 0-byte
         // file, which is fine: it is only read on the success path.
+        //
+        // chmodSync, not openSync's mode argument alone: oam drops the creation
+        // mode (measured 2026-09-20 on 0.16.2 -- a file opened 0o400 comes back
+        // writable there, where node marks it read-only), and oam is the runtime
+        // bin/aws-mcp.mjs picks by default. The exclusive create itself DOES reach
+        // oam; only the mode has to be set a second way.
         const outPath = join(dir, "response.json");
         closeSync(openSync(outPath, "wx", 0o600));
+        chmodSync(outPath, 0o600);
 
         // The payload goes through a FILE (`--payload fileb://...`), not an
         // argv value, for three separate reasons:
@@ -527,7 +534,11 @@ export const lambdaTools: readonly Tool[] = [
         let payloadArg: string | undefined;
         if (i.payload !== undefined) {
           const payloadPath = join(dir, "payload.json");
+          // The event body is caller data and can hold anything, so the same
+          // chmodSync as the outfile above: writeFileSync's `mode` is dropped on
+          // oam exactly the way openSync's is.
           writeFileSync(payloadPath, JSON.stringify(i.payload), { mode: 0o600 });
+          chmodSync(payloadPath, 0o600);
           payloadArg = `fileb://${payloadPath}`;
           extraFlags.push("--payload", payloadArg);
         }
