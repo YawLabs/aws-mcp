@@ -544,9 +544,41 @@ describe("shellQuoteArg", () => {
   it("escapes an embedded single quote with the POSIX close-escape-reopen idiom", () => {
     // Inside single quotes a POSIX shell expands nothing and there is no
     // escape character, so the only way to include one is to close, emit an
-    // escaped quote, and reopen.
-    assert.equal(shellQuoteArg("it's"), `'it'\\''s'`);
-    assert.equal(shellQuoteArg("'"), `''\\'''`);
+    // escaped quote, and reopen. Platform passed explicitly so both dialects are
+    // asserted from either host -- there is no Mac here and only one Windows box,
+    // so a default-platform assertion would test exactly one of the two branches.
+    assert.equal(shellQuoteArg("it's", "linux"), `'it'\\''s'`);
+    assert.equal(shellQuoteArg("'", "linux"), `''\\'''`);
+    assert.equal(shellQuoteArg("it's", "darwin"), `'it'\\''s'`);
+  });
+
+  it("doubles an embedded single quote on win32, because PowerShell EXECUTES the POSIX idiom", () => {
+    // The POSIX form is not merely wrong in PowerShell. Measured on win32/arm64,
+    // PowerShell 5.1: a --query value of  x'; echo PWNED #  emitted as the POSIX
+    // close-escape-reopen form tokenised into separate words, the ';' ended the
+    // statement, and PWNED was PRINTED. PowerShell's own escape is to double the
+    // quote, so that is what a Windows host emits.
+    assert.equal(shellQuoteArg("it's", "win32"), `'it''s'`);
+    assert.equal(shellQuoteArg("'", "win32"), `''''`);
+
+    // The regression that matters: whatever the value, the win32 form must never
+    // contain the backslash-quote sequence PowerShell breaks out of.
+    for (const value of ["it's", "'", "x'; echo PWNED #", "a'b'c", `x' & echo PWNED`, `'; rm -rf / #`]) {
+      const quoted = shellQuoteArg(value, "win32");
+      assert.doesNotMatch(quoted, /\\'/, `win32 quoting of ${JSON.stringify(value)} must not emit \\' -- ${quoted}`);
+      // And it stays one PowerShell string: an even number of quotes, opening and
+      // closing included, is what makes the doubled form parse as a single token.
+      assert.equal((quoted.match(/'/g) ?? []).length % 2, 0, `unbalanced quotes in ${quoted}`);
+    }
+  });
+
+  it("is inert in bash even when it quoted for PowerShell", () => {
+    // A Windows host's string pasted into Git Bash gets a WRONG value, not a
+    // running command: 'a''b' is concatenation in POSIX, so the quote simply
+    // disappears. Wrong-but-inert is the trade this makes deliberately.
+    const quoted = shellQuoteArg("x'; echo PWNED #", "win32");
+    assert.doesNotMatch(quoted, /\\/, "no backslashes, so bash has nothing to escape out of");
+    assert.ok(quoted.startsWith("'") && quoted.endsWith("'"), quoted);
   });
 
   it("quotes an empty argv entry so it stays visible", () => {

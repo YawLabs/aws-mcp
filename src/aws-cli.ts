@@ -23,7 +23,7 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, fchmodSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, fstatSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -202,8 +202,23 @@ const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
  * boundary here, so they get asserted head-on rather than only through a
  * spawned call.
  */
-export function shellQuoteArg(arg: string): string {
+export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.platform): string {
   if (SHELL_SAFE_ARG_RE.test(arg)) return arg;
+  // The POSIX idiom for an embedded single quote -- close, escape, reopen --
+  // is not merely wrong in PowerShell, it EXECUTES. PowerShell reads '...' as
+  // literal text the way POSIX does, but has no backslash escape inside it, so
+  // the emitted form tokenises as a string, a stray backslash, an empty string,
+  // then bare words: a ';' in the value ends the statement, whatever follows it
+  // RUNS, and a '#' comments out the dangling quote that would otherwise be a
+  // parse error. Measured on win32/arm64, PowerShell 5.1: a --query value of
+  // x'; echo PWNED # printed PWNED. The other 24 probes all arrived byte-identical,
+  // so this is specifically about values containing a single quote.
+  //
+  // So quote for the shell the READER is in. On Windows that is PowerShell,
+  // which escapes a single quote by doubling it. That form is also inert in
+  // bash -- 'a''b' is concatenation -- so a Git Bash paste yields a wrong value
+  // rather than a running command, and wrong-but-inert beats correct-but-armed.
+  if (platform === "win32") return `'${arg.replace(/'/g, "''")}'`;
   return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -751,6 +766,33 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           // On the fd, before the payload exists, so there is no window in which
           // the file holds the params at a wider mode.
           fchmodSync(fd, 0o600);
+          // Then CHECK it, before the payload exists. A filesystem is allowed to
+          // ignore a chmod and report success, and one this server actually runs
+          // on does: measured on WSL Ubuntu (linux/arm64, Node 22.23.2), with
+          // TMPDIR on a Windows drive (/mnt/c, v9fs/DrvFs), mkdtemp returns 0777,
+          // the exclusive create returns 0777, and fchmodSync(fd, 0o600) succeeds
+          // while changing nothing -- so every word of the guarantee above was
+          // false and nothing could tell. That configuration is one people choose
+          // deliberately, to share a scratch directory between the Windows and WSL
+          // halves of one machine. World-WRITABLE is the worse half: the CLI opens
+          // this path after we have closed it, so another local user can swap the
+          // payload in between.
+          //
+          // Failing here means the params are never written at all, which is the
+          // right end for a file documented to hold credentials or a SecureString.
+          // POSIX only: on Windows chmod moves nothing but the read-only bit and
+          // the mode reads back 0666 whatever we ask for (measured, win32/arm64) --
+          // privacy there rests on the per-user %TEMP% ACL, as above.
+          if (process.platform !== "win32") {
+            const mode = fstatSync(fd).mode & 0o777;
+            if (mode !== 0o600) {
+              throw new Error(
+                `the temp directory does not honour file modes, so the 0600 this file's privacy rests on is not in effect (it is 0${mode.toString(8)}). ` +
+                  "A Windows drive mounted into WSL reports 0777 for every file and ignores chmod without failing. " +
+                  "Point TMPDIR, TMP or TEMP at a native filesystem such as /tmp",
+              );
+            }
+          }
           writeSync(fd, toAsciiJson(json));
         } finally {
           closeSync(fd);
@@ -779,7 +821,11 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   // that is the literal `aws`, because the absolute path is noise to the reader
   // (and, for the override, the operator's own file layout). A test seam's
   // command still shows itself.
-  const displayCommand = [resolution.display, ...redactDisplayArgs(displayArgs)].map(shellQuoteArg).join(" ");
+  // Arrow, not a bare function reference: .map passes the index as the second
+  // argument, which shellQuoteArg would now read as the platform.
+  const displayCommand = [resolution.display, ...redactDisplayArgs(displayArgs)]
+    .map((entry) => shellQuoteArg(entry))
+    .join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;

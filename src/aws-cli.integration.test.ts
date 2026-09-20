@@ -5,7 +5,19 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  linkSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
@@ -15,6 +27,39 @@ import { _resetSession, setProfile, setRegion } from "./session.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "testing", "fake-aws.js");
+
+/**
+ * Does os.tmpdir() sit on a filesystem that accepts a chmod and ignores it?
+ *
+ * WSL's DrvFs does: a Windows drive under /mnt reports 0777 for every file, and
+ * fchmodSync succeeds while changing nothing (measured on linux/arm64, Node
+ * 22.23.2, TMPDIR under /mnt/c). aws-cli.ts refuses to write the params file
+ * there rather than leave a world-readable, world-WRITABLE payload, so the tests
+ * that exercise that transport have to know which behaviour to expect.
+ *
+ * Always false on Windows: chmod moves nothing but the read-only bit there and
+ * the mode reads back 0666 whatever is asked for, so the product does not check
+ * it and neither does this -- privacy on Windows rests on the per-user %TEMP% ACL.
+ */
+function tmpdirIgnoresModes(): boolean {
+  if (process.platform === "win32") return false;
+  const dir = mkdtempSync(join(tmpdir(), "aws-mcp-modeprobe-"));
+  try {
+    const fd = openSync(join(dir, "probe"), "wx", 0o600);
+    try {
+      fchmodSync(fd, 0o600);
+      return (fstatSync(fd).mode & 0o777) !== 0o600;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // A tmpdir we cannot even probe is not the case this is guarding; let the
+    // test proceed and fail on its own terms.
+    return false;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 function fakeOpts(scenario: string, overrides: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}) {
   return {
@@ -862,6 +907,22 @@ describe("spawn-hardening: params too long for a command line", () => {
       params,
       ...fakeOpts("spawn-hardening_read_input_file"),
     });
+
+    // On a filesystem that ignores chmod, the call is SUPPOSED to refuse: this
+    // payload can hold credentials or a SecureString, and the 0600 the privacy
+    // rests on is unavailable there. Asserting the refusal rather than skipping
+    // means the guard has real coverage on exactly the machines that need it,
+    // and a contributor whose TMPDIR points into a Windows drive sees a green
+    // suite describing the behaviour instead of a red one they have to diagnose.
+    if (tmpdirIgnoresModes()) {
+      assert.equal(r.ok, false, "a mode-ignoring temp dir must not yield a successful private-file call");
+      if (r.ok) return;
+      assert.equal(r.kind, "spawn_failure");
+      assert.match(r.error, /does not honour file modes/);
+      assert.match(r.error, /TMPDIR/, "the message has to name the variable the operator can change");
+      return;
+    }
+
     assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
     if (!r.ok) return;
     const data = r.data as {
