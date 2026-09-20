@@ -11,6 +11,13 @@ if (!tool) throw new Error("iamSimulateTools missing aws_iam_simulate");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
+// What EvalResourceName carries since IAM's 2026-07-30 change for any action
+// that has an ARN format: an ARN TEMPLATE, not a resource anyone asked about.
+// The ${...} are IAM's own placeholders inside a plain string -- nothing here is
+// JS interpolation.
+// biome-ignore lint/suspicious/noTemplateCurlyInString: IAM's own ARN template in a plain string, not JS interpolation
+const ARN_TEMPLATE = "arn:${Partition}:s3:::${BucketName}/${KeyName}";
+
 let prevCommand: string | undefined;
 let prevPrefixArgs: string | undefined;
 before(() => {
@@ -140,6 +147,58 @@ describe("aws_iam_simulate handler validation", () => {
   });
 });
 
+describe("aws_iam_simulate principalArn guard -- STS assumed-role sessions", () => {
+  // aws_whoami reports arn:aws:sts::<account>:assumed-role/<role>/<session> for
+  // every SSO and assume-role session, which makes it the ARN a model reaches
+  // for first. ARN_RE accepts any service segment, so it used to sail through to
+  // IAM, which rejects it: PolicySourceArn takes a user, group or role ARN only.
+  // The tool does not rebuild the role ARN, because the session ARN drops the
+  // role's PATH (SSO roles live under aws-reserved/sso.amazonaws.com/).
+  it("rejects the session ARN and names the get-role lookup", async () => {
+    const r = await tool.handler({
+      principalArn: "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_abc/jeff@example.com",
+      actions: ["s3:GetObject"],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /assumed-role session ARN/);
+    assert.match(r.error ?? "", /get-role/);
+    // The role NAME has to be echoed, or the caller can't run the lookup.
+    assert.match(r.error ?? "", /AWSReservedSSO_Admin_abc/);
+    // NEGATIVE contract, and the no-spawn proof: this returns before runAwsCall,
+    // so nothing classified the failure. With AWS_MCP_FAKE_SCENARIO unset (the
+    // afterEach clears it), a spawn would reach fake-aws's default branch, exit
+    // 2, and come back errorKind "nonzero_exit".
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+
+  it("rejects it in every partition", async () => {
+    const r = await tool.handler({
+      principalArn: "arn:aws-cn:sts::123456789012:assumed-role/Admin/session-1",
+      actions: ["s3:GetObject"],
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /assumed-role session ARN/);
+    assert.match(r.error ?? "", /RoleName: 'Admin'/);
+  });
+
+  it("does not fire on an IAM role ARN whose PATH contains the same words", async () => {
+    // Both of these are valid PolicySourceArns: an SSO role's real IAM ARN, and
+    // a role deliberately pathed 'assumed-role/'. Guarding on the words rather
+    // than on the sts: service segment would reject the exact ARN the error
+    // above tells the caller to pass.
+    for (const principalArn of [
+      "arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_abc",
+      "arn:aws:iam::123456789012:role/assumed-role/x",
+    ]) {
+      const r = await tool.handler({ principalArn, actions: ["s3:GetObject"] } as never);
+      // The call may still fail downstream (no scenario is set, so the fake
+      // exits 2); only the guard itself is under test.
+      if (!r.ok) assert.doesNotMatch(r.error ?? "", /assumed-role session ARN/);
+    }
+  });
+});
+
 describe("parseSimulationResults", () => {
   it("returns empty array for non-array input", () => {
     assert.deepEqual(parseSimulationResults(null), []);
@@ -218,7 +277,277 @@ describe("parseSimulationResults", () => {
   });
 });
 
+describe("parseSimulationResults -- per-resource results (2026-07-30 shape)", () => {
+  // Since 2026-07-30 IAM returns ONE EvaluationResult per action whose
+  // EvalDecision is the most restrictive answer across every resource and whose
+  // EvalResourceName is an ARN TEMPLATE. The per-resource answers live only in
+  // ResourceSpecificResults. Reading just the top level collapsed 'can X do
+  // these actions to these three buckets' into one row per action that said
+  // deny for all three and named none of them.
+  it("expands one row per resource, each with its own decision, ids and missing keys", () => {
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "explicitDeny",
+        // The parent's ids are the UNION across resources, which is exactly what
+        // must not be copied onto a row.
+        MatchedStatements: [
+          { SourcePolicyId: "AllowA", SourcePolicyType: "IAM Policy" },
+          { SourcePolicyId: "DenyB", SourcePolicyType: "IAM Policy" },
+        ],
+        MissingContextValues: ["aws:RequestTag/Project"],
+        ResourceSpecificResults: [
+          {
+            EvalResourceName: "arn:aws:s3:::probe-a/k",
+            EvalResourceDecision: "allowed",
+            MatchedStatements: [{ SourcePolicyId: "AllowA", SourcePolicyType: "IAM Policy" }],
+            MissingContextValues: [],
+          },
+          {
+            EvalResourceName: "arn:aws:s3:::probe-b/k",
+            EvalResourceDecision: "explicitDeny",
+            MatchedStatements: [{ SourcePolicyId: "DenyB", SourcePolicyType: "IAM Policy" }],
+            MissingContextValues: ["aws:RequestTag/Project"],
+          },
+        ],
+      },
+    ]);
+    assert.equal(out.length, 2);
+    assert.deepEqual(
+      out.map((r) => r.resource),
+      ["arn:aws:s3:::probe-a/k", "arn:aws:s3:::probe-b/k"],
+    );
+    for (const r of out) assert.doesNotMatch(r.resource, /\$\{/, "no row may carry IAM's ARN template");
+    assert.equal(out[0].decision, "allowed");
+    assert.equal(out[1].decision, "explicitDeny");
+    assert.deepEqual(out[0].matchedStatementIds, ["AllowA"]);
+    assert.deepEqual(out[1].matchedStatementIds, ["DenyB"]);
+    assert.equal(out[0].missingContextValues, undefined);
+    assert.deepEqual(out[1].missingContextValues, ["aws:RequestTag/Project"]);
+  });
+
+  it("reads a result whose per-resource entry mirrors its top level identically", () => {
+    // SYNTHETIC: nobody here has observed the real pre-2026-07-30 response. The
+    // API reference says that shape returned one result per resource, each
+    // carrying the same aggregate decision, with the resource repeated in
+    // ResourceSpecificResults. The point of the test is that reading RSR is safe
+    // in that shape too -- one code path, no version sniffing.
+    const er = {
+      EvalActionName: "s3:GetObject",
+      EvalResourceName: "arn:aws:s3:::probe-a/k",
+      EvalDecision: "allowed",
+      MatchedStatements: [{ SourcePolicyId: "AllowA", SourcePolicyType: "IAM Policy" }],
+      MissingContextValues: [],
+    };
+    const expanded = parseSimulationResults([
+      {
+        ...er,
+        ResourceSpecificResults: [
+          {
+            EvalResourceName: "arn:aws:s3:::probe-a/k",
+            EvalResourceDecision: "allowed",
+            MatchedStatements: [{ SourcePolicyId: "AllowA", SourcePolicyType: "IAM Policy" }],
+            MissingContextValues: [],
+          },
+        ],
+      },
+    ]);
+    assert.deepEqual(expanded, parseSimulationResults([er]));
+  });
+
+  it("never lets a malformed ResourceSpecificResults drop the action", () => {
+    // An entry with no usable EvalResourceName can't be attributed to a
+    // resource. Skipping every one of them must leave the action's own answer
+    // standing, not an empty results array.
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: "arn:aws:s3:::b/k",
+        EvalDecision: "allowed",
+        ResourceSpecificResults: [null, 42, { EvalResourceDecision: "allowed" }, { EvalResourceName: "" }],
+      },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].resource, "arn:aws:s3:::b/k");
+    assert.equal(out[0].decision, "allowed");
+  });
+
+  it("reports an entry with no EvalResourceDecision as unknown", () => {
+    const out = parseSimulationResults([
+      { EvalActionName: "a", EvalDecision: "allowed", ResourceSpecificResults: [{ EvalResourceName: "arn:x" }] },
+    ]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].resource, "arn:x");
+    assert.equal(out[0].decision, "unknown");
+  });
+
+  it("carries the action-level Organizations verdict onto rows, except an allowed one", () => {
+    // AWS reports OrganizationsDecisionDetail per ACTION. An SCP deny cannot
+    // coexist with an allow, so the allowed row reads "allowed" and only the
+    // non-allowed row inherits the action's aggregate deny.
+    const mixed = parseSimulationResults([
+      {
+        EvalActionName: "ec2:RunInstances",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "explicitDeny",
+        OrganizationsDecisionDetail: { AllowedByOrganizations: false },
+        ResourceSpecificResults: [
+          { EvalResourceName: "arn:a", EvalResourceDecision: "allowed" },
+          { EvalResourceName: "arn:b", EvalResourceDecision: "explicitDeny" },
+        ],
+      },
+    ]);
+    assert.equal(mixed[0].organizationsDecision, "allowed");
+    assert.equal(mixed[1].organizationsDecision, "denied");
+
+    const allAllowed = parseSimulationResults([
+      {
+        EvalActionName: "ec2:RunInstances",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "allowed",
+        OrganizationsDecisionDetail: { AllowedByOrganizations: true },
+        ResourceSpecificResults: [
+          { EvalResourceName: "arn:a", EvalResourceDecision: "allowed" },
+          { EvalResourceName: "arn:b", EvalResourceDecision: "implicitDeny" },
+        ],
+      },
+    ]);
+    assert.equal(allAllowed[0].organizationsDecision, "allowed");
+    assert.equal(allAllowed[1].organizationsDecision, "allowed");
+  });
+
+  it("prefers an entry's own decision details over the action-level ones", () => {
+    // ResourceSpecificResult has its own PermissionsBoundaryDecisionDetail in the
+    // model aws-cli 2.34.3 bundles. It has no OrganizationsDecisionDetail there,
+    // and 2.34.3 silently drops one if AWS sends it -- but the API reference
+    // points at RSR for per-resource Organizations detail, so a future CLI model
+    // will render it. Preferring the entry's own value is forward-compatible.
+    const out = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "implicitDeny",
+        PermissionsBoundaryDecisionDetail: { AllowedByPermissionsBoundary: false },
+        OrganizationsDecisionDetail: { AllowedByOrganizations: false },
+        ResourceSpecificResults: [
+          {
+            EvalResourceName: "arn:a",
+            EvalResourceDecision: "implicitDeny",
+            PermissionsBoundaryDecisionDetail: { AllowedByPermissionsBoundary: true },
+            OrganizationsDecisionDetail: { AllowedByOrganizations: true },
+          },
+          { EvalResourceName: "arn:b", EvalResourceDecision: "implicitDeny" },
+        ],
+      },
+    ]);
+    assert.equal(out[0].permissionsBoundaryDecision, "allowed", "the entry's own boundary verdict wins");
+    assert.equal(out[0].organizationsDecision, "allowed", "so does its own Organizations verdict");
+    assert.equal(out[1].permissionsBoundaryDecision, "denied", "an entry with none inherits the action's");
+    assert.equal(out[1].organizationsDecision, "denied");
+  });
+
+  it("inherits missing context keys onto a '*' entry only", () => {
+    // The API reference reports the missing keys for a '*' simulation on the
+    // TOP-LEVEL result, and puts them per resource only when the call named
+    // resources. Resource-less calls are the commonest shape, so an RSR-only
+    // read would have dropped missingContextValues from exactly the 'can I do
+    // this at all?' question. A SPECIFIC ARN must not inherit: the top-level
+    // list is a union, so it would blame that ARN for another resource's keys.
+    const star = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "implicitDeny",
+        MissingContextValues: ["s3:ExistingObjectTag/env"],
+        ResourceSpecificResults: [
+          { EvalResourceName: "*", EvalResourceDecision: "implicitDeny", MissingContextValues: [] },
+        ],
+      },
+    ]);
+    assert.deepEqual(star[0].missingContextValues, ["s3:ExistingObjectTag/env"]);
+
+    const specific = parseSimulationResults([
+      {
+        EvalActionName: "s3:GetObject",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "implicitDeny",
+        MissingContextValues: ["s3:ExistingObjectTag/env"],
+        ResourceSpecificResults: [
+          { EvalResourceName: "arn:aws:s3:::probe-a/k", EvalResourceDecision: "allowed", MissingContextValues: [] },
+        ],
+      },
+    ]);
+    assert.equal(specific[0].missingContextValues, undefined);
+  });
+
+  it("reports '*' rather than the ARN template when the call named no resources", () => {
+    // The fallback row is the action-level answer, and under the new shape its
+    // EvalResourceName is a template. A resource-less call has always reported
+    // '*' -- AWS applies ['*'] server-side -- so the option keeps it doing that.
+    const er = { EvalActionName: "s3:GetObject", EvalResourceName: ARN_TEMPLATE, EvalDecision: "allowed" };
+    assert.equal(parseSimulationResults([er], { resourcesOmitted: true })[0].resource, "*");
+    // A call that DID name resources and got no per-resource breakdown keeps
+    // AWS's own value, because that is the only resource word AWS gave.
+    assert.equal(parseSimulationResults([er])[0].resource, ARN_TEMPLATE);
+  });
+
+  it("treats any decision outside IAM's enum as unknown, at both levels", () => {
+    // PolicyEvaluationDecisionType is allowed | explicitDeny | implicitDeny. The
+    // README promised `unknown` covers a decision that is "missing or
+    // unrecognized", but only a missing one landed there: every other string,
+    // including "" and a miscased "Allowed", passed through and was counted as
+    // a DENY -- a wrong answer dressed as a real one.
+    assert.deepEqual(
+      parseSimulationResults([
+        { EvalActionName: "a", EvalDecision: "garbage" },
+        { EvalActionName: "b", EvalDecision: "" },
+        { EvalActionName: "c", EvalDecision: "Allowed" },
+        { EvalActionName: "d", EvalDecision: "allowed" },
+      ]).map((r) => r.decision),
+      ["unknown", "unknown", "unknown", "allowed"],
+    );
+    const perResource = parseSimulationResults([
+      {
+        EvalActionName: "a",
+        EvalDecision: "allowed",
+        ResourceSpecificResults: [{ EvalResourceName: "arn:x", EvalResourceDecision: "garbage" }],
+      },
+    ]);
+    assert.equal(perResource[0].decision, "unknown");
+  });
+
+  it("yields exactly max(1, usable per-resource entries) rows per EvaluationResult", () => {
+    // The invariant that keeps summary.total honest and keeps an action from
+    // vanishing: never zero rows for a result, never one row for three answers.
+    const out = parseSimulationResults([
+      { EvalActionName: "one", EvalResourceName: "*", EvalDecision: "allowed" },
+      {
+        EvalActionName: "three",
+        EvalResourceName: ARN_TEMPLATE,
+        EvalDecision: "explicitDeny",
+        ResourceSpecificResults: [
+          { EvalResourceName: "arn:a", EvalResourceDecision: "allowed" },
+          { EvalResourceName: "arn:b", EvalResourceDecision: "explicitDeny" },
+          { EvalResourceName: "arn:c", EvalResourceDecision: "implicitDeny" },
+        ],
+      },
+      { EvalActionName: "alsoOne", EvalResourceName: "*", EvalDecision: "allowed", ResourceSpecificResults: [] },
+    ]);
+    assert.equal(out.length, 5);
+    assert.deepEqual(
+      out.map((r) => r.action),
+      ["one", "three", "three", "three", "alsoOne"],
+    );
+  });
+});
+
 describe("aws_iam_simulate handler (fake-aws integration)", () => {
+  // Every fixture in this block is pre-2026-07-30 shape -- no
+  // ResourceSpecificResults anywhere -- so these cases all exercise the parser's
+  // action-level FALLBACK path. That is why the whole suite stayed green while
+  // the per-resource answers were being dropped in production; the per-resource
+  // path is covered by the describe below.
   it("returns summary + flattened results for a single allowed action", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_allow";
     const r = await tool.handler({
@@ -457,6 +786,128 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
   });
 });
 
+describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 shape)", () => {
+  // These four scenarios were transcribed from captures the REAL aws-cli 2.34.3
+  // rendered from the API reference's documented XML, driven through a local
+  // loopback stub. They are what the handler now has to answer correctly, and
+  // what no fixture in the block above could show.
+  it("answers per resource for a 2-action x 3-resource call", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_rsr_split";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:role/newshape",
+      actions: ["s3:GetObject", "s3:ListAllMyBuckets"],
+      resources: ["arn:aws:s3:::probe-a/k", "arn:aws:s3:::probe-b/k", "arn:aws:s3:::probe-c/k"],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      summary: { allowed: number; denied: number; unknown: number; total: number };
+      results: {
+        action: string;
+        resource: string;
+        decision: string;
+        missingContextValues?: string[];
+        organizationsDecision?: string;
+      }[];
+    };
+    // 3 per-resource rows for s3:GetObject + 1 fallback row for
+    // s3:ListAllMyBuckets, which has no ARN format and so no breakdown.
+    assert.deepEqual(data.summary, { allowed: 2, denied: 2, unknown: 0, total: 4 });
+    for (const row of data.results) {
+      assert.doesNotMatch(row.resource, /\$\{/, `row for ${row.action} leaked IAM's ARN template`);
+    }
+    const gets = data.results.filter((row) => row.action === "s3:GetObject");
+    assert.deepEqual(gets.map((row) => row.resource).sort(), [
+      "arn:aws:s3:::probe-a/k",
+      "arn:aws:s3:::probe-b/k",
+      "arn:aws:s3:::probe-c/k",
+    ]);
+    // The bug in one assertion: the top-level EvalDecision for this action is
+    // explicitDeny, and before the fix that single verdict spoke for all three.
+    assert.deepEqual(
+      gets.map((row) => row.decision),
+      ["allowed", "explicitDeny", "implicitDeny"],
+    );
+    const probeC = gets.find((row) => row.resource === "arn:aws:s3:::probe-c/k");
+    assert.ok(probeC);
+    assert.deepEqual(probeC.missingContextValues, ["aws:RequestTag/Project"]);
+    // AllowedByOrganizations is true at the action level, so every row reads
+    // allowed -- the SCPs are not what denied probe-b.
+    for (const row of gets) assert.equal(row.organizationsDecision, "allowed");
+
+    const list = data.results.find((row) => row.action === "s3:ListAllMyBuckets");
+    assert.ok(list);
+    assert.equal(list.resource, "*");
+    assert.equal(list.decision, "allowed");
+  });
+
+  it("attributes an SCP deny to the requested ARN, with no statement to name", async () => {
+    // The shape behind the description's SCP caveat: explicitDeny with EMPTY
+    // MatchedStatements, and AllowedByOrganizations:false the only tell.
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_scp_deny";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:role/scpdeny",
+      actions: ["ec2:RunInstances"],
+      resources: ["arn:aws:ec2:eu-west-1:123456789012:instance/*"],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      results: { resource: string; decision: string; matchedStatementIds?: string[]; organizationsDecision?: string }[];
+    };
+    assert.equal(data.results.length, 1);
+    assert.equal(data.results[0].resource, "arn:aws:ec2:eu-west-1:123456789012:instance/*");
+    assert.equal(data.results[0].decision, "explicitDeny");
+    assert.equal(data.results[0].organizationsDecision, "denied");
+    assert.equal(data.results[0].matchedStatementIds, undefined, "an SCP deny never names its statement");
+  });
+
+  it("reads each row's own permissions-boundary verdict", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_rsr_boundary";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:role/boundary",
+      actions: ["s3:GetObject"],
+      resources: ["arn:aws:s3:::x-a/k", "arn:aws:s3:::x-b/k"],
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as { results: { resource: string; permissionsBoundaryDecision?: string }[] };
+    assert.deepEqual(
+      data.results.map((row) => [row.resource, row.permissionsBoundaryDecision]),
+      [
+        ["arn:aws:s3:::x-a/k", "allowed"],
+        ["arn:aws:s3:::x-b/k", "denied"],
+      ],
+    );
+  });
+
+  it("reports '*' for a resource-less call, even when AWS answers with an ARN template", async () => {
+    // Pins the handler's resourcesOmitted wiring. Without it the commonest call
+    // shape -- "can I do this at all?" -- would answer with IAM's ARN template.
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_nores_template";
+    const omitted = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:role/nores",
+      actions: ["s3:GetObject"],
+    } as never);
+    assert.equal(omitted.ok, true);
+    const omittedData = omitted.data as { results: { resource: string; missingContextValues?: string[] }[] };
+    assert.equal(omittedData.results[0].resource, "*");
+    // And the keys for a '*' simulation, which AWS reports at the top level,
+    // still reach the row.
+    assert.deepEqual(omittedData.results[0].missingContextValues, ["s3:ExistingObjectTag/env"]);
+
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_nores_template";
+    const named = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:role/nores",
+      actions: ["s3:GetObject"],
+      resources: ["arn:aws:s3:::probe-a/k"],
+    } as never);
+    assert.equal(named.ok, true);
+    const namedData = named.data as { results: { resource: string }[] };
+    // Documented: a call that DID name resources and got no per-resource
+    // breakdown keeps AWS's own EvalResourceName, template and all. It is the
+    // only resource word AWS gave, and inventing one would be worse.
+    assert.match(namedData.results[0].resource, /\$\{Partition\}/);
+  });
+});
+
 describe("aws_iam_simulate request bounds", () => {
   // Results are actions x resources and the whole request travels in ONE argv
   // entry (--cli-input-json). Without a cap, a plausible 300-ARN batch died as
@@ -503,7 +954,8 @@ describe("aws_iam_simulate response shape", () => {
   it("surfaces pagination state and drops the duplicated raw evaluationResults", async () => {
     // IsTruncated/Marker were read by nobody, so `summary.total` was reported
     // as if it were the complete answer. hasMore/marker now say otherwise on a
-    // truncated page; on a complete one they are false/null.
+    // resumed page that is itself truncated; on a complete one they are
+    // false/null, which is every first call (see the pagination describe below).
     // `evaluationResults` used to echo the entire raw array next to the flat
     // `results` derived from it -- double payload, no consumer.
     process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
@@ -524,17 +976,18 @@ describe("aws_iam_simulate response shape", () => {
   });
 });
 
-describe("aws_iam_simulate pagination -- truncated page and resume", () => {
-  // The complete-page half (hasMore:false / marker:null) is covered above. The
-  // TRUNCATED half had never executed: no scenario emitted IsTruncated or
-  // Marker, so neither the echoed cursor nor the resume input ran. Silent
-  // undercounting on a truncated authorization answer is the exact failure
-  // hasMore/marker were added to prevent.
-  it("reports hasMore:true and echoes IAM's Marker verbatim on a truncated page", async () => {
+describe("aws_iam_simulate pagination -- merged first call and resume", () => {
+  // The CLI follows IAM's IsTruncated/Marker itself, so a FIRST call is always
+  // complete and hasMore/marker are false/null. Supplying a Marker turns that
+  // auto-pagination off, and only then can a response carry either field. All
+  // three branches were verified by driving aws-cli/2.34.3 against a three-page
+  // local stub (iam-simulate planning, 2026-09-19); the fake models the CLI's
+  // output, not IAM's, because the fake's job is to stand in for the CLI.
+  it("reports a first call as complete -- the CLI already merged IAM's pages", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/jeff",
-      actions: ["s3:GetObject", "s3:DeleteObject"],
+      actions: ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
       resources: ["arn:aws:s3:::my-bucket/*"],
     } as never);
     assert.equal(r.ok, true);
@@ -544,21 +997,22 @@ describe("aws_iam_simulate pagination -- truncated page and resume", () => {
       summary: { allowed: number; denied: number; unknown: number; total: number };
       results: { action: string; decision: string }[];
     };
-    assert.equal(data.hasMore, true, "IsTruncated:true must surface as hasMore:true");
-    assert.equal(data.marker, "obs2-iam-marker-page2==", "the resume cursor must be echoed byte-for-byte");
-    // summary covers only THIS page -- the whole point of surfacing hasMore is
-    // that total:1 is not the complete answer to a 2-action request.
-    assert.deepEqual(data.summary, { allowed: 1, denied: 0, unknown: 0, total: 1 });
-    assert.equal(data.results.length, 1);
+    assert.equal(data.hasMore, false, "a first call cannot be truncated: the CLI followed every page");
+    assert.equal(data.marker, null, "and so carries no resume cursor");
+    // All three of the stub's pages, merged by the CLI before the handler saw a
+    // byte. The old fake emitted page 1 alone with IsTruncated:true here, so
+    // this suite used to assert a total the real CLI never produces.
+    assert.deepEqual(data.summary, { allowed: 2, denied: 1, unknown: 0, total: 3 });
+    assert.equal(data.results.length, 3);
   });
 
-  it("resumes from the marker and reports the final page as complete", async () => {
-    // Same scenario: the fake switches on a Marker in --cli-input-json, so both
-    // pages are driven through the real handler in one self-contained pair.
+  it("reports a resumed page that is itself truncated, and echoes IAM's Marker verbatim", async () => {
+    // Same scenario: the fake switches on the Marker in --cli-input-json, so
+    // every page is driven through the real handler in one self-contained set.
     process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/jeff",
-      actions: ["s3:GetObject", "s3:DeleteObject"],
+      actions: ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
       resources: ["arn:aws:s3:::my-bucket/*"],
       marker: "obs2-iam-marker-page2==",
     } as never);
@@ -566,12 +1020,35 @@ describe("aws_iam_simulate pagination -- truncated page and resume", () => {
     const data = r.data as {
       hasMore: boolean;
       marker: string | null;
+      summary: { allowed: number; denied: number; unknown: number; total: number };
       results: { action: string; decision: string }[];
     };
-    assert.equal(data.hasMore, false, "the last page must not claim more");
-    assert.equal(data.marker, null);
-    assert.equal(data.results[0].action, "s3:DeleteObject", "the resume call must return the SECOND page");
+    assert.equal(data.hasMore, true, "IsTruncated:true on a resumed page must surface as hasMore:true");
+    assert.equal(data.marker, "obs2-iam-marker-page3==", "the next cursor must be echoed byte-for-byte");
+    // summary covers only THIS page -- the whole point of surfacing hasMore is
+    // that total:1 is not the complete answer to a 3-action request.
+    assert.deepEqual(data.summary, { allowed: 0, denied: 1, unknown: 0, total: 1 });
+    assert.equal(data.results[0].action, "s3:DeleteObject", "the resume call must return the page it asked for");
     assert.equal(data.results[0].decision, "explicitDeny");
+  });
+
+  it("reports the last page as complete", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
+    const r = await tool.handler({
+      principalArn: "arn:aws:iam::123456789012:user/jeff",
+      actions: ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
+      resources: ["arn:aws:s3:::my-bucket/*"],
+      marker: "obs2-iam-marker-page3==",
+    } as never);
+    assert.equal(r.ok, true);
+    const data = r.data as {
+      hasMore: boolean;
+      marker: string | null;
+      results: { action: string; decision: string }[];
+    };
+    assert.equal(data.hasMore, false, "IsTruncated:false with no Marker is the end of the batch");
+    assert.equal(data.marker, null);
+    assert.equal(data.results[0].action, "s3:PutObject");
   });
 
   it("forwards `marker` to the CLI as PascalCase Marker inside --cli-input-json", async () => {
