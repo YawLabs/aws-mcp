@@ -1,21 +1,23 @@
 # @yawlabs/aws-mcp
 
-A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over hundreds of resource types, live docs lookup, server-side scripting for batched workflows.**
+A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over 1,300+ resource types, live docs lookup, server-side scripting for batched workflows.**
 
-It's an **alternative to AWS's official MCP server**, not a complement -- both call any AWS API, so running both just gives the model two redundant tools. Pick one. The honest comparison:
+It's an **alternative to AWS's official MCP server**, not a complement -- both reach any AWS API, so running both hands the model two overlapping ways to do the same thing. (AWS gives the same advice about its own older servers: its setup guide says to remove them "to avoid tool conflicts that can confuse AI agents".) Pick one. They overlap in coverage and differ in shape. The honest comparison:
 
-- **[AWS MCP Server](https://aws.amazon.com/blogs/aws/the-aws-mcp-server-is-now-generally-available/)** -- AWS's hosted server (`uvx mcp-proxy-for-aws`), GA since May 2026. Strong on AWS-team-curated skills, a server-side Python sandbox (`run_script`), days-fresh API coverage, per-tool CloudWatch metrics, and semantic Agent-SOP discovery. Since June 2026 it also takes a profile per request for cross-account / cross-role work in one session (that feature launched in `us-east-1` and `eu-central-1` only). Requires Python + `uv`, routes through a proxy that bridges IAM SigV4 to OAuth, and assumes your local credentials already work.
-- **`@yawlabs/aws-mcp`** (this server) -- Node/npm-only, runs locally. Wins on SSO re-login when `aws sso login`'s browser handoff drops (Windows especially), ergonomic CCAPI CRUD with dry-run diffs, multi-region fan-out, pre-flight IAM permission checks, and a JS scripting tool for batching (in-process, not a security sandbox -- see the tools table). Live AWS docs search + read is built in too -- parity with the official server's `search_documentation` / `read_documentation`, no second server needed either way.
+- **[AWS MCP Server](https://docs.aws.amazon.com/agent-toolkit/latest/userguide/getting-started-aws-mcp-server.html)** -- AWS's hosted server, GA since May 2026 and part of the Agent Toolkit for AWS. Strong on AWS-team-curated skills, a server-side Python sandbox (`run_script`) with days-fresh API coverage, a read-only serverless troubleshooting capability (Lambda `diagnose`, recent changes, X-Ray trace summaries), IAM condition keys that tell its calls apart from direct API calls, and per-tool CloudWatch metrics. As of September 2026, `run_script` is its only general-purpose way to call an AWS API -- the single-call `call_aws` tool has been removed -- so every call, even a one-off `describe`, is a Python script the model writes. The endpoint runs in `us-east-1` and `eu-central-1`. Two ways to connect:
+  - **OAuth** through AWS Sign-in (since July 2026): nothing to install -- your client opens a browser and connects straight to the endpoint. Each session is bound to one IAM role and refreshes for up to 12 hours, and the principal needs `signin:AuthorizeOAuth2Access` and `signin:CreateOAuth2Token`.
+  - **SigV4** through a local proxy run with `uv` (`uvx mcp-proxy-for-aws-cli@latest` in AWS's guide), signing with your AWS CLI credentials (CLI 2.32.0+). AWS recommends this path for terminal and IDE coding agents, and it is the only one that switches profiles per call, from an allowlist fixed when the proxy starts. Since AWS CLI 2.35.0, `aws configure agent-toolkit` writes a SigV4 entry (`uvx mcp-proxy-for-aws@latest`) into your agent's MCP config for you, under the key `aws-mcp`.
+- **`@yawlabs/aws-mcp`** (this server) -- installs from npm and runs locally on your own `aws` CLI and profiles: one `npx` line, no `uv`, no proxy, no hosted hop. Wins on SSO re-login when `aws sso login`'s browser handoff drops (Windows especially), one AWS operation per tool call (`aws_call` takes `service`, `operation` and `params`, so a host's approval prompt shows the operation itself, not a script), ergonomic CCAPI CRUD with dry-run diffs, multi-region and multi-account fan-out, pre-flight IAM permission checks, and a JS scripting tool for when you do want a batch (in-process, not a security sandbox -- see the tools table). Live AWS docs search + page read are built in too, so you don't need a second docs server either way -- they cover the same ground as the official server's `search_documentation` / `read_documentation`, without its topic routing or skills results.
 
-The one MCP that genuinely pairs with *either* choice is **[`awslabs/mcp`](https://github.com/awslabs/mcp)** -- AWS Labs' fleet of typed per-service servers (Lambda invoke, Bedrock retrieval, DynamoDB with type-marshalling). Those are per-service helpers, no overlap with a general AWS-API server.
+The MCPs that genuinely pair with *either* choice are the per-service servers in **[`awslabs/mcp`](https://github.com/awslabs/mcp)** that reach what a general AWS-API tool cannot -- Bedrock's agentic Knowledge Base retrieval is the clearest case (see [the companion config](#optional-companion-aws-labs-per-service-servers)). AWS now describes that repo as succeeded by the Agent Toolkit for AWS; it still works and takes contributions, but some of its servers are deprecated or superseded -- its general AWS API server among them -- so check a server's README before adding it.
 
 Five things this server tries to handle well:
 
-1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess -- on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + code, you click once, done. (`--no-browser` on its own is no longer enough -- AWS CLI 2.22.0 made the PKCE authorization-code flow the default, and it prints no short code -- so this server pairs it with `--use-device-code`, probing `aws --version` once to stay compatible with pre-2.22 CLIs.) There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow. AWS's hosted server bridges IAM-to-OAuth via a local proxy; it doesn't help with the `aws sso login` browser-handoff failure.
-2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface -- including services AWS adds tomorrow -- with no SDK bundling and no service-by-service tool sprawl. That is not aspirational: August 2026's arrivals (Lambda MicroVMs, Resilience Hub V2, ACM public ACME issuance, Agent Registry, Support AuthZ, EC2 account-level VPC encryption controls, the IPAM build-out) are reachable the moment your local `aws` CLI knows them -- no `@yawlabs/aws-mcp` upgrade required. `aws_paginate` handles paginated list/describe ops, `aws_multi_region` fans the same op out across N regions in parallel, and a JMESPath `query` parameter trims responses server-side (useful when a `describe-instances` result would otherwise blow past the 5 MB output cap).
-3. **Generic CRUD across services.** `aws_resource_*` (seven tools, including `aws_resource_diff` for dry-run previews) wraps AWS Cloud Control API, so the same lifecycle -- get / list / create / update / delete / status -- works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and a few hundred more. Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. CCAPI is control-plane only -- for data-plane ops (S3 reads, Lambda invokes, Bedrock inference, DynamoDB GetItem) drop down to `aws_call` or use a typed AWS Labs server.
+1. **SSO re-login.** When your token expires mid-session, `aws sso login` tries to open a browser from a subprocess -- on Windows (and sometimes elsewhere) that handoff drops silently. You end up context-switching to a terminal, running the command yourself, then coming back. The `--no-browser` device-code flow fixes this: the assistant surfaces a short URL + code, you click once, done. (`--no-browser` on its own is no longer enough -- AWS CLI 2.22.0 made the PKCE authorization-code flow the default, and it prints no short code -- so this server pairs it with `--use-device-code`, probing `aws --version` once to stay compatible with pre-2.22 CLIs.) There's also `aws_refresh_if_expiring_soon` for proactive top-ups before a long workflow. AWS's hosted server goes around the problem rather than through it. On its OAuth path your MCP client runs its own browser sign-in, and the tokens are bound to that client and that server, so nothing else on the machine benefits; on its SigV4 path, AWS's troubleshooting table tells SSO users to run `aws sso login` themselves and then restart the MCP client. Here the re-login refreshes the same `~/.aws/sso/cache` token the CLI, the SDKs and every other tool on the machine read.
+2. **Calling any AWS API.** `aws_call` proxies the `aws` CLI directly. One tool covers the full API surface -- including services AWS adds tomorrow -- with no SDK bundling and no service-by-service tool sprawl. That is not aspirational: September 2026's arrivals -- AWS Batch bulk `cancel-jobs` / `terminate-jobs` (CLI 2.36.44), the STS session-token size fields (2.36.45), Elastic Beanstalk cluster environments (2.36.47), "Tunnel" VPC endpoints (2.36.48) -- are reachable the moment your local `aws` CLI knows them, with no `@yawlabs/aws-mcp` upgrade. An older CLI rejects an operation it does not know before anything is sent, and the error says to upgrade. `aws_paginate` handles paginated list/describe ops, `aws_multi_region` fans the same op out across N regions in parallel, and a JMESPath `query` parameter trims responses server-side. Reach for them long before this server's 5 MB output cap: MCP hosts cut in much sooner -- Claude Code warns at 10,000 tokens and, by default, saves any result over 25,000 tokens to a file the model has to read back.
+3. **Generic CRUD across services.** `aws_resource_*` (seven tools, including `aws_resource_diff` for dry-run previews) wraps AWS Cloud Control API, so the same lifecycle -- get / list / create / update / delete / status -- works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and the rest of the 1,300 types on AWS's published list (not every type implements every verb). Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. AWS Labs deprecated its own Cloud Control API MCP server in March 2026, and [its migration guide](https://github.com/awslabs/mcp/blob/main/docs/migration-ccapi.md) lists no direct replacement for resource get / list / create / update / delete: the successor authors CloudFormation and CDK instead. CCAPI is control-plane only. On the data plane, DynamoDB `get-item` / `query` and Bedrock `converse` are ordinary operations `aws_call` handles (DynamoDB values stay in its typed JSON, `{"S": "..."}`), and Lambda invokes have their own tool, `aws_lambda_invoke`. Two kinds of operation are out of `aws_call`'s reach: those that write their response body to a positional outfile (S3 `get-object`, Bedrock `invoke-model`), and event-stream operations the CLI does not ship at all (Bedrock `converse-stream`, `invoke-agent`, agentic Knowledge Base retrieval).
 4. **Live AWS docs.** `aws_docs_search` queries the same backend that powers the docs.aws.amazon.com search box; `aws_docs_read` fetches a doc page and returns it as paginated markdown. Lets the agent discover new services and look up exact parameter names without a second MCP server installed.
-5. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet in a `node:vm` context with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, `aws.logsTail`, `aws.metricsQuery`, `aws.iamSimulate`, `aws.multiRegion`, `aws.assumeRole`, and `aws.docs.{search,read}` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same shape as AWS's `run_script` (Python, sandboxed server-side) -- yours is JS-native and runs locally.
+5. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet in a `node:vm` context with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, `aws.logsTail`, `aws.metricsQuery`, `aws.iamSimulate`, `aws.multiRegion`, `aws.assumeRole`, and `aws.docs.{search,read}` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same idea as AWS's `run_script` (Python, sandboxed server-side), which is now that server's only general-purpose way to call an AWS API; here it is the batching option -- JS-native, running locally -- with `aws_call` for single operations.
 
 [![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=AWS&command=npx&args=-y%2C%40yawlabs%2Faws-mcp&env=AWS_PROFILE%2CAWS_REGION&description=Call%20any%20AWS%20API%20from%20one%20server%20-%20CCAPI%20CRUD%2C%20multi-region%2C%20SSO%20re-login&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Faws-mcp)
 
@@ -23,7 +25,7 @@ One click adds this to your local Yaw MCP config so it's available in every Yaw 
 
 ## Optional companion: AWS Labs per-service servers
 
-For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval, DynamoDB with type-marshalling -- add the relevant [`awslabs/mcp`](https://github.com/awslabs/mcp) server alongside this one. Those are per-service helpers with no tool-name overlap, so they pair cleanly:
+For work a general AWS-API tool cannot do, add the relevant [`awslabs/mcp`](https://github.com/awslabs/mcp) server alongside this one. Bedrock's agentic Knowledge Base retrieval is the clearest case: it calls `AgenticRetrieveStream`, an event-stream operation the AWS CLI leaves out of its command table, so no CLI-based tool -- `aws_call` included -- can reach it. (Plain retrieval, `bedrock-agent-runtime retrieve`, is an ordinary `aws_call` operation.) These are Python servers run with `uvx`, and they have no tool-name overlap with this one, so they pair cleanly:
 
 ```json
 {
@@ -32,31 +34,37 @@ For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval
       "command": "npx",
       "args": ["-y", "@yawlabs/aws-mcp@latest"]
     },
-    "aws-lambda": {
+    "aws-bedrock-kb": {
       "command": "uvx",
-      "args": ["awslabs.lambda-mcp-server@latest"]
+      "args": ["awslabs.bedrock-kb-retrieval-mcp-server@latest"],
+      "env": { "AWS_PROFILE": "my-profile", "AWS_REGION": "us-east-1" }
     }
   }
 }
 ```
 
+Its agentic tool works on managed knowledge bases, and by default the server lists only knowledge bases tagged `mcp-multirag-kb=true`; its [README](https://github.com/awslabs/mcp/tree/main/src/bedrock-kb-retrieval-mcp-server) covers the tag and the IAM permissions. Skip the older `awslabs.lambda-mcp-server`: every release is yanked on PyPI, and Lambda invokes are built in here as `aws_lambda_invoke`.
+
 ## When to reach for this vs the other AWS MCPs
 
 | Need | Best fit |
 |------|----------|
-| One config entry covering most of AWS | **`@yawlabs/aws-mcp`** |
-| SSO re-login on Windows / broken browser handoff | **`@yawlabs/aws-mcp`** (`aws_login_start` device-code flow) |
-| Generic CRUD across hundreds of resource types | **`@yawlabs/aws-mcp`** (`aws_resource_*`) |
+| Node/npm-only install, running locally on your own `aws` CLI and profiles (no `uv`, no proxy) | **`@yawlabs/aws-mcp`** |
+| Nothing installed locally (remote server, browser sign-in) | **AWS MCP Server** (OAuth) |
+| SSO re-login on Windows / broken browser handoff, fixed for every tool on the machine | **`@yawlabs/aws-mcp`** (`aws_login_start` device-code flow) |
+| One AWS operation per tool call -- the approval prompt shows `service`, `operation` and `params`, not a script | **`@yawlabs/aws-mcp`** (`aws_call`) |
+| Generic CRUD across 1,300+ resource types | **`@yawlabs/aws-mcp`** (`aws_resource_*`) |
 | Dry-run an update before applying it | **`@yawlabs/aws-mcp`** (`aws_resource_diff`) |
 | Multi-region fan-out in one call | **`@yawlabs/aws-mcp`** (`aws_multi_region`) |
+| Same operation across many accounts in one call | **`@yawlabs/aws-mcp`** (`aws_multi_account`) |
 | Batch N tool calls into one round-trip (JS) | **`@yawlabs/aws-mcp`** (`aws_script`) |
 | Check IAM permissions before attempting an op | **`@yawlabs/aws-mcp`** (`aws_iam_simulate`) |
-| Node/npm-only install (no Python) | **`@yawlabs/aws-mcp`** |
-| Cross-account / cross-role in one session | **Either** -- both take a `profile` per call; this server adds `aws_assume_role` for STS role-chaining |
+| Cross-account / cross-role in one session | **Either** -- this server takes any configured `profile` on every call and adds `aws_assume_role` for STS role-chaining; AWS's takes one per call over SigV4 only, from profiles declared when its proxy starts (an OAuth session is one role) |
 | Sandboxed Python script execution server-side | **AWS MCP Server** (`run_script`) |
-| AWS-team-curated best-practice skills | **AWS MCP Server** (skills) |
-| Days-fresh API coverage via hosted endpoint | **AWS MCP Server** (`call_aws`) |
-| Typed per-service helpers (Lambda invoke, Bedrock KB, DynamoDB type-marshalling, ...) | **`awslabs/mcp`** (per-service servers) |
+| Days-fresh API coverage via hosted endpoint | **AWS MCP Server** (`run_script`) |
+| AWS-team-curated best-practice skills | **AWS MCP Server** (`retrieve_skill`) |
+| Guided Lambda troubleshooting (diagnose, recent changes, trace summary) | **AWS MCP Server** (serverless capability) |
+| Typed per-service helpers for what a CLI-based tool cannot reach (Bedrock agentic KB retrieval, ...) | **`awslabs/mcp`** (per-service servers) |
 
 `@yawlabs/aws-mcp` and AWS's official server are an either/or -- pick the one whose tradeoffs fit. `awslabs/mcp` per-service servers pair cleanly with whichever you pick.
 
@@ -64,8 +72,8 @@ For deep work in a single service -- typed `lambda_invoke`, Bedrock KB retrieval
 
 Credit where due -- two features here were shaped by the official AWS MCP Server:
 
-- **`aws_script`** mirrors the official server's `run_script`: a sandboxed scripting tool that collapses "list X, fetch Y for each, return Z" pipelines into one round-trip. Theirs is Python, sandboxed server-side; this one is JS-native and runs **in this server's own process** -- see the trust note in the tools table.
-- **`aws_docs_search` / `aws_docs_read`** were added to match the official server's `search_documentation` / `read_documentation`, so you don't need a separate docs MCP regardless of which server you pick.
+- **`aws_script`** mirrors the official server's `run_script`: a scripting tool that collapses "list X, fetch Y for each, return Z" pipelines into one round-trip. Theirs is Python, sandboxed server-side, and is now that server's only general-purpose API path; this one is JS-native, runs **in this server's own process** -- see the trust note in the tools table -- and sits beside `aws_call` rather than replacing it.
+- **`aws_docs_search` / `aws_docs_read`** were added so you don't need a separate docs MCP whichever server you pick. They cover the same ground as the official server's `search_documentation` / `read_documentation` -- live search and page reads -- without its topic routing or skills results.
 
 The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-region fan-out, IAM pre-flight checks -- is this server's own.
 
@@ -117,6 +125,8 @@ Add to your MCP client config (e.g. `.mcp.json`):
 }
 ```
 
+Keep the key `aws` (anything but `aws-mcp`). AWS's `aws configure agent-toolkit` wizard registers its hosted server under `aws-mcp`, and reports an existing `aws-mcp` entry as already configured without looking at what it runs.
+
 The `-y` flag is what gives you **auto-update on each session load**: every time your MCP client spawns the server, `npx` checks the registry for the latest `@yawlabs/aws-mcp` and downloads it if newer. The first launch in a fresh cache adds ~100-500 ms; subsequent launches use npm's cache (typical metadata-freshness window: 5 min) and add ~50 ms or less. Once the server is up, tool calls have zero auto-update overhead -- the check fires only on (re-)spawn. No separate install step is needed; `-y` covers both first-time install and ongoing updates.
 
 If you'd rather pin a specific version (no auto-update, but zero startup overhead), install globally and point the config at the installed binary:
@@ -162,7 +172,7 @@ Claude: (calls aws_login_complete with the sessionId)
 
 The SSO flow took one click. No "the browser didn't open, let me run it in a terminal" context switch.
 
-For a larger list where the response might exceed the 5 MB output cap, the assistant reaches for `aws_paginate`:
+For a larger list -- anything that would run past your MCP host's output limit, which is far smaller than this server's 5 MB cap -- the assistant reaches for `aws_paginate`:
 
 ```
 (calls aws_paginate with service='ec2', operation='describe-instances',
@@ -230,8 +240,12 @@ For multi-region reads:
 ## Requirements
 
 - Node.js 22+ (or [oam.js](https://oamjs.org) -- see [Runtime](#runtime))
-- AWS CLI v2 installed and on `PATH` (for `aws sso login`). 2.22.0+ recommended: that release added `--use-device-code`, which this server needs to keep the SSO short-code flow working. Older 2.x still works -- the server detects the version and adapts. AWS CLI **v1 is unsupported**; it entered maintenance mode on 2026-07-15 and reaches end of support on 2027-07-15.
-- An AWS profile configured for SSO / IAM Identity Center in `~/.aws/config`
+- AWS CLI v2 on `PATH`. Every tool that talks to AWS shells out to it (all but `aws_docs_*`, `aws_session_*` and `aws_list_profiles`), so the CLI you have installed decides which services, operations and parameters are reachable. No minimum version is enforced:
+  - **2.22.0+ recommended.** That release added `--use-device-code`, which this server needs to keep the SSO short-code flow working. Older 2.x still works -- the server detects the version and adapts.
+  - **Developed and tested against 2.34.3.** Anything newer than your CLI is rejected by the CLI itself before a request is sent: an unknown service or operation as an "invalid choice" (the error then says to upgrade), a new parameter as `Unknown parameter in input`. Upgrade with `aws update` (CLI 2.36.0+, for installs made with AWS's installer or install script), otherwise with [the installer](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) or your package manager.
+  - **Security, as of 2026-09:** CLI 2.35.3 or newer clears every published AWS CLI v2 advisory ([GHSA-747p-wmpv-9c78](https://github.com/aws/aws-cli/security/advisories/GHSA-747p-wmpv-9c78), [CVE-2026-13769](https://github.com/aws/aws-cli/security/advisories/GHSA-wfp6-f47h-hxc3), [CVE-2026-18654](https://github.com/aws/aws-cli/security/advisories/GHSA-hqvf-45jj-mccq)). None of the affected paths is reachable through this server: the four commands (`emr ssh/socks/put/get`, `codeartifact login`, `deploy register`, `iam create-virtual-mfa-device`) all register no `--cli-input-json`, which is the only way `aws_call` passes parameters, and the third advisory is about the opt-in `cli_history` database, which this server never enables. You do share that CLI install with everything else on the machine, though. Worth checking [the advisory list](https://github.com/aws/aws-cli/security/advisories) for newer ones: v2 ships as an installer, so a dependency scanner will never flag it.
+  - AWS CLI **v1 is unsupported**; it entered maintenance mode on 2026-07-15 and reaches end of support on 2027-07-15.
+- An AWS profile the CLI can already use -- see [Environment](#environment) for how the profile is chosen. SSO / IAM Identity Center profiles also get the device-code re-login tools.
 
 ## Runtime
 
