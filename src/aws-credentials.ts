@@ -47,6 +47,7 @@ import {
   writeSync,
 } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { assertPrivateMode } from "./private-file.js";
 
 interface AssumedCredentials {
   aws_access_key_id: string;
@@ -370,7 +371,9 @@ function writeAllSync(fd: number, text: string): void {
  * Read, modify, and atomically rewrite a credentials file. Creates the file
  * if it doesn't exist. The tmp file is opened 0o600 and fchmod-ed to 0o600
  * before a credential byte is written, and renameSync replaces the destination
- * inode, so the resulting credentials file is 0o600 on Unix.
+ * inode, so the resulting credentials file is 0o600 on Unix -- VERIFIED rather
+ * than assumed, because a filesystem may accept the fchmod and ignore it (see
+ * private-file.ts). On such a mount the write is refused instead.
  *
  * The fchmod is not redundant belt-and-braces: open's mode argument is honoured
  * by node (and only ever narrowed by umask, never widened) but DROPPED by oam,
@@ -408,6 +411,21 @@ export async function upsertProfile(
         // Before writeAllSync, so the credentials never exist on disk at a mode
         // open(2) set and oam ignored. See the note on this function.
         fchmodSync(fd, 0o600);
+        // And VERIFY it, before any credential byte exists. fchmod succeeding is
+        // not the same as the mode being set: on a filesystem with no inode mode
+        // it returns success and changes nothing, which would leave all three
+        // plaintext credentials in a world-readable AND world-writable file with
+        // nothing able to detect it. Reachable through a documented, advertised
+        // variable -- AWS_SHARED_CREDENTIALS_FILE pointed at a Windows-side
+        // ~/.aws so a WSL distro and its Windows host share one credentials file.
+        // Measured 0777 there against the real upsertProfile. Throwing here hands
+        // control to the catch below, which unlinks the tmp file, so nothing is
+        // stranded and nothing secret was written.
+        assertPrivateMode(
+          fd,
+          tmpPath,
+          "Point AWS_SHARED_CREDENTIALS_FILE at a path on a native filesystem, or unset it to use ~/.aws/credentials.",
+        );
         // Loops on the byte count: a partial write must not be renamed over
         // the real credentials file. See writeAllSync.
         writeAllSync(fd, nextText);

@@ -72,9 +72,17 @@ export const AWS_CLI_OVERRIDE_ENV = "AWS_MCP_AWS_CLI";
  * `PYTHONUTF8=1` has a disclosed side effect on CLIs before 2.25.0, which are
  * frozen with a PyInstaller that honors it for the whole interpreter rather than
  * for output alone: it also switches how the CLI DECODES ~/.aws/config,
- * ~/.aws/credentials and `file://` params, from the code page to UTF-8. A
- * code-page-encoded non-ASCII byte in one of those files starts failing every
- * call (and a UTF-8 byte undefined in the code page starts working). Accepted
+ * ~/.aws/credentials and `file://` params to UTF-8. A code-page-encoded
+ * non-ASCII byte in one of those files starts failing every call (and a UTF-8
+ * byte undefined in the code page starts working).
+ *
+ * That side effect is WINDOWS-ONLY, which the earlier wording ("from the code
+ * page to UTF-8") did not say: it describes a switch away from an ANSI code page,
+ * and POSIX has none. MEASURED on linux/arm64 with aws-cli 2.36.49 under
+ * LANG=C.UTF-8: a cp1252 byte in ~/.aws/config fails to parse identically with
+ * PYTHONUTF8 unset, =0 and =1, and under LC_ALL=C and LC_ALL=POSIX, while the
+ * same character as UTF-8 parses in all of them -- so on POSIX the pin changes
+ * nothing about config decoding and costs nothing. Accepted
  * and documented in the CHANGELOG and the README: the corruption above hits
  * every Windows install on any non-ASCII output, current editors save UTF-8,
  * this server's own aws_assume_role writes the credentials file as UTF-8, and

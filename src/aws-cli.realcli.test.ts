@@ -242,16 +242,41 @@ describe(`runAwsCall -- installed AWS CLI${detected?.ok ? ` (${detected.cli.vers
       Buffer.from([0xe9]), // 'é' in cp1252, and not valid UTF-8 on its own
       Buffer.from("\n", "ascii"),
     ]);
+    // The version is only half the discriminator; the other half is the
+    // platform's preferred encoding, and this case used to assert the Windows
+    // half as if it were universal.
+    //
+    // On Windows the ANSI code page IS cp1252, so a modern CLI -- which applies
+    // the pin to output alone -- decodes this file and the call succeeds.
+    //
+    // On POSIX the preferred encoding is UTF-8 whatever the pin says, so a lone
+    // 0xE9 never parses, on ANY CLI version. MEASURED on linux/arm64 with
+    // aws-cli 2.36.49 (Python 3.14.6, LANG=C.UTF-8) through `aws configure list`,
+    // which parses config and opens no connection: identical failure with
+    // PYTHONUTF8 unset, =0 and =1, and under LC_ALL=C, LC_ALL=POSIX and
+    // PYTHONCOERCECLOCALE=0, while the same character encoded as UTF-8 parses in
+    // every one of those. So the pin is NOT what breaks it there and this is not
+    // a cost this server introduced -- a cp1252 ~/.aws/config was unreadable on
+    // Linux before this server existed. Asserting the failure on POSIX keeps the
+    // trade pinned on Windows, where it is real, without a red suite off it.
     const modern = detected?.ok ? meetsMinVersion(detected.cli.version, [2, 25, 0]) : true;
+    const expectParses = process.platform === "win32" && modern;
     await withConfig(legacyConfig, async () => {
       const r = await callSts();
-      if (modern) {
+      if (expectParses) {
         assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
         return;
       }
-      // Measured on 2.22.0: exit 255, `Unable to parse config file: <path>`,
-      // with the same file read fine when PYTHONUTF8 is unset.
-      assert.equal(r.ok, false, "a pre-2.25.0 CLI reads config as UTF-8 under PYTHONUTF8=1");
+      // Measured on 2.22.0 on Windows: exit 255, `Unable to parse config file:
+      // <path>`, with the same file read fine when PYTHONUTF8 is unset. On POSIX
+      // the same failure, for the platform's own reason rather than the pin's.
+      assert.equal(
+        r.ok,
+        false,
+        process.platform === "win32"
+          ? "a pre-2.25.0 CLI reads config as UTF-8 under PYTHONUTF8=1"
+          : "a cp1252 byte in ~/.aws/config cannot parse where the preferred encoding is UTF-8",
+      );
       if (r.ok) return;
       assert.equal(r.kind, "nonzero_exit");
       assert.match(r.error, /Unable to parse config file/i);

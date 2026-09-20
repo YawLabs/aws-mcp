@@ -22,7 +22,14 @@ import { dirname, join } from "node:path";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
+import { modeHonouringTmpBase } from "../testing/tmpdir-modes.js";
 import { invokeChildEnv, invokeTimeouts, lambdaTools } from "./lambda.js";
+
+// Not os.tmpdir(): these cases write files whose 0600 is enforced, and on a
+// filesystem that ignores chmod the product now refuses outright (see
+// private-file.ts). A base that honours modes keeps them exercising the behaviour
+// they are about on a machine whose TMPDIR points into a Windows drive.
+const PRIVATE_TMP_BASE = modeHonouringTmpBase() ?? tmpdir();
 
 const tool = lambdaTools.find((t) => t.name === "aws_lambda_invoke");
 if (!tool) throw new Error("lambdaTools missing aws_lambda_invoke");
@@ -41,7 +48,7 @@ const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 // re-reads TEMP/TMP (win32) / TMPDIR (POSIX) on every call, so pointing them at
 // a private root makes both the handler's dirs and the scan below process-local.
 // The root's own prefix deliberately does NOT start with "aws-mcp-lambda-".
-const TMP_ROOT = mkdtempSync(join(tmpdir(), "aws-mcp-lambdatests-"));
+const TMP_ROOT = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-lambdatests-"));
 const TMP_SNAPSHOT = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
 process.env.TEMP = TMP_ROOT;
 process.env.TMP = TMP_ROOT;

@@ -23,13 +23,14 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, fchmodSync, fstatSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { awsChildEnv, isCliSafeFilePath, resolveAwsCommand } from "./aws-spawn.js";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { KILL_ESCALATION_MS, killProc, procHasExited } from "./kill-proc.js";
+import { assertPrivateMode } from "./private-file.js";
 import {
   getProfile,
   getRegion,
@@ -783,16 +784,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           // POSIX only: on Windows chmod moves nothing but the read-only bit and
           // the mode reads back 0666 whatever we ask for (measured, win32/arm64) --
           // privacy there rests on the per-user %TEMP% ACL, as above.
-          if (process.platform !== "win32") {
-            const mode = fstatSync(fd).mode & 0o777;
-            if (mode !== 0o600) {
-              throw new Error(
-                `the temp directory does not honour file modes, so the 0600 this file's privacy rests on is not in effect (it is 0${mode.toString(8)}). ` +
-                  "A Windows drive mounted into WSL reports 0777 for every file and ignores chmod without failing. " +
-                  "Point TMPDIR, TMP or TEMP at a native filesystem such as /tmp",
-              );
-            }
-          }
+          assertPrivateMode(fd, paramsFile, "Point TMPDIR, TMP or TEMP at a native filesystem such as /tmp.");
           writeSync(fd, toAsciiJson(json));
         } finally {
           closeSync(fd);

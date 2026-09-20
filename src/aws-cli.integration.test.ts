@@ -5,61 +5,17 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import {
-  chmodSync,
-  closeSync,
-  copyFileSync,
-  existsSync,
-  fchmodSync,
-  fstatSync,
-  linkSync,
-  mkdtempSync,
-  openSync,
-  readFileSync,
-  rmSync,
-} from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { INLINE_CLI_INPUT_JSON_MAX_CHARS, runAwsCall } from "./aws-cli.js";
 import { _resetSession, setProfile, setRegion } from "./session.js";
+import { tmpdirIgnoresModes } from "./testing/tmpdir-modes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "testing", "fake-aws.js");
-
-/**
- * Does os.tmpdir() sit on a filesystem that accepts a chmod and ignores it?
- *
- * WSL's DrvFs does: a Windows drive under /mnt reports 0777 for every file, and
- * fchmodSync succeeds while changing nothing (measured on linux/arm64, Node
- * 22.23.2, TMPDIR under /mnt/c). aws-cli.ts refuses to write the params file
- * there rather than leave a world-readable, world-WRITABLE payload, so the tests
- * that exercise that transport have to know which behaviour to expect.
- *
- * Always false on Windows: chmod moves nothing but the read-only bit there and
- * the mode reads back 0666 whatever is asked for, so the product does not check
- * it and neither does this -- privacy on Windows rests on the per-user %TEMP% ACL.
- */
-function tmpdirIgnoresModes(): boolean {
-  if (process.platform === "win32") return false;
-  const dir = mkdtempSync(join(tmpdir(), "aws-mcp-modeprobe-"));
-  try {
-    const fd = openSync(join(dir, "probe"), "wx", 0o600);
-    try {
-      fchmodSync(fd, 0o600);
-      return (fstatSync(fd).mode & 0o777) !== 0o600;
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    // A tmpdir we cannot even probe is not the case this is guarding; let the
-    // test proceed and fail on its own terms.
-    return false;
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
 
 function fakeOpts(scenario: string, overrides: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}) {
   return {
