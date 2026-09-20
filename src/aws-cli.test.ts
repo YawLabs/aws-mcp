@@ -848,3 +848,40 @@ describe("truncateForErrorMsg boundary", () => {
     assert.match(result, /\[truncated; 1 chars omitted\]/);
   });
 });
+
+describe("the aws child's spawn options", () => {
+  // bin/aws-mcp.mjs passes windowsHide on its version probe and both launch
+  // paths; the spawns that run the actual AWS CLI did not, so libuv never added
+  // CREATE_NO_WINDOW for them. Only visible when the server itself has no console
+  // -- a GUI-subsystem MCP host launching it detached -- which is why this is
+  // pinned by asserting the option rather than by looking for a window.
+  it("passes windowsHide, matching the launcher", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const cp = childProcess as { spawn: typeof childProcess.spawn };
+    const original = cp.spawn;
+    cp.spawn = ((_command: string, _args: string[], opts: Record<string, unknown>) => {
+      seen.push(opts);
+      const proc = new EventEmitter() as EventEmitter & Record<string, unknown>;
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.exitCode = 0;
+      proc.signalCode = null;
+      proc.kill = () => true;
+      setImmediate(() => {
+        proc.stdout && (proc.stdout as EventEmitter).emit("data", Buffer.from("{}", "utf8"));
+        proc.emit("exit", 0, null);
+        proc.emit("close", 0, null);
+      });
+      return proc;
+    }) as unknown as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    try {
+      await runAwsCall({ service: "s3api", operation: "list-buckets", timeoutMs: 5000, command: "aws" });
+    } finally {
+      cp.spawn = original;
+      syncBuiltinESMExports();
+    }
+    assert.equal(seen.length, 1, "exactly one child should have been spawned");
+    assert.equal(seen[0].windowsHide, true, `spawn options were ${JSON.stringify(Object.keys(seen[0]))}`);
+  });
+});

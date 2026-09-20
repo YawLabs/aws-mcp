@@ -708,6 +708,7 @@ export const lambdaTools: readonly Tool[] = [
           ok: true,
           data: {
             command: result.command,
+            commandArgv: result.commandArgv,
             statusCode: meta.StatusCode,
             functionError: meta.FunctionError,
             executedVersion: meta.ExecutedVersion,

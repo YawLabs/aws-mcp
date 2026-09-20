@@ -250,12 +250,40 @@ try {
 // Exit with biome's own status so `npm run lint` stays a usable gate, and so a
 // non-zero result is a real finding rather than this wrapper's opinion.
 //
-// `shell` is enabled ONLY for a .cmd/.bat target: spawning one with shell:false
-// throws EINVAL on Node 22 (the `.bin/biome.cmd` shim fallback, and any
-// AWS_MCP_BIOME_BIN pointing at a batch file). Everything else -- including
-// every normal .exe path -- stays shell-free so arguments are passed verbatim.
-const needsShell = /\.(cmd|bat)$/i.test(binary);
-const run = spawnSync(binary, process.argv.slice(2), { stdio: "inherit", shell: needsShell, timeout: LINT_TIMEOUT_MS });
+// A .cmd/.bat target cannot be spawned with shell:false -- Node 22 throws EINVAL
+// (the `.bin/biome.cmd` shim fallback, and any AWS_MCP_BIOME_BIN pointing at a
+// batch file). `shell: true` was the old answer, and it carries the same defect
+// npmCliPath() documents above, one level further out: Node builds
+// `cmd.exe /d /s /c "<command> <args>"` WITHOUT quoting <command>, so cmd splits
+// the binary path at a space. Measured with a fakebiome.cmd under a directory
+// named `lint space dir`: shell:true -> exit 1, "'C:\...\lint' is not
+// recognized as an internal or external command"; shell:false -> EINVAL, which is
+// why the shell was turned on in the first place.
+//
+// So invoke the command processor directly with the shell OFF, and hand it a
+// command line built here. Two details are load-bearing, both measured:
+//   * windowsVerbatimArguments, because without it Node applies its own quoting
+//     to the token and cmd receives the escaped form -- measured:
+//     '\"C:\...fakebiome.cmd\"' is not recognized.
+//   * the WHOLE command line wrapped in one more pair of quotes, which is cmd's
+//     documented /c idiom when the command itself is quoted.
+// ComSpec rather than a literal cmd.exe because that is what the OS says the
+// processor is. Every normal .exe path was already shell-free and is untouched.
+const isBatch = /\.(cmd|bat)$/i.test(binary);
+const forwarded = process.argv.slice(2);
+// Only a space needs it here (biome's own flags carry none), and quoting
+// unconditionally would change arguments that are currently passed verbatim.
+const quoteForCmd = (value) => (/\s/.test(value) ? "\"" + value + "\"" : value);
+let spawnTarget = binary;
+let spawnArgs = forwarded;
+let spawnOpts = { stdio: 'inherit', shell: false, timeout: LINT_TIMEOUT_MS };
+if (isBatch) {
+  const inner = [quoteForCmd(binary), ...forwarded.map(quoteForCmd)].join(' ');
+  spawnTarget = process.env.ComSpec || 'cmd.exe';
+  spawnArgs = ['/d', '/s', '/c', "\"" + inner + "\""];
+  spawnOpts = { ...spawnOpts, windowsVerbatimArguments: true };
+}
+const run = spawnSync(spawnTarget, spawnArgs, spawnOpts);
 // Checked BEFORE the generic error and crash branches: a timeout kill sets
 // `signal` to SIGTERM, which the crash check below would otherwise report as
 // the known native-binary crash -- the wrong diagnosis entirely.

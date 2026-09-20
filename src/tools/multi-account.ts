@@ -123,9 +123,9 @@ export interface AccountResult extends CappableResult {
  *
  * Defense in depth on top of a structural argument, not a substitute for it: the
  * credentials go to the child through its ENVIRONMENT, never argv, so
- * runAwsCall's `command` (built from argv, with --cli-input-json already
- * redacted) cannot contain them, and the AWS CLI does not print its resolved
- * credentials to stderr. Both of those are properties of code that can change.
+ * runAwsCall's `command` and `commandArgv` (both built from argv, with
+ * --cli-input-json already redacted) cannot contain them, and the AWS CLI does
+ * not print its resolved credentials to stderr. Both of those are properties of code that can change.
  * Scrubbing the two strings this tool actually returns makes the invariant
  * enforced rather than argued, and gives the test something to assert against a
  * subprocess that deliberately tries to leak.
@@ -451,6 +451,15 @@ export const multiAccountTools: readonly Tool[] = [
               accountId,
               ok: false,
               ...(r.command !== undefined ? { command: redactSecrets(r.command, creds) } : {}),
+              // Scrubbed element by element, on the same defense-in-depth footing
+              // as the string: the credentials reach the child through its
+              // environment and never argv, so neither form can carry them, but
+              // enforcing it on both keeps the invariant enforced rather than
+              // argued -- and an unscrubbed argv would be a way around the string
+              // scrub that a test asserting only `command` would not catch.
+              ...(r.commandArgv !== undefined
+                ? { commandArgv: r.commandArgv.map((entry) => redactSecrets(entry, creds)) }
+                : {}),
               error: redactSecrets(message, creds),
               errorKind: r.kind,
             };
@@ -461,7 +470,13 @@ export const multiAccountTools: readonly Tool[] = [
           // that MINTS credentials (iam create-access-key, sts
           // get-session-token) returns the caller's own requested output, which
           // is not this tool's to scrub.
-          return { accountId, ok: true, command: redactSecrets(r.command, creds), data: r.data };
+          return {
+            accountId,
+            ok: true,
+            command: redactSecrets(r.command, creds),
+            commandArgv: r.commandArgv.map((entry) => redactSecrets(entry, creds)),
+            data: r.data,
+          };
         } catch (err) {
           return {
             accountId,

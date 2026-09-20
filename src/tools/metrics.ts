@@ -544,6 +544,7 @@ export const metricsTools: readonly Tool[] = [
         ok: true,
         data: {
           command: result.command,
+          commandArgv: result.commandArgv,
           profile: effectiveProfile,
           region: effectiveRegion,
           startTime: startDate.toISOString(),

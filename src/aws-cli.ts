@@ -399,6 +399,13 @@ interface AwsCallSuccess {
    */
   data: unknown;
   command: string;
+  /**
+   * The exact argv behind `command`, unquoted and redacted identically: entry 0
+   * is the binary as displayed, the rest are its arguments one per entry. Present
+   * whenever `command` is. Prefer this over parsing `command`, which is a
+   * rendering for a reader and is only correct in a POSIX shell or PowerShell.
+   */
+  commandArgv: string[];
   rawStdout: string;
 }
 
@@ -423,6 +430,10 @@ export interface AwsCallFailure {
    */
   suggestion?: string;
   command?: string;
+  /** The exact argv behind `command`, unquoted and redacted identically. Present
+   *  exactly when `command` is -- both are absent on a failure that never got as
+   *  far as building an argv (bad input, a refused CLI path). */
+  commandArgv?: string[];
   exitCode?: number | null;
   rawStdout?: string;
   rawStderr?: string;
@@ -818,19 +829,30 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   const displayArgs =
     paramsDisplay === null ? args : args.map((value, i) => (i === paramsDisplay.index ? paramsDisplay.inline : value));
 
-  // Display string for logging / the MCP response, shell-quoted per entry so
-  // it survives a paste into a POSIX shell. The real invocation still uses the
-  // argv array above (no shell involved), so the quoting here is purely about
-  // what the caller SEES -- and the caller is a model that will paste it.
+  // What the caller SEES, in two forms, and the argv is the source of truth.
+  //
+  // `commandArgv` is the exact tokens, unquoted and already redacted: one array
+  // entry per argv entry, which is what the real invocation passes (no shell is
+  // involved at any point). It exists because no single string can be correct in
+  // every shell. `command` is a convenience rendering of it for a human or a
+  // model to read, shell-quoted per entry -- correct in a POSIX shell and, on
+  // Windows, in PowerShell; NOT correct in cmd.exe, where `&`, `|` and a
+  // newline are live whatever the quoting (measured 0 of 24 probes), nor in Git
+  // Bash on Windows, where the doubled-quote form reads as concatenation. A
+  // consumer that needs to run this anywhere else re-quotes `commandArgv` for
+  // its own shell and never has to unpick the string form.
+  //
+  // The string is derived FROM the array rather than built beside it, so the two
+  // can never disagree and the redaction cannot apply to one and not the other.
+  //
   // `resolution.display`, not `command`: for a resolved or overridden binary
   // that is the literal `aws`, because the absolute path is noise to the reader
   // (and, for the override, the operator's own file layout). A test seam's
   // command still shows itself.
+  const displayArgv = [resolution.display, ...redactDisplayArgs(displayArgs)];
   // Arrow, not a bare function reference: .map passes the index as the second
   // argument, which shellQuoteArg would now read as the platform.
-  const displayCommand = [resolution.display, ...redactDisplayArgs(displayArgs)]
-    .map((entry) => shellQuoteArg(entry))
-    .join(" ");
+  const displayCommand = displayArgv.map((entry) => shellQuoteArg(entry)).join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;
@@ -855,6 +877,15 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         // REPLACE-the-parent semantics AwsCallOptions.env documents are
         // unchanged for everything else in it.
         env: awsChildEnv(opts.env ?? process.env),
+        // Matches every spawn in bin/aws-mcp.mjs, which passes it on its version
+        // probe and both launch paths. libuv only adds CREATE_NO_WINDOW when asked,
+        // so without it a console window can flash for each aws child -- bounded
+        // honestly: a console app inherits its parent's console, so this is visible
+        // only when the server itself has none, which is a GUI-subsystem MCP host
+        // launching it detached. ASSERTED, not measured: discriminating it needs a
+        // console-less parent plus a window probe, and MainWindowHandle is
+        // unreliable under ConPTY here. Inert on POSIX.
+        windowsHide: true,
       });
     } catch (err) {
       removeInputDir();
@@ -874,6 +905,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
             `characters and Linux caps one argument at 131,072. Params over ${INLINE_CLI_INPUT_JSON_MAX_CHARS} ` +
             `characters already travel in a temp file -- shrink or split this value.`,
           command: displayCommand,
+          commandArgv: displayArgv,
         });
         return;
       }
@@ -884,6 +916,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           code === "ENOENT" ? " Is the AWS CLI installed and on PATH?" : ""
         }`,
         command: displayCommand,
+        commandArgv: displayArgv,
       });
       return;
     }
@@ -948,6 +981,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           kind: "timeout",
           error: `aws CLI timed out after ${Math.round(timeoutMs / 1000)}s. Raise timeoutMs or narrow the query (filters, --max-items).`,
           command: displayCommand,
+          commandArgv: displayArgv,
           rawStdout: stdoutBuf,
           rawStderr: stderrBuf,
         });
@@ -959,6 +993,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           kind: "output_too_large",
           error: `aws CLI stdout exceeded ${MAX_OUTPUT_BYTES / 1024 / 1024} MB. Narrow the query or paginate (--max-items + --starting-token).`,
           command: displayCommand,
+          commandArgv: displayArgv,
           rawStderr: stderrBuf,
         });
         return;
@@ -1012,6 +1047,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           ...(suggestion !== undefined ? { suggestion } : {}),
           error: errorMsg,
           command: displayCommand,
+          commandArgv: displayArgv,
           exitCode: code,
           rawStdout: stdoutBuf,
           rawStderr: stderrBuf,
@@ -1022,11 +1058,17 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       if (outputFormat === "json") {
         const trimmed = stdoutBuf.trim();
         if (!trimmed) {
-          settle({ ok: true, data: null, command: displayCommand, rawStdout: stdoutBuf });
+          settle({ ok: true, data: null, command: displayCommand, commandArgv: displayArgv, rawStdout: stdoutBuf });
           return;
         }
         try {
-          settle({ ok: true, data: JSON.parse(trimmed), command: displayCommand, rawStdout: stdoutBuf });
+          settle({
+            ok: true,
+            data: JSON.parse(trimmed),
+            command: displayCommand,
+            commandArgv: displayArgv,
+            rawStdout: stdoutBuf,
+          });
         } catch (err) {
           // Two very different situations reach this catch, and collapsing them
           // into one ok:true was hiding the bad one.
@@ -1049,16 +1091,17 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
               kind: "malformed_json",
               error: `aws CLI exited 0 but its stdout opens as JSON and failed to parse: ${detail}. The payload is most likely truncated. Retry, or narrow the response with --query / pagination. Raw stdout is preserved in rawStdout.`,
               command: displayCommand,
+              commandArgv: displayArgv,
               exitCode: code,
               rawStdout: stdoutBuf,
               rawStderr: stderrBuf,
             });
             return;
           }
-          settle({ ok: true, data: trimmed, command: displayCommand, rawStdout: stdoutBuf });
+          settle({ ok: true, data: trimmed, command: displayCommand, commandArgv: displayArgv, rawStdout: stdoutBuf });
         }
       } else {
-        settle({ ok: true, data: stdoutBuf, command: displayCommand, rawStdout: stdoutBuf });
+        settle({ ok: true, data: stdoutBuf, command: displayCommand, commandArgv: displayArgv, rawStdout: stdoutBuf });
       }
     };
 
@@ -1158,6 +1201,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         kind: "spawn_failure",
         error: `Failed to run '${command}': ${err.message}.${enoent ? " Is the AWS CLI installed and on PATH?" : ""}`,
         command: displayCommand,
+        commandArgv: displayArgv,
       });
     });
 

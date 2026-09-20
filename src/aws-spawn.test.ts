@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, beforeEach, describe, it } from "node:test";
 import {
+  _resetMiscasedOverrideWarnings,
   AWS_CLI_OVERRIDE_ENV,
   awsChildEnv,
   envLookup,
@@ -424,11 +425,14 @@ describe("resolveAwsCommand -- AWS_MCP_AWS_CLI", () => {
       }),
     );
     assert.match(missing.error, /points at 'C:\\custom\\aws\.exe', which does not exist or is not a file/);
+    // A POSIX name deliberately: a linux override ending in .exe is refused
+    // earlier now, for being a Windows binary, and this case is about a path that
+    // exists but is not a regular file.
     const directory = failed(
       resolveAwsCommand({
-        env: { [AWS_CLI_OVERRIDE_ENV]: "/opt/aws.exe" },
+        env: { [AWS_CLI_OVERRIDE_ENV]: "/opt/aws" },
         platform: "linux",
-        probe: probeFor({ "/opt/aws.exe": { isFile: false } }),
+        probe: probeFor({ "/opt/aws": { isFile: false } }),
       }),
     );
     assert.match(directory.error, /does not exist or is not a file/);
@@ -569,5 +573,158 @@ describe("isCliSafeFilePath", () => {
     // Only a LEADING tilde expands, so a short name such as JEFF~1 is fine.
     assert.equal(isCliSafeFilePath("C:\\Users\\JEFF~1\\AppData\\Local\\Temp\\aws-mcp-input-AbC123"), true);
     assert.equal(isCliSafeFilePath("/tmp/aws-mcp-input-AbC123"), true);
+  });
+});
+
+describe("a mis-cased AWS_MCP_AWS_CLI on a case-sensitive platform", () => {
+  // envLookup case-folds only on win32, which is right -- it is what spawn does.
+  // The cost is that a misspelling on POSIX is indistinguishable from "unset", so
+  // the PATH walk answers and the server runs a different binary than the operator
+  // configured, with no diagnostic. This variable picks which binary handles the
+  // user's credentials, so a near-miss says so.
+
+  beforeEach(() => {
+    _resetMiscasedOverrideWarnings();
+  });
+
+  const realAws = "/usr/local/bin/aws";
+  const pathAws = "/usr/bin/aws";
+  const probe: PathProbe = (p) => (p === realAws || p === pathAws ? { isFile: true, executable: true } : null);
+
+  it("still resolves from PATH -- the variable really is unset as far as the platform is concerned", () => {
+    const warnings: string[] = [];
+    const restore = console.warn;
+    console.warn = (msg: unknown) => void warnings.push(String(msg));
+    try {
+      const r = resolveAwsCommand({
+        env: { aws_mcp_aws_cli: realAws, PATH: "/usr/bin" },
+        platform: "linux",
+        probe,
+      });
+      assert.equal(r.ok, true);
+      if (!r.ok) return;
+      // Unchanged behaviour: the walk answers. The point is that it is no longer SILENT.
+      assert.equal(r.source, "path");
+      assert.equal(r.command, pathAws);
+    } finally {
+      console.warn = restore;
+    }
+    assert.equal(warnings.length, 1, warnings.join(" | "));
+    assert.match(warnings[0], /aws_mcp_aws_cli/, "the message must show the spelling that was found");
+    assert.match(warnings[0], /AWS_MCP_AWS_CLI/, "and the canonical one");
+    assert.match(warnings[0], /case-sensitive/);
+    assert.match(warnings[0], /different aws than you configured/);
+  });
+
+  it("warns once per spelling, not once per call", () => {
+    const warnings: string[] = [];
+    const restore = console.warn;
+    console.warn = (msg: unknown) => void warnings.push(String(msg));
+    try {
+      for (let i = 0; i < 4; i++) {
+        resolveAwsCommand({ env: { Aws_Mcp_Aws_Cli: realAws, PATH: "/usr/bin" }, platform: "linux", probe });
+      }
+    } finally {
+      console.warn = restore;
+    }
+    assert.equal(warnings.length, 1, `every aws call must not print this: ${warnings.length} lines`);
+  });
+
+  it("says nothing on win32, where the lookup finds it anyway", () => {
+    const warnings: string[] = [];
+    const restore = console.warn;
+    console.warn = (msg: unknown) => void warnings.push(String(msg));
+    let r: ReturnType<typeof resolveAwsCommand>;
+    try {
+      r = resolveAwsCommand({
+        env: { aws_mcp_aws_cli: "C:/aws/aws.exe" },
+        platform: "win32",
+        probe: (p) => (p === "C:/aws/aws.exe" ? { isFile: true, executable: true } : null),
+      });
+    } finally {
+      console.warn = restore;
+    }
+    assert.equal(warnings.length, 0, warnings.join(" | "));
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(r.source, "override", "win32 case-folds, so the override is honoured");
+  });
+
+  it("says nothing when the name is spelled correctly, or when no near-miss exists", () => {
+    const warnings: string[] = [];
+    const restore = console.warn;
+    console.warn = (msg: unknown) => void warnings.push(String(msg));
+    try {
+      resolveAwsCommand({ env: { AWS_MCP_AWS_CLI: realAws }, platform: "linux", probe });
+      resolveAwsCommand({ env: { PATH: "/usr/bin", AWS_PROFILE: "x" }, platform: "linux", probe });
+    } finally {
+      console.warn = restore;
+    }
+    assert.equal(warnings.length, 0, warnings.join(" | "));
+  });
+
+  it("ignores an empty near-miss, which carries no intent", () => {
+    const warnings: string[] = [];
+    const restore = console.warn;
+    console.warn = (msg: unknown) => void warnings.push(String(msg));
+    try {
+      resolveAwsCommand({ env: { aws_mcp_aws_cli: "   ", PATH: "/usr/bin" }, platform: "linux", probe });
+    } finally {
+      console.warn = restore;
+    }
+    assert.equal(warnings.length, 0, warnings.join(" | "));
+  });
+});
+
+describe("a Windows AWS CLI named from a POSIX process (the WSL trap)", () => {
+  // Under WSL, /mnt/c/.../aws.exe passes every other check -- isAbsoluteFor
+  // accepts it, the win32-only .exe rule is skipped, and DrvFs reports 0777 so
+  // X_OK is granted -- and interop really does execute it. It then resolves the
+  // POSIX paths this server passes against the current drive, so the params temp
+  // file and aws_lambda_invoke's outfile break while ordinary calls appear fine.
+  const winCli = "/mnt/c/Program Files/Amazon/AWSCLIV2/aws.exe";
+
+  it("is refused, naming both the binary and the platform", () => {
+    for (const platform of ["linux", "darwin"] as const) {
+      const r = resolveAwsCommand({
+        env: { [AWS_CLI_OVERRIDE_ENV]: winCli },
+        platform,
+        // Deliberately a probe that WOULD accept it: this must be refused on the
+        // name, before any filesystem question, because under WSL the answer to
+        // the filesystem question is yes.
+        probe: () => ({ isFile: true, executable: true }),
+      });
+      assert.equal(r.ok, false, `${platform} must refuse a Windows CLI`);
+      if (r.ok) continue;
+      assert.match(r.error, /Windows executable/);
+      assert.match(r.error, new RegExp(platform), "the message must name the platform it is running on");
+      assert.match(r.error, /current drive/, "and say why it breaks, not just that it is wrong");
+      assert.match(r.error, /--cli-input-json|outfile/, "and which transports break");
+    }
+  });
+
+  it("is case-insensitive about the extension", () => {
+    const r = resolveAwsCommand({
+      env: { [AWS_CLI_OVERRIDE_ENV]: "/mnt/c/aws/AWS.EXE" },
+      platform: "linux",
+      probe: () => ({ isFile: true, executable: true }),
+    });
+    assert.equal(r.ok, false);
+  });
+
+  it("still accepts the POSIX build, and still accepts .exe ON win32", () => {
+    const posix = resolveAwsCommand({
+      env: { [AWS_CLI_OVERRIDE_ENV]: "/home/u/bin/aws" },
+      platform: "linux",
+      probe: (p) => (p === "/home/u/bin/aws" ? { isFile: true, executable: true } : null),
+    });
+    assert.equal(posix.ok, true, posix.ok ? "" : posix.error);
+
+    const win = resolveAwsCommand({
+      env: { [AWS_CLI_OVERRIDE_ENV]: "C:/Program Files/Amazon/AWSCLIV2/aws.exe" },
+      platform: "win32",
+      probe: () => ({ isFile: true, executable: true }),
+    });
+    assert.equal(win.ok, true, win.ok ? "" : win.error);
   });
 });

@@ -66,6 +66,8 @@ export interface CappableResult {
   ok: boolean;
   data?: unknown;
   command?: string;
+  /** The exact argv behind `command`, unquoted and redacted identically. */
+  commandArgv?: string[];
   error?: string;
   errorKind?: string;
   /**
@@ -335,6 +337,7 @@ export const multiRegionTools: readonly Tool[] = [
               region,
               ok: false,
               command: r.command,
+              commandArgv: r.commandArgv,
               error: r.error,
               errorKind: r.kind,
             };

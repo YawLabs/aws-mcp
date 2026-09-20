@@ -299,6 +299,8 @@ interface PollResult {
   ok: boolean;
   progressEvent: Record<string, unknown> | null;
   command: string;
+  /** The exact argv behind `command`, unquoted and redacted identically. */
+  commandArgv: string[];
   attempts: number;
   elapsedMs: number;
   error?: string;
@@ -413,6 +415,9 @@ export async function pollUntilTerminal(
   let attempts = 0;
   let lastEvent: Record<string, unknown> | null = null;
   let lastCommand = "";
+  // Tracked beside lastCommand for the same reason: a poll that ends without a
+  // fresh result still reports the argv of the last call it made.
+  let lastCommandArgv: string[] = [];
   let lastStatus: string | null = null;
   const outOfBudget = (): PollResult => {
     const elapsed = Date.now() - start;
@@ -420,6 +425,7 @@ export async function pollUntilTerminal(
       ok: false,
       progressEvent: lastEvent,
       command: lastCommand,
+      commandArgv: lastCommandArgv,
       attempts,
       elapsedMs: elapsed,
       error: `Polled for ${Math.round(elapsed / 1000)}s without reaching a terminal state (last status: ${lastStatus ?? "unknown"}). Increase maxWaitMs, or call aws_resource_status with requestToken='${opts.requestToken}' to keep checking.`,
@@ -436,6 +442,7 @@ export async function pollUntilTerminal(
       cancelled: true,
       progressEvent: lastEvent,
       command: lastCommand,
+      commandArgv: lastCommandArgv,
       attempts,
       elapsedMs: elapsed,
       error: `Cancelled by the client after ${Math.round(elapsed / 1000)}s and ${attempts} poll(s) (last status: ${lastStatus ?? "unknown"}). Polling stopped; the AWS operation itself was NOT cancelled and is likely still running -- call aws_resource_status with requestToken='${opts.requestToken}' to check how it ended.`,
@@ -465,6 +472,7 @@ export async function pollUntilTerminal(
         ok: false,
         progressEvent: lastEvent,
         command: result.command ?? lastCommand,
+        commandArgv: result.commandArgv ?? lastCommandArgv,
         attempts,
         elapsedMs: Date.now() - start,
         error: result.error,
@@ -473,6 +481,7 @@ export async function pollUntilTerminal(
       };
     }
     lastCommand = result.command;
+    lastCommandArgv = result.commandArgv;
     lastEvent = unwrapProgressEvent(result.data);
     lastStatus =
       lastEvent && typeof lastEvent.OperationStatus === "string" ? (lastEvent.OperationStatus as string) : null;
@@ -489,7 +498,14 @@ export async function pollUntilTerminal(
       `Poll ${attempts}: ${lastStatus ?? "unknown"} after ${Math.round(elapsed / 1000)}s`,
     );
     if (lastStatus && TERMINAL_STATUSES.has(lastStatus)) {
-      return { ok: true, progressEvent: lastEvent, command: lastCommand, attempts, elapsedMs: Date.now() - start };
+      return {
+        ok: true,
+        progressEvent: lastEvent,
+        command: lastCommand,
+        commandArgv: lastCommandArgv,
+        attempts,
+        elapsedMs: Date.now() - start,
+      };
     }
     let waitMs = opts.pollIntervalMs;
     const retryAfterRaw =
@@ -515,7 +531,7 @@ export async function pollUntilTerminal(
  * flat fields for callers that need extra context.
  */
 async function buildMutationResponse(
-  initial: { command: string; data: unknown },
+  initial: { command: string; commandArgv: string[]; data: unknown },
   i: {
     profile?: string;
     region?: string;
@@ -711,6 +727,7 @@ export const resourceTools: readonly Tool[] = [
         ok: true,
         data: {
           command: result.command,
+          commandArgv: result.commandArgv,
           typeName: raw?.TypeName ?? i.typeName,
           identifier: parsed.Identifier,
           properties: parsed.Properties,
@@ -786,6 +803,7 @@ export const resourceTools: readonly Tool[] = [
         ok: true,
         data: {
           command: result.command,
+          commandArgv: result.commandArgv,
           typeName: i.typeName,
           resources,
           nextToken,
@@ -841,7 +859,11 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("create-resource", extraFlags, i);
       if (!result.ok) return ccapiFailure(result);
 
-      return buildMutationResponse({ command: result.command, data: result.data }, i, ctx);
+      return buildMutationResponse(
+        { command: result.command, commandArgv: result.commandArgv, data: result.data },
+        i,
+        ctx,
+      );
     },
   },
 
@@ -914,7 +936,11 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("update-resource", extraFlags, i);
       if (!result.ok) return ccapiFailure(result);
 
-      return buildMutationResponse({ command: result.command, data: result.data }, i, ctx);
+      return buildMutationResponse(
+        { command: result.command, commandArgv: result.commandArgv, data: result.data },
+        i,
+        ctx,
+      );
     },
   },
 
@@ -957,7 +983,11 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("delete-resource", extraFlags, i);
       if (!result.ok) return ccapiFailure(result);
 
-      return buildMutationResponse({ command: result.command, data: result.data }, i, ctx);
+      return buildMutationResponse(
+        { command: result.command, commandArgv: result.commandArgv, data: result.data },
+        i,
+        ctx,
+      );
     },
   },
 
@@ -1059,6 +1089,7 @@ export const resourceTools: readonly Tool[] = [
         ok: true,
         data: {
           command: getResult.command,
+          commandArgv: getResult.commandArgv,
           typeName: i.typeName,
           identifier: parsed.Identifier ?? i.identifier,
           before,

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { INLINE_CLI_INPUT_JSON_MAX_CHARS, runAwsCall } from "./aws-cli.js";
+import { INLINE_CLI_INPUT_JSON_MAX_CHARS, runAwsCall, shellQuoteArg } from "./aws-cli.js";
 import { _resetSession, setProfile, setRegion } from "./session.js";
 import { tmpdirIgnoresModes } from "./testing/tmpdir-modes.js";
 
@@ -1339,5 +1339,139 @@ describe("runAwsCall — a descendant holding the stdio pipes must not hang the 
     } finally {
       reapOrphan(pidPath);
     }
+  });
+});
+
+describe("commandArgv: the unambiguous form of the display command", () => {
+  // `command` cannot be correct in every shell -- measured 0 of 24 probes in
+  // cmd.exe, where `&`, `|` and a newline are live whatever the quoting, and the
+  // Windows quoting fix makes a single-quoted value arrive wrong in Git Bash.
+  // `commandArgv` is the answer to all of that: the exact tokens, so a consumer
+  // re-quotes for its own shell and never unpicks the string.
+
+  it("is the exact argv, and `command` is that argv quoted", async () => {
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query: "Buckets[].Name",
+      ...fakeOpts("call_json_success"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+
+    // Entry 0 is the binary as displayed; the rest are one argument per entry,
+    // unquoted. No entry may carry the shell quoting the string form adds.
+    assert.ok(Array.isArray(r.commandArgv), "commandArgv must be an array");
+    // Entry 0 is the binary AS DISPLAYED, which is the literal `aws` for a
+    // resolved or overridden CLI and the real path for a test seam -- these tests
+    // drive the fake through prefixArgs, so it is node here. The invariant worth
+    // asserting is that it is the same head the string form shows, not a literal.
+    assert.ok(r.commandArgv.length > 1 && r.commandArgv[0].length > 0, JSON.stringify(r.commandArgv));
+    assert.ok(r.command.startsWith(shellQuoteArg(r.commandArgv[0])), r.command);
+    assert.ok(r.commandArgv.includes("s3api"), r.commandArgv.join(" "));
+    assert.ok(r.commandArgv.includes("list-buckets"));
+    assert.ok(r.commandArgv.includes("Buckets[].Name"), "the query is one entry, unquoted");
+    assert.ok(
+      !r.commandArgv.some((entry) => entry.startsWith("'") && entry.endsWith("'") && entry.length > 1),
+      `no entry may be shell-quoted: ${JSON.stringify(r.commandArgv)}`,
+    );
+
+    // And the string is exactly that array, quoted per entry -- derived from it,
+    // so the two cannot drift apart.
+    assert.equal(r.command, r.commandArgv.map((entry) => shellQuoteArg(entry)).join(" "));
+  });
+
+  it("keeps a cmd.exe metacharacter inside ONE entry, which is what retires the injection", async () => {
+    // The F2 case: `--query 'x & echo PWNED_CMD'` printed PWNED_CMD when the
+    // string form was pasted into cmd.exe, because single quotes do not quote
+    // there. In argv form it is one element and there is nothing to re-parse.
+    const hostile = "x & echo PWNED_CMD | more ^caret";
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query: hostile,
+      ...fakeOpts("call_json_success"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    assert.equal(
+      r.commandArgv.filter((entry) => entry === hostile).length,
+      1,
+      `the whole value must be exactly one entry: ${JSON.stringify(r.commandArgv)}`,
+    );
+  });
+
+  it("carries a single-quoted JMESPath exactly, which the string form cannot on Windows", async () => {
+    // The F3 case: on Windows `command` quotes for PowerShell, so Git Bash reads
+    // 'a''b' as concatenation and Buckets[?Name=='prod'].Name arrives as
+    // Buckets[?Name==prod].Name -- a different, invalid expression. The argv is
+    // unaffected, and this is the commonest non-trivial --query shape.
+    const query = "Buckets[?Name=='prod'].Name";
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query,
+      ...fakeOpts("call_json_success"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    assert.ok(r.commandArgv.includes(query), `the quotes must survive: ${JSON.stringify(r.commandArgv)}`);
+  });
+
+  it("carries backslashes exactly, which fish's single quotes do not", async () => {
+    // The F7 case: fish treats \ and \' as escapes inside single quotes, so
+    // a\b arrived as a\b -- silent corruption in the one POSIX shell the string
+    // form is wrong for. argv is byte-exact.
+    const value = "C:logsa\\b";
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      query: value,
+      ...fakeOpts("call_json_success"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    assert.ok(r.commandArgv.includes(value), `backslashes must survive: ${JSON.stringify(r.commandArgv)}`);
+  });
+
+  it("redacts in the argv exactly as in the string, so neither form leaks", async () => {
+    // The redaction is applied once, to the array, and the string is rendered
+    // from it -- so a secret cannot be scrubbed from one and not the other.
+    const r = await runAwsCall({
+      service: "secretsmanager",
+      operation: "create-secret",
+      params: { Name: "n", SecretString: "hunter2-secret" },
+      ...fakeOpts("call_json_success"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    assert.ok(
+      !r.commandArgv.some((entry) => entry.includes("hunter2-secret")),
+      `the secret must not be in the argv: ${JSON.stringify(r.commandArgv)}`,
+    );
+    assert.ok(!r.command.includes("hunter2-secret"));
+    assert.ok(
+      r.commandArgv.some((entry) => /^<redacted len=\d+>$/.test(entry)),
+      `the stub must be its own entry: ${JSON.stringify(r.commandArgv)}`,
+    );
+  });
+
+  it("is present on a failure whenever the string is", async () => {
+    // Both are absent only on a failure that never built an argv. Once a call
+    // has spawned, a consumer inspecting the failure gets the same two forms.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_nonzero_exit"),
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(
+      r.command === undefined,
+      r.commandArgv === undefined,
+      "command and commandArgv must be present or absent together",
+    );
+    if (r.command === undefined || r.commandArgv === undefined) return;
+    assert.equal(r.command, r.commandArgv.map((entry) => shellQuoteArg(entry)).join(" "));
   });
 });
