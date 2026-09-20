@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
+import { createContext, runInContext } from "node:vm";
 import {
   allTools,
   buildToolContext,
   errorToMcpResult,
   findDuplicateToolNames,
   hardenWindowsExeSearch,
+  logUnhandledRejection,
   toMcpResult,
 } from "./index.js";
 import { assumeTools } from "./tools/assume.js";
@@ -220,23 +222,27 @@ describe("toMcpResult — ok:true (success) branches", () => {
   });
 });
 
+// Module scope, not describe scope: two suites capture stderr (errorToMcpResult
+// and logUnhandledRejection, the server's only two console.error surfaces). The
+// restore is a module-level afterEach so a test that throws mid-capture cannot
+// leave the rest of the file writing into an array.
+const realErr = console.error;
+let captured: string[] = [];
+
+afterEach(() => {
+  console.error = realErr;
+  captured = [];
+});
+
+function stubConsoleError(): string[] {
+  captured = [];
+  console.error = (...args: unknown[]) => {
+    captured.push(args.map(String).join(" "));
+  };
+  return captured;
+}
+
 describe("errorToMcpResult — thrown-handler catch path", () => {
-  const realErr = console.error;
-  let captured: string[] = [];
-
-  afterEach(() => {
-    console.error = realErr;
-    captured = [];
-  });
-
-  function stubConsoleError(): string[] {
-    captured = [];
-    console.error = (...args: unknown[]) => {
-      captured.push(args.map(String).join(" "));
-    };
-    return captured;
-  }
-
   it("maps an Error to message-only text and logs message + stack to stderr", () => {
     const logs = stubConsoleError();
     const err = new Error("boom");
@@ -291,6 +297,54 @@ describe("errorToMcpResult — thrown-handler catch path", () => {
     // Non-Error has no .stack -> only the single labelled message line is logged.
     assert.equal(logs.length, 1);
     assert.equal(logs[0], "[aws-mcp] handler 'aws_call' threw: plain string failure");
+  });
+});
+
+describe("logUnhandledRejection -- the process-level handler that keeps the server up", () => {
+  it("logs message then stack for a host-realm Error", () => {
+    const logs = stubConsoleError();
+
+    logUnhandledRejection(new Error("boom"));
+
+    assert.equal(logs.length, 2);
+    assert.equal(logs[0], "[aws-mcp] unhandled promise rejection (server kept running): boom");
+    assert.match(logs[1], /^Error: boom/);
+  });
+
+  it("logs message then stack for an Error from ANOTHER REALM -- the shape the real failure has", () => {
+    // aws_script's bridge re-throws every failure as the sandbox realm's own
+    // Error (`new fresh.Error(...)` in tools/script.ts), so the reason that
+    // motivated this handler is NOT `instanceof Error` in the server's realm --
+    // `types.isNativeError` is what recognizes it. An `instanceof`-only logger
+    // would fall through to String(reason) here: the first line would read
+    // "...: Error: realm boom" and no stack would follow.
+    const logs = stubConsoleError();
+
+    logUnhandledRejection(runInContext("new Error('realm boom')", createContext({})));
+
+    assert.equal(logs.length, 2);
+    assert.equal(logs[0], "[aws-mcp] unhandled promise rejection (server kept running): realm boom");
+    assert.match(logs[1], /^Error: realm boom/);
+  });
+
+  it("stringifies a non-Error reason and logs no stack", () => {
+    const logs = stubConsoleError();
+
+    logUnhandledRejection("plain");
+
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0], "[aws-mcp] unhandled promise rejection (server kept running): plain");
+  });
+
+  it("does NOT inspect a rejected AwsCallResult-shaped object into operator stderr", () => {
+    // Same rule as errorToMcpResult: a rejected value carrying rawStdout /
+    // rawStderr must not have those printed. String(reason), never inspect.
+    const logs = stubConsoleError();
+
+    logUnhandledRejection({ rawStdout: "SECRET-STDOUT-PAYLOAD", rawStderr: "SECRET-STDERR-PAYLOAD" });
+
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0], "[aws-mcp] unhandled promise rejection (server kept running): [object Object]");
   });
 });
 
