@@ -267,6 +267,24 @@ command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
+# --- oam floor preflight -------------------------------------------------
+# The policy is that the launcher's floor is the latest oam release and the server
+# is verified on that one release. oam ships often enough that this goes stale
+# between releases on its own: 0.16.3 was published two hours before the 2.5.0
+# release that pinned it. So ask before publishing rather than discovering it in a
+# bug report.
+#
+# The DRIFT half of this check (does the whole repo agree on the floor?) needs no
+# network and runs in the test suite instead, so step 2 already covers it.
+#
+# Exits non-zero when the floor is behind; AWS_MCP_ALLOW_STALE_OAM=1 is the
+# deliberate way past it. A machine with no network is not a failure -- the check
+# says so and continues.
+if [ -f scripts/check-oam-floor.mjs ]; then
+  echo ""
+  node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set AWS_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+fi
+
 RESUMING=false
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
