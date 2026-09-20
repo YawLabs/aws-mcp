@@ -44,6 +44,32 @@ import { lambdaTools } from "./lambda.js";
 const tool = lambdaTools.find((t) => t.name === "aws_lambda_invoke");
 if (!tool) throw new Error("lambdaTools missing aws_lambda_invoke");
 
+// A private temp root for this process, set before anything else runs.
+//
+// node --test runs each test FILE in its own process, in PARALLEL, and this file
+// and lambda.test.ts both drive lambda.ts's
+// mkdtempSync(join(tmpdir(), "aws-mcp-lambda-")) -- so the scan below, and the
+// identical one there, see the other process's scratch dirs appear and vanish
+// mid-assertion. With this suite opted in that failed 2 runs in 3 here, reported
+// as "aws_lambda_invoke leaks a temp directory". os.tmpdir() re-reads TEMP/TMP
+// (win32) / TMPDIR (POSIX) on every call, so pointing them at a private root
+// makes both the handler's dirs and the scan process-local. Set before
+// isolateAwsEnv: its snapshot then carries these three and restore() puts them
+// back (it scrubs only AWS_*, PYTHON* and the proxy names).
+const TMP_ROOT = mkdtempSync(join(tmpdir(), "aws-mcp-lambdatests-realcli-"));
+const TMP_SNAPSHOT = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+process.env.TEMP = TMP_ROOT;
+process.env.TMP = TMP_ROOT;
+process.env.TMPDIR = TMP_ROOT;
+
+after(() => {
+  for (const [key, value] of Object.entries(TMP_SNAPSHOT)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(TMP_ROOT, { recursive: true, force: true });
+});
+
 // Only probe for a CLI when the suite would actually run: detection spawns
 // `aws --version`, and an opt-in suite should cost a skipped `npm test` nothing.
 const detected = REAL_CLI_SLOW ? detectRealAwsCli({ minVersion: [2, 13, 0] }) : null;
@@ -65,7 +91,11 @@ type InvokeResult = {
 const LOG_TAIL_TEXT = "START RequestId: realcli\nhello from the stub\nEND RequestId: realcli\n";
 const LOG_RESULT = Buffer.from(LOG_TAIL_TEXT, "utf8").toString("base64");
 
-/** The handler's own scratch directories, by the prefix mkdtempSync is given. */
+/**
+ * The handler's own scratch directories, by the prefix mkdtempSync is given --
+ * inside this process's private temp root, so the sibling suite's dirs are not
+ * in view.
+ */
 function lambdaTmpDirs(): string[] {
   return readdirSync(tmpdir())
     .filter((n) => n.startsWith("aws-mcp-lambda-"))

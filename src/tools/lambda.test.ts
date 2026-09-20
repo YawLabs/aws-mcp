@@ -16,10 +16,10 @@
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { invokeChildEnv, invokeTimeouts, lambdaTools } from "./lambda.js";
@@ -30,14 +30,39 @@ if (!tool) throw new Error("lambdaTools missing aws_lambda_invoke");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
 
+// A private temp root for this process, set before anything calls the handler.
+//
+// node --test runs each test FILE in its own process, in PARALLEL, and this file
+// and lambda.realcli.test.ts both drive lambda.ts's
+// mkdtempSync(join(tmpdir(), "aws-mcp-lambda-")) -- so a scan of the machine
+// temp dir sees the other process's scratch dirs appear and vanish mid-assertion.
+// With AWS_MCP_REAL_CLI_TESTS=1 (release.sh's test step) that failed 2 runs in 3
+// here, reported as "aws_lambda_invoke leaks a temp directory". os.tmpdir()
+// re-reads TEMP/TMP (win32) / TMPDIR (POSIX) on every call, so pointing them at
+// a private root makes both the handler's dirs and the scan below process-local.
+// The root's own prefix deliberately does NOT start with "aws-mcp-lambda-".
+const TMP_ROOT = mkdtempSync(join(tmpdir(), "aws-mcp-lambdatests-"));
+const TMP_SNAPSHOT = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+process.env.TEMP = TMP_ROOT;
+process.env.TMP = TMP_ROOT;
+process.env.TMPDIR = TMP_ROOT;
+
+after(() => {
+  for (const [key, value] of Object.entries(TMP_SNAPSHOT)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(TMP_ROOT, { recursive: true, force: true });
+});
+
 /**
  * The handler's own scratch directories, by the prefix mkdtempSync is given.
  *
  * Used as a before/after set comparison rather than a bare count so an
  * unrelated leftover from a previous run cannot turn into a false failure. Safe
- * against interference from sibling test FILES because nothing else in the
- * suite creates this prefix, and node:test runs the subtests within one file
- * sequentially.
+ * against interference from sibling test FILES because the scan is confined to
+ * this process's private temp root (above), and node:test runs the subtests
+ * within one file sequentially.
  */
 function lambdaTmpDirs(): string[] {
   return readdirSync(tmpdir())
