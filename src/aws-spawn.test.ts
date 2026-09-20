@@ -324,7 +324,11 @@ describe("resolveAwsCommand -- POSIX PATH walk", () => {
   });
 
   it("skips a file that is not executable", () => {
-    // Unlike win32, X_OK carries real information here.
+    // On a native POSIX filesystem X_OK carries real information, unlike win32.
+    // Not everywhere POSIX, though: under WSL, DrvFs reports 0777 for every file
+    // on a Windows drive, so the check cannot reject a non-executable there. See
+    // fsProbe. This case drives the probe directly, so it tests the rule rather
+    // than any filesystem's willingness to report it.
     const r = ok(
       resolveAwsCommand({
         env: { PATH: "/a:/b" },

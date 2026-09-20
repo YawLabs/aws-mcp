@@ -179,7 +179,13 @@ export function redactDisplayArgs(args: readonly string[]): string[] {
 
 // Characters that need no quoting in a POSIX shell word. Deliberately
 // conservative: anything outside this set gets single-quoted.
-const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+// '%' is deliberately NOT in this set. It is inert in every POSIX shell and in
+// PowerShell, but cmd.exe and a .bat file expand %VAR% -- measured: a display
+// string carrying a bare %PATH% arrived as one empty token in a batch file, argc
+// dropped by one. Quoting it does not make the string safe for cmd.exe (nothing
+// does -- see shellQuoteArg), but a quoted %VAR% at least survives as text
+// everywhere else instead of vanishing where it is read.
+const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@+=:,./-]+$/;
 
 /**
  * Quote one argv entry for a POSIX shell, so displayCommand is something the
@@ -195,9 +201,16 @@ const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
  *
  * Single-quoting is the safe form: inside single quotes a POSIX shell expands
  * nothing. An embedded single quote closes, escapes, and reopens ('\'').
- * cmd.exe and PowerShell quote differently, so this is still a display string
- * rather than a universal one -- but it is now correct wherever `aws` is
- * normally driven from.
+ * cmd.exe and PowerShell quote differently, so this is a display string rather
+ * than a universal one. Precisely: it is correct in a POSIX shell and, on
+ * Windows, in PowerShell. It is NOT correct in cmd.exe, where `&`, `|` and a
+ * newline are live regardless of quoting (measured 0 of 24 probes correct), nor
+ * in Git Bash on Windows, where the doubled-quote form this emits reads as
+ * concatenation and the quotes are silently dropped. A value carrying a single
+ * quote is the only one affected there -- `Buckets[?Name=='prod'].Name` is the
+ * realistic case, and it degrades to invalid JMESPath rather than to something
+ * that runs. Making the string universal is not possible by quoting; a separate
+ * argv array is the fix, and is deliberately left for its own release.
  *
  * Exported for direct unit coverage: the quoting rules are the security
  * boundary here, so they get asserted head-on rather than only through a
@@ -740,7 +753,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         //
         // Exclusivity comes from open(2)'s O_EXCL via `openSync(..., "wx")`,
         // which node 22.22.2 and oam 0.16.2 both honour. writeFileSync's `flag`
-        // option does NOT reach oam: measured 2026-09-20, a second
+        // option does NOT reach oam: measured 2026-09-20 on Windows, a second
         // `writeFileSync(path, ..., {flag: "wx"})` over an existing file
         // SUCCEEDED there and the readback returned the second payload, where
         // node raises EEXIST. bin/aws-mcp.mjs defaults AWS_MCP_RUNTIME=auto, so

@@ -66,7 +66,9 @@
  * it gates, so it is not offered rather than shipped as security theatre.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * The floor, bumped to each new oam release. Currently 0.15.2; verified on 0.16.1
+ * and 0.16.2. It is a FLOOR, not a pin: the launcher runs the newest oam it finds
+ * at or above it.
  * Only the current oam is used and verified; an older one falls back to Node.
  * The floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,

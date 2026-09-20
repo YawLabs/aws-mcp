@@ -533,6 +533,21 @@ describe("shellQuoteArg", () => {
     assert.equal(shellQuoteArg("a>b"), "'a>b'");
   });
 
+  it("quotes a %VAR% rather than leaving it bare for cmd.exe to expand", () => {
+    // '%' used to be in SHELL_SAFE_ARG_RE, so %PATH% was emitted unquoted. It is
+    // inert in POSIX shells and PowerShell, but cmd.exe and a .bat file expand it:
+    // measured, a bare %PATH% in a batch file arrived as one empty token and argc
+    // dropped by one. Quoting cannot make the string safe for cmd.exe, but it
+    // keeps the value readable as text instead of disappearing where it is read.
+    assert.equal(shellQuoteArg("%PATH%"), "'%PATH%'");
+    assert.equal(shellQuoteArg("%USERPROFILE%.aws", "win32"), "'%USERPROFILE%.aws'");
+    // The rest of the safe set is unchanged -- this must not start quoting
+    // ordinary tokens.
+    for (const safe of ["us-east-1", "org:account:role", "user@company.com", "a.b,c+d=e", "--cli-input-json"]) {
+      assert.equal(shellQuoteArg(safe), safe);
+    }
+  });
+
   it("quotes JMESPath expressions, which are full of shell-active characters", () => {
     assert.equal(shellQuoteArg("Buckets[].Name"), "'Buckets[].Name'");
     assert.equal(

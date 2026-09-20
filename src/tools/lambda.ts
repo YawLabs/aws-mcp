@@ -499,7 +499,7 @@ export const lambdaTools: readonly Tool[] = [
         // file, which is fine: it is only read on the success path.
         //
         // chmodSync, not openSync's mode argument alone: oam drops the creation
-        // mode (measured 2026-09-20 on 0.16.2 -- a file opened 0o400 comes back
+        // mode (measured 2026-09-20 on Windows, oam 0.16.2 -- a file opened 0o400 comes back
         // writable there, where node marks it read-only), and oam is the runtime
         // bin/aws-mcp.mjs picks by default. The exclusive create itself DOES reach
         // oam; only the mode has to be set a second way.

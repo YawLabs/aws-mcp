@@ -377,11 +377,15 @@ function writeAllSync(fd: number, text: string): void {
  *
  * The fchmod is not redundant belt-and-braces: open's mode argument is honoured
  * by node (and only ever narrowed by umask, never widened) but DROPPED by oam,
- * which bin/aws-mcp.mjs picks by default -- measured 2026-09-20 on oam 0.16.2, a
- * file opened 0o400 comes back writable where node marks it read-only, so on
- * Linux this file would land at the umask default and `~/.aws/credentials` would
- * end up world-readable with an access key, a secret key and a session token in
- * it. fchmodSync itself both runtimes honour. It goes on the fd rather than the
+ * which bin/aws-mcp.mjs picks by default -- measured 2026-09-20 on WIN32/ARM64,
+ * oam 0.16.2: a file opened 0o400 comes back writable where node marks it
+ * read-only. On POSIX the same divergence WOULD leave this file at the umask
+ * default, with an access key, a secret key and a session token in a
+ * world-readable `~/.aws/credentials` -- ASSERTED, not measured: oam publishes no
+ * linux-arm64 build and there is no Mac here, so no POSIX oam measurement exists
+ * anywhere. Note also that a Windows mode argument can only toggle
+ * FILE_ATTRIBUTE_READONLY, so that particular row does not transfer cleanly; the
+ * `flag: "wx"` row does, being flag-string parsing above the OS layer. fchmodSync itself both runtimes honour. It goes on the fd rather than the
  * path so there is no moment where the file holds credentials at a wider mode.
  *
  * Returns `{ existed: true }` when the profile was already present and its
