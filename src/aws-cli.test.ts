@@ -243,6 +243,42 @@ describe("runAwsCall — input validation (no spawn)", () => {
     assert.match(r.error, /the value of --identifier/);
   });
 
+  it("refuses the combined --flag=file:// spelling, which the CLI expands the same way", async () => {
+    // One argv entry, not two: the CLI runs its paramfile loader on the segment
+    // after the first `=`, so this spelling reaches the endpoint as the file's
+    // contents (verified on 2.34.3 against a loopback stub). No shipped tool
+    // builds it -- the scan covers it so the first one that does is guarded.
+    const r = await runAwsCall({
+      service: "cloudcontrol",
+      operation: "get-resource",
+      extraFlags: ["--type-name", "AWS::S3::Bucket", `--identifier=file://${MISSING}`],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input");
+    assert.match(r.error, /the value of --identifier/);
+    // The preview is the value the CLI would read, not the whole entry.
+    assert.match(r.error, /Refusing 'file:\/\//);
+  });
+
+  it("lets the CLI's near misses through in the combined spelling too", async () => {
+    // Same reason as the separate-entry near misses below: the loader's match on
+    // the post-`=` segment is its own `str.startswith`, so these travel as
+    // themselves (verified against the stub -- no file was read for either).
+    for (const entry of [`--identifier=FILE://${MISSING}`, `--identifier=file:/${MISSING}`]) {
+      const r = await runAwsCall({
+        service: "cloudcontrol",
+        operation: "get-resource",
+        extraFlags: ["--type-name", "AWS::S3::Bucket", entry],
+        command: NO_BINARY,
+      });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "spawn_failure", `${JSON.stringify(entry)} must not be refused by the paramfile guard`);
+    }
+  });
+
   it("refuses a positional file:// entry, with no flag to name", async () => {
     const r = await runAwsCall({
       service: "s3api",
@@ -298,6 +334,22 @@ describe("runAwsCall — input validation (no spawn)", () => {
     assert.equal(r.ok, false);
     if (r.ok) return;
     assert.equal(r.kind, "spawn_failure", "the value cleared the guard and the pinned command failed to spawn");
+  });
+
+  it("exempts a trusted combined entry, listed the way the caller built it", async () => {
+    // A caller that mints `--payload=fileb://<temp>` as one entry lists that
+    // whole string, so the exemption has to be checked against the entry as well
+    // as the value inside it.
+    const r = await runAwsCall({
+      service: "lambda",
+      operation: "invoke",
+      extraFlags: ["--payload=fileb://a"],
+      trustedParamFileArgs: ["--payload=fileb://a"],
+      command: NO_BINARY,
+    });
+    assert.equal(r.ok, false);
+    if (r.ok) return;
+    assert.equal(r.kind, "spawn_failure", "the entry cleared the guard and the pinned command failed to spawn");
   });
 
   it("lets the CLI's near misses through, because the CLI sends them as themselves", async () => {

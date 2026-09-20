@@ -430,15 +430,35 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   //   - `service` and the operation tokens match SAFE_NAME_RE, which has no `/`.
   // Scanning opts.extraFlags rather than the assembled argv is also what keeps
   // a future server-minted `--cli-input-json file://<temp>` transport out of it.
+  //
+  // Both argv spellings are covered: `--flag value` as two entries, and
+  // `--flag=value` as one, the second by the segment after the first `=` --
+  // that is where the loader looks. Verified on aws-cli 2.34.3 against a
+  // loopback stub: `--identifier=file://<path>` reaches the endpoint as the
+  // file's contents, while the near misses stay near misses there too
+  // (`=FILE://` and `=file:/` travel literally). No tool builds the combined
+  // form today; the scan covers it so the first one that does is guarded.
   const extra = opts.extraFlags ?? [];
+  const trusted = opts.trustedParamFileArgs;
   for (let idx = 0; idx < extra.length; idx++) {
     const value = extra[idx];
-    if (!isParamFileUri(value) || opts.trustedParamFileArgs?.includes(value)) continue;
+    if (trusted?.includes(value)) continue;
+    // A trusted whole entry is listed as the whole entry, so check both
+    // spellings against the list: a caller minting `--payload=fileb://<tmp>`
+    // exempts that string, not the bare `fileb://<tmp>` inside it.
+    const eq = value.startsWith("--") ? value.indexOf("=") : -1;
+    const inner = eq > 0 ? value.slice(eq + 1) : null;
+    const combined = inner !== null && isParamFileUri(inner) && !trusted?.includes(inner);
+    if (!combined && !isParamFileUri(value)) continue;
     // Name the flag when there is one, so the caller learns WHICH field it was.
     // A positional entry (lambda's outfile, say) has no flag to name.
-    const where =
-      idx > 0 && extra[idx - 1].startsWith("--") ? `the value of ${extra[idx - 1]}` : "a command-line argument";
-    const preview = value.length > 60 ? `${value.slice(0, 60)}...` : value;
+    const shown = combined ? (inner as string) : value;
+    const where = combined
+      ? `the value of ${value.slice(0, eq)}`
+      : idx > 0 && extra[idx - 1].startsWith("--")
+        ? `the value of ${extra[idx - 1]}`
+        : "a command-line argument";
+    const preview = shown.length > 60 ? `${shown.slice(0, 60)}...` : shown;
     return Promise.resolve({
       ok: false,
       kind: "bad_input",

@@ -4,11 +4,12 @@
  * `file://` with the contents of that local file, and sends every near miss as
  * itself. The guard's regex is deliberately no wider than the CLI's own
  * `str.startswith`, and the error message says the CLI would read a file -- both
- * claims rest on the four cases below. A future CLI that normalized case, or
- * accepted a leading space, would reopen the hole this guard closes, and this
+ * claims rest on the five cases below, which also pin the `--flag=value`
+ * spelling the loader reads past the `=` of. A future CLI that normalized case,
+ * or accepted a leading space, would reopen the hole this guard closes, and this
  * suite is what goes red on the first `npm test` run on that CLI.
  *
- * Default-on: four CLI starts, no timeouts and nothing to wait out, so it runs
+ * Default-on: five CLI starts, no timeouts and nothing to wait out, so it runs
  * on every `npm test` and skips only when there is no AWS CLI v2 to run. See
  * testing/real-cli.ts for why nothing here can reach AWS -- fake static keys, a
  * throwaway config, and a dead proxy for every address but the loopback. Per the
@@ -51,12 +52,12 @@ describe(`paramfile guard -- installed AWS CLI${detected.ok ? ` (${detected.cli.
   let iso: IsolatedAwsEnv;
   let canaryPath: string;
 
-  /** Cloud Control get-resource at the stub, with `identifier` as passed. */
-  const getResource = (identifier: string, trustedParamFileArgs?: readonly string[]) =>
+  /** Cloud Control get-resource at the stub, with `extraFlags` as passed. */
+  const callWith = (extraFlags: readonly string[], trustedParamFileArgs?: readonly string[]) =>
     runAwsCall({
       service: "cloudcontrol",
       operation: "get-resource",
-      extraFlags: ["--type-name", TYPE_NAME, "--identifier", identifier],
+      extraFlags: [...extraFlags],
       ...(trustedParamFileArgs ? { trustedParamFileArgs } : {}),
       prefixArgs: ["--endpoint-url", stub.url],
       profile: "default",
@@ -65,6 +66,10 @@ describe(`paramfile guard -- installed AWS CLI${detected.ok ? ` (${detected.cli.
       // `node --test` run; nothing here waits on a timeout.
       timeoutMs: 60_000,
     });
+
+  /** The same call with `identifier` as its own argv entry, the shape every tool builds. */
+  const getResource = (identifier: string, trustedParamFileArgs?: readonly string[]) =>
+    callWith(["--type-name", TYPE_NAME, "--identifier", identifier], trustedParamFileArgs);
 
   /** The Identifier the CLI actually put on the wire (Cloud Control is JSON). */
   const identifierSent = (): string => {
@@ -111,6 +116,23 @@ describe(`paramfile guard -- installed AWS CLI${detected.ok ? ` (${detected.cli.
     // exemption -- the value reaches the CLI untouched, and the CLI does the
     // substitution the guard refuses for every other value.
     const r = await getResource(arg, [arg]);
+    assert.equal(r.ok, true, `call failed: ${r.ok ? "" : `${r.kind}: ${r.error}`}`);
+    assert.equal(identifierSent(), CANARY, "the CLI sent the file's contents as the identifier");
+  });
+
+  it("expands the combined --identifier=file:// entry too -- the loader reads past the '='", async (t) => {
+    // The predicate the guard's combined-form scan rests on: the CLI parses
+    // `--flag=value` as ONE argv entry and runs the paramfile loader on the
+    // segment after the first `=`. Trusted here so the value reaches the CLI --
+    // what is being pinned is the CLI's behavior, not the guard's, and the guard
+    // refusing this spelling is covered in aws-cli.test.ts. If a future CLI
+    // stopped expanding it, the scan would be dead weight rather than wrong.
+    if (/[$%]/.test(canaryPath)) {
+      t.skip(`temp path contains $ or %, which the CLI's expandvars would rewrite: ${canaryPath}`);
+      return;
+    }
+    const entry = `--identifier=file://${canaryPath}`;
+    const r = await callWith(["--type-name", TYPE_NAME, entry], [entry]);
     assert.equal(r.ok, true, `call failed: ${r.ok ? "" : `${r.kind}: ${r.error}`}`);
     assert.equal(identifierSent(), CANARY, "the CLI sent the file's contents as the identifier");
   });
