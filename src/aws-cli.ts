@@ -22,8 +22,11 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { awsChildEnv, resolveAwsCommand } from "./aws-spawn.js";
+import { awsChildEnv, isCliSafeFilePath, resolveAwsCommand } from "./aws-spawn.js";
 import { type AuthErrorKind, classifyAuthError, parseAwsError } from "./errors.js";
 import { KILL_ESCALATION_MS, killProc, procHasExited } from "./kill-proc.js";
 import {
@@ -36,6 +39,31 @@ import {
 } from "./session.js";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * Ceiling on timeoutMs, because node stores a timer delay in a signed 32-bit
+ * int. A larger delay does not wait longer -- node warns
+ * (`TimeoutOverflowWarning: ... does not fit into a 32-bit signed integer.
+ * Timeout duration was set to 1.`) and fires the timer after 1 ms, so asking for
+ * 30 days timed the call out at once. Measured on node 22.22.2 with
+ * `setTimeout(fn, 2 ** 31 + 1000)`.
+ *
+ * 2,147,483,647 ms is about 24.8 days, so clamping costs no caller anything real.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Params longer than this travel in a temp file rather than on the command line.
+ *
+ * Well under both OS limits -- Windows caps a whole command line at 32,767
+ * characters and Linux one argument at 131,072 (both measured; a 40,000-character
+ * argv entry throws ENAMETOOLONG synchronously here on node 22.22.2) -- because
+ * the params JSON is not the only thing on the line, and a value just under the
+ * cap would fail depending on how long the profile and region happen to be.
+ * Everything below the threshold stays inline, which keeps `command` strings,
+ * the fake CLI's argv parsing and 59 existing test references unchanged.
+ */
+export const INLINE_CLI_INPUT_JSON_MAX_CHARS = 8_192;
+const CLI_INPUT_TEMP_PREFIX = "aws-mcp-input-";
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024; // 5 MB per stream
 // Cap the stderr we surface as an error message to avoid flooding the MCP
 // response. Full stderr still lands in rawStderr for diagnosis.
@@ -176,6 +204,44 @@ const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 export function shellQuoteArg(arg: string): string {
   if (SHELL_SAFE_ARG_RE.test(arg)) return arg;
   return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Re-encode a JSON string so every byte is ASCII, with non-ASCII characters as
+ * `\uXXXX` escapes.
+ *
+ * For the params temp file, because the CLI reads a `file://` param file as TEXT
+ * in the locale's preferred encoding (`awscli/compat.py` `compat_open` ->
+ * `getpreferredencoding`), which on Windows is the ANSI code page, not UTF-8.
+ * Measured against a loopback stub on 2.34.3 and 2.22.0: a UTF-8 file holding
+ * `café-日本-😀` reached the endpoint as `cafÃ©-æ—¥æœ¬-ðŸ˜€` with exit 0 --
+ * silent corruption -- while the same payload written with `\u` escapes arrived
+ * exactly. Escaping needs no environment variable to be right, which is why it
+ * is kept even though PYTHONUTF8=1 makes an older CLI read the file as UTF-8.
+ *
+ * Surrogate halves are escaped individually, which is valid JSON and parses back
+ * to the same astral character. Only the inside of a JSON string can hold a
+ * non-ASCII character, so this never touches the structure.
+ */
+export function toAsciiJson(json: string): string {
+  return json.replace(/[\u007f-￿]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/**
+ * The longest entry in an assembled argv, and the flag that carries it, for the
+ * "too long for the command line" message. A value has a flag when the entry
+ * before it starts with `--`; a positional (lambda's outfile, say) does not.
+ */
+function longestArgvValue(args: readonly string[]): { flag: string; length: number } {
+  let at = 0;
+  for (let i = 1; i < args.length; i++) {
+    if (args[i].length > args[at].length) at = i;
+  }
+  const previous = at > 0 ? args[at - 1] : undefined;
+  return {
+    flag: previous?.startsWith("--") ? previous : "an argument",
+    length: args.length === 0 ? 0 : args[at].length,
+  };
 }
 
 export function truncateForErrorMsg(text: string): string {
@@ -525,7 +591,10 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     });
   }
   const outputFormat = opts.outputFormat ?? "json";
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // Clamped, not rejected: a caller asking for more than 24.8 days wants "do not
+  // time this out", and the clamp gives it -- where the raw value gave the
+  // opposite (see MAX_TIMEOUT_MS).
+  const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
   // The --query length check, hoisted out of the argv block below so it runs
   // BEFORE the binary is resolved: an over-long JMESPath expression is the
@@ -592,9 +661,74 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   if (query !== undefined) {
     args.push("--query", query);
   }
+  // The temp directory holding this call's params file, when one was needed.
+  // Removed in settle() -- the CLI reads the file while it starts up, long before
+  // it exits -- and on the synchronous-throw path below.
+  let inputDir: string | null = null;
+  const removeInputDir = (): void => {
+    if (inputDir === null) return;
+    try {
+      rmSync(inputDir, { recursive: true, force: true });
+    } catch {
+      // Best effort. A server killed hard between the write and the settle can
+      // leave one 0600 params.json in the user's temp dir; tools/lambda.ts has
+      // the same exposure for its payload file.
+    }
+    inputDir = null;
+  };
+
+  // Set when the params went to a file: the argv index of the `file://` value and
+  // the inline JSON to show there instead, so `command` reads the same whichever
+  // transport carried the payload and the redaction stub keeps reporting the
+  // payload's length rather than a temp path's.
+  let paramsDisplay: { index: number; inline: string } | null = null;
   if (opts.params !== undefined && Object.keys(opts.params).length > 0) {
-    args.push("--cli-input-json", JSON.stringify(opts.params));
+    const json = JSON.stringify(opts.params);
+    if (json.length <= INLINE_CLI_INPUT_JSON_MAX_CHARS) {
+      args.push("--cli-input-json", json);
+    } else {
+      // Above the threshold the payload cannot ride on the command line at all
+      // on Windows, and the failure used to be `spawn ENAMETOOLONG. Is the AWS
+      // CLI installed and on PATH?` -- a message about a PATH that was fine. A
+      // CloudFormation template body (up to 51,200 bytes), a Step Functions
+      // definition or an SSM document all reach this size legitimately.
+      const dir = tmpdir();
+      if (!isCliSafeFilePath(dir)) {
+        // Checked before writing, so the caller hears about TMP/TEMP rather than
+        // a CLI error about a path it never wrote: the CLI runs
+        // expandvars(expanduser()) on a file:// path (awscli/paramfile.py).
+        return Promise.resolve({
+          ok: false,
+          kind: "bad_input",
+          error:
+            `The request params are ${json.length} characters, so they must travel in a temp file, but the temp ` +
+            `directory (${dir}) contains '$' or '%' or starts with '~', which the AWS CLI expands in a file:// path. ` +
+            `Point TMP/TEMP (Windows) or TMPDIR at a plain directory.`,
+        });
+      }
+      let paramsFile: string;
+      try {
+        inputDir = mkdtempSync(join(dir, CLI_INPUT_TEMP_PREFIX));
+        paramsFile = join(inputDir, "params.json");
+        // 0600 and `wx`: the payload can hold credentials or a SecureString
+        // value, and it lives in a directory mkdtemp created for this call alone
+        // (0700 on POSIX, the per-user %TEMP% ACL on Windows).
+        writeFileSync(paramsFile, toAsciiJson(json), { mode: 0o600, flag: "wx" });
+      } catch (err) {
+        removeInputDir();
+        return Promise.resolve({
+          ok: false,
+          kind: "spawn_failure",
+          error: `Could not write the request params to a temp file: ${err instanceof Error ? err.message : String(err)}.`,
+        });
+      }
+      args.push("--cli-input-json", `file://${paramsFile}`);
+      paramsDisplay = { index: args.length - 1, inline: json };
+    }
   }
+
+  const displayArgs =
+    paramsDisplay === null ? args : args.map((value, i) => (i === paramsDisplay.index ? paramsDisplay.inline : value));
 
   // Display string for logging / the MCP response, shell-quoted per entry so
   // it survives a paste into a POSIX shell. The real invocation still uses the
@@ -604,20 +738,22 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   // that is the literal `aws`, because the absolute path is noise to the reader
   // (and, for the override, the operator's own file layout). A test seam's
   // command still shows itself.
-  const displayCommand = [resolution.display, ...redactDisplayArgs(args)].map(shellQuoteArg).join(" ");
+  const displayCommand = [resolution.display, ...redactDisplayArgs(displayArgs)].map(shellQuoteArg).join(" ");
 
   return new Promise<AwsCallResult>((resolve) => {
     let proc: ChildProcess;
-    // This catch is near-unreachable and stays deliberately. ENOENT -- the
-    // failure that actually happens (no `aws` on PATH) -- arrives async on the
-    // 'error' event below, not here; spawn only throws synchronously on
-    // argument-shape errors (ERR_INVALID_ARG_TYPE and friends), which the
-    // validation above already rules out for every production path.
+    // This catch is reachable, which the comment here used to deny. Node throws
+    // synchronously for every spawn errno except EACCES, EAGAIN, EMFILE, ENFILE
+    // and ENOENT -- so an argv too long for the OS lands here: measured
+    // ENAMETOOLONG for a 40,000-character argv entry on Windows (node 22.22.2)
+    // and E2BIG for a 131,072-character one on Linux. A `.cmd` path gives EINVAL
+    // the same way. ENOENT, the failure that actually happens when no CLI is
+    // there, still arrives async on the 'error' event below.
     //
-    // What it buys: a throw inside a Promise executor REJECTS the promise. Every
-    // caller of runAwsCall consumes an AwsCallResult envelope and none of them
-    // wrap the call in try/catch, so without this the one exotic case would
-    // bypass the envelope entirely and surface as an unhandled rejection.
+    // It also buys the envelope: a throw inside a Promise executor REJECTS the
+    // promise, and every caller of runAwsCall consumes an AwsCallResult without
+    // try/catch, so without this the exotic cases would surface as unhandled
+    // rejections instead.
     try {
       proc = spawn(command, args, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -629,10 +765,32 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         env: awsChildEnv(opts.env ?? process.env),
       });
     } catch (err) {
+      removeInputDir();
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENAMETOOLONG" || code === "E2BIG") {
+        // bad_input, not spawn_failure: the caller's own value is what does not
+        // fit, and runAwsCall already answers an over-long --query the same way.
+        // After the params temp file above, only an extraFlags payload (a large
+        // CCAPI --desired-state or --patch-document) can still get here.
+        const longest = longestArgvValue(args);
+        resolve({
+          ok: false,
+          kind: "bad_input",
+          error:
+            `The request is too large to pass to the AWS CLI on its command line (spawn ${code}): the longest value ` +
+            `is ${longest.flag} at ${longest.length} characters. Windows caps a whole command line at 32,767 ` +
+            `characters and Linux caps one argument at 131,072. Params over ${INLINE_CLI_INPUT_JSON_MAX_CHARS} ` +
+            `characters already travel in a temp file -- shrink or split this value.`,
+          command: displayCommand,
+        });
+        return;
+      }
       resolve({
         ok: false,
         kind: "spawn_failure",
-        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}. Is the AWS CLI installed and on PATH?`,
+        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}.${
+          code === "ENOENT" ? " Is the AWS CLI installed and on PATH?" : ""
+        }`,
         command: displayCommand,
       });
       return;
@@ -669,6 +827,11 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         clearTimeout(graceHandle);
         graceHandle = null;
       }
+      // Also the single place the params temp file goes away. Safe here rather
+      // than at 'exit': the CLI reads a file:// param while it starts up, and
+      // every settle path is either past the child's death or a timeout that has
+      // already killed it.
+      removeInputDir();
       resolve(result);
     };
 

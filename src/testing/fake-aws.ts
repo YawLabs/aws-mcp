@@ -624,6 +624,44 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "spawn-hardening_read_input_file": {
+      // Answers "how did the params arrive, and did they survive the trip" for
+      // both transports: inline argv, or the private temp file runAwsCall writes
+      // above INLINE_CLI_INPUT_JSON_MAX_CHARS. readCliInputJson is the shared
+      // reader, so this scenario cannot drift from the other consumers of the
+      // same argv.
+      const { readCliInputJson } = await import("./cli-input.js");
+      const payload = readCliInputJson(process.argv.slice(2));
+      if (payload === null) {
+        process.stderr.write("fake-aws: spawn-hardening_read_input_file needs a --cli-input-json value\n");
+        process.exit(2);
+      }
+      const binaryFormatIdx = process.argv.indexOf("--cli-binary-format");
+      let mode: number | null = null;
+      if (payload.path !== null && process.platform !== "win32") {
+        // POSIX only: on Windows the mode bits say nothing (the directory's ACL
+        // is what makes the file private), and node reports 0o666 whatever we ask
+        // for.
+        const fs = await import("node:fs");
+        mode = fs.statSync(payload.path).mode & 0o777;
+      }
+      process.stdout.write(
+        `${JSON.stringify({
+          viaFile: payload.source !== "inline",
+          path: payload.path,
+          // The real CLI decodes a file:// param in the locale code page, so the
+          // bytes being ASCII is what makes the round trip exact. Asserted here
+          // rather than assumed.
+          asciiOnly: payload.bytes === null ? null : payload.bytes.every((b) => b < 0x80),
+          mode,
+          binaryFormat: binaryFormatIdx === -1 ? null : (process.argv[binaryFormatIdx + 1] ?? null),
+          params: payload.params,
+        })}\n`,
+      );
+      process.exit(0);
+      return;
+    }
+
     case "spawn-hardening_error_format": {
       // Both bodies are verbatim captures from aws-cli 2.34.3 answering one 403
       // InvalidClientTokenId from a loopback stub, with the CLI's own newline

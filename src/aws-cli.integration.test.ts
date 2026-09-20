@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { runAwsCall } from "./aws-cli.js";
+import { INLINE_CLI_INPUT_JSON_MAX_CHARS, runAwsCall } from "./aws-cli.js";
 import { _resetSession, setProfile, setRegion } from "./session.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -785,6 +785,95 @@ describe("spawn-hardening: the pinned child environment", () => {
     if (r.ok) return;
     assert.equal(r.kind, "invalid_creds", `stderr was: ${r.rawStderr}`);
     assert.match(r.error, /rejected by AWS/);
+  });
+});
+
+describe("spawn-hardening: params too long for a command line", () => {
+  // café-日本-😀: a cp1252 character, a CJK one and an astral one, which is what
+  // caught the first attempt at this -- a plain UTF-8 temp file reached the
+  // endpoint as cafÃ©-æ—¥æœ¬-ðŸ˜€ because the CLI reads a file:// param in the
+  // locale code page.
+  const UNICODE_VALUE = "café-日本-😀";
+
+  it("passes small params inline, exactly as before", async () => {
+    const r = await runAwsCall({
+      service: "dynamodb",
+      operation: "put-item",
+      params: { TableName: "t", Item: { pk: { S: UNICODE_VALUE } } },
+      ...fakeOpts("spawn-hardening_read_input_file"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    const data = r.data as { viaFile: boolean; params: { Item: { pk: { S: string } } } };
+    assert.equal(data.viaFile, false);
+    assert.equal(data.params.Item.pk.S, UNICODE_VALUE);
+  });
+
+  it("sends params over the inline cap through a private ASCII-only temp file, and removes it", async () => {
+    // 51,200 bytes is a real CloudFormation template body, so this size is not a
+    // synthetic edge: before the temp file it was unsendable on Windows, with an
+    // error blaming PATH.
+    const params = { TableName: "t", Item: { pk: { S: UNICODE_VALUE }, blob: { S: "x".repeat(12_000) } } };
+    const json = JSON.stringify(params);
+    assert.ok(json.length > INLINE_CLI_INPUT_JSON_MAX_CHARS, "the test payload must exceed the inline cap");
+
+    const r = await runAwsCall({
+      service: "dynamodb",
+      operation: "put-item",
+      params,
+      ...fakeOpts("spawn-hardening_read_input_file"),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
+    if (!r.ok) return;
+    const data = r.data as {
+      viaFile: boolean;
+      path: string;
+      asciiOnly: boolean;
+      mode: number | null;
+      params: typeof params;
+    };
+    assert.equal(data.viaFile, true, "a payload this size must not be on the command line");
+    assert.equal(data.asciiOnly, true, "the file has to be ASCII-only or the CLI decodes it in the code page");
+    assert.deepEqual(data.params, params, "and it still has to parse back to exactly what was asked for");
+    if (process.platform !== "win32") assert.equal(data.mode, 0o600);
+    // Gone by the time the promise settles -- the CLI read it at startup.
+    assert.equal(existsSync(dirname(data.path)), false, "the temp directory must not outlive the call");
+    // The display string is the inline form either way, so no temp path leaks
+    // into `command` and the redaction stub still reports the payload's length.
+    assert.ok(!r.command.includes("file://"), r.command);
+    assert.ok(r.command.includes(`<redacted len=${json.length}>`), r.command);
+  });
+
+  it("calls an argv value that still will not fit bad_input, naming the flag", async () => {
+    // Only extraFlags can reach this now: CCAPI passes its payloads as dedicated
+    // flags rather than through --cli-input-json. 40,000 chars throws
+    // ENAMETOOLONG synchronously on Windows (measured); Linux caps a single
+    // argument at 131,072, so it needs more.
+    const size = process.platform === "win32" ? 40_000 : 3 * 1024 * 1024;
+    const r = await runAwsCall({
+      service: "cloudcontrol",
+      operation: "create-resource",
+      extraFlags: ["--desired-state", "x".repeat(size)],
+      ...fakeOpts("call_echo_args"),
+    });
+    assert.equal(r.ok, false, r.ok ? "the OS accepted an argv this long; raise `size`" : "");
+    if (r.ok) return;
+    assert.equal(r.kind, "bad_input", `error was: ${r.error}`);
+    assert.match(r.error, /too large to pass to the AWS CLI/);
+    assert.match(r.error, /--desired-state/, "the message has to name which value is too long");
+    assert.doesNotMatch(r.error, /on PATH/, "the old message sent readers to debug a PATH that was fine");
+  });
+
+  it("does not time out at once when timeoutMs is above a 32-bit timer", async () => {
+    // node stores a timer delay in a signed 32-bit int: 2**31 + 1000 warns
+    // (TimeoutOverflowWarning) and fires after 1 ms, so this call used to come
+    // back as a timeout immediately. Measured on node 22.22.2.
+    const r = await runAwsCall({
+      service: "s3api",
+      operation: "list-buckets",
+      ...fakeOpts("call_json_success", { timeoutMs: 2 ** 31 + 1000 }),
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
   });
 });
 

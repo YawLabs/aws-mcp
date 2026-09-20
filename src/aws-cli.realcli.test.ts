@@ -84,7 +84,15 @@ describe(`runAwsCall -- installed AWS CLI${detected?.ok ? ` (${detected.cli.vers
     });
 
   before(async () => {
-    stub = await startLoopbackStub((_req, res) => {
+    stub = await startLoopbackStub((req, res) => {
+      // DynamoDB speaks JSON 1.0 and names the operation in a header, so one
+      // empty JSON document answers any of its calls. Only the large-params case
+      // uses it, and what that case asserts is the REQUEST body.
+      if (req.headers["x-amz-target"] !== undefined) {
+        res.writeHead(200, { "content-type": "application/x-amz-json-1.0" });
+        res.end("{}");
+        return;
+      }
       if (mode === "throttle") {
         res.writeHead(400, { "content-type": "text/xml" });
         res.end(THROTTLING_BODY);
@@ -248,6 +256,35 @@ describe(`runAwsCall -- installed AWS CLI${detected?.ok ? ` (${detected.cli.vers
       assert.equal(r.kind, "nonzero_exit");
       assert.match(r.error, /Unable to parse config file/i);
     });
+  });
+
+  it("sends 45 KB of non-ASCII params through the temp file and the endpoint gets them exactly", async () => {
+    // The whole point of writing the file ASCII-escaped: the CLI reads a file://
+    // param as TEXT in the locale's preferred encoding, so a plain UTF-8 file
+    // turned café into cafÃ© on the wire. Driven through the real CLI because
+    // that decoding is the real CLI's behavior -- no fake can stand in for it.
+    const value = `café-日本-😀-${"x".repeat(45_000)}`;
+    const params = { TableName: "aws-mcp-realcli", Item: { pk: { S: value } } };
+    assert.ok(JSON.stringify(params).length > 8_192, "the payload has to exceed the inline cap");
+    const seenBefore = stub.requests.length;
+    const r = await runAwsCall({
+      service: "dynamodb",
+      operation: "put-item",
+      params,
+      prefixArgs: ["--endpoint-url", stub.url],
+      profile: "default",
+      region: "us-east-1",
+      timeoutMs: 120_000,
+    });
+    assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error} / ${r.rawStderr ?? ""}`);
+    const sent = stub.requests.slice(seenBefore).at(-1);
+    assert.ok(sent, "the CLI never reached the stub");
+    // The stub records the body decoded as UTF-8, which is what DynamoDB's JSON
+    // protocol sends -- so an exact match here means the escapes survived the
+    // CLI's own file read and its re-serialization.
+    assert.deepEqual(JSON.parse(sent.body), params);
+    // And `command` shows the payload's length, with no temp path in it.
+    assert.ok(!(r.ok ? r.command : "").includes("file://"), r.ok ? r.command : "");
   });
 
   it("runs the installed CLI even from a working directory holding an aws.exe", async () => {
