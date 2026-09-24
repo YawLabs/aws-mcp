@@ -1,5 +1,9 @@
 # @yawlabs/aws-mcp
 
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=AWS&command=npx&args=-y%2C%40yawlabs%2Faws-mcp&env=AWS_PROFILE%2CAWS_REGION&description=Call%20any%20AWS%20API%20from%20one%20server%20-%20CCAPI%20CRUD%2C%20multi-region%2C%20SSO%20re-login&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Faws-mcp)
+
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
+
 A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over 1,300+ resource types, live docs lookup, server-side scripting for batched workflows.**
 
 It's an **alternative to AWS's official MCP server**, not a complement -- both reach any AWS API, so running both hands the model two overlapping ways to do the same thing. (AWS gives the same advice about its own older servers: its setup guide says to remove them "to avoid tool conflicts that can confuse AI agents".) Pick one. They overlap in coverage and differ in shape. The honest comparison:
@@ -18,10 +22,6 @@ Five things this server tries to handle well:
 3. **Generic CRUD across services.** `aws_resource_*` (seven tools, including `aws_resource_diff` for dry-run previews) wraps AWS Cloud Control API, so the same lifecycle -- get / list / create / update / delete / status -- works for any control-plane resource with a CloudFormation schema: Lambda functions, S3 buckets, IAM roles, SSM parameters, RDS instances, and the rest of the 1,300 types on AWS's published list (not every type implements every verb). Pass `awaitCompletion: true` and the server polls the async create/update/delete through to terminal state for you. AWS Labs deprecated its own Cloud Control API MCP server in March 2026, and [its migration guide](https://github.com/awslabs/mcp/blob/main/docs/migration-ccapi.md) lists no direct replacement for resource get / list / create / update / delete: the successor authors CloudFormation and CDK instead. CCAPI is control-plane only. On the data plane, DynamoDB `get-item` / `query` and Bedrock `converse` are ordinary operations `aws_call` handles (DynamoDB values stay in its typed JSON, `{"S": "..."}`), and Lambda invokes have their own tool, `aws_lambda_invoke`. Three kinds of operation are out of `aws_call`'s reach: those that write their response body to a positional outfile (S3 `get-object`, Bedrock `invoke-model`), the CLI's hand-written commands, which register no `--cli-input-json` (`s3 cp/ls/sync`, `logs tail`, `cloudformation deploy`), and event-stream operations the CLI does not ship at all (Bedrock `converse-stream`, `invoke-agent`, agentic Knowledge Base retrieval).
 4. **Live AWS docs.** `aws_docs_search` queries the same backend that powers the docs.aws.amazon.com search box; `aws_docs_read` fetches a doc page and returns it as paginated markdown. Lets the agent discover new services and look up exact parameter names without a second MCP server installed.
 5. **Batched workflows in one round-trip.** `aws_script` runs a short JS snippet in a `node:vm` context with `aws.call`, `aws.paginate`, `aws.paginateAll`, `aws.resource.*`, `aws.logsTail`, `aws.metricsQuery`, `aws.iamSimulate`, `aws.multiRegion`, `aws.assumeRole`, and `aws.docs.{search,read}` available. Best for "list X, fetch Y for each, return Z" pipelines that would otherwise need N tool calls. Same idea as AWS's `run_script` (Python, sandboxed server-side), which is now that server's only general-purpose way to call an AWS API; here it is the batching option -- JS-native, running locally -- with `aws_call` for single operations.
-
-[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=AWS&command=npx&args=-y%2C%40yawlabs%2Faws-mcp&env=AWS_PROFILE%2CAWS_REGION&description=Call%20any%20AWS%20API%20from%20one%20server%20-%20CCAPI%20CRUD%2C%20multi-region%2C%20SSO%20re-login&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Faws-mcp)
-
-One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
 ## Optional companion: AWS Labs per-service servers
 
@@ -462,4 +462,4 @@ environment variable, which are skipped in a standard `npm test` run.
 
 MIT
 
-[![Follow @TokenLimitNews on X](https://img.shields.io/badge/follow-%40TokenLimitNews-000000?logo=x&logoColor=white)](https://x.com/TokenLimitNews)
+[![Follow @YawLabs on X](https://img.shields.io/badge/follow-%40YawLabs-000000?logo=x&logoColor=white)](https://x.com/YawLabs)
