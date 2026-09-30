@@ -66,13 +66,14 @@
  * it gates, so it is not offered rather than shipped as security theatre.
  *
  * MINIMUM OAM VERSION
- * The floor, bumped to each new oam release. Currently 0.16.3, verified on it:
- * full MCP handshake, all 28 tools (2026-09-20, oam 0.16.3 aarch64-pc-windows-msvc,
- * checksum matched against the release SHA256SUMS). It is a FLOOR, not a pin: the
+ * The floor, bumped to each new oam release. Currently 0.17.0, verified on it:
+ * full MCP handshake listing all 28 tools, a local tool call and the aws_script
+ * sandbox check (2026-09-29, oam 0.17.0 aarch64-pc-windows-msvc, checksum matched
+ * against the release SHA256SUMS). It is a FLOOR, not a pin: the
  * launcher runs the newest oam it finds at or above it, and falls back to Node
  * rather than serving on an older one -- which is the point, because an older oam
  * is not what this server is verified on.
- * Only the current oam is used and verified; an older one falls back to Node.
+ * Only an oam at or above the floor is used; an older one falls back to Node.
  * The floor is not cosmetic: before 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
  * `spawnSync` truncated at `maxBuffer` while reporting success, and
@@ -97,8 +98,11 @@ import { constants, homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** Oldest oam whose `child_process` matches Node. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 16, 3];
+/**
+ * The oam release this server is verified on; the launcher never serves below
+ * it. See MINIMUM OAM VERSION above.
+ */
+const OAM_MIN = [0, 17, 0];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;

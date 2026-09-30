@@ -100,6 +100,20 @@ describe("check-oam-floor catches drift", () => {
     assert.equal(r.code, 0, r.out);
   });
 
+  it("flags a stale claim on a line that also names the current floor", () => {
+    // The README's env-var rows are one table line each, carrying several floor
+    // claims. The 0.17.0 bump rewrote "X or newer" on them and left "older than
+    // 0.16.3" and "0.16.3+" behind, and this checker passed both: it skipped any
+    // line that named the current floor.
+    const root = fixture({
+      readme:
+        "| `AWS_MCP_RUNTIME` | on oam if that is 0.16.3 or newer. An oam host older than 0.15.2 never serves. |\n",
+    });
+    const r = runChecker(root);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /README\.md:1 +says 0\.15\.2/);
+  });
+
   it("does NOT flag AWS CLI versions, which are a different dependency", () => {
     // "CLI 2.35.3 or newer" and "2.25.0 or newer" are about the AWS CLI. The first
     // version of this checker produced five false positives from lines like these,

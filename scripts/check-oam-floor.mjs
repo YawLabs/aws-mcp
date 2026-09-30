@@ -51,9 +51,9 @@ const SCANNED = ["bin/aws-mcp.mjs", "README.md", "src/launcher.test.ts"];
 
 /**
  * A line is making a claim ABOUT the floor when it carries one of these. Chosen
- * from how the floor is actually phrased in this repo rather than invented:
- * "0.16.3 or newer", "older than 0.16.3", "oam 0.16.3 is the minimum", "the
- * current 0.16.3 floor", and the constant itself.
+ * from how the floor is actually phrased in this repo rather than invented
+ * (X.Y.Z standing for the floor): "X.Y.Z or newer", "older than X.Y.Z",
+ * "oam X.Y.Z is the minimum", "the current X.Y.Z floor", and the constant itself.
  */
 const FLOOR_CLAIM = /or newer|older than|is the minimum|floor|OAM_MIN/i;
 
@@ -70,12 +70,18 @@ const ABOUT_OAM = /\boam\b|OAM_MIN|OAM_BIN/i;
  * ...unless the line is talking about the PAST, in which case an old version on
  * it is the point. Every one of these is a real sentence in the repo: the startup
  * numbers "taken with oam 0.8.2, long before the current floor", the sandbox note
- * "re-measured against oam 0.16.3", and the launcher comment about a bug where it
+ * "re-measured against oam X.Y.Z", and the launcher comment about a bug where it
  * "bound to 0.9.0" despite a newer oam being on PATH.
  */
 const HISTORICAL = /taken with|re-measured|long before|used to|bound to|before 0\.9\.0/i;
 
 const VERSION_RE = /(\d+)\.(\d+)\.(\d+)/g;
+
+/**
+ * The one version a floor claim may carry that is not the floor: the host's, in
+ * the launcher's diagnostic "this process is oam <host>, older than <floor>".
+ */
+const HOST_VERSION = /\bis oam \d+\.\d+\.\d+, older than/g;
 
 export function parseVersion(text) {
   const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(text.trim());
@@ -89,7 +95,7 @@ export function compareVersions(a, b) {
   return 0;
 }
 
-/** The source of truth: `const OAM_MIN = [0, 16, 3];` in the launcher. */
+/** The source of truth: `const OAM_MIN = [x, y, z];` in the launcher. */
 export function readFloor(root) {
   const text = readFileSync(join(root, "bin/aws-mcp.mjs"), "utf8");
   const m = /const OAM_MIN = \[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(text);
@@ -101,7 +107,7 @@ export function readFloor(root) {
  * Every floor claim in the repo that names a version other than the floor.
  *
  * Backslashes are stripped before matching because launcher.test.ts states the
- * floor inside a regex literal (`older than 0\.16\.3`), and that is a floor claim
+ * floor inside a regex literal (`older than X\.Y\.Z`), and that is a floor claim
  * like any other -- it is asserting the launcher's own diagnostic.
  */
 export function findDrift(root, floor) {
@@ -119,13 +125,14 @@ export function findDrift(root, floor) {
       const raw = lines[i];
       if (!FLOOR_CLAIM.test(raw) || !ABOUT_OAM.test(raw) || HISTORICAL.test(raw)) continue;
       const line = raw.replaceAll("\\", "");
-      // A line that already names the current floor is comparing two things and is
-      // self-consistent -- "this process is oam 0.9.0, older than 0.16.3" states a
-      // HOST version beside the floor, and both belong there. Skipping it is what
-      // keeps the rule from flagging every such diagnostic; a line that claims a
-      // floor and never mentions the real one is the shape being hunted.
-      if (line.includes(want)) continue;
-      for (const m of line.matchAll(VERSION_RE)) {
+      // A HOST version beside the floor is not a floor claim: "this process is oam
+      // 0.9.0, older than X.Y.Z" names the oam that was found AND the floor, and
+      // both belong there. Only that one token is set aside. This used to skip any
+      // line that named the floor, which passed a table row holding "X.Y.Z or
+      // newer" beside a stale "older than <old floor>" -- the README's env-var
+      // rows, after the 0.17.0 bump.
+      const claims = line.replace(HOST_VERSION, "is oam <host>, older than");
+      for (const m of claims.matchAll(VERSION_RE)) {
         if (m[0] !== want) {
           problems.push({ file: rel, line: i + 1, found: m[0], text: raw.trim().slice(0, 110) });
         }

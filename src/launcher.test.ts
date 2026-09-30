@@ -76,11 +76,11 @@ describe("launcher runtimePlan()", () => {
     // asking what it was already running on. `auto` and `oam` both have to take
     // the shortcut -- `oam` demands oam, and the host already is one.
     //
-    // 0.16.3 pins the floor as inclusive (it IS the supported release), and
-    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.16.3 as a string, so a
+    // 0.17.0 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.17.0 as a string, so a
     // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.16.3", "0.16.4", "0.100.0", "1.0.0", "0.16.3-dev"]) {
+      for (const hostOam of ["0.17.0", "0.17.1", "0.100.0", "1.0.0", "0.17.0-dev"]) {
         assert.equal(runtimePlan({ mode, hostOam }), "in-process", `mode=${mode} hostOam=${hostOam}`);
       }
     }
@@ -92,9 +92,9 @@ describe("launcher runtimePlan()", () => {
     // anything older than the latest release is not what the server is
     // verified on.
     for (const mode of ["auto", "oam"]) {
-      // 0.16.2 is the just-below case that matters on each bump: the previous
+      // 0.16.4 is the just-below case that matters on each bump: the previous
       // release stops being served the moment the floor moves past it.
-      for (const hostOam of ["0.16.2", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
+      for (const hostOam of ["0.16.4", "0.16.3", "0.9.0", "0.8.2", "0.0.1"]) {
         assert.equal(runtimePlan({ mode, hostOam }), "discover", `mode=${mode} hostOam=${hostOam}`);
       }
     }
@@ -112,7 +112,7 @@ describe("launcher runtimePlan()", () => {
 
   it("runs AWS_MCP_RUNTIME=node on Node: in-process on a Node host, handed off from any oam host", () => {
     assert.equal(runtimePlan({ mode: "node", hostOam: undefined }), "in-process");
-    for (const hostOam of ["0.8.2", "0.15.2", "1.0.0", "dev"]) {
+    for (const hostOam of ["0.8.2", "0.15.2", "0.17.0", "1.0.0", "dev"]) {
       assert.equal(runtimePlan({ mode: "node", hostOam }), "handoff-node", `hostOam=${hostOam}`);
     }
   });
@@ -123,25 +123,25 @@ describe("launcher pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    assert.deepEqual(floor, [0, 16, 3]);
+    assert.deepEqual(floor, [0, 17, 0]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug: discovery stopped at the first binary that existed, so an older
     // copy in an earlier location (the installed dir is searched before PATH)
     // hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 16, 3]), at("path-a", [0, 17, 0]), at("path-b", [0, 16, 9])]);
+    const chosen = pickNewest([at("installed", [0, 17, 0]), at("path-a", [0, 18, 0]), at("path-b", [0, 17, 9])]);
     assert.equal(chosen?.path, "path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
-    assert.equal(pickNewest([at("a", [0, 16, 3]), at("b", [0, 100, 0])])?.path, "b");
-    assert.equal(pickNewest([at("first", [0, 16, 3]), at("second", [0, 16, 3])])?.path, "first");
+    assert.equal(pickNewest([at("a", [0, 17, 0]), at("b", [0, 100, 0])])?.path, "b");
+    assert.equal(pickNewest([at("first", [0, 17, 0]), at("second", [0, 17, 0])])?.path, "first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    assert.equal(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 16, 3])])?.path, "good");
-    assert.equal(pickNewest([at("old", [0, 16, 2]), at("broken", null)]), null);
+    assert.equal(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 17, 0])])?.path, "good");
+    assert.equal(pickNewest([at("old", [0, 16, 4]), at("broken", null)]), null);
     assert.equal(pickNewest([]), null);
   });
 });
@@ -228,14 +228,14 @@ describe("launcher on an oam host", () => {
   it("serves in-process instead of spawning a nested oam", { timeout }, async () => {
     const envs: Record<string, string>[] = [{}, { AWS_MCP_RUNTIME: "oam" }];
     for (const extraEnv of envs) {
-      const run = await runLauncher("0.16.3", extraEnv);
+      const run = await runLauncher("0.17.0", extraEnv);
       assert.equal(servedInProcess(run), true, `${JSON.stringify(extraEnv)} -> ${JSON.stringify(run)}`);
       assert.match(run.stderr, /LAUNCHER_ARGV1=.*dist[\\/]index\.js/);
     }
   });
 
   it("still discovers when the host oam is below the floor", { timeout }, async () => {
-    const run = await runLauncher("0.16.2");
+    const run = await runLauncher("0.16.4");
     assert.equal(servedInProcess(run), false, `a below-floor host must not shortcut, got ${JSON.stringify(run)}`);
     assert.notEqual(run.code, 0);
     // A spawned child failing, not the launcher diagnosing: every launcher
@@ -277,7 +277,7 @@ describe("launcher with no usable oam", () => {
     assert.equal(run.stdout.trim(), PACKAGE_VERSION, "the Node child must still serve");
     assert.match(
       run.stderr,
-      /this process is oam 0\.9\.0, older than 0\.16\.3, and no newer oam was found; running on .*node/,
+      /this process is oam 0\.9\.0, older than 0\.17\.0, and no newer oam was found; running on .*node/,
     );
     // Served by the child, not in the launcher process: argv[1] was never
     // pointed at dist/index.js.
@@ -294,10 +294,14 @@ describe("launcher with no usable oam", () => {
   });
 
   it("hands AWS_MCP_RUNTIME=node off to Node even on a supported oam host", { timeout }, async () => {
-    const run = await runLauncher("0.15.2", isolated({ AWS_MCP_RUNTIME: "node" }));
+    // At the floor, so this is the supported-host branch: a handoff with no
+    // below-floor reason. (It used 0.15.2, which each floor bump since has made a
+    // below-floor host, so the branch the name promises went untested.)
+    const run = await runLauncher("0.17.0", isolated({ AWS_MCP_RUNTIME: "node" }));
     assert.equal(run.code, 0, JSON.stringify(run));
     assert.equal(run.stdout.trim(), PACKAGE_VERSION);
     assert.match(run.stderr, /LAUNCHER_ARGV1=.*aws-mcp\.mjs/);
+    assert.doesNotMatch(run.stderr, /older than/, "a supported host hands off without a below-floor reason");
   });
 
   it("still falls back when the chosen oam fails to spawn on an oam host", { timeout }, async () => {
