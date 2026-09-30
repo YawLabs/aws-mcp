@@ -218,8 +218,8 @@ export function invokeTimeouts(timeoutMs: number | undefined): {
  *
  * Deleting the case-variants is load-bearing rather than tidy. Given both
  * AWS_MAX_ATTEMPTS and aws_max_attempts, Node 22.22.2 hands the child the
- * upper-case one while oam 0.16.2 -- the runtime the published command uses by
- * default -- hands it the LAST key in the object (measured both ways). So an
+ * upper-case one while oam 0.16.2, where this was measured, hands it the LAST
+ * key in the object (measured both ways). So an
  * operator's lower-case spelling could win there, on the one setting that keeps
  * the function from running twice.
  */

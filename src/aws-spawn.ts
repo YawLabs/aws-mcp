@@ -152,7 +152,7 @@ export function envLookup(
  * does not, so `{aws_cli_error_format: "json", AWS_CLI_ERROR_FORMAT: "enhanced"}`
  * is a real possibility and which one the child sees depends on the runtime:
  * node 22.22.2 hands over the upper-case one whatever the insertion order, while
- * oam 0.16.2 -- the runtime the published binary uses -- hands over the LAST key
+ * oam 0.16.2, where this was measured, hands over the LAST key
  * in the object (both measured, both directions). Deleting is what makes the
  * result the same either way.
  */
