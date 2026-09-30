@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.5.1] — 2026-09-29
+
 ### Changed
 - **The oam floor moves from 0.16.3 to 0.17.0, so the `aws-mcp` launcher no longer runs the server on an older oam.** This server is verified on one oam release at a time, and the floor keeps the launcher off anything older than that release. 0.17.0 is verified on the published aarch64-pc-windows-msvc binary, checksum matched against the release SHA256SUMS: a full MCP handshake listing all 28 tools, `aws_list_profiles` served, and the documented `aws_script` sandbox divergence re-measured on it (inside the sandbox `eval('1+1')` returns 2 and `Function('return 7')()` returns 7 under oam, while both raise `EvalError` under Node; `Function('return this')()` still yields a global whose `process` and `require` are `undefined`). **If the launcher finds only oam 0.16.3 or 0.16.4, it now falls back to Node under the default `AWS_MCP_RUNTIME=auto`, and exits with an error under `AWS_MCP_RUNTIME=oam`** -- it says so on stderr, naming the version it found and the floor. On Node the tools and the AWS CLI they run are the same; the one difference is in `aws_script`, where `eval` and `Function` raise `EvalError` instead of working (see Runtime in the README). A client that runs `oam run /path/to/aws-mcp/dist/index.js` directly, as the README's Runtime section shows, bypasses the launcher and keeps the oam it names. Run `oam self-update`, or set `AWS_MCP_RUNTIME=node` to make the choice explicit.
 
@@ -1130,7 +1132,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.5.1...HEAD
+[2.5.1]: https://github.com/YawLabs/aws-mcp/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/YawLabs/aws-mcp/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/YawLabs/aws-mcp/compare/v2.3.4...v2.4.0
 [2.3.4]: https://github.com/YawLabs/aws-mcp/compare/v2.3.3...v2.3.4
