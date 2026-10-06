@@ -66,9 +66,9 @@
  * it gates, so it is not offered rather than shipped as security theatre.
  *
  * MINIMUM OAM VERSION
- * The floor, bumped to each new oam release. Currently 0.17.0, verified on it:
+ * The floor, bumped to each new oam release. Currently 0.18.0, verified on it:
  * full MCP handshake listing all 28 tools, a local tool call and the aws_script
- * sandbox check (2026-09-29, oam 0.17.0 aarch64-pc-windows-msvc, checksum matched
+ * sandbox check (2026-10-06, oam 0.18.0 aarch64-pc-windows-msvc, checksum matched
  * against the release SHA256SUMS). It is a FLOOR, not a pin: the
  * launcher runs the newest oam it finds at or above it, and falls back to Node
  * rather than serving on an older one -- which is the point, because an older oam
@@ -102,7 +102,7 @@ import { fileURLToPath } from "node:url";
  * The oam release this server is verified on; the launcher never serves below
  * it. See MINIMUM OAM VERSION above.
  */
-const OAM_MIN = [0, 17, 0];
+const OAM_MIN = [0, 18, 0];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
