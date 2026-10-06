@@ -46,7 +46,7 @@ import type { Tool, ToolResult } from "./tool.js";
  *
  * RUNTIME CAVEAT (oam.js): `codeGeneration: { strings: false }` is honored by
  * Node but NOT by oam -- under oam, `eval` and `Function` still work inside the
- * context. Measured, not assumed, and re-measured against oam 0.17.0: still
+ * context. Measured, not assumed, and re-measured against oam 0.18.0: still
  * divergent, so this is a standing difference rather than a bug awaiting a fix.
  * Given the bridge-constructor path above, that divergence changes how
  * convenient an escape is, not whether one exists. Do not treat the
