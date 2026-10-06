@@ -11,6 +11,9 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Security
+- **The bundled MCP SDK moves from 1.30.0 to 1.32.1** (GHSA-6qxp-vccf-f47h, high: the SDK's OAuth client could send credentials to an authorization server chosen by the MCP server). The SDK is bundled into `dist`, so this ships in the package; the dependency floor is now `^1.32.1`. Transitive dev dependencies are patched alongside it: `proxy-addr` 2.0.8 (GHSA-jqcg-44mw-7w3h), `fast-uri` 3.1.8 (GHSA-hrr3-gc8f-f4qj) and `ip-address` 10.7.3 (GHSA-j6r3-76f7-8jcv). `npm audit` reports 0 vulnerabilities.
+
 ### Fixed
 - `release.sh` runs every mcp-publisher call to the MCP Registry, each login and each publish attempt, under coreutils `timeout` (`MCP_PUBLISH_TIMEOUT_S`, default 90 s) where one (or Homebrew's `gtimeout`) is on PATH -- without one the call runs unbounded, and a warning says so -- because mcp-publisher waits for the registry's answer with no limit of its own and a registry that never answered would have hung the release. A publish attempt that gets no answer is retried on the same 30, 60 and 90 s clock as the registry's own 429-504: one the limit stopped, which used to hang the step, and one whose connection failed or dropped (the client's `error sending request` or `error reading response`), which used to fail it at once. A login the limit stopped says the registry did not answer; one that failed any other way says how to read mcp-publisher's output (a 401 is the registry refusing the token exchange; a 429, a 5xx or a connection error is the registry or the network) instead of naming token scopes, which never fail a login: the registry reads the org role at login and refuses only at publish. A publish refused with a 403 says what the io.github.YawLabs namespace takes: a YawLabs org Owner whose token can read org roles. Release tooling only; the server itself is unchanged.
 
