@@ -11,6 +11,9 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Fixed
+- `scripts/update-manifests.mjs` escapes every value it writes into a Ruby string in the Homebrew formula (CodeQL js/incomplete-sanitization). The `desc` escaped `"` but not `\`, so a description holding `\"` came out as `\\"` -- an escaped backslash and then a closing quote -- and it left `#{...}` alone, which Ruby interpolates inside double quotes, so such a description would have run as code when brew loaded the formula. A new `rubyString()` escapes the backslash first, then `"`, a `#` that starts interpolation (`#{`, `#@`, `#$`; a plain `#` stays as written so `brew style` does not flag it), CR and LF, and is applied to desc, homepage, version, license, the release URLs, the sha256s and the command name. For the real package.json the generated formula and Scoop manifest are byte-identical to the old script's (checked on v1.5.3). Release tooling only; the server itself is unchanged.
+
 ## [2.5.2] — 2026-10-06
 
 ### Changed
