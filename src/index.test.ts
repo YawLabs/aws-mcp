@@ -10,7 +10,7 @@ import {
   logUnhandledRejection,
   toMcpResult,
 } from "./index.js";
-import { HOST_TEXT_CAP_BYTES } from "./server-instructions.js";
+import { HOST_TEXT_CAP_BYTES, SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_CAP_BYTES } from "./server-instructions.js";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
 import { callTools } from "./tools/call.js";
@@ -456,6 +456,36 @@ describe("host text budgets -- Claude Code truncates a tool description at 2 KB"
       [],
       "a description past the cap is silently cut from the END before the model ever sees it -- " +
         "trim it, or move what matters to the front",
+    );
+  });
+});
+
+describe("server instructions", () => {
+  it("fit the 2000-byte ceiling yaw-mcp cuts upstream instructions at", () => {
+    const bytes = Buffer.byteLength(SERVER_INSTRUCTIONS, "utf8");
+    assert.ok(
+      bytes <= SERVER_INSTRUCTIONS_CAP_BYTES,
+      `SERVER_INSTRUCTIONS is ${bytes} bytes, over the ${SERVER_INSTRUCTIONS_CAP_BYTES}-byte ceiling`,
+    );
+    assert.equal(SERVER_INSTRUCTIONS_CAP_BYTES, 2000);
+  });
+
+  it("are plain printable ASCII", () => {
+    assert.match(SERVER_INSTRUCTIONS, /^[\x20-\x7e\n]+$/);
+  });
+
+  it("route to every tool, and only to tools that exist", () => {
+    const named = new Set(SERVER_INSTRUCTIONS.match(/\baws_[a-z_]+\b/g) ?? []);
+    const real = new Set(allTools.map((t) => t.name));
+    assert.deepEqual(
+      [...named].filter((n) => !real.has(n)),
+      [],
+      "names a tool that does not exist",
+    );
+    assert.deepEqual(
+      [...real].filter((n) => !named.has(n)),
+      [],
+      "leaves a tool out of the routing guide",
     );
   });
 });

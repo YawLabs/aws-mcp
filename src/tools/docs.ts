@@ -827,10 +827,15 @@ const CONNECT_FAILURE_CODES = new Set([
 ]);
 
 /**
- * oam's HTTP stack reports a transport failure with no code at all -- a
- * self-signed certificate comes back as this message and nothing else (measured
- * on oam 0.16.2). A refused proxy there DOES carry ECONNREFUSED, so an uncoded
- * failure under oam points at the certificate first.
+ * An oam transport failure that still carries no code. Since oam 0.16.3 a
+ * refused certificate carries Node's code (DEPTH_ZERO_SELF_SIGNED_CERT,
+ * CERT_HAS_EXPIRED, ...) and takes the TLS_TRUST_CODES branch like Node does;
+ * up to 0.16.2 it came back as this bare message. On oam 0.18.0 the bare message
+ * still appears for a non-certificate transport or protocol failure -- measured
+ * against a local server that answers TLS with garbage, where Node gives
+ * ERR_SSL_PACKET_LENGTH_TOO_LONG -- which in practice means a TLS-intercepting
+ * proxy speaking something other than TLS, or an HTTPS_PROXY that cannot be
+ * reached. A refused proxy connection DOES carry ECONNREFUSED.
  */
 const UNCODED_TRANSPORT_RE = /error sending request for url/i;
 
@@ -930,7 +935,7 @@ function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): strin
     cause.message !== null &&
     UNCODED_TRANSPORT_RE.test(cause.message)
   ) {
-    return `This server is running under the oam runtime, which reports no failure code for a transport error. The usual cause is a certificate it does not trust. ${CA_TRUST_REMEDY} A proxy in HTTPS_PROXY that cannot be reached looks the same from here.`;
+    return `This server is running under the oam runtime, which reported this transport failure with no failure code. A refused certificate would carry one, so this points at the connection itself: a TLS-intercepting proxy or gateway that is not speaking TLS, or a proxy in HTTPS_PROXY that cannot be reached. Check HTTPS_PROXY in this server's MCP-config \`env\` block, and whether a gateway on this network intercepts HTTPS.`;
   }
   // A missing code covers the timeout branches, where the abort is all there is
   // to read: a proxy-only network with the proxy ignored has nothing to connect
@@ -954,8 +959,9 @@ function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): strin
  * gateway every docs call reported "fetch failed" and aws_docs_search went on to
  * blame AWS's undocumented search backend for a request that never left the
  * machine. Reproduced here on 2026-09-19: Node 22.22.2 against a local
- * self-signed server gives cause code DEPTH_ZERO_SELF_SIGNED_CERT, and oam
- * 0.16.2 gives the same condition with no code at all.
+ * self-signed server gives cause code DEPTH_ZERO_SELF_SIGNED_CERT, and so does
+ * oam since 0.16.3 (0.16.2 and older gave it no code at all; see
+ * UNCODED_TRANSPORT_RE for what an uncoded oam failure means now).
  *
  * Returns "" when there is nothing to add, and otherwise a string that starts
  * with a space -- every caller appends it to a sentence that already ends in a

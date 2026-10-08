@@ -385,7 +385,10 @@ function writeAllSync(fd: number, text: string): void {
  * linux-arm64 build and there is no Mac here, so no POSIX oam measurement exists
  * anywhere. Note also that a Windows mode argument can only toggle
  * FILE_ATTRIBUTE_READONLY, so that particular row does not transfer cleanly; the
- * `flag: "wx"` row does, being flag-string parsing above the OS layer. fchmodSync itself both runtimes honour. It goes on the fd rather than the
+ * `flag: "wx"` row did, being flag-string parsing above the OS layer -- and on
+ * oam >= 0.18.0 (the launcher's floor) "wx" is honoured by openSync and
+ * writeFileSync alike, as on node. The creation mode still needs the fchmod:
+ * no oam release records open's mode argument as honoured. fchmodSync itself both runtimes honour. It goes on the fd rather than the
  * path so there is no moment where the file holds credentials at a wider mode.
  *
  * Returns `{ existed: true }` when the profile was already present and its

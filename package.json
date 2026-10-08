@@ -56,13 +56,15 @@
     "check:oam": "oam check",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
     "prepublishOnly": "npm run build",
-    "build:binary:oam": "node scripts/build-binary-oam.mjs"
+    "build:binary:oam": "node scripts/build-binary-oam.mjs",
+    "check:compliance": "node scripts/check-compliance.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.4",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@types/node": "^26.0.1",
     "@types/turndown": "^5.0.6",
+    "@yawlabs/mcp-compliance": "^0.20.4",
     "esbuild": "^0.28.1",
     "node-html-parser": "^9.0.0",
     "postject": "^1.0.0-alpha.6",

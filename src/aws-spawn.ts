@@ -150,11 +150,12 @@ export function envLookup(
  * On win32 every case-variant of a pinned name is deleted before the pins go on.
  * Windows itself treats environment names case-insensitively, but a JS object
  * does not, so `{aws_cli_error_format: "json", AWS_CLI_ERROR_FORMAT: "enhanced"}`
- * is a real possibility and which one the child sees depends on the runtime:
- * node 22.22.2 hands over the upper-case one whatever the insertion order, while
- * oam 0.16.2, where this was measured, hands over the LAST key
- * in the object (both measured, both directions). Deleting is what makes the
- * result the same either way.
+ * is a real possibility. node 22.22.2 hands over the upper-case one whatever the
+ * insertion order, and so does oam >= 0.18.0, which keeps the first in sort
+ * order as node does (oam 0.16.2 handed over the LAST key in the object; both
+ * measured, both directions). Deleting every variant stays as the defence that
+ * does not depend on the runtime's tie-break: a plain-object base is
+ * case-sensitive even on node, and the pin has to be the one spelling left.
  */
 export function awsChildEnv(
   base: NodeJS.ProcessEnv = process.env,

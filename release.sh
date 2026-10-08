@@ -323,7 +323,7 @@ fi
 if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
-  echo "  1. Run lint + tests"
+  echo "  1. Run lint + tests + MCP compliance"
   echo "  2. Build"
   echo "  3. Bump version in package.json"
   echo "  4. Commit, tag, and push"
@@ -362,6 +362,25 @@ npm run build || fail "Build failed"
 export AWS_MCP_REAL_CLI_TESTS="${AWS_MCP_REAL_CLI_TESTS:-1}"
 npm test || fail "Tests failed"
 info "All tests passed"
+
+# MCP compliance, graded with the @yawlabs/mcp-compliance line yaw-mcp grades
+# with (pinned in devDependencies), against the published launcher under
+# AWS_MCP_RUNTIME=node and again under oam. A required-test failure stops the
+# release. A leg that could not run (package not installed, no oam on PATH)
+# exits 2 and is reported as a WARNING here -- never as a green step -- and
+# AWS_MCP_SKIP_COMPLIANCE=1 is the deliberate, loudly-reported way past it.
+if [ "${AWS_MCP_SKIP_COMPLIANCE:-}" = "1" ]; then
+  warn "AWS_MCP_SKIP_COMPLIANCE=1 -- MCP compliance NOT checked for this release"
+else
+  # `|| status=$?`, not set +e: a bare failing command would still fire the ERR trap.
+  COMPLIANCE_STATUS=0
+  node scripts/check-compliance.mjs || COMPLIANCE_STATUS=$?
+  case "$COMPLIANCE_STATUS" in
+    0) info "MCP compliance passed (node and oam)" ;;
+    2) warn "MCP compliance only partly checked -- see the WARNING above" ;;
+    *) fail "MCP compliance failed -- see above. Set AWS_MCP_SKIP_COMPLIANCE=1 to release without it deliberately." ;;
+  esac
+fi
 
 step 3 "Bump version to $VERSION"
 # Re-read from disk -- the version in $CURRENT_VERSION was captured at script

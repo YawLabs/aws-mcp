@@ -762,12 +762,12 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         // is created exclusively and made private -- and both have to be spelled
         // out this way to hold on the runtime the package actually ships on.
         //
-        // Exclusivity comes from open(2)'s O_EXCL via `openSync(..., "wx")`,
-        // which node 22.22.2 and oam 0.16.2 both honour. writeFileSync's `flag`
-        // option does NOT reach oam: measured 2026-09-20 on Windows, a second
-        // `writeFileSync(path, ..., {flag: "wx"})` over an existing file
-        // SUCCEEDED there and the readback returned the second payload, where
-        // node raises EEXIST. bin/aws-mcp.mjs defaults AWS_MCP_RUNTIME=auto, so
+        // Exclusivity comes from open(2)'s O_EXCL via `openSync(..., "wx")`.
+        // "wx" is honoured by openSync and by writeFileSync's `flag` option alike
+        // on node and on oam >= 0.18.0 (the floor bin/aws-mcp.mjs enforces;
+        // before 0.18.0 oam's writeFileSync ignored its flag and overwrote an
+        // existing file). openSync stays because the fd is what the fchmod and
+        // fstat below need. bin/aws-mcp.mjs defaults AWS_MCP_RUNTIME=auto, so
         // oam is the runtime whenever one is found.
         //
         // The creation mode is dropped on oam too -- a file opened 0o400 comes
@@ -779,9 +779,8 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         // runtimes; the containing directory is the other half, and there the
         // split is by platform, as lambda.ts documents for its own temp files:
         // Windows os.tmpdir() is the per-user %TEMP%, already ACL'd, while on
-        // POSIX it rests on mkdtemp(3)'s 0700 -- which oam reimplements (its names
-        // are a nanosecond clock value, not node's six random characters) and this
-        // Windows host cannot check.
+        // POSIX it rests on mkdtemp(3)'s 0700, which under oam this Windows host
+        // has not measured.
         //
         // Every failure here is reported: the catch below turns it into
         // spawn_failure and removes the directory, so an EEXIST from a name a

@@ -32,6 +32,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, write
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import esbuild from 'esbuild';
+import { parseManifest, predatesSigning, verifyManifestSignature } from './lib/oam-release-verify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
@@ -117,10 +118,16 @@ rmSync(outExe, { force: true });
 //   AWS_MCP_BINARY_TARGET=linux-x64 node scripts/build-binary-oam.mjs
 //
 // The carrier is fetched from the published oam release and verified against
-// that release's SHA256SUMS. That check is not optional: the carrier becomes the
-// bulk of a binary we then ship, so an unverified download would be a supply
-// chain hole opened by our own build script. A missing or mismatched entry
-// aborts rather than warning.
+// that release's SIGNED RELEASE-MANIFEST (oam v0.18.0+): `ssh-keygen -Y verify`
+// against the release keys vendored in scripts/oam-release-keys/, the manifest's
+// tag checked against the one requested, and the carrier's sha256 taken from
+// the manifest -- not from the unsigned SHA256SUMS served beside the binary,
+// which only proves the two came from the same server. See
+// scripts/lib/oam-release-verify.mjs. That check is not optional: the carrier
+// becomes the bulk of a binary we then ship, so an unverified download would be
+// a supply chain hole opened by our own build script. Every failure aborts
+// rather than warning. Only a tag before v0.18.0, which has no manifest, falls
+// back to SHA256SUMS, and says so.
 const OAM_ASSETS = {
   'win32-x64': 'oam-x86_64-pc-windows-msvc.exe',
   'win32-arm64': 'oam-aarch64-pc-windows-msvc.exe',
@@ -129,7 +136,30 @@ const OAM_ASSETS = {
   'linux-x64': 'oam-x86_64-unknown-linux-gnu',
 };
 
-/** Fetch the published oam release binary for `target`, verified against SHA256SUMS. */
+/** The launcher's floor, `const OAM_MIN = [x, y, z]` in the bin, as a tag. */
+function launcherFloorTag() {
+  const launcher = join(repoRoot, Object.values(pkg.bin ?? {})[0] ?? `bin/${binName}.mjs`);
+  const m = /const OAM_MIN = \[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(readFileSync(launcher, 'utf-8'));
+  if (!m) {
+    console.error(`build-binary-oam: could not read OAM_MIN from ${launcher}; set OAM_VERSION=vX.Y.Z`);
+    process.exit(1);
+  }
+  return `v${m[1]}.${m[2]}.${m[3]}`;
+}
+
+async function download(url, dest) {
+  console.log(`> fetch ${url}`);
+  const res = await fetch(url);
+  if (!res.ok) {
+    console.error(`build-binary-oam: downloading ${url} failed (HTTP ${res.status}); refusing to use an unverified carrier`);
+    process.exit(1);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (dest) writeFileSync(dest, buf);
+  return buf;
+}
+
+/** Fetch the published oam release binary for `target`, verified against its signed RELEASE-MANIFEST. */
 async function fetchOamCarrier(target) {
   const asset = OAM_ASSETS[target];
   if (!asset) {
@@ -139,36 +169,50 @@ async function fetchOamCarrier(target) {
     );
     process.exit(1);
   }
-  // OAM_VERSION pins the release; default tracks latest. Pin it in CI so a
-  // rebuild of an old tag does not silently acquire a newer runtime.
-  const tag = process.env.OAM_VERSION ?? 'latest';
-  const base =
-    tag === 'latest'
-      ? 'https://github.com/YawLabs/oam/releases/latest/download'
-      : `https://github.com/YawLabs/oam/releases/download/${tag}`;
+  // OAM_VERSION pins the release; the default is the launcher's floor
+  // (OAM_MIN), the one oam release this server is verified on -- never
+  // 'latest', which would let a rebuild silently acquire a newer runtime and
+  // has no fixed tag for the manifest to be checked against.
+  const rawTag = process.env.OAM_VERSION ?? launcherFloorTag();
+  const tag = rawTag.startsWith('v') ? rawTag : `v${rawTag}`;
+  let unsigned;
+  try {
+    unsigned = predatesSigning(tag);
+  } catch (err) {
+    console.error(`build-binary-oam: OAM_VERSION ${err.message}`);
+    process.exit(1);
+  }
+  const base = `https://github.com/YawLabs/oam/releases/download/${tag}`;
   const dest = join(tmpDir, asset);
+  await download(`${base}/${asset}`, dest);
 
-  console.log(`> fetch ${base}/${asset}`);
-  const res = await fetch(`${base}/${asset}`);
-  if (!res.ok) {
-    console.error(`build-binary-oam: downloading ${asset} failed (HTTP ${res.status})`);
-    process.exit(1);
+  let want;
+  if (unsigned) {
+    // Releases before v0.18.0 carry no manifest; their SHA256SUMS is all there is.
+    console.warn(`WARNING: oam ${tag} predates signed releases; checking ${asset} against its unsigned SHA256SUMS only.`);
+    const sums = (await download(`${base}/SHA256SUMS`)).toString('utf-8');
+    want = sums
+      .split('\n')
+      .map((l) => l.trim().split(/\s+/))
+      .find(([, name]) => name?.replace(/^\*/, '') === asset)?.[0];
+  } else {
+    const manifestPath = join(tmpDir, `RELEASE-MANIFEST-${tag}`);
+    const sigPath = `${manifestPath}.sig`;
+    await download(`${base}/RELEASE-MANIFEST`, manifestPath);
+    await download(`${base}/RELEASE-MANIFEST.sig`, sigPath);
+    try {
+      const principal = verifyManifestSignature({ manifestPath, sigPath, tag });
+      want = parseManifest(readFileSync(manifestPath, 'utf-8'), tag).get(asset);
+      console.log(`  RELEASE-MANIFEST ${tag} signed by ${principal}`);
+    } catch (err) {
+      console.error(`build-binary-oam: ${err.message}; refusing to use an unverified carrier`);
+      process.exit(1);
+    }
   }
-  writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
-
-  const sumsRes = await fetch(`${base}/SHA256SUMS`);
-  if (!sumsRes.ok) {
-    console.error(
-      `build-binary-oam: could not fetch SHA256SUMS (HTTP ${sumsRes.status}); refusing to use an unverified carrier`,
-    );
-    process.exit(1);
-  }
-  const want = (await sumsRes.text())
-    .split('\n')
-    .map((l) => l.trim().split(/\s+/))
-    .find(([, name]) => name?.replace(/^\*/, '') === asset)?.[0];
   if (!want) {
-    console.error(`build-binary-oam: ${asset} has no entry in SHA256SUMS; refusing to use an unverified carrier`);
+    console.error(
+      `build-binary-oam: ${asset} has no entry in the ${unsigned ? 'SHA256SUMS' : 'signed manifest'} for ${tag}; refusing to use an unverified carrier`,
+    );
     process.exit(1);
   }
   const got = createHash('sha256').update(readFileSync(dest)).digest('hex');

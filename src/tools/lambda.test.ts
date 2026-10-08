@@ -206,10 +206,10 @@ describe("aws_lambda_invoke — invoke timers and child environment (pure)", () 
   });
 
   it("sets AWS_MAX_ATTEMPTS=1 and drops every other spelling of it", () => {
-    // Windows env names are case-insensitive but a JS object's keys are not, and
-    // the runtimes disagree about which duplicate a child sees: Node hands over
-    // the upper-case one, oam the last key in the object. Deleting the variants
-    // is what makes "the invoke is sent once" hold on both.
+    // Windows env names are case-insensitive but a JS object's keys are not.
+    // Node and oam >= 0.18.0 hand over the upper-case duplicate (older oam
+    // handed over the last key in the object). Deleting the variants is what
+    // makes "the invoke is sent once" hold whatever the tie-break.
     const base: NodeJS.ProcessEnv = {
       PATH: "p",
       aws_max_attempts: "5",

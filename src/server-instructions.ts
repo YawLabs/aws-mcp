@@ -8,9 +8,10 @@
  * END, which is where a "this is billed", "this is not a security boundary" or
  * "this never stops the query" sentence usually sits.
  *
- * The server `instructions` block this module is named for lands in 2.5.0, with
- * its own tighter ceiling (it is paid on every session, not once per tool load).
- * Today the cap is the only export, and only the test imports it.
+ * The server `instructions` block this module is named for is SERVER_INSTRUCTIONS
+ * below, with its own tighter ceiling (it is paid on every session, not once per
+ * tool load). src/index.ts hands it to the McpServer; src/index.test.ts holds it
+ * to SERVER_INSTRUCTIONS_CAP_BYTES and the descriptions to HOST_TEXT_CAP_BYTES.
  */
 
 /**
@@ -35,3 +36,27 @@
  * is why the claim is framed as a count rather than a list.
  */
 export const HOST_TEXT_CAP_BYTES = 2048;
+
+/**
+ * The ceiling for SERVER_INSTRUCTIONS, tighter than HOST_TEXT_CAP_BYTES. yaw-mcp,
+ * which fronts this server for most of its users, renders an upstream server's
+ * instructions once per session and cuts them at 2000 UTF-8 bytes
+ * (MAX_UPSTREAM_INSTRUCTIONS_BYTES in its src/upstream-instructions.ts), so text
+ * past that is lost there before Claude Code's own 2048-character cut applies.
+ */
+export const SERVER_INSTRUCTIONS_CAP_BYTES = 2000;
+
+/**
+ * The MCP `instructions` string: which tool to reach for, nothing else. Plain
+ * ASCII, routing guidance only -- every behavioural detail lives in the tool
+ * descriptions, which are loaded with the tools. Held to
+ * SERVER_INSTRUCTIONS_CAP_BYTES by src/index.test.ts.
+ */
+export const SERVER_INSTRUCTIONS = [
+  "AWS through the locally installed aws CLI, using the caller's own profiles.",
+  "Start with aws_whoami to confirm the identity and SSO token; if it reports an expired SSO session, use aws_login_start then aws_login_complete; aws_refresh_if_expiring_soon renews it ahead of a long task. aws_list_profiles lists profiles; aws_session_set pins a profile and region for later calls (aws_session_get shows them, aws_session_clear resets).",
+  "Any single API operation: aws_call. One page of a list or describe operation: aws_paginate. The same operation across regions or accounts: aws_multi_region or aws_multi_account. Many dependent calls with filtering or aggregation: aws_script, one snippet instead of many round trips.",
+  "Resources by CloudFormation type name (AWS::Service::Resource): aws_resource_list and aws_resource_get to read; aws_resource_diff to preview a patch before aws_resource_update; aws_resource_create and aws_resource_delete; aws_resource_status to poll a change those return.",
+  "Logs: aws_logs_tail for recent lines, aws_logs_query for CloudWatch Logs Insights. Metrics: aws_metrics_query. Permissions: aws_iam_simulate. Lambda: aws_lambda_invoke. Temporary role credentials as a named profile: aws_assume_role.",
+  "AWS documentation: aws_docs_search, then aws_docs_read on a result.",
+].join("\n");

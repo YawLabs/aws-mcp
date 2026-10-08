@@ -495,16 +495,31 @@ describe("describeFetchFailure", () => {
   });
 
   it("explains an uncoded transport failure under the oam runtime", () => {
-    // Measured on oam 0.16.2 against the same self-signed server: the identical
-    // condition Node codes as DEPTH_ZERO_SELF_SIGNED_CERT arrives with no code.
+    // Measured on oam 0.18.0 against a local server that answers TLS with
+    // garbage: Node codes it ERR_SSL_PACKET_LENGTH_TOO_LONG, oam still reports
+    // the bare "error sending request for url" with no code. A refused
+    // certificate is coded there (see the next case), so this is not one.
     const s = describeFetchFailure(fetchFailed("error sending request for url (https://docs.aws.amazon.com/x.html)"), {
       ...NO_PROXY_ENV,
       envProxyEnabled: true,
-      oamVersion: "0.16.2",
+      oamVersion: "0.18.0",
     });
-    assert.match(s, /oam runtime, which reports no failure code/);
-    assert.match(s, /NODE_EXTRA_CA_CERTS/);
+    assert.match(s, /oam runtime, which reported this transport failure with no failure code/);
+    assert.match(s, /TLS-intercepting proxy/);
     assert.match(s, /HTTPS_PROXY/, "an unreachable proxy looks the same under oam");
+    assert.doesNotMatch(s, /NODE_EXTRA_CA_CERTS/, "a refused certificate is coded since oam 0.16.3");
+  });
+
+  it("gives a coded certificate refusal under oam the CA remedy", () => {
+    // Since oam 0.16.3 fetch's cause carries Node's TLS code.
+    const s = describeFetchFailure(fetchFailed("self-signed certificate", "DEPTH_ZERO_SELF_SIGNED_CERT"), {
+      ...NO_PROXY_ENV,
+      envProxyEnabled: true,
+      oamVersion: "0.18.0",
+    });
+    assert.match(s, /A certificate in the chain could not be verified/);
+    assert.match(s, /NODE_EXTRA_CA_CERTS/);
+    assert.doesNotMatch(s, /oam runtime/);
   });
 
   it("says when Node is ignoring the HTTPS_PROXY that is set", () => {
@@ -639,8 +654,8 @@ describe("readFetchEnvFacts", () => {
   });
 
   it("treats the oam runtime as the opt-in, with no variable set at all", () => {
-    const facts = readFetchEnvFacts({}, { oam: "0.16.2" });
-    assert.equal(facts.oamVersion, "0.16.2");
+    const facts = readFetchEnvFacts({}, { oam: "0.18.0" });
+    assert.equal(facts.oamVersion, "0.18.0");
     assert.equal(facts.envProxyEnabled, true);
     assert.equal(readFetchEnvFacts({}, {}).oamVersion, null);
   });

@@ -91,8 +91,9 @@ describe("awsChildEnv", () => {
 
   it("win32: deletes every case-variant, so exactly one spelling of each pin reaches the child", () => {
     // Windows environment names are case-insensitive but a JS object's keys are
-    // not, and which duplicate the child sees is runtime-dependent (node 22.22.2
-    // hands over the upper-case one, oam 0.16.2 the last key in the object).
+    // not. node 22.22.2 and oam >= 0.18.0 hand over the upper-case one (oam
+    // 0.16.2 handed over the last key in the object); deleting the variants
+    // keeps the result independent of that tie-break.
     const env = awsChildEnv(
       {
         PATH: "C:\\Windows\\System32",
