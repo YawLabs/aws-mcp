@@ -2,10 +2,12 @@
 // Grade the built server with @yawlabs/mcp-compliance, on each runtime the
 // launcher can pick, before a release.
 //
-// yaw-mcp grades every server it fronts with @yawlabs/mcp-compliance and can
-// refuse to spawn one graded below its floor (YAW_MCP_MIN_COMPLIANCE), so this
-// repo pins the same version line yaw-mcp grades with (devDependencies) and runs
-// it here rather than finding out from a user's refused spawn.
+// yaw-mcp grades the servers it fronts with @yawlabs/mcp-compliance
+// (`yaw-mcp audit`) and can refuse to spawn one graded below its floor
+// (YAW_MCP_MIN_COMPLIANCE), so this repo runs the suite here rather than finding
+// out from a user's refused spawn. The version is pinned in devDependencies at
+// the current release line (^0.20.4); yaw-mcp itself still pins ^0.17.1, so its
+// rubric is the older of the two.
 //
 //   node scripts/check-compliance.mjs        both legs: AWS_MCP_RUNTIME=node, then =oam
 //

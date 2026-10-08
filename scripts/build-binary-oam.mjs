@@ -32,7 +32,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, write
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import esbuild from 'esbuild';
-import { parseManifest, predatesSigning, verifyManifestSignature } from './lib/oam-release-verify.mjs';
+import {
+  parseManifest,
+  predatesSigning,
+  verifyManifestSignature,
+  verifyPresigningSums,
+} from './lib/oam-release-verify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, '..');
@@ -126,8 +131,10 @@ rmSync(outExe, { force: true });
 // scripts/lib/oam-release-verify.mjs. That check is not optional: the carrier
 // becomes the bulk of a binary we then ship, so an unverified download would be
 // a supply chain hole opened by our own build script. Every failure aborts
-// rather than warning. Only a tag before v0.18.0, which has no manifest, falls
-// back to SHA256SUMS, and says so.
+// rather than warning. Only a tag before v0.18.0, which has no manifest, uses
+// its SHA256SUMS -- checked against the pinned digest vendored in
+// scripts/oam-release-keys/presigning-sums, as oam's installers check it -- and
+// says so.
 const OAM_ASSETS = {
   'win32-x64': 'oam-x86_64-pc-windows-msvc.exe',
   'win32-arm64': 'oam-aarch64-pc-windows-msvc.exe',
@@ -188,13 +195,16 @@ async function fetchOamCarrier(target) {
 
   let want;
   if (unsigned) {
-    // Releases before v0.18.0 carry no manifest; their SHA256SUMS is all there is.
-    console.warn(`WARNING: oam ${tag} predates signed releases; checking ${asset} against its unsigned SHA256SUMS only.`);
-    const sums = (await download(`${base}/SHA256SUMS`)).toString('utf-8');
-    want = sums
-      .split('\n')
-      .map((l) => l.trim().split(/\s+/))
-      .find(([, name]) => name?.replace(/^\*/, '') === asset)?.[0];
+    // Releases before v0.18.0 carry no manifest. Their SHA256SUMS is checked
+    // against the vendored pin for that tag, as oam's installers do.
+    console.warn(`WARNING: oam ${tag} predates signed releases; checking its SHA256SUMS against the pinned digest.`);
+    const sumsBytes = await download(`${base}/SHA256SUMS`);
+    try {
+      want = verifyPresigningSums({ sumsBytes, tag }).get(asset);
+    } catch (err) {
+      console.error(`build-binary-oam: ${err.message}; refusing to use an unverified carrier`);
+      process.exit(1);
+    }
   } else {
     const manifestPath = join(tmpDir, `RELEASE-MANIFEST-${tag}`);
     const sigPath = `${manifestPath}.sig`;
@@ -211,7 +221,7 @@ async function fetchOamCarrier(target) {
   }
   if (!want) {
     console.error(
-      `build-binary-oam: ${asset} has no entry in the ${unsigned ? 'SHA256SUMS' : 'signed manifest'} for ${tag}; refusing to use an unverified carrier`,
+      `build-binary-oam: ${asset} has no entry in the ${unsigned ? 'pinned SHA256SUMS' : 'signed manifest'} for ${tag}; refusing to use an unverified carrier`,
     );
     process.exit(1);
   }

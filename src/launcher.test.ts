@@ -211,6 +211,19 @@ describe("launcher childEnv()", () => {
     assert.equal(env.PATH, "p");
   });
 
+  it("drops the unquoted rest of a permission path with a space, and keeps quoted options whole", () => {
+    // oam (like node's copyPermissionModelFlagsToEnv) appends the flag as
+    // spelled, unquoted, so a path holding a space arrives as two tokens.
+    const env = childEnv(
+      {
+        NODE_OPTIONS:
+          '--require "C:\\a b\\hook.js" --allow-fs-read=C:\\Program Files\\x --permission --title="x y" "--allow-fs-write=C:\\q r"',
+      },
+      "0.18.0",
+    );
+    assert.equal(env.NODE_OPTIONS, '--require "C:\\a b\\hook.js" --title="x y"');
+  });
+
   it("drops NODE_OPTIONS entirely when nothing else was in it", () => {
     const env = childEnv({ PATH: "p", NODE_OPTIONS: "--permission --allow-child-process" }, "0.18.0");
     assert.equal("NODE_OPTIONS" in env, false);

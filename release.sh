@@ -363,8 +363,8 @@ export AWS_MCP_REAL_CLI_TESTS="${AWS_MCP_REAL_CLI_TESTS:-1}"
 npm test || fail "Tests failed"
 info "All tests passed"
 
-# MCP compliance, graded with the @yawlabs/mcp-compliance line yaw-mcp grades
-# with (pinned in devDependencies), against the published launcher under
+# MCP compliance, graded with @yawlabs/mcp-compliance (pinned in
+# devDependencies; see scripts/check-compliance.mjs), against the launcher under
 # AWS_MCP_RUNTIME=node and again under oam. A required-test failure stops the
 # release. A leg that could not run (package not installed, no oam on PATH)
 # exits 2 and is reported as a WARNING here -- never as a green step -- and

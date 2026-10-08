@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -21,6 +22,7 @@ interface Verify {
   predatesSigning(tag: string): boolean;
   principalsForTag(ranges: string, tag: string): string[];
   parseManifest(text: string, tag: string): Map<string, string>;
+  verifyPresigningSums(opts: { sumsBytes: Buffer; tag: string; keysDir?: string }): Map<string, string>;
   verifyManifestSignature(opts: { manifestPath: string; sigPath: string; tag: string; keysDir?: string }): string;
   MANIFEST_HEADER: string;
 }
@@ -70,6 +72,50 @@ describe("oam release verification: pure parts", () => {
       () => verify.parseManifest(`${verify.MANIFEST_HEADER}\ntag v0.18.0\nnot-a-hash x\n`, "v0.18.0"),
       /malformed/,
     );
+  });
+});
+
+describe("oam release verification: releases before signing", () => {
+  function keysWithPin(tag: string, body: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "aws-mcp-oampin-"));
+    dirs.push(dir);
+    const digest = createHash("sha256").update(body).digest("hex");
+    writeFileSync(join(dir, "presigning-sums"), `# comment\n${tag} ${digest}\n`);
+    return dir;
+  }
+
+  it("accepts a SHA256SUMS that matches its pinned digest", () => {
+    const body = `${HASH}  oam-x86_64-unknown-linux-gnu\n`;
+    const sums = verify.verifyPresigningSums({
+      sumsBytes: Buffer.from(body),
+      tag: "v0.17.1",
+      keysDir: keysWithPin("v0.17.1", body),
+    });
+    assert.equal(sums.get("oam-x86_64-unknown-linux-gnu"), HASH);
+  });
+
+  it("refuses a SHA256SUMS that is not the pinned file, and a tag with no pin", () => {
+    const body = `${HASH}  oam-x86_64-unknown-linux-gnu\n`;
+    const keysDir = keysWithPin("v0.17.1", body);
+    assert.throws(
+      () => verify.verifyPresigningSums({ sumsBytes: Buffer.from(`${body}\n`), tag: "v0.17.1", keysDir }),
+      /pinned digest is/,
+    );
+    assert.throws(
+      () => verify.verifyPresigningSums({ sumsBytes: Buffer.from(body), tag: "v0.17.0", keysDir }),
+      /no pinned SHA256SUMS digest/,
+    );
+  });
+
+  it("vendors oam's pre-signing pins, ending at v0.17.1", () => {
+    const pins = readFileSync(join(KEYS_DIR, "presigning-sums"), "utf-8");
+    assert.match(pins, /^v0\.17\.1 [0-9a-f]{64}$/m);
+    assert.doesNotMatch(pins, /^v0\.18\./m);
+  });
+
+  it("refuses an asset listed twice", () => {
+    const text = `${verify.MANIFEST_HEADER}\ntag v0.18.0\n${HASH}  a\n${"b".repeat(64)}  *a\n`;
+    assert.throws(() => verify.parseManifest(text, "v0.18.0"), /more than once/);
   });
 });
 

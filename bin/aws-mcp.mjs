@@ -416,9 +416,47 @@ function remedyFor({ passedOver, overrideMissing, shim, platform = process.platf
  */
 function childEnv(env = process.env, hostOam = process.versions.oam) {
   if (hostOam === undefined || !env.NODE_OPTIONS) return env;
-  const kept = env.NODE_OPTIONS.split(/\s+/).filter(
-    (token) => token && !/^--(?:permission|experimental-permission|allow-[a-z0-9-]+)(?:=.*)?$/.test(token),
-  );
+  // Tokenized as node's ParseNodeOptionsEnvVar does: spaces separate outside
+  // double quotes, and a backslash escapes the next character inside them. Each
+  // token keeps its raw text, so whatever is kept goes on exactly as written;
+  // the unquoted value is what gets matched.
+  const text = env.NODE_OPTIONS;
+  const tokens = [];
+  let raw = "";
+  let value = "";
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\" && quoted && i + 1 < text.length) {
+      raw += c + text[i + 1];
+      value += text[++i];
+    } else if (c === " " && !quoted) {
+      if (raw) tokens.push({ raw, value });
+      raw = "";
+      value = "";
+    } else {
+      raw += c;
+      if (c === '"') quoted = !quoted;
+      else value += c;
+    }
+  }
+  if (raw) tokens.push({ raw, value });
+  // oam and node append a permission flag AS SPELLED and unquoted, so an
+  // --allow-fs-read=C:\Program Files\x arrives as two tokens; and a value can
+  // be given as the next token. Either way the words after a dropped flag, up
+  // to the next option, belong to it and go with it.
+  const kept = [];
+  let dropping = false;
+  for (const { raw: tok, value: val } of tokens) {
+    if (/^--(?:permission|experimental-permission|allow-[a-z0-9-]+)(?:=.*)?$/s.test(val)) {
+      dropping = true;
+    } else if (dropping && !val.startsWith("-")) {
+      // the rest of the dropped flag's value
+    } else {
+      dropping = false;
+      kept.push(tok);
+    }
+  }
   const next = { ...env };
   if (kept.length > 0) next.NODE_OPTIONS = kept.join(" ");
   else delete next.NODE_OPTIONS;

@@ -17,3 +17,6 @@ package-lock.json text eol=lf
 *.ico binary
 *.woff binary
 *.woff2 binary
+
+# Signed release fixtures: the signature covers these exact bytes.
+src/testing/oam-release-*/RELEASE-MANIFEST* -text

@@ -10,15 +10,25 @@
 // fetched from the same place as the binary, so checking a download against it
 // proves only that the two came from the same server.
 //
-// The trust root is VENDORED in scripts/oam-release-keys/ (a copy of oam's
-// release-keys/allowed_signers and ranges), never fetched alongside the release
-// it is judging. When oam rotates a key, re-copy both files from the oam repo.
+// Releases before v0.18.0 have no manifest. oam's installers check such a
+// release's SHA256SUMS against a pinned digest of that file
+// (release-keys/presigning-sums: bounded and immutable, one line per
+// pre-signing tag) and refuse a tag the table does not list; so does
+// verifyPresigningSums here.
+//
+// The trust root is VENDORED in scripts/oam-release-keys/ (byte-identical
+// copies of oam's release-keys/allowed_signers, ranges and presigning-sums),
+// never fetched alongside the release it is judging. When oam rotates a key,
+// re-copy the files from the oam repo.
 //
 // Everything here fails closed: a missing ssh-keygen, a signature that does not
-// verify, a manifest signed for another tag, a key outside its range, or an
-// asset absent from the manifest is an error, never a warning.
+// verify, a manifest signed for another tag, a key outside its range, a
+// pre-signing tag that is not pinned or whose SHA256SUMS does not match its
+// pin, or an asset absent from (or listed twice in) the checksums is an error,
+// never a warning.
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,17 +103,59 @@ export function parseManifest(manifestText, tag) {
     }
     throw new Error(`RELEASE-MANIFEST's header is not byte-exact for ${want}`);
   }
+  return parseSums(manifestText.slice(prefix.length), 'RELEASE-MANIFEST');
+}
+
+/**
+ * A SHA256SUMS body as a Map of asset name -> lowercase sha256 hex. A malformed
+ * line, or an asset listed twice, throws: the installers likewise refuse an
+ * asset that is not listed exactly once. `what` names the source in errors.
+ */
+export function parseSums(text, what = 'SHA256SUMS') {
   const sums = new Map();
-  for (const raw of manifestText.slice(prefix.length).split('\n')) {
+  for (const raw of text.split('\n')) {
     const line = raw.trim();
     if (!line) continue;
-    const [hash, name] = line.split(/\s+/);
-    if (!/^[0-9a-f]{64}$/i.test(hash ?? '') || !name) {
-      throw new Error(`RELEASE-MANIFEST has a malformed SHA256SUMS line: '${line}'`);
+    const [hash, rawName] = line.split(/\s+/);
+    if (!/^[0-9a-f]{64}$/i.test(hash ?? '') || !rawName) {
+      throw new Error(`${what} has a malformed SHA256SUMS line: '${line}'`);
     }
-    sums.set(name.replace(/^\*/, ''), hash.toLowerCase());
+    const name = rawName.replace(/^\*/, '');
+    if (sums.has(name)) throw new Error(`${what} lists ${name} more than once`);
+    sums.set(name, hash.toLowerCase());
   }
   return sums;
+}
+
+/**
+ * For a tag before v0.18.0: check the downloaded SHA256SUMS bytes against the
+ * vendored pin for that tag (release-keys/presigning-sums, `<tag> <sha256>`),
+ * as oam's installers do, and return its parsed entries. Throws when the tag
+ * has no pin -- there is no such pre-signing release -- or the bytes differ.
+ */
+export function verifyPresigningSums({ sumsBytes, tag, keysDir = RELEASE_KEYS_DIR }) {
+  const v = parseTag(tag);
+  if (!v) throw new Error(`'${tag}' is not a plain vX.Y.Z tag`);
+  const want = `v${v.join('.')}`;
+  const pinsPath = join(keysDir, 'presigning-sums');
+  let pinned = null;
+  for (const raw of readFileSync(pinsPath, 'utf-8').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const [t, hash] = line.split(/\s+/);
+    if (t === want) {
+      pinned = (hash ?? '').toLowerCase();
+      break;
+    }
+  }
+  if (!pinned) {
+    throw new Error(`${want} predates signed releases and has no pinned SHA256SUMS digest in ${pinsPath}`);
+  }
+  const got = createHash('sha256').update(sumsBytes).digest('hex');
+  if (got !== pinned) {
+    throw new Error(`SHA256SUMS for ${want} hashes to ${got}, but its pinned digest is ${pinned}`);
+  }
+  return parseSums(Buffer.from(sumsBytes).toString('utf-8'));
 }
 
 /**
