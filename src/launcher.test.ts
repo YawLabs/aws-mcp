@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -143,6 +143,119 @@ describe("launcher pickNewest()", () => {
     assert.equal(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 18, 0])])?.path, "good");
     assert.equal(pickNewest([at("old", [0, 17, 0]), at("broken", null)]), null);
     assert.equal(pickNewest([]), null);
+  });
+});
+
+type Remedy = (ctx: {
+  passedOver: (number[] | null)[];
+  overrideMissing: boolean;
+  shim: string | null;
+  platform?: string;
+  arch?: string;
+}) => string;
+
+describe("launcher remedyFor()", () => {
+  const remedyFor = new Function(
+    `${extract([OAM_MIN_DECL, /function selfUpdateAdvice\(\) \{[\s\S]*?\n\}/, /function remedyFor\(\{[^)]*\}\) \{[\s\S]*?\n\}/])}\nreturn remedyFor;`,
+  )() as Remedy;
+  const base = { passedOver: [], overrideMissing: false, shim: null, platform: "win32", arch: "x64" };
+
+  it("sends an outdated oam to self-update, with the ssh-keygen note, not to the website", () => {
+    const r = remedyFor({ ...base, passedOver: [[0, 17, 1]] });
+    assert.match(r, /Run `oam self-update` to get oam 0\.18\.0 or newer/);
+    assert.match(r, /ssh-keygen 8\.1 or later/);
+    assert.doesNotMatch(r, /oamjs\.org/);
+    assert.match(r, /AWS_MCP_RUNTIME=node/);
+  });
+
+  it("does not tell an unrunnable binary to update", () => {
+    const r = remedyFor({ ...base, passedOver: [null] });
+    assert.match(r, /executable oam binary for this platform/);
+    assert.doesNotMatch(r, /self-update|oamjs\.org/);
+  });
+
+  it("names a missing OAM_BIN", () => {
+    const r = remedyFor({ ...base, overrideMissing: true });
+    assert.match(r, /Point OAM_BIN at an existing oam binary/);
+    assert.doesNotMatch(r, /oamjs\.org/);
+  });
+
+  it("offers the install URL only when no oam was found at all", () => {
+    assert.match(remedyFor(base), /Install oam from https:\/\/oamjs\.org/);
+    assert.doesNotMatch(remedyFor({ ...base, shim: "C:\\x\\oam.cmd" }), /oamjs\.org/);
+  });
+
+  it("never offers an install on linux-arm64, where oam publishes no build", () => {
+    const r = remedyFor({ ...base, platform: "linux", arch: "arm64" });
+    assert.match(r, /no build for linux-arm64/);
+    assert.doesNotMatch(r, /oamjs\.org/);
+    assert.match(remedyFor({ ...base, platform: "linux", arch: "x64" }), /oamjs\.org/);
+  });
+});
+
+describe("launcher childEnv()", () => {
+  type ChildEnv = (env: Record<string, string | undefined>, hostOam: string | undefined) => Record<string, string>;
+  const childEnv = new Function(
+    `${extract([/function childEnv\(env = process\.env, hostOam = process\.versions\.oam\) \{[\s\S]*?\n\}/])}\nreturn childEnv;`,
+  )() as ChildEnv;
+
+  it("strips oam's inherited permission flags from NODE_OPTIONS on an oam host", () => {
+    const env = childEnv(
+      {
+        PATH: "p",
+        NODE_OPTIONS: "--max-old-space-size=4096 --permission --allow-net --allow-env=HOME,PATH --allow-fs-read=*",
+      },
+      "0.18.0",
+    );
+    assert.equal(env.NODE_OPTIONS, "--max-old-space-size=4096");
+    assert.equal(env.PATH, "p");
+  });
+
+  it("drops the unquoted rest of a permission path with a space, and keeps quoted options whole", () => {
+    // oam (like node's copyPermissionModelFlagsToEnv) appends the flag as
+    // spelled, unquoted, so a path holding a space arrives as two tokens.
+    const env = childEnv(
+      {
+        NODE_OPTIONS:
+          '--require "C:\\a b\\hook.js" --allow-fs-read=C:\\Program Files\\x --permission --title="x y" "--allow-fs-write=C:\\q r"',
+      },
+      "0.18.0",
+    );
+    assert.equal(env.NODE_OPTIONS, '--require "C:\\a b\\hook.js" --title="x y"');
+  });
+
+  it("drops NODE_OPTIONS entirely when nothing else was in it", () => {
+    const env = childEnv({ PATH: "p", NODE_OPTIONS: "--permission --allow-child-process" }, "0.18.0");
+    assert.equal("NODE_OPTIONS" in env, false);
+  });
+
+  it("leaves a Node host's NODE_OPTIONS alone", () => {
+    const original = { NODE_OPTIONS: "--permission --allow-net" };
+    assert.equal(childEnv(original, undefined), original);
+  });
+});
+
+describe("launcher discovery", () => {
+  it("searches OAM_INSTALL_DIR first when it is set", () => {
+    const src = extract([/function pathKey\(p\) \{[\s\S]*?\n\}/, /function discoverOamPaths\(\) \{[\s\S]*?\n\}/]);
+    const isWin = process.platform === "win32";
+    const exe = isWin ? "oam.exe" : "oam";
+    const custom = mkdtempSync(join(tmpdir(), "aws-mcp-oam-install-"));
+    const home = mkdtempSync(join(tmpdir(), "aws-mcp-oam-home-"));
+    writeFileSync(join(custom, exe), "");
+    const fakeProcess = { env: { OAM_INSTALL_DIR: custom, LOCALAPPDATA: home, PATH: "" } };
+    const discover = new Function(
+      "existsSync",
+      "realpathSync",
+      "homedir",
+      "join",
+      "delimiter",
+      "process",
+      `const isWin = ${isWin}; const exe = ${JSON.stringify(exe)};\n${src}\nreturn discoverOamPaths;`,
+    )(existsSync, realpathSync, () => home, join, delimiter, fakeProcess) as () => string[];
+    assert.deepEqual(discover(), [join(custom, exe)]);
+    fakeProcess.env.OAM_INSTALL_DIR = "";
+    assert.deepEqual(discover(), [], "unset, the custom directory is not searched");
   });
 });
 

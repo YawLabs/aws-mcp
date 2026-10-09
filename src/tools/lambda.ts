@@ -218,10 +218,11 @@ export function invokeTimeouts(timeoutMs: number | undefined): {
  *
  * Deleting the case-variants is load-bearing rather than tidy. Given both
  * AWS_MAX_ATTEMPTS and aws_max_attempts, Node 22.22.2 hands the child the
- * upper-case one while oam 0.16.2, where this was measured, hands it the LAST
- * key in the object (measured both ways). So an
- * operator's lower-case spelling could win there, on the one setting that keeps
- * the function from running twice.
+ * upper-case one, and so does oam >= 0.18.0 (it keeps the first in sort order,
+ * as node does); oam 0.16.2 handed over the LAST key in the object (measured
+ * both ways). Deleting every variant is the defence that holds whatever the
+ * runtime's tie-break, so an operator's lower-case spelling can never win on
+ * the one setting that keeps the function from running twice.
  */
 export function invokeChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
