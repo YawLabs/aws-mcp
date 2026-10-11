@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.6.0] — 2026-10-11
+
 ### Added
 - **The server now sends MCP `instructions`**: a short, plain-ASCII routing guide that names which tool to reach for (start with `aws_whoami`, one operation with `aws_call`, fan-out with `aws_multi_region` / `aws_multi_account`, resources by CloudFormation type, logs, metrics, docs). It is held under 2000 bytes, the ceiling yaw-mcp cuts upstream instructions at, by a test that also fails if it names a tool that does not exist or leaves one out. `src/server-instructions.ts` had promised this block since 2.5.0 without it ever being wired.
 - **`release.sh` grades the server with `@yawlabs/mcp-compliance` before every release**, pinned at `^0.20.4`, the current release line (yaw-mcp's own `yaw-mcp audit` still pins `^0.17.1`). `npm run check:compliance` runs `mcp-compliance test --strict` against the published launcher under `AWS_MCP_RUNTIME=node` and again under oam; a required-test failure stops the release, and a leg that could not run (the package not installed, no oam on PATH) is reported as a warning, never as a pass. Both legs grade A here. Release tooling only.
@@ -1158,7 +1160,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.5.2...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/YawLabs/aws-mcp/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/YawLabs/aws-mcp/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/YawLabs/aws-mcp/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/YawLabs/aws-mcp/compare/v2.4.0...v2.5.0
