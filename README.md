@@ -306,12 +306,11 @@ published npm package:
   by planting a type error in a test file and watching both reject it.
   `npx tsc --noEmit` remains the portable default.
 - **`npm run build:binary:oam`** -- builds the standalone binary via
-  `oam compile` instead of Node SEA. Measured **58.60 MB against 76.28 MB**, plus
-  ~493 KB of embedded V8 bytecode the SEA path doesn't produce. Writes to the
-  same `bin/<platform>-<arch>/` path as `npm run build:binary`, so the release
-  staging script consumes either unchanged -- run one or the other, not both. If
-  you redistribute that binary it embeds oam's runtime, so ship oam's `LICENSE`,
-  `NOTICE` and `THIRD_PARTY_LICENSES.md` with it.
+  `oam compile`. Measured **58.60 MB** on win32-arm64, including ~493 KB of
+  embedded V8 bytecode. Writes to `bin/<platform>-<arch>/`, which the release
+  staging script consumes. If you redistribute that binary it embeds oam's
+  runtime, so ship oam's `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES.md` with
+  it.
 
 The source stays runtime-agnostic on purpose: no `oam:` imports anywhere, and
 tests stay on `node:test`. That is what keeps the Node fallback real rather than

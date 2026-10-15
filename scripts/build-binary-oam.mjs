@@ -1,26 +1,22 @@
 #!/usr/bin/env node
 // Build a self-contained single-file binary of the @yawlabs/aws-mcp sidecar
-// using `oam compile` instead of Node SEA.
+// using `oam compile`.
 //
-// Same contract as scripts/build-binary.mjs -- same entry, same output path
-// (bin/<platform>-<arch>/<binName>[.exe]) -- so scripts/stage-release-asset.mjs
-// and the release flow consume either one unchanged. Run ONE or the OTHER, not
-// both: they write to the same path.
+// Output path is bin/<platform>-<arch>/<binName>[.exe], which is what
+// scripts/stage-release-asset.mjs and the release flow consume.
 //
-// Why this exists: `oam compile` embeds a pre-bundled file into oam's runtime
-// carrier, which is smaller than the Node SEA carrier and needs no postject
-// injection step or fuse sentinel. Measured on win32-arm64 at aws-mcp 1.6.0:
-//   Node SEA  79,989,248 bytes (76.28 MB)
-//   oam compile 61,447,168 bytes (58.60 MB)
-// plus ~493 KB of embedded V8 bytecode that the SEA path does not produce.
+// `oam compile` embeds a pre-bundled file into oam's runtime carrier and writes
+// the finished executable directly: no blob generation, no injection step, no
+// fuse sentinel. Measured on win32-arm64 at aws-mcp 1.6.0: 61,447,168 bytes
+// (58.60 MB) including ~493 KB of embedded V8 bytecode.
 //
 // CRITICAL: the bundle handed to `oam compile` MUST be CJS.
 // `oam compile` runs the embedded file as CommonJS. Feeding it the ESM bundle
 // that build.mjs writes to dist/index.js produces a binary that dies at startup
 // with `SyntaxError: Cannot use import statement outside a module`, because
 // esbuild's ESM banner (`import { createRequire } from 'node:module'`) is the
-// first statement. So we re-bundle as CJS here with the same banner/define pair
-// build-binary.mjs uses for SEA, rather than reusing dist/index.js.
+// first statement. So we re-bundle as CJS here with a banner/define pair that
+// polyfills import.meta.url, rather than reusing dist/index.js.
 //
 // This script ONLY reads node_modules (via esbuild's resolver) and writes to
 // build-tmp/ and bin/<platform>-<arch>/. It does NOT mutate package.json,
@@ -89,8 +85,9 @@ function fmtSize(p) {
 mkdirSync(tmpDir, { recursive: true });
 mkdirSync(binDir, { recursive: true });
 
-// 1. Bundle everything into one CJS file. Mirrors build-binary.mjs step 1 --
-// see the CRITICAL note above for why CJS is not optional here.
+// 1. Bundle everything into one CJS file via esbuild's JS API (NOT the CLI bin:
+// on Linux/macOS node_modules/esbuild/bin/esbuild is the native binary, not a
+// JS shim). See the CRITICAL note above for why CJS is not optional here.
 await esbuild.build({
   entryPoints: [join(repoRoot, srcEntry)],
   bundle: true,
@@ -100,16 +97,16 @@ await esbuild.build({
   // esbuild leaves import.meta.url EMPTY in cjs output, so a server that reads
   // it (createRequire(import.meta.url) to find package.json) would crash at
   // load. Polyfill it to the carrier's own path.
-  banner: { js: "const __seaImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
-  define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__seaImportMetaUrl' },
+  banner: { js: "const __oamImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
+  define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__oamImportMetaUrl' },
   external: ['cpu-features'],
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
 
-// 2. Embed the bundle into oam's runtime carrier. Unlike the SEA path there is
-// no separate blob-generation or postject-injection step -- compile writes the
-// finished executable directly.
+// 2. Embed the bundle into oam's runtime carrier. There is no separate
+// blob-generation or injection step -- compile writes the finished executable
+// directly.
 rmSync(outExe, { force: true });
 // ---------------------------------------------------------------- cross-build
 //
@@ -256,8 +253,9 @@ if (!targetIsWin) chmodSync(outExe, 0o755);
 
 // 3. macOS: ad-hoc re-sign. Apple Silicon SIGKILLs a Mach-O with no/invalid
 // signature at exec, and `--sign -` is the free ad-hoc identity. Best-effort:
-// if oam already emits a signed binary this is a harmless no-op. Kept in step
-// with build-binary.mjs, whose remove/re-sign dance this mirrors.
+// if oam already emits a signed binary this is a harmless no-op. `--force`
+// replaces any residual signature; `--timestamp=none` keeps it offline and
+// reproducible.
 if (process.platform === 'darwin') {
   try {
     run('codesign', ['--sign', '-', '--force', '--timestamp=none', outExe]);
@@ -268,8 +266,8 @@ if (process.platform === 'darwin') {
 }
 
 // 4. Smoke: --verify proves a signature, not that the thing runs. Actually
-// launch it, exactly as build-binary.mjs does on darwin, but on every platform
-// since oam compile is the newer path and deserves the check everywhere.
+// launch it, on every platform -- arm64 macOS SIGKILLs a bad-sig Mach-O only at
+// exec, and a binary that does not start is the whole failure this defends.
 //
 // Except a cross build, which cannot be launched here by definition -- the NOTE
 // above already says so. MEASURED 2026-09-20 on win32-arm64, oam 0.16.1:

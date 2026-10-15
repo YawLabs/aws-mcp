@@ -258,11 +258,10 @@ export function logUnhandledRejection(reason: unknown): void {
 // plain-tsc builds.
 //
 // Uses the STATIC createRequire import above, not a dynamic
-// `(await import("node:module"))`. The dynamic form was both redundant (the
-// symbol is already imported for the isSeaBinary probe below) and a top-level
-// await -- which contradicts the deliberately TLA-free `server.connect().then()`
-// form at the bottom of this file, whose whole point is that the CJS SEA bundle
-// can't express top-level await. esbuild folds this ternary to `true ? "x" : ...`
+// `(await import("node:module"))`. The dynamic form was a top-level await --
+// which contradicts the deliberately TLA-free `server.connect().then()` form at
+// the bottom of this file, whose whole point is that the CJS bundle built for
+// the oam binary can't express top-level await. esbuild folds this ternary to `true ? "x" : ...`
 // but KEEPS the dead branch, and it used to rewrite the dynamic import to a bare
 // `null`, emitting `null.createRequire(...)`. So the fallback was dead code that
 // would also have thrown a TypeError had it ever run in a bundled build -- which
@@ -272,27 +271,6 @@ const version =
   typeof __VERSION__ !== "undefined"
     ? __VERSION__
     : (createRequire(import.meta.url)("../package.json") as { version: string }).version;
-
-// True inside a Node Single Executable Application (the SEA binary). In the
-// CJS bundle esbuild emits for the binary, `import.meta.url` is empty, so the
-// argv[1] check below can never match -- without this short-circuit the binary
-// would do nothing. A SEA is always its own entry point (never imported as a
-// test module), so isSea() === true is a reliable "this is the entry" signal.
-// node:sea exists on Node >= 20.12 and isSea() is true only inside a SEA, so a
-// missing module or thrown call (plain `node`) safely falls through to false.
-const isSeaBinary = (() => {
-  try {
-    // In the CJS SEA bundle `import.meta.url` is empty, which makes
-    // createRequire(import.meta.url) throw -- fall back to a valid base
-    // (process.execPath) so node:sea still resolves inside the binary.
-    const base = import.meta.url || pathToFileURL(process.execPath).href;
-    const require = createRequire(base);
-    const sea = require("node:sea") as { isSea?: () => boolean };
-    return typeof sea.isSea === "function" && sea.isSea() === true;
-  } catch {
-    return false;
-  }
-})();
 
 /**
  * realpath plus a platform-appropriate case fold, or undefined when the path
@@ -322,47 +300,45 @@ function canonicalPath(p: string): string | undefined {
 // where argv[1] genuinely IS this module. So resolve both sides through
 // realpath before concluding otherwise, and when the answer is still "not the
 // entry point", say why on stderr instead of vanishing.
-const isEntryPoint =
-  isSeaBinary ||
-  (() => {
-    const entry = process.argv[1];
-    // No argv[1] at all: `node -e`, a REPL, an embedder. Genuinely not an
-    // entry point and not worth a diagnostic.
-    if (!entry) return false;
-    if (import.meta.url === pathToFileURL(entry).href) return true;
+const isEntryPoint = (() => {
+  const entry = process.argv[1];
+  // No argv[1] at all: `node -e`, a REPL, an embedder. Genuinely not an
+  // entry point and not worth a diagnostic.
+  if (!entry) return false;
+  if (import.meta.url === pathToFileURL(entry).href) return true;
 
-    let self: string | undefined;
-    try {
-      self = import.meta.url ? canonicalPath(fileURLToPath(import.meta.url)) : undefined;
-    } catch {
-      self = undefined;
+  let self: string | undefined;
+  try {
+    self = import.meta.url ? canonicalPath(fileURLToPath(import.meta.url)) : undefined;
+  } catch {
+    self = undefined;
+  }
+  const target = canonicalPath(entry);
+
+  if (self !== undefined && target !== undefined) {
+    if (self === target) return true;
+    // Two genuinely different files. Overwhelmingly this is the intended
+    // case -- a test importing the module -- so only speak up when argv[1]
+    // carries OUR filename, which means someone meant to run this server and
+    // started a different copy of it. Warning on every import would be noise.
+    if (basename(self) === basename(target)) {
+      console.error(
+        `[aws-mcp] not starting: the process entry point (${target}) is a different file from this module (${self}). ` +
+          "Launch the installed dist/index.js, or go through the aws-mcp bin.",
+      );
     }
-    const target = canonicalPath(entry);
-
-    if (self !== undefined && target !== undefined) {
-      if (self === target) return true;
-      // Two genuinely different files. Overwhelmingly this is the intended
-      // case -- a test importing the module -- so only speak up when argv[1]
-      // carries OUR filename, which means someone meant to run this server and
-      // started a different copy of it. Warning on every import would be noise.
-      if (basename(self) === basename(target)) {
-        console.error(
-          `[aws-mcp] not starting: the process entry point (${target}) is a different file from this module (${self}). ` +
-            "Launch the installed dist/index.js, or go through the aws-mcp bin.",
-        );
-      }
-      return false;
-    }
-
-    // One side would not resolve: a deleted or unreadable path, or an empty
-    // import.meta.url outside a SEA. Neither answer is provable, and guessing
-    // "not the entry point" costs a silent hang -- so report it.
-    console.error(
-      `[aws-mcp] could not resolve the entry point (argv[1]=${entry}, module=${import.meta.url || "<empty>"}); ` +
-        "not starting the stdio server. If your MCP host is waiting on a handshake, this is why.",
-    );
     return false;
-  })();
+  }
+
+  // One side would not resolve: a deleted or unreadable path, or an empty
+  // import.meta.url. Neither answer is provable, and guessing
+  // "not the entry point" costs a silent hang -- so report it.
+  console.error(
+    `[aws-mcp] could not resolve the entry point (argv[1]=${entry}, module=${import.meta.url || "<empty>"}); ` +
+      "not starting the stdio server. If your MCP host is waiting on a handshake, this is why.",
+  );
+  return false;
+})();
 
 const subcommand = process.argv[2];
 if (isEntryPoint && (subcommand === "version" || subcommand === "--version")) {
@@ -510,7 +486,7 @@ if (isEntryPoint) {
   }
 
   const transport = new StdioServerTransport();
-  // Non-top-level-await form so the CJS bundle (esbuild, for the SEA binary)
+  // Non-top-level-await form so the CJS bundle (esbuild, for the oam binary)
   // builds -- CJS output cannot emit top-level await.
   server
     .connect(transport)
