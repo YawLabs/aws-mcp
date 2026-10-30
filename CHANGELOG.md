@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.6.1] — 2026-10-30
+
 ### Changed
 - **The oam floor moves from 0.18.0 to 0.19.1, so the `aws-mcp` launcher no longer runs the server on oam 0.18.x or 0.19.0.** 0.19.1 is verified on the installed aarch64-pc-windows-msvc binary through the launcher with `OAM_BIN` pointing at it and `AWS_MCP_RUNTIME=oam`: a full MCP handshake listing all 28 tools, `aws_list_profiles` served, and the documented `aws_script` sandbox divergence re-measured on it (`eval('1+1')` returns 2 and `Function('return 7')()` returns 7 under oam; `Function('return this')()` still yields a global with no `process` and no `require`; the host `process.versions.oam` read through the bridge was 0.19.1). An `OAM_BIN` at oam 0.19.0 is now refused under `AWS_MCP_RUNTIME=oam` with `Run oam self-update`, and falls back to Node under the default `auto`. The self-update advice's `ssh-keygen` note now names only an oam that predates 0.18.0, the first signed release, since a below-floor oam may now be a signed one.
 - Source comments that said oam drops the creation mode of `open` / `writeFileSync` now say that was true before 0.19.1: oam 0.19.1 honours it like Node (re-measured on Windows: a file created 0o400 comes back read-only). The `fchmod` / `chmod` / private-mode checks stay, as defense in depth for mounts that ignore modes and for a client that runs `oam run` directly and bypasses the launcher's floor. No behaviour change.
@@ -1167,7 +1169,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.6.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.6.1...HEAD
+[2.6.1]: https://github.com/YawLabs/aws-mcp/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/YawLabs/aws-mcp/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/YawLabs/aws-mcp/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/YawLabs/aws-mcp/compare/v2.5.0...v2.5.1
