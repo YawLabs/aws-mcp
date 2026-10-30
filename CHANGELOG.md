@@ -11,6 +11,13 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.18.0 to 0.19.1, so the `aws-mcp` launcher no longer runs the server on oam 0.18.x or 0.19.0.** 0.19.1 is verified on the installed aarch64-pc-windows-msvc binary through the launcher with `OAM_BIN` pointing at it and `AWS_MCP_RUNTIME=oam`: a full MCP handshake listing all 28 tools, `aws_list_profiles` served, and the documented `aws_script` sandbox divergence re-measured on it (`eval('1+1')` returns 2 and `Function('return 7')()` returns 7 under oam; `Function('return this')()` still yields a global with no `process` and no `require`; the host `process.versions.oam` read through the bridge was 0.19.1). An `OAM_BIN` at oam 0.19.0 is now refused under `AWS_MCP_RUNTIME=oam` with `Run oam self-update`, and falls back to Node under the default `auto`. The self-update advice's `ssh-keygen` note now names only an oam that predates 0.18.0, the first signed release, since a below-floor oam may now be a signed one.
+- Source comments that said oam drops the creation mode of `open` / `writeFileSync` now say that was true before 0.19.1: oam 0.19.1 honours it like Node (re-measured on Windows: a file created 0o400 comes back read-only). The `fchmod` / `chmod` / private-mode checks stay, as defense in depth for mounts that ignore modes and for a client that runs `oam run` directly and bypasses the launcher's floor. No behaviour change.
+
+### Fixed
+- `scripts/check-oam-floor.mjs` (run by `release.sh` and `npm run check:oam-floor`) now runs from a junctioned or symlinked checkout. It decided whether it was the main module by comparing `process.argv[1]` with its own URL, which Node realpaths and `argv[1]` does not, so from such a checkout it printed nothing and exited 0 -- a silent pass of the release gate. Both sides are now realpath'd. Release tooling only.
+
 ## [2.6.0] — 2026-10-11
 
 ### Added

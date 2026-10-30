@@ -499,11 +499,11 @@ export const lambdaTools: readonly Tool[] = [
         // On a failed invoke the CLI writes nothing and this stays a 0-byte
         // file, which is fine: it is only read on the success path.
         //
-        // chmodSync, not openSync's mode argument alone: oam drops the creation
-        // mode (measured 2026-09-20 on Windows, oam 0.16.2 -- a file opened 0o400 comes back
-        // writable there, where node marks it read-only), and oam is the runtime
-        // bin/aws-mcp.mjs picks by default. The exclusive create itself DOES reach
-        // oam; only the mode has to be set a second way.
+        // chmodSync, not openSync's mode argument alone: oam before 0.19.1
+        // dropped the creation mode (measured 2026-09-20 on Windows, oam 0.16.2 --
+        // a file opened 0o400 came back writable there, where node marks it
+        // read-only). oam 0.19.1, the launcher's floor, honours it, so the chmod
+        // is now defense in depth, for an `oam run` that bypasses the floor.
         const outPath = join(dir, "response.json");
         closeSync(openSync(outPath, "wx", 0o600));
         chmodSync(outPath, 0o600);
@@ -536,8 +536,8 @@ export const lambdaTools: readonly Tool[] = [
         if (i.payload !== undefined) {
           const payloadPath = join(dir, "payload.json");
           // The event body is caller data and can hold anything, so the same
-          // chmodSync as the outfile above: writeFileSync's `mode` is dropped on
-          // oam exactly the way openSync's is.
+          // chmodSync as the outfile above: before 0.19.1 oam dropped
+          // writeFileSync's `mode` exactly the way it dropped openSync's.
           writeFileSync(payloadPath, JSON.stringify(i.payload), { mode: 0o600 });
           chmodSync(payloadPath, 0o600);
           payloadArg = `fileb://${payloadPath}`;

@@ -376,19 +376,20 @@ function writeAllSync(fd: number, text: string): void {
  * private-file.ts). On such a mount the write is refused instead.
  *
  * The fchmod is not redundant belt-and-braces: open's mode argument is honoured
- * by node (and only ever narrowed by umask, never widened) but DROPPED by oam,
- * which bin/aws-mcp.mjs picks by default -- measured 2026-09-20 on WIN32/ARM64,
- * oam 0.16.2: a file opened 0o400 comes back writable where node marks it
- * read-only. On POSIX the same divergence WOULD leave this file at the umask
+ * by node (and only ever narrowed by umask, never widened), but oam before
+ * 0.19.1 DROPPED it -- measured 2026-09-20 on WIN32/ARM64, oam 0.16.2: a file
+ * opened 0o400 came back writable where node marks it read-only. oam 0.19.1
+ * (the launcher's floor) honours it like node (re-measured 2026-10-30 on
+ * WIN32/ARM64: 0o400 comes back read-only), but a client running `oam run`
+ * directly bypasses the floor, and a mount with no inode mode ignores both. On POSIX the same divergence WOULD leave this file at the umask
  * default, with an access key, a secret key and a session token in a
  * world-readable `~/.aws/credentials` -- ASSERTED, not measured: oam publishes no
  * linux-arm64 build and there is no Mac here, so no POSIX oam measurement exists
  * anywhere. Note also that a Windows mode argument can only toggle
  * FILE_ATTRIBUTE_READONLY, so that particular row does not transfer cleanly; the
  * `flag: "wx"` row did, being flag-string parsing above the OS layer -- and on
- * oam >= 0.18.0 (the launcher's floor) "wx" is honoured by openSync and
- * writeFileSync alike, as on node. The creation mode still needs the fchmod:
- * no oam release records open's mode argument as honoured. fchmodSync itself both runtimes honour. It goes on the fd rather than the
+ * oam >= 0.18.0 "wx" is honoured by openSync and writeFileSync alike, as on
+ * node. The fchmod stays for the reasons above. fchmodSync itself both runtimes honour. It goes on the fd rather than the
  * path so there is no moment where the file holds credentials at a wider mode.
  *
  * Returns `{ existed: true }` when the profile was already present and its
@@ -416,7 +417,8 @@ export async function upsertProfile(
     try {
       try {
         // Before writeAllSync, so the credentials never exist on disk at a mode
-        // open(2) set and oam ignored. See the note on this function.
+        // open(2) set and something ignored (oam before 0.19.1 did). See the
+        // note on this function.
         fchmodSync(fd, 0o600);
         // And VERIFY it, before any credential byte exists. fchmod succeeding is
         // not the same as the mode being set: on a filesystem with no inode mode

@@ -64,17 +64,17 @@
  * `--allow-child-process` is mandatory, and the CLI needs the filesystem for
  * ~/.aws/config and the SSO cache. The sandbox would end up granting everything
  * it gates, so it is not offered rather than shipped as security theatre. Under
- * oam 0.18.0 it would also reach the CLI itself: a child of a `--permission`
+ * oam (since 0.18.0) it would also reach the CLI itself: a child of a `--permission`
  * process gets the permission flags appended to its NODE_OPTIONS, and a list
  * `--allow-env` leaves the child only the variables it names -- so the aws CLI
  * would lose the environment it inherits (SYSTEMROOT on Windows, HOME, the
  * AWS_* settings) and break.
  *
  * MINIMUM OAM VERSION
- * The floor, bumped to each new oam release. Currently 0.18.0, verified on it:
+ * The floor, bumped to each new oam release. Currently 0.19.1, verified on it:
  * full MCP handshake listing all 28 tools, a local tool call and the aws_script
- * sandbox check (2026-10-06, oam 0.18.0 aarch64-pc-windows-msvc, checksum matched
- * against the release SHA256SUMS). It is a FLOOR, not a pin: the
+ * sandbox check (2026-10-30, oam 0.19.1 aarch64-pc-windows-msvc, the installed
+ * ~/.oam/bin/oam.exe, run as OAM_BIN). It is a FLOOR, not a pin: the
  * launcher runs the newest oam it finds at or above it, and falls back to Node
  * rather than serving on an older one -- which is the point, because an older oam
  * is not what this server is verified on.
@@ -107,7 +107,7 @@ import { fileURLToPath } from "node:url";
  * The oam release this server is verified on; the launcher never serves below
  * it. See MINIMUM OAM VERSION above.
  */
-const OAM_MIN = [0, 18, 0];
+const OAM_MIN = [0, 19, 1];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -360,15 +360,17 @@ function chooseOam() {
 
 /**
  * The `oam self-update` advice, for an oam that is by construction below the
- * floor -- and so, while the floor is 0.18.0, older than the first signed
- * release. Such a binary's self-update still pipes the 0.18.0 installer, which
- * verifies the signed release and needs ssh-keygen 8.1 or later to do it (macOS
- * and Linux ship it; on Windows it is the inbox OpenSSH client).
+ * floor. When the floor was 0.18.0 that also made it older than the first signed
+ * release; with the floor past it, a below-floor oam may be a signed 0.18.x or
+ * 0.19.0, so the ssh-keygen note is scoped to the oam it applies to. An oam that
+ * predates signing still pipes an installer that verifies the signed release and
+ * needs ssh-keygen 8.1 or later to do it (macOS and Linux ship it; on Windows it
+ * is the inbox OpenSSH client).
  */
 function selfUpdateAdvice() {
   return (
     `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer ` +
-    "(updating from an oam older than 0.18.0 needs ssh-keygen 8.1 or later to verify the signed release)"
+    "(an oam that predates 0.18.0, the first signed release, needs ssh-keygen 8.1 or later to verify it)"
   );
 }
 

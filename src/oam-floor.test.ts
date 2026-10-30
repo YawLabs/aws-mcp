@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // The same one-level hop src/release-metadata.test.ts and src/lint-script.test.ts
 // use: authored in src/, executed from dist/, so resolving off import.meta.url
@@ -142,5 +142,36 @@ describe("check-oam-floor catches drift", () => {
     const r = runChecker(root);
     assert.notEqual(r.code, 0, r.out);
     assert.match(r.out, /OAM_MIN/);
+  });
+});
+
+describe("check-oam-floor runs from a linked checkout", () => {
+  // Node realpaths the main module's URL but not process.argv[1], so the old
+  // resolve()-only main-module test was false from a junctioned or symlinked
+  // checkout: main() never ran and the script exited 0 with no output -- a
+  // silent pass of release.sh's gate.
+  it("still checks when invoked through a junction / symlink", () => {
+    const linkParent = mkdtempSync(join(tmpdir(), "aws-mcp-floor-link-"));
+    dirs.push(linkParent);
+    const link = join(linkParent, "scripts");
+    symlinkSync(join(repoRoot, "scripts"), link, process.platform === "win32" ? "junction" : "dir");
+    const root = fixture({ launcherTest: "    assert.deepEqual(floor, [0, 15, 2]);\n" });
+    const r = spawnSync(process.execPath, [join(link, "check-oam-floor.mjs"), "--offline", "--root", root], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    assert.equal(r.status, 1, out);
+    assert.match(out, /pins the floor at 0\.15\.2/);
+  });
+
+  it("isMainModule() is false with no argv[1] and true for the module itself", async () => {
+    const { isMainModule } = (await import(pathToFileURL(CHECKER).href)) as {
+      isMainModule: (argv1: string | undefined, moduleUrl: string) => boolean;
+    };
+    const url = pathToFileURL(CHECKER).href;
+    assert.equal(isMainModule(undefined, url), false);
+    assert.equal(isMainModule(CHECKER, url), true);
+    assert.equal(isMainModule(join(repoRoot, "scripts", "no-such.mjs"), url), false);
   });
 });

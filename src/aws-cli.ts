@@ -764,7 +764,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         //
         // Exclusivity comes from open(2)'s O_EXCL via `openSync(..., "wx")`.
         // "wx" is honoured by openSync and by writeFileSync's `flag` option alike
-        // on node and on oam >= 0.18.0 (the floor bin/aws-mcp.mjs enforces;
+        // on node and on oam >= 0.18.0 (so on every oam the bin/aws-mcp.mjs floor admits;
         // before 0.18.0 oam's writeFileSync ignored its flag and overwrote an
         // existing file). openSync stays because the fd is what the fchmod and
         // fstat below need. bin/aws-mcp.mjs defaults AWS_MCP_RUNTIME=auto, so
