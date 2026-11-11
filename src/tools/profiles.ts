@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { z } from "zod";
+import { resolveAwsConfigPath } from "../aws-paths.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 export interface AwsProfile {
@@ -143,7 +142,7 @@ export const profilesTools: readonly Tool[] = [
   {
     name: "aws_list_profiles",
     description:
-      "List AWS profiles configured in ~/.aws/config. Returns profile name, region, and SSO metadata (start URL, region, session name) where set, plus an `isSso` flag. Use when the user hasn't named a profile, when they ask to switch profiles, or when an SSO-expired error mentions a profile you haven't seen.",
+      "List AWS profiles configured in the AWS config file (AWS_CONFIG_FILE, else ~/.aws/config). Returns profile name, region, and SSO metadata (start URL, region, session name) where set, plus an `isSso` flag. Use when the user hasn't named a profile, when they ask to switch profiles, or when an SSO-expired error mentions a profile you haven't seen.",
     annotations: {
       title: "List configured AWS profiles",
       readOnlyHint: true,
@@ -153,7 +152,16 @@ export const profilesTools: readonly Tool[] = [
     },
     inputSchema: z.object({}),
     handler: async (_input: unknown): Promise<ToolResult> => {
-      const configPath = join(homedir(), ".aws", "config");
+      const configPath = resolveAwsConfigPath();
+      if (configPath === "") {
+        // Set but empty: the aws CLI loads no config file at all, so there are
+        // no profiles it can use. Say so instead of reading some other file.
+        return {
+          ok: false,
+          error:
+            "AWS_CONFIG_FILE is set to an empty value, so the AWS CLI loads no config file and no profiles are configured. Unset it to use ~/.aws/config, or point it at a config file.",
+        };
+      }
       try {
         const text = readFileSync(configPath, "utf-8");
         const profiles = parseAwsConfig(text);

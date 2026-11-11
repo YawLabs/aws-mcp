@@ -550,6 +550,7 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
   let homeDir: string;
   let homeBackup: string | undefined;
   let userprofileBackup: string | undefined;
+  let configFileBackup: string | undefined;
 
   beforeEach(() => {
     _resetSession();
@@ -559,8 +560,12 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
     homeDir = mkdtempSync(join(tmpdir(), "aws-mcp-login-complete-"));
     homeBackup = process.env.HOME;
     userprofileBackup = process.env.USERPROFILE;
+    configFileBackup = process.env.AWS_CONFIG_FILE;
     process.env.HOME = homeDir;
     process.env.USERPROFILE = homeDir;
+    // An ambient AWS_CONFIG_FILE would redirect startUrlForProfile away from
+    // the HOME-override config these tests write.
+    delete process.env.AWS_CONFIG_FILE;
   });
 
   afterEach(() => {
@@ -573,6 +578,8 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
     else process.env.HOME = homeBackup;
     if (userprofileBackup === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = userprofileBackup;
+    if (configFileBackup === undefined) delete process.env.AWS_CONFIG_FILE;
+    else process.env.AWS_CONFIG_FILE = configFileBackup;
     rmSync(homeDir, { recursive: true, force: true });
   });
 
@@ -709,6 +716,35 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
       "minutesLeft should reflect the ~8h-out cached token",
     );
   });
+
+  it("resolves the profile's start URL from AWS_CONFIG_FILE, not ~/.aws/config", async () => {
+    // The config lives ONLY at AWS_CONFIG_FILE (outside HOME/.aws), as in a
+    // per-user gateway deployment. A second, later-expiring token for another
+    // start URL sits in the cache: if the start-URL lookup missed the config,
+    // the latest-expiry fallback would surface that other token instead.
+    const startUrl = "https://config-file.awsapps.com/start";
+    const configPath = join(homeDir, "per-user-config");
+    writeFileSync(
+      configPath,
+      `[profile cf-prof]\nsso_start_url = ${startUrl}\nsso_region = us-east-1\nregion = us-east-1\n`,
+    );
+    process.env.AWS_CONFIG_FILE = configPath;
+    writeCachedToken(startUrl);
+    const otherExpiry = new Date(Date.now() + 20 * 3600_000).toISOString();
+    writeFileSync(
+      join(homeDir, ".aws", "sso", "cache", "other.json"),
+      JSON.stringify({ accessToken: "other", expiresAt: otherExpiry, startUrl: "https://other.awsapps.com/start" }),
+    );
+
+    const sessionId = await seedSession("cf-prof", "happy");
+    process.env.AWS_MCP_FAKE_SCENARIO = "sts_caller_identity_success";
+    const r = (await completeTool.handler({ sessionId, profile: "cf-prof" })) as {
+      ok: boolean;
+      data?: { ssoToken?: { startUrl?: string } | null };
+    };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.ssoToken?.startUrl, startUrl);
+  });
 });
 
 describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
@@ -735,6 +771,7 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
   let homeDir: string;
   let homeBackup: string | undefined;
   let userprofileBackup: string | undefined;
+  let configFileBackup: string | undefined;
 
   beforeEach(() => {
     _resetSession();
@@ -742,8 +779,10 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
     homeDir = mkdtempSync(join(tmpdir(), "aws-mcp-refresh-"));
     homeBackup = process.env.HOME;
     userprofileBackup = process.env.USERPROFILE;
+    configFileBackup = process.env.AWS_CONFIG_FILE;
     process.env.HOME = homeDir;
     process.env.USERPROFILE = homeDir;
+    delete process.env.AWS_CONFIG_FILE;
   });
 
   afterEach(() => {
@@ -756,6 +795,8 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
     else process.env.HOME = homeBackup;
     if (userprofileBackup === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = userprofileBackup;
+    if (configFileBackup === undefined) delete process.env.AWS_CONFIG_FILE;
+    else process.env.AWS_CONFIG_FILE = configFileBackup;
     rmSync(homeDir, { recursive: true, force: true });
   });
 
