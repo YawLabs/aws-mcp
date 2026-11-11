@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.7.1] — 2026-11-11
+
 ### Changed
 - **A `tools/call` whose undeclared arguments total more than 64 KiB is refused with JSON-RPC `-32602`** instead of being processed with those arguments silently dropped. Undeclared arguments are never read by any tool, so no legitimate input is lost: declared arguments are never measured, and large ones (an `aws_lambda_invoke` payload, `aws_call` params, `aws_script` code, an `aws_resource_*` desired state) go through as before. A small stray argument is still ignored. The refusal names the undeclared keys (at most 10, each cut to 64 characters) and the tool's declared ones. This clears the `security-oversized-input` warning from `@yawlabs/mcp-compliance` on both the Node and oam legs.
 
@@ -1193,7 +1195,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.0...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.1...HEAD
+[2.7.1]: https://github.com/YawLabs/aws-mcp/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/YawLabs/aws-mcp/compare/v2.6.1...v2.7.0
 [2.6.1]: https://github.com/YawLabs/aws-mcp/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/YawLabs/aws-mcp/compare/v2.5.2...v2.6.0
