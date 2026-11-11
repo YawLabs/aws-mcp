@@ -778,7 +778,7 @@ describe("runAwsCall — AbortSignal", () => {
       assert.equal(r.ok, false);
       if (r.ok) return;
       assert.equal(r.kind, "cancelled");
-      assert.match(r.error, /before the aws CLI was started/);
+      assert.match(r.error, /before this aws CLI call was started, so this call sent nothing to AWS/);
       assert.equal(r.command, undefined, "nothing ran, so there is no command to show");
       assert.equal(existsSync(callsPath), false, "fake-aws must never have been spawned");
     } finally {

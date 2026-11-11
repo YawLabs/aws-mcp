@@ -158,10 +158,11 @@ export async function runWithConcurrency<I, R>(
   fn: (input: I, index: number) => Promise<R>,
   opts?: {
     /**
-     * When this aborts, workers stop CLAIMING new inputs. Work already in
-     * flight is allowed to finish rather than being abandoned: those calls are
-     * already spent against AWS, and dropping their results would throw away
-     * answers the caller has effectively paid for.
+     * When this aborts, workers stop CLAIMING new inputs. This helper never
+     * interrupts work already in flight; whether that work stops is up to `fn`.
+     * aws_multi_region and aws_multi_account pass the same signal into
+     * runAwsCall, which kills the running CLI child, so their in-flight entries
+     * come back as cancelled too.
      */
     signal?: AbortSignal;
     /**
@@ -177,8 +178,8 @@ export async function runWithConcurrency<I, R>(
   let next = 0;
   const worker = async (): Promise<void> => {
     while (true) {
-      // Checked before CLAIMING, so an abort stops the batch growing without
-      // interrupting a call that is already outstanding.
+      // Checked before CLAIMING, so an abort stops the batch growing. A call
+      // already outstanding is fn's to stop (see the signal doc above).
       if (opts?.signal?.aborted) return;
       const i = next++;
       if (i >= inputs.length) return;

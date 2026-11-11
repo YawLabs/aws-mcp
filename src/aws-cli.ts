@@ -560,7 +560,7 @@ function validateNames(service: string, operationTokens: string[]): string | nul
 function cancelledMessage(started: boolean): string {
   return started
     ? "Cancelled by the client: the aws CLI was stopped before it finished. If the operation changes state, check whether the request reached AWS before retrying."
-    : "Cancelled by the client before the aws CLI was started. Nothing was sent to AWS.";
+    : "Cancelled by the client before this aws CLI call was started, so this call sent nothing to AWS (an earlier step of the same tool, such as an AssumeRole, may already have run).";
 }
 
 export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
