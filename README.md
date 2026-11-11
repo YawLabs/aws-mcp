@@ -337,6 +337,7 @@ directory -- already in `.gitignore`.
 |----------|---------|---------|
 | `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | `default` | Profile used when a tool call omits `profile`. `AWS_DEFAULT_PROFILE` is the legacy spelling. `AWS_PROFILE` wins if both are set, as in AWS CLI v2 (standalone botocore and boto3 check `AWS_DEFAULT_PROFILE` first). An empty value counts as unset. |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | Region used when a tool call omits `region`. `AWS_REGION` wins if both are set. |
+| `AWS_CONFIG_FILE` | `~/.aws/config` | The AWS config file. The CLI reads it for every call; `aws_list_profiles` and the SSO start-URL lookup in `aws_whoami` / `aws_login_complete` / `aws_refresh_if_expiring_soon` read the same file, with `~` expansion like botocore. |
 | `AWS_SHARED_CREDENTIALS_FILE` | `~/.aws/credentials` | Where `aws_assume_role` writes the profile it creates. Honored (with `~` expansion, like botocore) so the write lands in the same file the CLI later reads. |
 | `AWS_MCP_AWS_CLI` | unset | Absolute path to the `aws` executable to run instead of the one found on `PATH`. For MCP hosts started from a GUI, which often inherit none of your shell's `PATH` -- and AWS's recommended installer now defaults to `~/.local/bin` on macOS and Linux, which such hosts rarely see. Find the path with `command -v aws` (macOS/Linux) or `where.exe aws` (Windows). In Git Bash on Windows use `where.exe aws`, not `command -v aws`: the latter prints a POSIX-style path (`/c/Program Files/...`) that this variable refuses, because it must be a native absolute path. It applies to every call and to `aws sso login`. Must be absolute, and on Windows must name `aws.exe`: a `.cmd` or `.bat` shim cannot be started without a shell. An unusable value fails every call with a message naming this variable, rather than quietly running a different CLI than you configured. Unset, the server walks the absolute directories on `PATH`; it never runs an `aws` from its working directory. |
 
@@ -368,6 +369,25 @@ Every call resolves a profile name first -- **explicit tool `profile` argument -
 The AWS CLI is a separate process with its own rules, so a `credential_process`, an SSO login or any `aws_call` behind the same gateway follows the [AWS CLI's own proxy configuration](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-proxy.html) (`HTTP_PROXY` / `HTTPS_PROXY` and `AWS_CA_BUNDLE`) rather than the Node variables above. Those failures now carry their own remedy too.
 
 If a call omits `profile`, `aws_session_set` has not been called, neither `AWS_PROFILE` nor `AWS_DEFAULT_PROFILE` is set to a non-empty value, and neither `~/.aws/config` nor `~/.aws/credentials` defines a `default` profile, the CLI rejects `--profile default` with `ProfileNotFound`, which the tool reports as a `no_creds` error. Set `AWS_PROFILE` in your MCP config to your usual working profile.
+
+### Multi-user gateways: one process per user
+
+To serve several people through an MCP aggregator or gateway, run **one server process per authenticated user**. The server is built for exactly one client per process: the session profile and region set by `aws_session_set`, and every pending SSO login, are held in process memory. Two users sharing one process would share them, so never multiplex users into a single process.
+
+Give each user's process its own environment. The `aws` CLI that every tool spawns inherits it, so the server and the CLI always read the same files:
+
+| Variable | Why it must be per user |
+|----------|-------------------------|
+| `HOME` (macOS / Linux) or `USERPROFILE` (Windows) | Locates `~/.aws/sso/cache`, where `aws sso login` writes the user's SSO token. There is no separate variable for the cache directory, so this is what keeps tokens apart. It is also the default location of the two files below. |
+| `AWS_CONFIG_FILE` | The user's profiles and `sso-session` blocks. Optional if it lives at `$HOME/.aws/config`. |
+| `AWS_SHARED_CREDENTIALS_FILE` | Where `aws_assume_role` writes the profiles it creates. Optional if it lives at `$HOME/.aws/credentials`. |
+| `TMPDIR` (macOS / Linux) or `TEMP` / `TMP` (Windows) | Scratch files for large `aws_call` payloads and Lambda packaging. |
+
+Lifecycle notes:
+
+- A login started by `aws_login_start` and not yet finished by `aws_login_complete` exists only in that process's memory. It is lost if the process restarts -- the user simply calls `aws_login_start` again -- and it expires after 10 minutes either way.
+- What the CLI writes to disk survives restarts: the SSO token in the cache, and the config and credentials files. Persist the per-user home (or those paths) across process recycling and the user stays signed in until the SSO token itself expires.
+- Gateway authentication is separate from AWS authentication. The server has no notion of gateway users; the gateway decides which process a request reaches. Route by the gateway's verified principal, never by a username, profile name or MCP session ID the caller supplies.
 
 ## How the SSO login flow works
 

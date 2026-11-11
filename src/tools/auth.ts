@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
+import { resolveAwsConfigPath } from "../aws-paths.js";
 import { getProfile, getRegion } from "../session.js";
 import { findActiveSessionByProfile, startSsoLogin, waitForLogin } from "../sso.js";
 import { resolveProfileStartUrl } from "./profiles.js";
@@ -180,13 +181,14 @@ function projectSsoToken(
 }
 
 /**
- * Resolve a profile's SSO start URL by reading ~/.aws/config. Returns null
- * if the config file isn't readable or the profile isn't SSO-backed; callers
- * then fall back to the legacy "first valid token" behavior.
+ * Resolve a profile's SSO start URL by reading the AWS config file (the same
+ * one the CLI reads: AWS_CONFIG_FILE, else ~/.aws/config). Returns null if the
+ * config file isn't readable or the profile isn't SSO-backed; callers then
+ * fall back to the legacy "first valid token" behavior.
  */
 function startUrlForProfile(profile: string): string | undefined {
   try {
-    const text = readFileSync(join(homedir(), ".aws", "config"), "utf-8");
+    const text = readFileSync(resolveAwsConfigPath(), "utf-8");
     return resolveProfileStartUrl(text, profile) ?? undefined;
   } catch {
     return undefined;

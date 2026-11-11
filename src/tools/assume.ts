@@ -1,8 +1,7 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { z } from "zod";
 import { runAwsCall, truncateForErrorMsg } from "../aws-cli.js";
 import { upsertProfile } from "../aws-credentials.js";
+import { resolveAwsCredentialsPath } from "../aws-paths.js";
 import { getProfile, getRegion, isValidProfileName } from "../session.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
@@ -35,17 +34,10 @@ function resolveTargetProfile(input: { targetProfile?: string; sessionName: stri
  * user who had it set was previously handed a profile written where the CLI
  * never looks, so the returned hint named a profile that did not exist from the
  * CLI's point of view. It is also the remedy the EACCES message below suggests
- * -- ignoring the variable made that advice a no-op.
+ * -- ignoring the variable made that advice a no-op. Resolution lives in
+ * aws-paths.ts, shared with every other in-process read of the AWS files.
  */
-function resolveCredentialsPath(): string {
-  const fromEnv = process.env.AWS_SHARED_CREDENTIALS_FILE?.trim();
-  if (!fromEnv) return join(homedir(), ".aws", "credentials");
-  // Mirror botocore's expanduser() so `~/creds` means <home>/creds rather than
-  // a literal `~` directory next to the cwd.
-  if (fromEnv === "~") return homedir();
-  if (fromEnv.startsWith("~/") || fromEnv.startsWith("~\\")) return join(homedir(), fromEnv.slice(2));
-  return fromEnv;
-}
+const resolveCredentialsPath = resolveAwsCredentialsPath;
 
 /**
  * The raw diagnostic to quote after "Underlying error:" when this tool

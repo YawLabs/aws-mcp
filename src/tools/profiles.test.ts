@@ -259,19 +259,60 @@ sso_session = my-org
 describe("aws_list_profiles handler", () => {
   let configDir: string;
   let homeBackup: string | undefined;
+  let userprofileBackup: string | undefined;
+  let configFileBackup: string | undefined;
 
   beforeEach(() => {
     configDir = mkdtempSync(join(tmpdir(), "aws-mcp-profiles-"));
     homeBackup = process.env.HOME;
+    userprofileBackup = process.env.USERPROFILE;
+    configFileBackup = process.env.AWS_CONFIG_FILE;
     process.env.HOME = configDir;
     // On Windows, homedir() uses USERPROFILE instead.
     process.env.USERPROFILE = configDir;
+    // An ambient AWS_CONFIG_FILE would take precedence over HOME/.aws/config.
+    delete process.env.AWS_CONFIG_FILE;
   });
 
   afterEach(() => {
     if (homeBackup === undefined) delete process.env.HOME;
     else process.env.HOME = homeBackup;
+    if (userprofileBackup === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = userprofileBackup;
+    if (configFileBackup === undefined) delete process.env.AWS_CONFIG_FILE;
+    else process.env.AWS_CONFIG_FILE = configFileBackup;
     rmSync(configDir, { recursive: true, force: true });
+  });
+
+  it("reads AWS_CONFIG_FILE instead of ~/.aws/config when it is set", async () => {
+    // Both files exist with different profiles, so the result proves which one
+    // was read -- the same file the aws CLI subprocess reads.
+    mkdirSync(join(configDir, ".aws"));
+    writeFileSync(join(configDir, ".aws", "config"), "[profile from-home]\nregion = us-east-1\n");
+    const perUser = join(configDir, "per-user-config");
+    writeFileSync(perUser, "[profile from-env]\nregion = eu-west-1\n");
+    process.env.AWS_CONFIG_FILE = perUser;
+
+    const r = (await listTool.handler({})) as { ok: boolean; data?: { configPath?: string; profiles?: AwsProfile[] } };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.configPath, perUser);
+    assert.deepEqual(
+      r.data?.profiles?.map((p) => p.name),
+      ["from-env"],
+    );
+  });
+
+  it("expands a leading ~ in AWS_CONFIG_FILE against the home directory", async () => {
+    writeFileSync(join(configDir, "cfg"), "[profile tilde]\nregion = us-west-2\n");
+    process.env.AWS_CONFIG_FILE = "~/cfg";
+
+    const r = (await listTool.handler({})) as { ok: boolean; data?: { configPath?: string; profiles?: AwsProfile[] } };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.configPath, join(configDir, "cfg"));
+    assert.deepEqual(
+      r.data?.profiles?.map((p) => p.name),
+      ["tilde"],
+    );
   });
 
   it("returns an error when ~/.aws/config doesn't exist", async () => {
