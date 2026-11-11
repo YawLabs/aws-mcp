@@ -654,7 +654,7 @@ function resolveWriteTarget(path: string, budget = { hops: MAX_SYMLINK_HOPS }): 
  * by node (and only ever narrowed by umask, never widened), but oam before
  * 0.19.1 DROPPED it -- measured 2026-09-20 on WIN32/ARM64, oam 0.16.2: a file
  * opened 0o400 came back writable where node marks it read-only. oam 0.19.1
- * (the launcher's floor) honours it like node, but a client running `oam run`
+ * and later (the launcher's floor among them) honour it like node, but a client running `oam run`
  * directly bypasses the floor, and a mount with no inode mode ignores both.
  * It goes on the fd rather than the path so there is no moment where the file
  * holds content at a wider mode.

@@ -502,7 +502,7 @@ export const lambdaTools: readonly Tool[] = [
         // chmodSync, not openSync's mode argument alone: oam before 0.19.1
         // dropped the creation mode (measured 2026-09-20 on Windows, oam 0.16.2 --
         // a file opened 0o400 came back writable there, where node marks it
-        // read-only). oam 0.19.1, the launcher's floor, honours it, so the chmod
+        // read-only). oam 0.19.1 and later, the launcher's floor among them, honour it, so the chmod
         // is now defense in depth, for an `oam run` that bypasses the floor.
         const outPath = join(dir, "response.json");
         closeSync(openSync(outPath, "wx", 0o600));

@@ -71,9 +71,9 @@
  * AWS_* settings) and break.
  *
  * MINIMUM OAM VERSION
- * The floor, bumped to each new oam release. Currently 0.19.1, verified on it:
- * full MCP handshake listing all 28 tools, a local tool call and the aws_script
- * sandbox check (2026-10-30, oam 0.19.1 aarch64-pc-windows-msvc, the installed
+ * The floor, bumped to each new oam release. Currently 0.19.5, verified on it:
+ * full MCP handshake listing all 30 tools, a local tool call and the aws_script
+ * sandbox check (2026-11-11, oam 0.19.5 aarch64-pc-windows-msvc, the installed
  * ~/.oam/bin/oam.exe, run as OAM_BIN). It is a FLOOR, not a pin: the
  * launcher runs the newest oam it finds at or above it, and falls back to Node
  * rather than serving on an older one -- which is the point, because an older oam
@@ -107,7 +107,7 @@ import { fileURLToPath } from "node:url";
  * The oam release this server is verified on; the launcher never serves below
  * it. See MINIMUM OAM VERSION above.
  */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 19, 5];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;

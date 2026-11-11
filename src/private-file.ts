@@ -6,7 +6,7 @@
  * `~/.aws/credentials` in aws-credentials.ts, which carries an access key, a
  * secret key and a session token in plaintext. Both open at 0600 and then
  * fchmod the fd at 0600 -- open's mode because node honours it (and oam does
- * too from 0.19.1, the launcher's floor), the fchmod because oam before 0.19.1
+ * too from 0.19.1 on), the fchmod because oam before 0.19.1
  * dropped open's mode, and it stays as defense in depth for the mounts below.
  *
  * Neither is sufficient, because a filesystem may accept a chmod, report
