@@ -394,6 +394,20 @@ const LOCK_STALE_AFTER_MS = 30_000;
 /** Base retry delay; jittered + scaled per attempt up to a cap. */
 const LOCK_BASE_RETRY_MS = 25;
 const LOCK_MAX_RETRY_MS = 250;
+/**
+ * How long an UNBROKEN run of EPERM/EACCES on the lock create is treated as a
+ * delete-pending lock (contention) on Windows before it is believed and
+ * rethrown. Far longer than a pending delete lasts, far shorter than
+ * LOCK_MAX_WAIT_MS, so a read-only ~/.aws still fails fast with its real error.
+ */
+const LOCK_WIN_DENIED_GRACE_MS = 1_000;
+
+/** Test seam for acquireLock: the platform and the exclusive lock-file create. */
+export interface LockSeam {
+  platform?: NodeJS.Platform;
+  /** Stands in for `openSync(path, "wx")`; must return a real fd on success. */
+  openExclusive?: (path: string) => number;
+}
 
 /**
  * Acquire a sidecar lock file via O_EXCL. Honored cross-process: both POSIX
@@ -416,9 +430,14 @@ const LOCK_MAX_RETRY_MS = 250;
  * in. Acceptable for these write paths; users who hit a permanent
  * "failed to acquire lock" error can manually remove `<file>.lock`.
  */
-async function acquireLock(lockPath: string): Promise<void> {
+async function acquireLock(lockPath: string, seam: LockSeam = {}): Promise<void> {
+  const platform = seam.platform ?? process.platform;
+  const openExclusive = seam.openExclusive ?? ((p: string) => openSync(p, "wx"));
   const start = Date.now();
   let attempt = 0;
+  // Start of the current unbroken run of Windows EPERM/EACCES on the lock
+  // create (see the catch below); null when the last attempt was not one.
+  let deniedSince: number | null = null;
   while (true) {
     // Timeout check at the top of the loop so EVERY iteration -- including
     // the stale-recovery and stat-failed `continue` paths below -- is bounded
@@ -435,9 +454,29 @@ async function acquireLock(lockPath: string): Promise<void> {
     // openSync-fail has nothing to unlink, write/close-fail does.
     let fd: number | null = null;
     try {
-      fd = openSync(lockPath, "wx");
+      fd = openExclusive(lockPath);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
+      if (platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+        // Under contention Windows can fail the O_EXCL create with EPERM
+        // instead of EEXIST. Measured on win32-arm64: 1-8 spurious EPERM
+        // failures on the lock create per 1600 writes from 16 processes, and
+        // one in the 2-process trials of aws-credentials.test.ts. The likely
+        // mechanism is a lock file the previous holder has unlinked but whose
+        // delete is still PENDING (another handle -- a waiter's statSync, an
+        // antivirus scan -- is open on it), which Windows reports as
+        // ACCESS_DENIED. Either way it is contention, not a permissions
+        // problem, and clears within milliseconds: back off and retry, but
+        // only for LOCK_WIN_DENIED_GRACE_MS of UNBROKEN denials, so a
+        // genuinely read-only directory still surfaces its real EPERM quickly
+        // instead of a misleading lock timeout. The stale check below is
+        // skipped: there may be no stat-able file to judge.
+        deniedSince ??= Date.now();
+        if (Date.now() - deniedSince > LOCK_WIN_DENIED_GRACE_MS) throw err;
+        await delay(LOCK_BASE_RETRY_MS + Math.random() * LOCK_BASE_RETRY_MS);
+        continue;
+      }
+      deniedSince = null;
       if (code !== "EEXIST") {
         // openSync itself failed for a non-EEXIST reason (EPERM on a
         // read-only ~/.aws, ENOENT on a missing parent dir, ENOSPC on a
@@ -577,6 +616,9 @@ export interface LockedWriteOptions {
   /** Test seam: platform + mode probe handed to assertPrivateMode, so the
    *  mode-ignoring-filesystem branch is drivable from any host. */
   privateModeOpts?: { platform?: NodeJS.Platform; probe?: ModeProbe };
+  /** Test seam: platform + lock-file create used by the lock acquire, so the
+   *  Windows delete-pending EPERM branch is drivable from any host. */
+  lockSeam?: LockSeam;
 }
 
 /** Max symlink hops followed by hand for a dangling chain (Linux's MAXSYMLINKS). */
@@ -685,7 +727,7 @@ export async function withLockedAtomicWrite(
   // missing dir) fails, so create the resolved directory instead.
   if (opts.ensureDir) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const lockPath = `${path}.lock`;
-  await acquireLock(lockPath);
+  await acquireLock(lockPath, opts.lockSeam);
   try {
     const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
     // Inside the lock, so the transform sees the text it is about to replace --
