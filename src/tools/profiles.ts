@@ -153,6 +153,15 @@ export const profilesTools: readonly Tool[] = [
     inputSchema: z.object({}),
     handler: async (_input: unknown): Promise<ToolResult> => {
       const configPath = resolveAwsConfigPath();
+      if (configPath === "") {
+        // Set but empty: the aws CLI loads no config file at all, so there are
+        // no profiles it can use. Say so instead of reading some other file.
+        return {
+          ok: false,
+          error:
+            "AWS_CONFIG_FILE is set to an empty value, so the AWS CLI loads no config file and no profiles are configured. Unset it to use ~/.aws/config, or point it at a config file.",
+        };
+      }
       try {
         const text = readFileSync(configPath, "utf-8");
         const profiles = parseAwsConfig(text);

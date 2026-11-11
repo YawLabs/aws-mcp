@@ -302,6 +302,34 @@ describe("aws_list_profiles handler", () => {
     );
   });
 
+  it("expands $VAR in AWS_CONFIG_FILE the way the CLI does", async () => {
+    writeFileSync(join(configDir, "var-cfg"), "[profile from-var]\nregion = us-west-2\n");
+    process.env.AWS_MCP_TEST_CFG_DIR = configDir;
+    try {
+      // The literal braced form "${AWS_MCP_TEST_CFG_DIR}/var-cfg".
+      process.env.AWS_CONFIG_FILE = `$\{AWS_MCP_TEST_CFG_DIR}/var-cfg`;
+      const r = (await listTool.handler({})) as { ok: boolean; data?: { profiles?: AwsProfile[] } };
+      assert.equal(r.ok, true);
+      assert.deepEqual(
+        r.data?.profiles?.map((p) => p.name),
+        ["from-var"],
+      );
+    } finally {
+      delete process.env.AWS_MCP_TEST_CFG_DIR;
+    }
+  });
+
+  it("reports an empty AWS_CONFIG_FILE instead of reading ~/.aws/config", async () => {
+    // The CLI loads NO config file for an empty value; listing the home
+    // config here would advertise profiles the CLI cannot use.
+    mkdirSync(join(configDir, ".aws"));
+    writeFileSync(join(configDir, ".aws", "config"), "[profile from-home]\nregion = us-east-1\n");
+    process.env.AWS_CONFIG_FILE = "";
+    const r = (await listTool.handler({})) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /AWS_CONFIG_FILE is set to an empty value/);
+  });
+
   it("expands a leading ~ in AWS_CONFIG_FILE against the home directory", async () => {
     writeFileSync(join(configDir, "cfg"), "[profile tilde]\nregion = us-west-2\n");
     process.env.AWS_CONFIG_FILE = "~/cfg";
