@@ -35,6 +35,41 @@ describe("URL_RE", () => {
     assert.match("https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-EFGH", URL_RE);
   });
 
+  it("preserves tenant portal and AWS sign-in device URLs", () => {
+    for (const url of [
+      "https://d-example.awsapps.com/start/#/device",
+      "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH",
+      "https://team-example.awsapps.com/start#/device?user_code=ABCD-EFGH",
+      "https://signin.aws/device",
+      "https://signin.aws/device?user_code=ABCD-EFGH",
+      "https://us-east-1.signin.aws/platform/d-example/device?user_code=ABCD-EFGH",
+    ]) {
+      assert.equal(url.match(URL_RE)?.[0], url);
+    }
+  });
+
+  it("rejects lookalike hosts, user information and non-device portal paths", () => {
+    for (const url of [
+      "https://team-example.awsapps.com.evil.example/start/#/device",
+      "https://signin.aws.evil.example/device",
+      "https://evil-signin.aws/device",
+      "https://device.sso.us-east-1.amazonaws.com.evil.example/",
+      "https://signin.aws@evil.example/device",
+      "https://user@signin.aws/device",
+      "http://signin.aws/device",
+      "http://team-example.awsapps.com/start/#/device",
+      "https://team-example.awsapps.com/start/#/authorize",
+      "https://team-example.awsapps.com/start/#/device-extra",
+      "https://team-example.awsapps.com/start/#/device/other",
+      "https://signin.aws/authorize?client_id=x",
+      "https://us-east-1.signin.aws/platform/d-example/authorize?client_id=x",
+      "https://signin.aws/device-extra",
+      "https://signin.aws/device/other",
+    ]) {
+      assert.doesNotMatch(url, URL_RE);
+    }
+  });
+
   it("rejects non-AWS URLs", () => {
     assert.doesNotMatch("https://example.com/", URL_RE);
     assert.doesNotMatch("https://sso.amazonaws.com/", URL_RE);
@@ -62,6 +97,21 @@ describe("CODE_RE", () => {
 });
 
 describe("parseLoginOutput", () => {
+  it("extracts the unchanged portal or sign-in link and short code", () => {
+    for (const url of [
+      "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH",
+      "https://us-east-1.signin.aws/platform/d-example/device?user_code=ABCD-EFGH",
+    ]) {
+      assert.deepEqual(
+        parseLoginOutput(`Open the following URL:\r\n\r\n${url}\r\nThen enter the code:\r\nABCD-EFGH\r\n`),
+        {
+          url,
+          code: "ABCD-EFGH",
+        },
+      );
+    }
+  });
+
   it("extracts both URL and code from full aws sso login output", () => {
     const sample = `Attempting to automatically open the SSO authorization page in your default browser.
 If the browser does not open or you wish to use a different device to authorize this request, open the following URL:

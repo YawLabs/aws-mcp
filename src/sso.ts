@@ -189,7 +189,14 @@ export function _dedupeKey(target: LoginTarget, opts: SsoLoginOptions): string {
 
 // Exported for tests — these regexes are load-bearing when the aws CLI output
 // format shifts between versions, so they need direct coverage.
-export const URL_RE = /https:\/\/device\.sso[.\w-]*\.amazonaws\.com\/[^\s]*/;
+// The CLI can print a regional device URL, a tenant portal device URL, or an
+// AWS sign-in URL. Preserve its complete link while keeping the host allowlist
+// explicit; portal and sign-in authorization pages are not device-code
+// verification URLs, so both of those hosts must end their path in `device`.
+// Matching a non-device URL would latch `urlSeen` and suppress the PKCE
+// fallback, turning a precise error into the generic URL-wait timeout.
+export const URL_RE =
+  /https:\/\/(?:device\.sso[.\w-]*\.amazonaws\.com\/[^\s<>"']*|[a-z0-9-]+\.awsapps\.com\/start\/?#\/device(?:\?[^\s<>"']*)?(?=$|[\s<>"'])|(?:[a-z0-9-]+\.)*signin\.aws\/(?:[^\s<>"'?#/]+\/)*device(?:\?[^\s<>"']*)?(?=$|[\s<>"']))/i;
 export const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
 // The authorize URL the PKCE flow prints instead. Never a success shape for
 // this server — no short code accompanies it — so matching it buys nothing but
@@ -683,6 +690,11 @@ async function doStartSsoLogin(
       if (urlSeen && codeSeen && !settled) {
         settled = true;
         clearTimeout(urlTimeout);
+        // Re-read the URL from the full buffer. `urlSeen` latched on the first
+        // chunk that matched, and a pipe chunk can end mid-URL (URL_RE accepts
+        // end-of-buffer as a terminator), dropping e.g. `?user_code=...`. The
+        // code always prints after the URL, so by now the URL line is whole.
+        urlSeen = stdoutBuf.match(URL_RE)?.[0] ?? urlSeen;
         const sessionId = randomUUID();
         // Deliberate handoff: the TTL killswitch is armed HERE, at the same
         // moment the urlWaitMs timeout is cleared, so the subprocess is under

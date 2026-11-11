@@ -446,6 +446,29 @@ async function main(): Promise<void> {
   if (await handleVersionProbe()) return;
   await recordCall();
   switch (scenario) {
+    case "portal_device_url":
+    case "signin_device_url": {
+      const url =
+        scenario === "portal_device_url"
+          ? "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH"
+          : "https://us-east-1.signin.aws/platform/d-example/device?user_code=ABCD-EFGH";
+      process.stdout.write(HAPPY_URL_CODE_BANNER.replace("https://device.sso.us-east-1.amazonaws.com/", url));
+      await sleep(200);
+      process.exit(0);
+      return;
+    }
+
+    case "split_portal_url": {
+      // The portal URL arrives across two pipe chunks, split inside its query
+      // string. The parser must surface the whole URL, not the first chunk's.
+      process.stdout.write("Open the following URL:\n\nhttps://team-example.awsapps.com/start/#/device?user_co");
+      await sleep(100);
+      process.stdout.write("de=ABCD-EFGH\n\nThen enter the code:\n\nABCD-EFGH\n");
+      await sleep(200);
+      process.exit(0);
+      return;
+    }
+
     case "happy": {
       // Realistic aws-cli output: banner text, URL, code, then successful auth.
       // HARD CONSTRAINT: the default 200ms exit timing is the contract that
