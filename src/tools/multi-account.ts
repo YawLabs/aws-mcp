@@ -441,6 +441,9 @@ export const multiAccountTools: readonly Tool[] = [
             // AwsCallOptions.omitProfile.
             env: credentialEnv(creds),
             omitProfile: true,
+            // A cancel kills an account still in flight, reported as errorKind
+            // "cancelled" like the accounts onCancelled covers below.
+            signal: ctx?.signal,
           });
 
           if (!r.ok) {

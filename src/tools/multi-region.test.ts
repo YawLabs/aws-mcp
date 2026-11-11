@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -774,5 +777,50 @@ describe("aws_multi_region -- progress reporting", () => {
       assert.equal(data.okCount, 2, "every region still ran and reported its result");
       assert.equal(data.results.length, 2);
     });
+  });
+});
+
+describe("aws_multi_region -- cancellation kills in-flight regions", () => {
+  it("a client cancel ends the regions already running instead of waiting out their timeout", async () => {
+    const readyPath = join(tmpdir(), `aws-mcp-mr-abort-${process.pid}-${randomUUID()}`);
+    const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
+    const prevReady = process.env.AWS_MCP_FAKE_READY_OUT;
+    process.env.AWS_MCP_FAKE_SCENARIO = "abort_hang";
+    process.env.AWS_MCP_FAKE_READY_OUT = readyPath;
+    try {
+      const pids = (): string[] =>
+        existsSync(readyPath) ? readFileSync(readyPath, "utf-8").split("\n").filter(Boolean) : [];
+      const ac = new AbortController();
+      const pending = tool.handler(
+        { service: "s3api", operation: "list-buckets", regions: ["us-east-1", "us-west-2"], profile: "default" },
+        { reportProgress: () => {}, signal: ac.signal },
+      );
+      // Both regions running, so neither is the never-started kind that
+      // onCancelled reports -- the kill is what has to produce "cancelled".
+      const deadline = Date.now() + 20_000;
+      while (pids().length < 2) {
+        if (Date.now() > deadline) throw new Error("both regions' fake-aws children never announced themselves");
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      const abortedAt = Date.now();
+      ac.abort();
+      const res = await pending;
+      const elapsed = Date.now() - abortedAt;
+      // abort_hang outlives the 60s default timeout, so only the kill settles
+      // this quickly.
+      assert.ok(elapsed < 15_000, `settled ${elapsed}ms after the abort`);
+      const results = (res.data as { results: RegionResult[] }).results;
+      assert.equal(results.length, 2);
+      for (const r of results) {
+        assert.equal(r.ok, false, r.region);
+        assert.equal(r.errorKind, "cancelled", r.region);
+      }
+    } finally {
+      if (prevScenario === undefined) delete process.env.AWS_MCP_FAKE_SCENARIO;
+      else process.env.AWS_MCP_FAKE_SCENARIO = prevScenario;
+      if (prevReady === undefined) delete process.env.AWS_MCP_FAKE_READY_OUT;
+      else process.env.AWS_MCP_FAKE_READY_OUT = prevReady;
+      rmSync(readyPath, { force: true });
+    }
   });
 });
