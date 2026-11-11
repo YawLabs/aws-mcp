@@ -13,6 +13,7 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ### Fixed
 - **A client cancel now stops the `aws` CLI child already in flight**, instead of leaving it to run to its per-call timeout (60s by default). `runAwsCall` takes an `AbortSignal`: already aborted, nothing is spawned; aborted mid-call, the child is killed through the same path the timeout uses and the call settles at once as `cancelled`. Wired into `aws_sso_list_assignments` / `aws_sso_generate_profiles` discovery, `aws_multi_region` and `aws_multi_account`, where an in-flight entry now comes back as `errorKind: "cancelled"`.
+- **Concurrent writes to `~/.aws/credentials` or the AWS config file no longer fail spuriously on Windows.** Under contention, Windows can fail the exclusive create of `<file>.lock` with `EPERM`/`EACCES` instead of `EEXIST` (likely a lock file whose delete is still pending), and the writer treated that as fatal, so a concurrent `aws_assume_role` or `aws_sso_generate_profiles` could fail with `EPERM ... credentials.lock`. On Windows an unbroken run of those errors is now retried as contention for up to 1 s, after which the real error is reported, so a genuinely read-only `~/.aws` still fails fast with its true cause. Other platforms are unchanged.
 
 ## [2.7.0] — 2026-11-11
 

@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -456,5 +457,93 @@ describe("withLockedAtomicWrite", () => {
       readdirSync(dir).filter((n) => n !== "config"),
       [],
     );
+  });
+
+  // Windows can fail the lock's O_EXCL create with EPERM/EACCES (not EEXIST)
+  // while the previous holder's unlink is still pending. Injected here so the
+  // branch is deterministic on every host.
+  function deniedThenReal(failures: number, code: string) {
+    let calls = 0;
+    const openExclusive = (p: string) => {
+      calls++;
+      if (calls <= failures) {
+        throw Object.assign(new Error(`${code}: operation not permitted, open '${p}'`), { code, syscall: "open" });
+      }
+      return openSync(p, "wx");
+    };
+    return { openExclusive, calls: () => calls };
+  }
+
+  for (const code of ["EPERM", "EACCES"]) {
+    it(`win32: a transient ${code} on the lock create is contention, retried until the lock is taken`, async () => {
+      const seam = deniedThenReal(3, code);
+      const r = await withLockedAtomicWrite(path, append(PROD), {
+        requirePrivate: false,
+        lockSeam: { platform: "win32", openExclusive: seam.openExclusive },
+      });
+      assert.equal(r.changed, true);
+      assert.equal(seam.calls(), 4);
+      assert.match(readFileSync(path, "utf-8"), /prod-Admin/);
+      assert.ok(!existsSync(`${path}.lock`));
+    });
+  }
+
+  it("win32: a persistent EPERM on the lock create surfaces the real error after the grace window, not a lock timeout", async () => {
+    const seam = deniedThenReal(Number.POSITIVE_INFINITY, "EPERM");
+    const t0 = Date.now();
+    await assert.rejects(
+      withLockedAtomicWrite(path, append(PROD), {
+        requirePrivate: false,
+        lockSeam: { platform: "win32", openExclusive: seam.openExclusive },
+      }),
+      { code: "EPERM" },
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed >= 1_000 && elapsed < 5_000, `gave up after ${elapsed}ms`);
+    assert.ok(seam.calls() > 1);
+    assert.ok(!existsSync(path));
+  });
+
+  it("win32: an EEXIST between denial bursts restarts the grace window", async () => {
+    // Two ~700 ms bursts of EPERM split by one EEXIST: each unbroken run stays
+    // under the 1 s grace window, the total does not. Every EPERM is thrown
+    // under 700 ms after its burst began, so this holds however slow the host.
+    const code = "EPERM";
+    const deny = (p: string, c: string) => Object.assign(new Error(`${c}: open '${p}'`), { code: c, syscall: "open" });
+    let burstStart: number | null = null;
+    let burst = 0;
+    let calls = 0;
+    const openExclusive = (p: string) => {
+      calls++;
+      burstStart ??= Date.now();
+      if (Date.now() - burstStart < 700) throw deny(p, code);
+      if (burst === 0) {
+        burst = 1;
+        burstStart = Date.now();
+        throw deny(p, "EEXIST");
+      }
+      return openSync(p, "wx");
+    };
+    const t0 = Date.now();
+    const r = await withLockedAtomicWrite(path, append(PROD), {
+      requirePrivate: false,
+      lockSeam: { platform: "win32", openExclusive },
+    });
+    assert.equal(r.changed, true);
+    assert.ok(Date.now() - t0 > 1_000, "the denials must outlast one grace window in total");
+    assert.ok(calls > 3);
+    assert.match(readFileSync(path, "utf-8"), /prod-Admin/);
+  });
+
+  it("non-Windows: EPERM on the lock create is a real error and is thrown at once", async () => {
+    const seam = deniedThenReal(1, "EPERM");
+    await assert.rejects(
+      withLockedAtomicWrite(path, append(PROD), {
+        requirePrivate: false,
+        lockSeam: { platform: "linux", openExclusive: seam.openExclusive },
+      }),
+      { code: "EPERM" },
+    );
+    assert.equal(seam.calls(), 1);
   });
 });
