@@ -490,6 +490,30 @@ describe("spawned server — MCP handshake over stdio", () => {
     });
   });
 
+  it("refuses a 1 MB UNDECLARED argument with a JSON-RPC error, and keeps serving", async () => {
+    // @yawlabs/mcp-compliance's security-oversized-input probe, verbatim: a 1 MB
+    // string under `data`, which aws_whoami does not declare. Before the guard
+    // McpServer stripped it and returned a RESULT, which the checker warns on;
+    // only a JSON-RPC error counts as a refusal (an isError result does not).
+    await withServer(async (server) => {
+      await server.initialize();
+      const reply = await server.request("tools/call", {
+        name: "aws_whoami",
+        arguments: { data: "A".repeat(1_048_576) },
+      });
+      assert.equal(reply.result, undefined, `expected a refusal, got a result: ${JSON.stringify(reply.result)}`);
+      assert.equal(reply.error?.code, -32602);
+      assert.match(reply.error?.message ?? "", /aws_whoami: undeclared argument\(s\) "data"/);
+
+      // A small stray argument is still ignored, not refused, and the server is
+      // still answering.
+      const after = toolResult(
+        await server.request("tools/call", { name: "aws_session_get", arguments: { stray: "x" } }),
+      );
+      assert.equal(after.isError, undefined);
+    });
+  });
+
   it("keeps serving after an aws_script leaves a rejected promise unhandled", async () => {
     // The availability bug this asserts against, measured on v2.3.3 over this
     // same stdio path: the script below returns 'returned' to the model, the

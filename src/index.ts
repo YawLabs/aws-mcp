@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { types } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { guardUndeclaredArguments } from "./request-guard.js";
 import { SERVER_INSTRUCTIONS } from "./server-instructions.js";
 import { assumeTools } from "./tools/assume.js";
 import { authTools } from "./tools/auth.js";
@@ -407,6 +408,15 @@ if (duplicateToolNames.length > 0) {
 }
 
 /**
+ * Each tool's declared top-level argument names, keyed by tool name: the
+ * schema keys server.tool() registers, so the request guard and the zod strip
+ * agree on what "undeclared" means.
+ */
+export function declaredArgumentsByTool(tools: readonly Tool[]): Map<string, Set<string>> {
+  return new Map(tools.map((tool) => [tool.name, new Set(Object.keys(tool.inputSchema.shape))]));
+}
+
+/**
  * Ask Windows to stop searching the current directory when it resolves a bare
  * executable name, unless the host already asked.
  *
@@ -488,6 +498,11 @@ if (isEntryPoint) {
   }
 
   const transport = new StdioServerTransport();
+  // Refuse a tools/call whose UNDECLARED arguments are bulky (a 1 MB string
+  // under a key the tool does not take) with a JSON-RPC error, before McpServer
+  // strips them unread. Declared arguments are never measured, so large real
+  // inputs are unaffected; see request-guard.ts.
+  guardUndeclaredArguments(transport, declaredArgumentsByTool(allTools));
   // Non-top-level-await form so the CJS bundle (esbuild, for the oam binary)
   // builds -- CJS output cannot emit top-level await.
   server
