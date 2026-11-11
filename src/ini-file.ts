@@ -459,8 +459,9 @@ async function acquireLock(lockPath: string, seam: LockSeam = {}): Promise<void>
       const code = (err as NodeJS.ErrnoException).code;
       if (platform === "win32" && (code === "EPERM" || code === "EACCES")) {
         // Under contention Windows can fail the O_EXCL create with EPERM
-        // instead of EEXIST. Measured on win32-arm64: 1-8 spurious EPERM
-        // failures on the lock create per 1600 writes from 16 processes, and
+        // instead of EEXIST. Measured on win32-arm64: 0-4 spurious EPERM
+        // failures on the lock create per 1600 writes from 16 processes (10
+        // across 8 runs), and
         // one in the 2-process trials of aws-credentials.test.ts. The likely
         // mechanism is a lock file the previous holder has unlinked but whose
         // delete is still PENDING (another handle -- a waiter's statSync, an
