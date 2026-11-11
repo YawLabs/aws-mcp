@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -22,6 +33,46 @@ const PROD = renderProfileSpec({
 });
 
 describe("planConfigUpserts", () => {
+  // botocore's RawConfigParser SECTCRE is unanchored at the end, so a header
+  // with a trailing comment is a real header. Missing it folded the hand-written
+  // section into the managed one above (rewriting its keys) or appended a
+  // duplicate section that RawConfigParser then rejects.
+  for (const tail of ["  # hand-written", " ; note", "\t"]) {
+    it(`sees a header with trailing ${JSON.stringify(tail)} after a managed section`, () => {
+      const acme = renderSessionSpec("acme", "https://acme.awsapps.com/start", "us-east-1");
+      const legacy = `[profile legacy]${tail}\nsso_start_url = https://other.awsapps.com/start\nsso_region = eu-west-1\n`;
+      const text = `${planConfigUpserts("", [acme]).text}\n${legacy}`;
+      const read = readSections(text);
+      assert.deepEqual(
+        read.map((r) => r.name),
+        ["sso-session acme", "profile legacy"],
+      );
+      assert.equal(read[0].values.get("sso_start_url"), "https://acme.awsapps.com/start");
+      assert.equal(read[0].values.get("sso_region"), "us-east-1");
+      const r = planConfigUpserts(text, [acme]);
+      assert.deepEqual(r.outcomes, ["unchanged"]);
+      assert.ok(r.text.endsWith(legacy), "the hand-written section must be untouched");
+    });
+  }
+
+  it("refuses (not duplicates) a hand-written section whose header carries a comment", () => {
+    const text = "[profile prod-Admin]  # my break-glass profile\nsso_account_id = 999999999999\n";
+    const r = planConfigUpserts(text, [PROD]);
+    assert.deepEqual(r.outcomes, ["refused-unmanaged"]);
+    assert.equal(r.text, text);
+  });
+
+  it("sees the first header of a BOM-prefixed file, and keeps the BOM", () => {
+    const text = `\uFEFF[profile prod-Admin]\n${MANAGED_MARKER}\nsso_session = acme\nsso_account_id = 111111111111\nsso_role_name = Admin\nregion = us-east-1\n`;
+    assert.deepEqual(
+      readSections(text).map((r) => r.name),
+      ["profile prod-Admin"],
+    );
+    const r = planConfigUpserts(text, [PROD]);
+    assert.deepEqual(r.outcomes, ["unchanged"]);
+    assert.equal(r.text, text);
+  });
+
   it("creates a section in an empty file with no leading blank line", () => {
     const r = planConfigUpserts("", [PROD]);
     assert.deepEqual(r.outcomes, ["created"]);
@@ -169,6 +220,25 @@ describe("withLockedAtomicWrite", () => {
   });
 
   const append = (spec: ManagedSectionSpec) => (text: string) => planConfigUpserts(text, [spec]).text;
+
+  it("writes through a symlinked config and keeps the link", async (t) => {
+    const realDir = join(dir, "dot");
+    mkdirSync(realDir);
+    const real = join(realDir, "config");
+    writeFileSync(real, "[default]\nregion = us-east-1\n");
+    try {
+      symlinkSync(real, path, "file");
+    } catch (err) {
+      // Windows without Developer Mode / admin cannot create symlinks.
+      t.skip(`symlinks unavailable: ${(err as Error).message}`);
+      return;
+    }
+    const r = await withLockedAtomicWrite(path, append(PROD), { requirePrivate: false });
+    assert.equal(r.changed, true);
+    assert.ok(lstatSync(path).isSymbolicLink(), "the link must survive the write");
+    assert.match(readFileSync(real, "utf-8"), /\[profile prod-Admin\]/);
+    assert.deepEqual(readdirSync(dir).sort(), ["config", "dot"], "no lock or tmp file stranded beside the link");
+  });
 
   it("creates a nonexistent file", async () => {
     const r = await withLockedAtomicWrite(path, append(PROD), { requirePrivate: false });

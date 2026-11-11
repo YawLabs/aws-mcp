@@ -89,7 +89,9 @@ export function parseAwsConfig(text: string): AwsProfile[] {
     if (current && MANAGED_MARKER_RE.test(rawLine)) current.managed = true;
     if (!line || line.startsWith("#") || line.startsWith(";")) continue;
 
-    const sectionMatch = line.match(/^\[(.+)\]$/);
+    // Same shape as ini-file.ts SECTION_HEADER_RE (botocore SECTCRE: unanchored,
+    // greedy to the last `]`), so `[profile x]  # note` is the profile x.
+    const sectionMatch = line.match(/^\[(.+)\]/);
     if (sectionMatch) {
       finishSection();
       const sectionName = sectionMatch[1].trim();

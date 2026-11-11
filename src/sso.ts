@@ -130,6 +130,10 @@ interface LoginSession {
   // so the expiry message can quote the actual configured value (tests
   // shrink it via SsoLoginOptions.sessionTtlMs).
   ttlMs: number;
+  // Set by cancelLogin before the proc is killed, so the exit handler phrases
+  // the wait result as "superseded" (with this reason) instead of a bare
+  // non-zero exit. Same handshake as ttlExpired.
+  supersededReason: string | null;
 }
 
 const sessions = new Map<string, LoginSession>();
@@ -177,6 +181,7 @@ export function _dedupeKey(target: LoginTarget, opts: SsoLoginOptions): string {
     completedReapMs: opts.completedReapMs ?? null,
     useDeviceCode: opts.useDeviceCode ?? null,
     versionProbeTimeoutMs: opts.versionProbeTimeoutMs ?? null,
+    dedupeTag: opts.dedupeTag ?? null,
     env: opts.env ? Object.entries(opts.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)) : null,
   });
   return createHash("sha256").update(payload).digest("hex");
@@ -463,6 +468,13 @@ interface SsoLoginOptions {
    * PARSED version needs room for the fake to actually answer.
    */
   versionProbeTimeoutMs?: number;
+  /**
+   * Extra dedupe-key input. The sso-session path passes the block's start URL
+   * and region: a start that read one URL must not be handed to a caller that
+   * just repointed the block at another (the CLI reads the config at launch,
+   * so the in-flight login is for the OLD instance).
+   */
+  dedupeTag?: string;
 }
 
 /**
@@ -694,6 +706,7 @@ async function doStartSsoLogin(
           reapTimer: null,
           ttlExpired: false,
           ttlMs: sessionTtlMs,
+          supersededReason: null,
         };
         registeredSession = session;
         registeredSessionId = sessionId;
@@ -724,10 +737,13 @@ async function doStartSsoLogin(
       // out its (now stale) URL+code to follow-up aws_login_start callers.
       const ttlExpired = registeredSession?.ttlExpired === true;
       const ttlMs = registeredSession?.ttlMs ?? SESSION_TTL_MS;
+      const supersededReason = registeredSession?.supersededReason ?? null;
       finalizeSession();
       const rawOutput = clampRawOutput(stdoutBuf + (stderrBuf ? `\n---stderr---\n${stderrBuf}` : ""));
       let result: LoginWaitResult;
-      if (ttlExpired && code !== 0) {
+      if (supersededReason !== null && code !== 0) {
+        result = { ok: false, exitCode: code, error: supersededReason, rawOutput };
+      } else if (ttlExpired && code !== 0) {
         // TTL killswitch fired and the subprocess exited non-zero (or via
         // signal). Surface the expiry, not the underlying signal/exit code.
         // Note: even after a TTL kill, the AWS CLI may have written a valid
@@ -854,6 +870,25 @@ export function findActiveSession(target: LoginTarget): ActiveSession | null {
     }
   }
   return null;
+}
+
+/**
+ * Abandon a live login: mark it completed (so findActiveSession stops handing
+ * out its URL+code at once) and kill its subprocess. A later waitForLogin on it
+ * resolves with `reason` as the error. Returns false when there was no live
+ * session to cancel.
+ */
+export function cancelLogin(sessionId: string, reason: string): boolean {
+  const s = sessions.get(sessionId);
+  if (!s || s.completed) return false;
+  s.supersededReason = reason;
+  s.completed = true;
+  if (s.ttlTimer) {
+    clearTimeout(s.ttlTimer);
+    s.ttlTimer = null;
+  }
+  killProc(s.proc);
+  return true;
 }
 
 /** The profile flow's original lookup; aws_refresh_if_expiring_soon and the

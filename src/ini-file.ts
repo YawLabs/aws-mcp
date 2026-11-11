@@ -28,6 +28,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -55,7 +56,17 @@ export interface Section {
 // previously disagreed, see the sectionName comment below. planConfigUpserts
 // uses it too, so the config editor and the credentials editor can never
 // disagree about where a section begins.
-const SECTION_HEADER_RE = /^\[(.+)\]\s*$/;
+//
+// Shape: botocore reads the file with RawConfigParser, whose SECTCRE is the
+// UNANCHORED `\[(?P<header>.+)\]` -- greedy up to the LAST `]`, anything after
+// it ignored. So `[profile x]  # note` and `[profile x] ; note` are the header
+// `profile x` to botocore. An end-anchored regex here missed them: the readers
+// folded the hand-written section into the one above it, and the writer either
+// rewrote its keys or appended a duplicate section that RawConfigParser then
+// rejects (DuplicateSectionError breaks every CLI/SDK call). The optional
+// leading U+FEFF lets a BOM-prefixed file's FIRST header be seen too; the BOM
+// stays in the raw line, so it is re-emitted byte-for-byte.
+const SECTION_HEADER_RE = /^\uFEFF?\[(.+)\]/;
 
 export function splitSections(text: string): Section[] {
   const sections: Section[] = [];
@@ -85,8 +96,8 @@ export function splitSections(text: string): Section[] {
  * Extract the profile name from a stored raw header line.
  *
  * MUST parse with SECTION_HEADER_RE, not `slice(1, -1)`. splitSections stores
- * the RAW line, and the regex tolerates trailing whitespace after the closing
- * bracket (`\s*$`). A naive slice(1, -1) on `"[mcp-dev]  "` drops the final
+ * the RAW line, and the regex tolerates anything after the closing
+ * bracket (whitespace, a comment). A naive slice(1, -1) on `"[mcp-dev]  "` drops the final
  * SPACE instead of the bracket, yielding `"mcp-dev]"` -- which matched no
  * profile, so upsertProfileIntoText appended a SECOND `[mcp-dev]` section and
  * left the stale credentials sitting in the first one. `[mcp-dev]\t` failed the
@@ -566,6 +577,17 @@ export interface LockedWriteOptions {
   privateModeOpts?: { platform?: NodeJS.Platform; probe?: ModeProbe };
 }
 
+/** The real file behind `path` (symlinks resolved), or `path` itself when it
+ *  does not exist yet. */
+function resolveWriteTarget(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return path;
+    throw err;
+  }
+}
+
 /**
  * Read `path` (as "" when absent), hand it to `transform`, and atomically
  * replace the file with the result -- all under the `<path>.lock` sidecar lock.
@@ -591,11 +613,18 @@ export interface LockedWriteOptions {
  * holds content at a wider mode.
  */
 export async function withLockedAtomicWrite(
-  path: string,
+  givenPath: string,
   transform: (text: string) => string | null,
   opts: LockedWriteOptions,
 ): Promise<{ changed: boolean }> {
-  if (opts.ensureDir) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (opts.ensureDir) mkdirSync(dirname(givenPath), { recursive: true, mode: 0o700 });
+  // Write THROUGH a symlink, not over it. A dotfiles-managed ~/.aws/config ->
+  // ~/dotfiles/aws/config would otherwise be replaced by a regular file: rename
+  // swaps the directory entry, so the link is lost and the dotfiles copy never
+  // sees the change. The lock, the tmp file and the rename all sit beside the
+  // TARGET, which also keeps the rename on one filesystem. `aws configure sso`
+  // writes in place and keeps the link; this matches it.
+  const path = resolveWriteTarget(givenPath);
   const lockPath = `${path}.lock`;
   await acquireLock(lockPath);
   try {

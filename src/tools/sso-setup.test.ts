@@ -53,6 +53,8 @@ const ENV_KEYS = [
   "AWS_MCP_FAKE_SCENARIO",
   "AWS_MCP_FAKE_CALLS_OUT",
   "AWS_MCP_FAKE_CLI_VERSION",
+  "AWS_MCP_FAKE_RELEASE_FILE",
+  "AWS_MCP_FAKE_SSO_TOKEN",
 ] as const;
 
 describe("IAM Identity Center bootstrap (fake-aws)", () => {
@@ -130,6 +132,7 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
         // The handler's env (profile selectors stripped) is what must reach the
         // child; only the scenario is layered on.
         env: { ...(extra?.env ?? process.env), AWS_MCP_FAKE_SCENARIO: "sso_session_login" },
+        dedupeTag: extra?.dedupeTag,
       }),
     );
   });
@@ -228,6 +231,43 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
     assert.equal(r.ok, true, r.error ?? "");
     assert.equal(r.data.sessionBlock, "updated");
     assert.match(readFileSync(configPath, "utf-8"), new RegExp(`sso_start_url = ${START}`));
+  });
+
+  it("repointing the block while a login is in flight abandons it and starts a fresh one", async () => {
+    process.env.AWS_MCP_FAKE_RELEASE_FILE = join(home, "release");
+    try {
+      const DEV = "https://dev-org.awsapps.com/start";
+      const first = await call("aws_login_start", { ssoSession: "acme", startUrl: DEV, ssoRegion: "us-east-1" });
+      assert.equal(first.ok, true, first.error ?? "");
+      // Same block again: the in-flight login is still the right one.
+      const again = await call("aws_login_start", { ssoSession: "acme", startUrl: DEV, ssoRegion: "us-east-1" });
+      assert.equal(again.data.reused, true);
+      assert.equal(again.data.sessionId, first.data.sessionId);
+      const second = await call("aws_login_start", { ssoSession: "acme", startUrl: START, ssoRegion: "us-east-1" });
+      assert.equal(second.ok, true, second.error ?? "");
+      assert.equal(second.data.sessionBlock, "updated");
+      assert.notEqual(second.data.sessionId, first.data.sessionId, "the dev-org login must not be handed out");
+      assert.equal(second.data.reused, undefined);
+      const old = await call("aws_login_complete", { sessionId: first.data.sessionId });
+      assert.equal(old.ok, false);
+      assert.match(old.error ?? "", /Superseded/);
+      writeFileSync(join(home, "release"), "");
+      const done = await call("aws_login_complete", { sessionId: second.data.sessionId });
+      assert.equal(done.ok, true, done.error ?? "");
+      assert.equal(done.data.ssoToken?.startUrl, START, "the token is for the repointed URL");
+    } finally {
+      delete process.env.AWS_MCP_FAKE_RELEASE_FILE;
+    }
+  });
+
+  it("treats empty-string optional fields as absent (profile login, not a cross-field error)", async () => {
+    const r = await call("aws_login_start", { profile: "dev", ssoSession: "", startUrl: "", ssoRegion: "" });
+    assert.notEqual(r.errorKind, "bad_input", r.error ?? "");
+    assert.ok(
+      calls().some((a) => a.includes("--profile") && a.includes("dev")),
+      "a profile login for 'dev' was attempted",
+    );
+    assert.ok(!existsSync(configPath), "no sso-session block may be written");
   });
 
   it("errors when the block is absent and no startUrl/ssoRegion were given", async () => {
@@ -364,6 +404,22 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
     assert.equal(r.ok, true, r.error ?? "");
     const dev = r.data.accounts.find((a: Json) => a.accountId === "222222222222");
     assert.match(dev.rolesError, /InternalServerException.*<redacted-token>/);
+  });
+
+  it("scrubs a long token whose echo crosses the 500-char cut", async () => {
+    // Real Identity Center tokens run 1000+ chars. Cutting before scrubbing left
+    // a token fragment the whole-token split could not match.
+    const longToken = `aoaAAAAAG${"x".repeat(1200)}Z9`;
+    seedSession({ token: longToken });
+    process.env.AWS_MCP_FAKE_SSO_TOKEN = longToken;
+    process.env.AWS_MCP_FAKE_SCENARIO = "sso_list_echo_token_error";
+    const r = await call("aws_sso_list_assignments", { ssoSession: "acme" });
+    assert.equal(r.ok, true, r.error ?? "");
+    const blob = JSON.stringify(r);
+    assert.ok(!blob.includes(longToken.slice(0, 40)), "a prefix of the token leaked");
+    const dev = r.data.accounts.find((a: Json) => a.accountId === "222222222222");
+    assert.match(dev.rolesError, /<redacted-token>/);
+    assert.ok(dev.rolesError.length <= 500);
   });
 
   it("no token, or an expired one, is sso_expired for list and generate", async () => {

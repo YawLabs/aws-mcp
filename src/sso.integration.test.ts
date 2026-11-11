@@ -1031,7 +1031,9 @@ describe("startSsoLogin -- sso-session targets", () => {
 
   it("does not gate a profile login on the same old CLI", async () => {
     _clearCliVersionCache();
-    const base = fakeOpts("happy_hold");
+    // Expects the URL to arrive, so it needs the generous hang guard (see the
+    // fakeOpts comment): 500 ms lost to a cold fake under a parallel run.
+    const base = fakeOpts("happy_hold", 10_000);
     const r = await startSsoLogin("old-cli-prof", {
       ...base,
       env: { ...base.env, AWS_MCP_FAKE_CLI_VERSION: "2.8.12" },

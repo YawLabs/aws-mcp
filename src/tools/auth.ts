@@ -5,6 +5,7 @@ import { resolveAwsConfigPath } from "../aws-paths.js";
 import { planConfigUpserts, withLockedAtomicWrite } from "../ini-file.js";
 import { getProfile, getRegion } from "../session.js";
 import {
+  cancelLogin,
   findActiveSession,
   findActiveSessionByProfile,
   getLoginTarget,
@@ -43,6 +44,8 @@ export { _resetUnparseableExpiryDedupe, findCachedSsoToken };
 // an injected test implementation can see -- and must forward -- that env.
 interface StartExtra {
   env?: NodeJS.ProcessEnv;
+  /** See SsoLoginOptions.dedupeTag. */
+  dedupeTag?: string;
 }
 type StartImpl = (target: LoginTarget | string, extra?: StartExtra) => ReturnType<typeof startSsoLogin>;
 const defaultStartImpl: StartImpl = (target, extra) => (extra ? startSsoLogin(target, extra) : startSsoLogin(target));
@@ -194,6 +197,19 @@ function startUrlForSsoSession(name: string): string | undefined {
 }
 
 /**
+ * sessionId -> the start URL + region its `aws sso login --sso-session` child
+ * read at launch. The child reads the config once, so a login started before
+ * the block was repointed is a login to the OLD Identity Center instance and
+ * must not be handed out as the login for the new one. Entries for sessions
+ * that are gone are pruned on every sso-session start.
+ */
+const sessionLoginConfig = new Map<string, string>();
+
+function loginConfigKey(startUrl: string, ssoRegion: string): string {
+  return `${startUrl}|${ssoRegion}`;
+}
+
+/**
  * aws_login_start's sso-session branch: validate, ensure the block, then reuse
  * an in-flight login or spawn `aws sso login --sso-session <name>` with the
  * profile selectors stripped from the child env.
@@ -227,7 +243,26 @@ async function startSessionLogin(i: {
     configPath: block.configPath,
     sessionBlock: block.outcome,
   };
-  const active = findActiveSession(target);
+  for (const id of sessionLoginConfig.keys()) {
+    if (getLoginTarget(id) === null) sessionLoginConfig.delete(id);
+  }
+  const wantConfig = loginConfigKey(block.startUrl, block.ssoRegion);
+  let active = findActiveSession(target);
+  // Reuse only a login whose child read the block as it is NOW. One started
+  // against a different URL/region (the block was just repointed, or an
+  // unknown login after an update) is abandoned: its device code would sign
+  // the user in to the wrong instance.
+  while (active) {
+    const had = sessionLoginConfig.get(active.sessionId);
+    const stale = had !== undefined ? had !== wantConfig : block.outcome === "updated";
+    if (!stale) break;
+    cancelLogin(
+      active.sessionId,
+      `Superseded: [sso-session ${i.ssoSession}] was repointed to ${block.startUrl} (${block.ssoRegion}) while this login was in flight. Use the sessionId from the latest aws_login_start.`,
+    );
+    sessionLoginConfig.delete(active.sessionId);
+    active = findActiveSession(target);
+  }
   if (active) {
     return {
       ok: true,
@@ -241,8 +276,9 @@ async function startSessionLogin(i: {
       },
     };
   }
-  const result = await _startSsoLoginImpl(target, { env: envWithoutProfile(process.env) });
+  const result = await _startSsoLoginImpl(target, { env: envWithoutProfile(process.env), dedupeTag: wantConfig });
   if (!result.ok) return { ok: false, error: result.error, rawBody: result.rawOutput };
+  sessionLoginConfig.set(result.sessionId, wantConfig);
   return {
     ok: true,
     data: {
@@ -402,12 +438,19 @@ export const authTools: readonly Tool[] = [
         .describe("Region of the Identity Center instance, e.g. us-east-1. Only with ssoSession."),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
-      const { profile, ssoSession, startUrl, ssoRegion } = input as {
+      const raw = input as {
         profile?: string;
         ssoSession?: string;
         startUrl?: string;
         ssoRegion?: string;
       };
+      // "" is absent, as at every `profile || getProfile()` site: a client that
+      // fills unused optional string fields with "" must still get a profile
+      // login, not a cross-field bad_input.
+      const profile = raw.profile || undefined;
+      const ssoSession = raw.ssoSession || undefined;
+      const startUrl = raw.startUrl || undefined;
+      const ssoRegion = raw.ssoRegion || undefined;
       if (ssoSession !== undefined || startUrl !== undefined || ssoRegion !== undefined) {
         if (profile !== undefined) {
           return { ok: false, errorKind: "bad_input", error: "Pass either profile or ssoSession, not both." };

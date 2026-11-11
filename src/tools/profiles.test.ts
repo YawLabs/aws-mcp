@@ -23,6 +23,24 @@ describe("parseAwsConfig", () => {
     assert.equal(profiles[0].isSso, false);
   });
 
+  it("reads a header with a trailing comment as that section (botocore SECTCRE)", () => {
+    const text =
+      "[sso-session acme]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = us-east-1\n" +
+      "[profile prod-Admin]  # my break-glass profile\nsso_account_id = 999999999999\n" +
+      "[profile legacy] ; note\nregion = eu-west-1\n";
+    assert.deepEqual(
+      parseAwsConfig(text).map((p) => [p.name, p.region]),
+      [
+        ["prod-Admin", undefined],
+        ["legacy", "eu-west-1"],
+      ],
+    );
+    assert.deepEqual(
+      parseSsoSessions(text).map((s) => [s.name, s.ssoStartUrl, s.ssoRegion]),
+      [["acme", "https://acme.awsapps.com/start", "us-east-1"]],
+    );
+  });
+
   it("strips the 'profile ' prefix from named sections", () => {
     const profiles = parseAwsConfig("[profile prod]\nregion = us-west-2\n");
     assert.equal(profiles[0].name, "prod");

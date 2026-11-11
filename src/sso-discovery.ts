@@ -91,7 +91,9 @@ function describeFailure(stderr: string, fallback: string, token: string): strin
   const text = parsed.code
     ? `${parsed.code}: ${parsed.message ?? ""}`.trim()
     : stderr.trim().split(/\r?\n/)[0] || fallback;
-  return scrubToken(text.slice(0, 500), token);
+  // Scrub BEFORE cutting: a cut through the token leaves a fragment the
+  // whole-token split can never match, leaking a long token prefix.
+  return scrubToken(text, token).slice(0, 500);
 }
 
 type CallOutcome = { ok: true; data: Record<string, unknown> } | { ok: false; unauthorized: boolean; message: string };
