@@ -154,7 +154,11 @@ function dedupeKey(profile: string, opts: SsoLoginOptions): string {
 
 // Exported for tests — these regexes are load-bearing when the aws CLI output
 // format shifts between versions, so they need direct coverage.
-export const URL_RE = /https:\/\/device\.sso[.\w-]*\.amazonaws\.com\/[^\s]*/;
+// The CLI can print a regional device URL, a tenant portal device URL, or an
+// AWS sign-in URL. Preserve its complete link while keeping the host allowlist
+// explicit; portal authorization pages are not device-code verification URLs.
+export const URL_RE =
+  /https:\/\/(?:device\.sso[.\w-]*\.amazonaws\.com\/[^\s<>"']*|[a-z0-9-]+\.awsapps\.com\/start\/?#\/device(?:\?[^\s<>"']*)?(?=$|[\s<>"'])|(?:[a-z0-9-]+\.)*signin\.aws\/[^\s<>"']*)/i;
 export const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
 // The authorize URL the PKCE flow prints instead. Never a success shape for
 // this server — no short code accompanies it — so matching it buys nothing but
