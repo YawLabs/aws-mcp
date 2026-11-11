@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.7.0] — 2026-11-11
+
 ### Added
 - **IAM Identity Center bootstrap for a user with no profile yet** (#65). `aws_login_start` takes `ssoSession` + `startUrl` + `ssoRegion`: it writes a managed `[sso-session]` block to the AWS config file and runs `aws sso login --sso-session` (AWS CLI 2.9.0+, with `AWS_PROFILE` stripped from the child so a stale one cannot fail it). `aws_login_complete` on such a login returns the token status instead of running an identity check there is no profile for. Two new tools follow it: `aws_sso_list_assignments` (read-only; every account and role the login can use, flagging which already have a profile) and `aws_sso_generate_profiles` (writes `[profile ...]` sections for all assignments, up to 200, or a `selection`; `dryRun` previews). Generated sections carry a `managed-by: aws-mcp` marker and are the only sections aws-mcp ever changes -- a hand-written section is never modified, and every other byte of the file is preserved. The SSO bearer token reaches the CLI only through a 0600 temp file and never appears in a tool result. `aws_list_profiles` gains `ssoAccountId`, `ssoRoleName` and `managed`.
 
@@ -1184,7 +1186,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.6.1...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.0...HEAD
+[2.7.0]: https://github.com/YawLabs/aws-mcp/compare/v2.6.1...v2.7.0
 [2.6.1]: https://github.com/YawLabs/aws-mcp/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/YawLabs/aws-mcp/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/YawLabs/aws-mcp/compare/v2.5.1...v2.5.2
