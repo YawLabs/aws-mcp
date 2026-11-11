@@ -241,8 +241,210 @@ function requireSingleAttempt(name: string): void {
   process.exit(2);
 }
 
+// --- IAM Identity Center bootstrap scenarios (sso_session_login, sso_list*) ---
+
+/**
+ * The bearer token the fake hands out and accepts. Distinctive on purpose: the
+ * leak test JSON.stringify's every tool result and asserts this string is
+ * nowhere in it, so it must not collide with anything a result legitimately
+ * carries.
+ */
+const FAKE_SSO_TOKEN = "FAKE-SSO-TOKEN-7f3c9a-DO-NOT-LEAK";
+
+/**
+ * Append this invocation's argv to AWS_MCP_FAKE_CALLS_OUT, one JSON array per
+ * line, so a test can assert what was (and was NOT) spawned -- e.g. that an
+ * sso-session aws_login_complete never runs `sts get-caller-identity`.
+ */
+async function recordCall(): Promise<void> {
+  const out = process.env.AWS_MCP_FAKE_CALLS_OUT;
+  if (!out) return;
+  const fs = await import("node:fs");
+  fs.appendFileSync(out, `${JSON.stringify(process.argv.slice(2))}\n`);
+}
+
+function failWith(code: number, message: string): never {
+  process.stderr.write(`fake-aws: ${message}\n`);
+  process.exit(code);
+}
+
+/** The value after `flag` in argv, or undefined. */
+function argAfter(flag: string): string | undefined {
+  const argv = process.argv.slice(2);
+  const i = argv.indexOf(flag);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+
+/** `[sso-session <name>]`'s keys from the config file the CLI would read
+ *  (AWS_CONFIG_FILE, else <home>/.aws/config). Reading it here is what proves
+ *  the child saw the same config file the server wrote. */
+async function readSessionBlock(name: string): Promise<Record<string, string> | null> {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const configPath = process.env.AWS_CONFIG_FILE || path.join(os.homedir(), ".aws", "config");
+  let text: string;
+  try {
+    text = fs.readFileSync(configPath, "utf-8");
+  } catch {
+    return null;
+  }
+  let inBlock = false;
+  let out: Record<string, string> | null = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    const h = /^\[(.+)\]$/.exec(line);
+    if (h) {
+      inBlock = h[1].trim().replace(/\s+/g, " ") === `sso-session ${name}`;
+      if (inBlock) out = {};
+      continue;
+    }
+    if (!inBlock || !out || line.startsWith("#") || line.startsWith(";")) continue;
+    const eq = line.indexOf("=");
+    if (eq > 0) out[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+  return out;
+}
+
+/**
+ * `aws sso login --sso-session <n>`: insists on the sso-session selector (exit 2
+ * if `--profile` shows up or the selector is missing) and on AWS_PROFILE being
+ * absent from its environment (exit 3) -- the two things the profile-free login
+ * path exists to guarantee. Prints the device-code banner, then (after
+ * AWS_MCP_FAKE_RELEASE_FILE appears, or 200 ms when that is unset) writes the
+ * token to <home>/.aws/sso/cache/<sha1(n)>.json -- the modern cache key -- with
+ * the start URL read back out of the config file.
+ */
+async function ssoSessionLoginScenario(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes("--profile")) failWith(2, "sso_session_login: --profile must not be passed");
+  const name = argAfter("--sso-session");
+  if (!name) failWith(2, "sso_session_login: --sso-session <name> is required");
+  if ("AWS_PROFILE" in process.env || "AWS_DEFAULT_PROFILE" in process.env) {
+    failWith(3, "sso_session_login: AWS_PROFILE / AWS_DEFAULT_PROFILE leaked into the child env");
+  }
+  const block = await readSessionBlock(name);
+  if (!block?.sso_start_url)
+    failWith(2, `sso_session_login: no [sso-session ${name}] with sso_start_url in the config`);
+  process.stdout.write(HAPPY_URL_CODE_BANNER);
+  const fs = await import("node:fs");
+  const release = process.env.AWS_MCP_FAKE_RELEASE_FILE;
+  if (release) {
+    const deadline = Date.now() + 60_000;
+    while (!fs.existsSync(release) && Date.now() < deadline) await sleep(20);
+  } else {
+    await sleep(200);
+  }
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const crypto = await import("node:crypto");
+  const cacheDir = path.join(os.homedir(), ".aws", "sso", "cache");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const file = path.join(cacheDir, `${crypto.createHash("sha1").update(name).digest("hex")}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      startUrl: block.sso_start_url,
+      region: block.sso_region,
+      accessToken: process.env.AWS_MCP_FAKE_SSO_TOKEN ?? FAKE_SSO_TOKEN,
+      expiresAt: new Date(Date.now() + 8 * 3600_000).toISOString(),
+    }),
+  );
+  process.stdout.write(`Successfully logged into Start URL: ${block.sso_start_url}\n`);
+  process.exit(0);
+}
+
+/** Accounts the sso_list* scenarios report. Two named "prod" for the name-clash
+ *  path; emailAddress present so a test can prove it is dropped. */
+const FAKE_SSO_ACCOUNTS = [
+  { accountId: "111111111111", accountName: "prod", emailAddress: "prod-owner@example.com" },
+  { accountId: "222222222222", accountName: "dev", emailAddress: "dev-owner@example.com" },
+  { accountId: "333333333333", accountName: "prod", emailAddress: "prod2-owner@example.com" },
+];
+
+function fakeRolesFor(accountId: string): string[] {
+  if (accountId === "111111111111") return ["AdministratorAccess", "ReadOnly"];
+  // "Bad Role" fails IAM's role-name charset: generate must skip it.
+  if (accountId === "222222222222") return ["Admin", "Bad Role"];
+  if (accountId === "333333333333") {
+    // 40 roles, so a test can tell a complete listing from a truncated one.
+    return ["AdministratorAccess", ...Array.from({ length: 39 }, (_, i) => `Role${String(i + 1).padStart(2, "0")}`)];
+  }
+  return [];
+}
+
+/**
+ * `aws sso list-accounts` / `list-account-roles`. Refuses (exit 4) params that
+ * did not arrive through a `file://` --cli-input-json -- the token must never be
+ * on argv -- and checks the same profile-free invariants as the login scenario,
+ * plus `--region` matching AWS_MCP_FAKE_SSO_REGION (default us-east-1). A wrong
+ * token is the real CLI's UnauthorizedException, exit 254.
+ */
+async function ssoListScenario(variant: string): Promise<void> {
+  const fs = await import("node:fs");
+  const argv = process.argv.slice(2);
+  if (argv[0] !== "sso") failWith(2, `${variant}: expected 'sso <op>', got ${argv.slice(0, 2).join(" ")}`);
+  if (argv.includes("--profile")) failWith(2, `${variant}: --profile must not be passed`);
+  if ("AWS_PROFILE" in process.env || "AWS_DEFAULT_PROFILE" in process.env) {
+    failWith(3, `${variant}: AWS_PROFILE / AWS_DEFAULT_PROFILE leaked into the child env`);
+  }
+  const wantRegion = process.env.AWS_MCP_FAKE_SSO_REGION ?? "us-east-1";
+  if (argAfter("--region") !== wantRegion) failWith(2, `${variant}: --region ${argAfter("--region")} != ${wantRegion}`);
+  const raw = argAfter("--cli-input-json") ?? "";
+  if (!raw.startsWith("file://")) failWith(4, `${variant}: --cli-input-json must be a file:// path`);
+  const input = JSON.parse(fs.readFileSync(raw.slice("file://".length), "utf-8")) as Record<string, string>;
+  const op = argv[1];
+  const opName = op === "list-accounts" ? "ListAccounts" : "ListAccountRoles";
+  const expected = process.env.AWS_MCP_FAKE_SSO_TOKEN ?? FAKE_SSO_TOKEN;
+  if (variant === "sso_list_unauthorized" || input.accessToken !== expected) {
+    process.stderr.write(
+      `\nAn error occurred (UnauthorizedException) when calling the ${opName} operation: Session token not found or invalid\n`,
+    );
+    process.exit(254);
+  }
+  if (op === "list-accounts") {
+    if (variant === "sso_list_paged_loop") {
+      process.stdout.write(`${JSON.stringify({ accountList: FAKE_SSO_ACCOUNTS.slice(0, 1), nextToken: "same" })}\n`);
+      process.exit(0);
+    }
+    if (variant === "sso_list_paged") {
+      const page =
+        input.nextToken === "p2"
+          ? { accountList: FAKE_SSO_ACCOUNTS.slice(1) }
+          : { accountList: FAKE_SSO_ACCOUNTS.slice(0, 1), nextToken: "p2" };
+      process.stdout.write(`${JSON.stringify(page)}\n`);
+      process.exit(0);
+    }
+    process.stdout.write(`${JSON.stringify({ accountList: FAKE_SSO_ACCOUNTS })}\n`);
+    process.exit(0);
+  }
+  if (op === "list-account-roles") {
+    const accountId = input.accountId;
+    if (variant === "sso_list_roles_throttle" && accountId === "222222222222") {
+      process.stderr.write(
+        "\nAn error occurred (TooManyRequestsException) when calling the ListAccountRoles operation: Rate exceeded\n",
+      );
+      process.exit(254);
+    }
+    if (variant === "sso_list_echo_token_error" && accountId === "222222222222") {
+      // A CLI (or a proxy) that echoes the request back into its error text:
+      // the scrub is what keeps this out of rolesError.
+      process.stderr.write(
+        `\nAn error occurred (InternalServerException) when calling the ListAccountRoles operation: bad request {"accessToken":"${input.accessToken}"}\n`,
+      );
+      process.exit(254);
+    }
+    process.stdout.write(
+      `${JSON.stringify({ roleList: fakeRolesFor(accountId).map((roleName) => ({ roleName, accountId })) })}\n`,
+    );
+    process.exit(0);
+  }
+  failWith(2, `${variant}: unexpected operation ${op}`);
+}
+
 async function main(): Promise<void> {
   if (await handleVersionProbe()) return;
+  await recordCall();
   switch (scenario) {
     case "portal_device_url":
     case "signin_device_url": {
@@ -2989,6 +3191,21 @@ async function main(): Promise<void> {
       // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
       // and exiting in the same breath truncates it on POSIX.
       process.stdout.write(`${JSON.stringify({ Region: region, Blob: "x".repeat(2_750_000) })}\n`);
+      return;
+    }
+
+    case "sso_session_login": {
+      await ssoSessionLoginScenario();
+      return;
+    }
+
+    case "sso_list":
+    case "sso_list_paged":
+    case "sso_list_paged_loop":
+    case "sso_list_unauthorized":
+    case "sso_list_roles_throttle":
+    case "sso_list_echo_token_error": {
+      await ssoListScenario(scenario);
       return;
     }
 

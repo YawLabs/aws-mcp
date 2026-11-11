@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { resolveAwsConfigPath } from "../aws-paths.js";
+import { EMPTY_CONFIG_FILE_ERROR, resolveAwsConfigPath } from "../aws-paths.js";
+import { MANAGED_MARKER_RE, readSections } from "../ini-file.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 export interface AwsProfile {
@@ -9,12 +10,45 @@ export interface AwsProfile {
   ssoRegion?: string;
   ssoSession?: string;
   region?: string;
+  /** `sso_account_id` / `sso_role_name`, when set. Additive: they let
+   *  aws_sso_list_assignments say which assignment a profile already points at. */
+  ssoAccountId?: string;
+  ssoRoleName?: string;
+  /** Present (true) only on a section carrying the aws-mcp ownership marker.
+   *  Absent rather than false, so the output for a hand-written config is
+   *  byte-identical to what it was before generated profiles existed. */
+  managed?: true;
   isSso: boolean;
 }
 
 interface SsoSession {
   ssoStartUrl?: string;
   ssoRegion?: string;
+}
+
+export interface SsoSessionBlock {
+  name: string;
+  ssoStartUrl?: string;
+  ssoRegion?: string;
+  managed: boolean;
+}
+
+/**
+ * Every `[sso-session <name>]` block in a config file, with whether aws-mcp
+ * owns it. Uses the managed-section reader in ini-file.ts, so "which block is
+ * this" is decided by the same header normalization the writer uses -- a
+ * reader and a writer that disagreed about `[sso-session  acme]` would let
+ * aws_login_start append a duplicate block.
+ */
+export function parseSsoSessions(text: string): SsoSessionBlock[] {
+  return readSections(text)
+    .filter((s) => s.name.startsWith("sso-session "))
+    .map((s) => ({
+      name: s.name.slice("sso-session ".length),
+      ssoStartUrl: s.values.get("sso_start_url"),
+      ssoRegion: s.values.get("sso_region"),
+      managed: s.managed,
+    }));
 }
 
 /**
@@ -50,9 +84,14 @@ export function parseAwsConfig(text: string): AwsProfile[] {
 
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
+    // The ownership marker is a comment, so it has to be recognized before the
+    // comment skip below throws it away.
+    if (current && MANAGED_MARKER_RE.test(rawLine)) current.managed = true;
     if (!line || line.startsWith("#") || line.startsWith(";")) continue;
 
-    const sectionMatch = line.match(/^\[(.+)\]$/);
+    // Same shape as ini-file.ts SECTION_HEADER_RE (botocore SECTCRE: unanchored,
+    // greedy to the last `]`), so `[profile x]  # note` is the profile x.
+    const sectionMatch = line.match(/^\[(.+)\]/);
     if (sectionMatch) {
       finishSection();
       const sectionName = sectionMatch[1].trim();
@@ -108,6 +147,12 @@ export function parseAwsConfig(text: string): AwsProfile[] {
       case "region":
         current.region = value;
         break;
+      case "sso_account_id":
+        current.ssoAccountId = value;
+        break;
+      case "sso_role_name":
+        current.ssoRoleName = value;
+        break;
     }
   }
   finishSection();
@@ -156,11 +201,7 @@ export const profilesTools: readonly Tool[] = [
       if (configPath === "") {
         // Set but empty: the aws CLI loads no config file at all, so there are
         // no profiles it can use. Say so instead of reading some other file.
-        return {
-          ok: false,
-          error:
-            "AWS_CONFIG_FILE is set to an empty value, so the AWS CLI loads no config file and no profiles are configured. Unset it to use ~/.aws/config, or point it at a config file.",
-        };
+        return { ok: false, error: EMPTY_CONFIG_FILE_ERROR };
       }
       try {
         const text = readFileSync(configPath, "utf-8");

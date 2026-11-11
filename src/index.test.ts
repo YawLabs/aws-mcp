@@ -26,6 +26,7 @@ import { profilesTools } from "./tools/profiles.js";
 import { resourceTools } from "./tools/resource.js";
 import { scriptTools } from "./tools/script.js";
 import { sessionTools } from "./tools/session.js";
+import { ssoSetupTools } from "./tools/sso-setup.js";
 import type { Tool, ToolContext, ToolResult } from "./tools/tool.js";
 
 // Direct tests for the result-mapping functions extracted from the
@@ -375,7 +376,7 @@ void _typePin;
  * loop at the bottom of the test will name both indexes.
  */
 describe("tool registry snapshot", () => {
-  it("allTools has 28 entries, every individual array contributes, every name is unique", () => {
+  it("allTools has 30 entries, every individual array contributes, every name is unique", () => {
     // The per-array imports mirror the spread order in src/index.ts
     // exactly. A typo in either place is caught at module load (spread) or
     // at the corresponding import (tsc).
@@ -384,6 +385,7 @@ describe("tool registry snapshot", () => {
       ["sessionTools", sessionTools],
       ["callTools", callTools],
       ["profilesTools", profilesTools],
+      ["ssoSetupTools", ssoSetupTools],
       ["paginateTools", paginateTools],
       ["assumeTools", assumeTools],
       ["logsTools", logsTools],
@@ -406,7 +408,7 @@ describe("tool registry snapshot", () => {
 
     // Total: pinned. Update this number whenever a tool is added or removed.
     const sumOfGroups = groups.reduce((n, [, arr]) => n + arr.length, 0);
-    assert.equal(sumOfGroups, 28, "sum of per-group tool counts drifted from the pinned total");
+    assert.equal(sumOfGroups, 30, "sum of per-group tool counts drifted from the pinned total");
 
     // allTools (the actual export consumed by the MCP registration loop) must
     // equal the per-group sum. A typo in src/index.ts referencing a wrong

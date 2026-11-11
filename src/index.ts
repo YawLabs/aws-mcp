@@ -23,6 +23,7 @@ import { profilesTools } from "./tools/profiles.js";
 import { resourceTools } from "./tools/resource.js";
 import { scriptTools } from "./tools/script.js";
 import { sessionTools } from "./tools/session.js";
+import { ssoSetupTools } from "./tools/sso-setup.js";
 import type { Tool, ToolContext, ToolResult } from "./tools/tool.js";
 
 /**
@@ -351,6 +352,7 @@ const allTools: readonly Tool[] = [
   ...sessionTools,
   ...callTools,
   ...profilesTools,
+  ...ssoSetupTools,
   ...paginateTools,
   ...assumeTools,
   ...logsTools,

@@ -1,80 +1,33 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-import { resolveAwsConfigPath } from "../aws-paths.js";
+import { EMPTY_CONFIG_FILE_ERROR, resolveAwsConfigPath } from "../aws-paths.js";
+import { planConfigUpserts, withLockedAtomicWrite } from "../ini-file.js";
 import { getProfile, getRegion } from "../session.js";
-import { findActiveSessionByProfile, startSsoLogin, waitForLogin } from "../sso.js";
-import { resolveProfileStartUrl } from "./profiles.js";
+import {
+  cancelLogin,
+  findActiveSession,
+  findActiveSessionByProfile,
+  getLoginTarget,
+  type LoginTarget,
+  startSsoLogin,
+  waitForLogin,
+} from "../sso.js";
+import {
+  envWithoutProfile,
+  normalizeStartUrl,
+  regionProblem,
+  renderSessionSpec,
+  ssoSessionNameProblem,
+} from "../sso-config.js";
+import { _resetUnparseableExpiryDedupe, findCachedSsoToken } from "../sso-token.js";
+import { parseSsoSessions, resolveProfileStartUrl } from "./profiles.js";
 import type { Tool, ToolResult } from "./tool.js";
 
-// Real SSO cache files are a few KB (JWT + metadata). 64 KB is a generous
-// cap that still keeps a malformed or malicious giant file from blocking the
-// event loop on readFileSync.
-const MAX_SSO_CACHE_FILE_BYTES = 64 * 1024;
-
-/**
- * Clock-skew cushion on the expiry check.
- *
- * Without one, a client clock even slightly fast makes `expiresAtMs <= now`
- * true for a token the SSO endpoint would still honor, so the cached token is
- * silently discarded and the caller is pushed through a pointless re-login.
- * Deliberately small: it must not keep a genuinely dead token alive long
- * enough that the NEXT CLI call fails with a confusing sso_expired. It only
- * covers seconds-scale skew -- a clock minutes off still needs fixing at the
- * OS level.
- */
-const EXPIRY_SKEW_GRACE_MS = 60_000;
-
-/**
- * Parse a cache file's `expiresAt` into epoch millis, or NaN.
- *
- * botocore's LEGACY SSO cache writer formats the field with strftime
- * `%Y-%m-%dT%H:%M:%S%Z`, which renders as `2026-08-30T12:00:00UTC` -- not an
- * ISO-8601 spelling, and `new Date()` returns NaN for it (with or without a
- * space before `UTC`). The modern `sso-session` path writes `...Z` and parses
- * fine, so this only bit profiles using the inline `sso_start_url` style:
- * every cache file was skipped, findCachedSsoToken returned null, and
- * aws_refresh_if_expiring_soon spawned a fresh login on every call while
- * reporting "No cached SSO token found".
- */
-function parseExpiresAt(raw: unknown): number {
-  if (typeof raw !== "string") return Number.NaN;
-  const direct = new Date(raw).getTime();
-  if (Number.isFinite(direct)) return direct;
-  // Rewrite only the trailing `UTC` designator; anything else is left alone so
-  // a genuinely malformed value still lands in the warn path below.
-  const normalized = raw.replace(/\s*UTC$/, "Z");
-  return normalized === raw ? Number.NaN : new Date(normalized).getTime();
-}
-
-/**
- * Warn-once dedupe for cache files whose `expiresAt` will not parse. Keyed by
- * file path plus raw value so a NEW bad file is still reported, while the
- * common case (the same bad file re-read on every aws_whoami) warns exactly
- * once. Mirrors the parseTestPrefixArgs dedupe in aws-cli.ts.
- */
-const warnedUnparseableExpiry = new Set<string>();
-
-/** For tests -- drop the warn-once dedupe so the warning can be re-observed. */
-export function _resetUnparseableExpiryDedupe(): void {
-  warnedUnparseableExpiry.clear();
-}
-
-/**
- * Surface an unparseable expiry instead of silently skipping the file. Goes to
- * stderr (console.warn), never stdout -- stdout is the MCP protocol channel.
- * The value is a timestamp, not credential material, so echoing it is safe.
- */
-function warnUnparseableExpiry(path: string, raw: unknown): void {
-  const key = `${path} :: ${String(raw)}`;
-  if (warnedUnparseableExpiry.has(key)) return;
-  warnedUnparseableExpiry.add(key);
-  console.warn(
-    `[aws-mcp] SSO cache file ${path} has an expiresAt this server cannot parse (${JSON.stringify(raw)}); treating it as no cached token. Re-run 'aws sso login' to rewrite the cache.`,
-  );
-}
+// The token-cache readers moved to src/sso-token.ts (shared with the Identity
+// Center discovery tools). Re-exported so existing importers -- the test suites
+// among them -- keep working unchanged.
+export { _resetUnparseableExpiryDedupe, findCachedSsoToken };
 
 // Test seam for the aws_login_start fresh-spawn branch. The handler calls
 // `_startSsoLoginImpl(useProfile)` rather than `startSsoLogin` directly so a
@@ -84,82 +37,28 @@ function warnUnparseableExpiry(path: string, raw: unknown): void {
 // the real startSsoLogin with no opts -- behavior is byte-identical to a
 // direct call. Follows the same `_`-prefixed exported-hook convention as
 // _resetSession / _clearSessions / _ttlKillswitchTick.
-let _startSsoLoginImpl: (profile: string) => ReturnType<typeof startSsoLogin> = (profile) => startSsoLogin(profile);
+//
+// The profile path calls it with a bare profile string and nothing else, so its
+// production call is still exactly `startSsoLogin(profile)`. The sso-session
+// path passes a LoginTarget plus the child env it needs (envWithoutProfile), so
+// an injected test implementation can see -- and must forward -- that env.
+interface StartExtra {
+  env?: NodeJS.ProcessEnv;
+  /** See SsoLoginOptions.dedupeTag. */
+  dedupeTag?: string;
+}
+type StartImpl = (target: LoginTarget | string, extra?: StartExtra) => ReturnType<typeof startSsoLogin>;
+const defaultStartImpl: StartImpl = (target, extra) => (extra ? startSsoLogin(target, extra) : startSsoLogin(target));
+let _startSsoLoginImpl: StartImpl = defaultStartImpl;
 
 /** For tests -- inject a startSsoLogin implementation (e.g. one that passes fakeOpts). */
-export function _setStartSsoLoginImpl(fn: (profile: string) => ReturnType<typeof startSsoLogin>): void {
+export function _setStartSsoLoginImpl(fn: StartImpl): void {
   _startSsoLoginImpl = fn;
 }
 
 /** For tests -- restore the production startSsoLogin call. Run in afterEach so the seam can't bleed across tests. */
 export function _resetStartSsoLoginImpl(): void {
-  _startSsoLoginImpl = (profile) => startSsoLogin(profile);
-}
-
-interface FindTokenOptions {
-  /**
-   * If set, only return tokens whose `startUrl` matches. Prevents the
-   * multi-org misread where the first valid token in the cache belongs to a
-   * different SSO instance than the profile the caller asked about.
-   */
-  startUrl?: string;
-}
-
-/**
- * Best-effort read of a non-expired SSO token from the CLI cache. When
- * `startUrl` is supplied, only tokens belonging to that SSO instance are
- * eligible -- callers with a known profile should always pass it to avoid
- * the multi-org hazard. When multiple eligible tokens exist (a re-login
- * leaves the previous one in the cache until it expires), returns the one
- * with the LATEST `expiresAt` so callers see the freshest minutesLeft.
- *
- * Exported with an optional `cacheDir` argument so tests can point it at a tmpdir.
- */
-export function findCachedSsoToken(
-  cacheDir: string = join(homedir(), ".aws", "sso", "cache"),
-  opts: FindTokenOptions = {},
-): { expiresAt: string; minutesLeft: number; startUrl?: string } | null {
-  try {
-    const files = readdirSync(cacheDir).filter((f) => f.endsWith(".json"));
-    const now = Date.now();
-    let best: { expiresAtIso: string; expiresAtMs: number; startUrl?: string } | null = null;
-    for (const f of files) {
-      try {
-        const path = join(cacheDir, f);
-        if (statSync(path).size > MAX_SSO_CACHE_FILE_BYTES) continue;
-        const contents = JSON.parse(readFileSync(path, "utf-8"));
-        if (!contents.accessToken || !contents.expiresAt) continue;
-        if (opts.startUrl && contents.startUrl !== opts.startUrl) continue;
-        const expiresAtMs = parseExpiresAt(contents.expiresAt);
-        if (!Number.isFinite(expiresAtMs)) {
-          // Not a silent skip: an unreadable expiry looks exactly like an
-          // empty cache to every caller, so say so once on stderr.
-          warnUnparseableExpiry(path, contents.expiresAt);
-          continue;
-        }
-        if (expiresAtMs <= now - EXPIRY_SKEW_GRACE_MS) continue;
-        if (!best || expiresAtMs > best.expiresAtMs) {
-          best = { expiresAtIso: contents.expiresAt, expiresAtMs, startUrl: contents.startUrl };
-        }
-      } catch {
-        // skip malformed cache file
-      }
-    }
-    if (best) {
-      return {
-        expiresAt: best.expiresAtIso,
-        // Clamped at 0: with EXPIRY_SKEW_GRACE_MS a token accepted here can
-        // already be a few seconds past its stamped expiry, and a negative
-        // minutesLeft would be a new shape for every caller. 0 still trips
-        // every `minutesLeft < threshold` refresh check.
-        minutesLeft: Math.max(0, Math.floor((best.expiresAtMs - now) / 60_000)),
-        startUrl: best.startUrl,
-      };
-    }
-  } catch {
-    // no cache dir
-  }
-  return null;
+  _startSsoLoginImpl = defaultStartImpl;
 }
 
 /**
@@ -193,6 +92,260 @@ function startUrlForProfile(profile: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+type SessionBlockOutcome = "created" | "existing" | "updated";
+
+/**
+ * Make sure `[sso-session <name>]` exists in the AWS config file before the
+ * login spawns -- `aws sso login --sso-session X` reads its start URL and region
+ * from that block, so there is nothing to log in to without it.
+ *
+ * Runs entirely under the config file's lock (withLockedAtomicWrite), so the
+ * decision below is made against the same text it replaces:
+ *   - absent + startUrl/ssoRegion given  -> create the managed block
+ *   - absent, not given                  -> error
+ *   - present, same values (or omitted)  -> reuse ("existing"), no write
+ *   - present, different, managed        -> rewrite only the managed keys
+ *   - present, different, hand-written   -> refuse; never touch a user's block
+ *
+ * A failed login later does NOT roll the block back: it is harmless and
+ * idempotent (the next start reports "existing"), and a rollback would race a
+ * concurrent start.
+ */
+async function ensureSsoSessionBlock(
+  name: string,
+  startUrl: string | undefined,
+  ssoRegion: string | undefined,
+): Promise<
+  | { ok: true; outcome: SessionBlockOutcome; startUrl: string; ssoRegion: string; configPath: string }
+  | { ok: false; error: string }
+> {
+  const configPath = resolveAwsConfigPath();
+  if (configPath === "") return { ok: false, error: EMPTY_CONFIG_FILE_ERROR };
+  let result:
+    | { ok: true; outcome: SessionBlockOutcome; startUrl: string; ssoRegion: string; configPath: string }
+    | { ok: false; error: string } = { ok: false, error: "internal: session block not evaluated" };
+  try {
+    await withLockedAtomicWrite(
+      configPath,
+      (text) => {
+        const block = parseSsoSessions(text).find((b) => b.name === name);
+        if (!block) {
+          if (startUrl === undefined || ssoRegion === undefined) {
+            result = {
+              ok: false,
+              error: `No [sso-session ${name}] in ${configPath}. Pass startUrl and ssoRegion to create it.`,
+            };
+            return null;
+          }
+          result = { ok: true, outcome: "created", startUrl, ssoRegion, configPath };
+          return planConfigUpserts(text, [renderSessionSpec(name, startUrl, ssoRegion)]).text;
+        }
+        if (startUrl === undefined || ssoRegion === undefined) {
+          if (!block.ssoStartUrl || !block.ssoRegion) {
+            result = {
+              ok: false,
+              error: `[sso-session ${name}] in ${configPath} has no sso_start_url / sso_region. Pass startUrl and ssoRegion, or fix the block.`,
+            };
+            return null;
+          }
+          result = {
+            ok: true,
+            outcome: "existing",
+            startUrl: block.ssoStartUrl,
+            ssoRegion: block.ssoRegion,
+            configPath,
+          };
+          return null;
+        }
+        if (block.ssoStartUrl === startUrl && block.ssoRegion === ssoRegion) {
+          result = { ok: true, outcome: "existing", startUrl, ssoRegion, configPath };
+          return null;
+        }
+        if (!block.managed) {
+          result = {
+            ok: false,
+            error: `[sso-session ${name}] in ${configPath} was not created by aws-mcp and has sso_start_url=${block.ssoStartUrl ?? "(unset)"} / sso_region=${block.ssoRegion ?? "(unset)"}. Pick a different ssoSession name, or edit the file yourself.`,
+          };
+          return null;
+        }
+        const planned = planConfigUpserts(text, [renderSessionSpec(name, startUrl, ssoRegion)]);
+        result = { ok: true, outcome: "updated", startUrl, ssoRegion, configPath };
+        return planned.outcomes[0] === "unchanged" ? null : planned.text;
+      },
+      // The config holds no secrets: create it 0600 like the CLI's own files,
+      // but do not refuse on a mount that cannot honour the mode.
+      { requirePrivate: false, ensureDir: true },
+    );
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Could not update ${configPath}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  return result;
+}
+
+/** Read an sso-session block's start URL from the config, or undefined. */
+function startUrlForSsoSession(name: string): string | undefined {
+  try {
+    const text = readFileSync(resolveAwsConfigPath(), "utf-8");
+    return parseSsoSessions(text).find((b) => b.name === name)?.ssoStartUrl;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * sessionId -> the start URL + region its `aws sso login --sso-session` child
+ * read at launch. The child reads the config once, so a login started before
+ * the block was repointed is a login to the OLD Identity Center instance and
+ * must not be handed out as the login for the new one. Entries for sessions
+ * that are gone are pruned on every sso-session start.
+ */
+const sessionLoginConfig = new Map<string, string>();
+
+function loginConfigKey(startUrl: string, ssoRegion: string): string {
+  return `${startUrl}|${ssoRegion}`;
+}
+
+/**
+ * Per-sso-session-name start serialization: name -> tail of the chain of
+ * starts holding or waiting for that name, plus how many there are.
+ *
+ * Without it, two concurrent starts that repoint the same block race: the
+ * child is spawned only after startSsoLogin's `await probeCliVersion`, and a
+ * start that has not registered its session yet is invisible to the supersede
+ * loop. So B could write the new URL while A's child was still unspawned; A's
+ * child then read B's block while labelled with A's URL, B could not see A to
+ * cancel it, and two `aws sso login --sso-session X` children ran. Holding the
+ * lock across write-block + supersede + start (until the start registers or
+ * fails) means the block a holder wrote is the block its child reads -- no
+ * other aws-mcp start can write that name in between -- and a later repoint
+ * finds the earlier login registered and cancels it through the normal path.
+ * Profile logins never take it.
+ */
+const sessionStartChains = new Map<string, Promise<void>>();
+const sessionStartDepth = new Map<string, number>();
+
+async function withSessionStartLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const prev = sessionStartChains.get(name) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => {
+    release = r;
+  });
+  // `prev` only ever resolves (each link is a bare release promise), so a
+  // failed holder cannot wedge the chain.
+  const tail = prev.then(() => mine);
+  sessionStartChains.set(name, tail);
+  sessionStartDepth.set(name, (sessionStartDepth.get(name) ?? 0) + 1);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    const depth = (sessionStartDepth.get(name) ?? 1) - 1;
+    if (depth <= 0) sessionStartDepth.delete(name);
+    else sessionStartDepth.set(name, depth);
+    if (sessionStartChains.get(name) === tail) sessionStartChains.delete(name);
+  }
+}
+
+/** For tests -- how many sso-session starts for `name` hold or await the lock. */
+export function _sessionStartQueueDepth(name: string): number {
+  return sessionStartDepth.get(name) ?? 0;
+}
+
+/**
+ * aws_login_start's sso-session branch: validate, ensure the block, then reuse
+ * an in-flight login or spawn `aws sso login --sso-session <name>` with the
+ * profile selectors stripped from the child env. Everything after validation
+ * runs under the per-name start lock (withSessionStartLock).
+ */
+async function startSessionLogin(i: {
+  ssoSession: string;
+  startUrl?: string;
+  ssoRegion?: string;
+}): Promise<ToolResult> {
+  const nameErr = ssoSessionNameProblem(i.ssoSession);
+  if (nameErr) return { ok: false, errorKind: "bad_input", error: nameErr };
+  let startUrl: string | undefined;
+  if (i.startUrl !== undefined) {
+    const norm = normalizeStartUrl(i.startUrl);
+    if (!norm.ok) return { ok: false, errorKind: "bad_input", error: norm.error };
+    startUrl = norm.url;
+  }
+  if (i.ssoRegion !== undefined) {
+    const regionErr = regionProblem("ssoRegion", i.ssoRegion);
+    if (regionErr) return { ok: false, errorKind: "bad_input", error: regionErr };
+  }
+  // Taken synchronously (no await above), so concurrent calls queue in call order.
+  return withSessionStartLock(i.ssoSession, () => startSessionLoginLocked(i, startUrl));
+}
+
+/** startSessionLogin's body, with `startUrl` already normalized; runs under the lock. */
+async function startSessionLoginLocked(
+  i: { ssoSession: string; ssoRegion?: string },
+  startUrl: string | undefined,
+): Promise<ToolResult> {
+  const block = await ensureSsoSessionBlock(i.ssoSession, startUrl, i.ssoRegion);
+  if (!block.ok) return { ok: false, error: block.error };
+
+  const target: LoginTarget = { kind: "sso-session", name: i.ssoSession };
+  const common = {
+    ssoSession: i.ssoSession,
+    startUrl: block.startUrl,
+    ssoRegion: block.ssoRegion,
+    configPath: block.configPath,
+    sessionBlock: block.outcome,
+  };
+  for (const id of sessionLoginConfig.keys()) {
+    if (getLoginTarget(id) === null) sessionLoginConfig.delete(id);
+  }
+  const wantConfig = loginConfigKey(block.startUrl, block.ssoRegion);
+  let active = findActiveSession(target);
+  // Reuse only a login whose child read the block as it is NOW. One started
+  // against a different URL/region (the block was just repointed, or an
+  // unknown login after an update) is abandoned: its device code would sign
+  // the user in to the wrong instance.
+  while (active) {
+    const had = sessionLoginConfig.get(active.sessionId);
+    const stale = had !== undefined ? had !== wantConfig : block.outcome === "updated";
+    if (!stale) break;
+    cancelLogin(
+      active.sessionId,
+      `Superseded: [sso-session ${i.ssoSession}] was repointed to ${block.startUrl} (${block.ssoRegion}) while this login was in flight. Use the sessionId from the latest aws_login_start.`,
+    );
+    sessionLoginConfig.delete(active.sessionId);
+    active = findActiveSession(target);
+  }
+  if (active) {
+    return {
+      ok: true,
+      data: {
+        sessionId: active.sessionId,
+        ...common,
+        verificationUrl: active.verificationUrl,
+        userCode: active.userCode,
+        reused: true,
+        instructions: `A login is already in progress for sso-session '${i.ssoSession}'. Open ${active.verificationUrl} in your browser, enter code ${active.userCode}, then call aws_login_complete with sessionId='${active.sessionId}' to confirm.`,
+      },
+    };
+  }
+  const result = await _startSsoLoginImpl(target, { env: envWithoutProfile(process.env), dedupeTag: wantConfig });
+  if (!result.ok) return { ok: false, error: result.error, rawBody: result.rawOutput };
+  sessionLoginConfig.set(result.sessionId, wantConfig);
+  return {
+    ok: true,
+    data: {
+      sessionId: result.sessionId,
+      ...common,
+      verificationUrl: result.verificationUrl,
+      userCode: result.userCode,
+      instructions: `Open ${result.verificationUrl} in your browser, enter code ${result.userCode}, then call aws_login_complete with sessionId='${result.sessionId}' to confirm.`,
+    },
+  };
 }
 
 /**
@@ -312,7 +465,7 @@ export const authTools: readonly Tool[] = [
   {
     name: "aws_login_start",
     description:
-      "Start an AWS SSO login via the device-code flow (no browser spawned from this process). Returns a verification URL and short code -- surface these to the user so they can open the URL in their own browser and paste the code. After they auth, call aws_login_complete with the returned sessionId to confirm completion.",
+      "Start an AWS SSO login via the device-code flow (no browser spawned from this process). Returns a verification URL and short code -- surface these to the user so they can open the URL in their own browser and paste the code. After they auth, call aws_login_complete with the returned sessionId to confirm completion. For a user with NO profile yet, pass ssoSession plus startUrl and ssoRegion instead of profile: this writes a managed [sso-session] block to the AWS config file (never touching one the user wrote) and logs in to IAM Identity Center directly; then use aws_sso_list_assignments and aws_sso_generate_profiles.",
     annotations: {
       title: "Start AWS SSO login (device code)",
       readOnlyHint: false,
@@ -320,11 +473,58 @@ export const authTools: readonly Tool[] = [
       idempotentHint: false,
       openWorldHint: true,
     },
+    // Cross-field rules live in the handler, not in .refine(): Tool.inputSchema
+    // is a ZodObject, and a refine would turn it into ZodEffects.
     inputSchema: z.object({
-      profile: z.string().optional().describe("AWS profile configured for SSO. Defaults to $AWS_PROFILE or 'default'."),
+      profile: z
+        .string()
+        .optional()
+        .describe(
+          "AWS profile configured for SSO. Defaults to $AWS_PROFILE or 'default'. Mutually exclusive with ssoSession.",
+        ),
+      ssoSession: z
+        .string()
+        .optional()
+        .describe(
+          "Log in to an IAM Identity Center sso-session directly, without any profile. Use with startUrl + ssoRegion to create the [sso-session] block on first use; omit them to log in to an existing block.",
+        ),
+      startUrl: z.string().optional().describe("Identity Center start URL (https://...). Only with ssoSession."),
+      ssoRegion: z
+        .string()
+        .optional()
+        .describe("Region of the Identity Center instance, e.g. us-east-1. Only with ssoSession."),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
-      const { profile } = input as { profile?: string };
+      const raw = input as {
+        profile?: string;
+        ssoSession?: string;
+        startUrl?: string;
+        ssoRegion?: string;
+      };
+      // "" is absent, as at every `profile || getProfile()` site: a client that
+      // fills unused optional string fields with "" must still get a profile
+      // login, not a cross-field bad_input.
+      const profile = raw.profile || undefined;
+      const ssoSession = raw.ssoSession || undefined;
+      const startUrl = raw.startUrl || undefined;
+      const ssoRegion = raw.ssoRegion || undefined;
+      if (ssoSession !== undefined || startUrl !== undefined || ssoRegion !== undefined) {
+        if (profile !== undefined) {
+          return { ok: false, errorKind: "bad_input", error: "Pass either profile or ssoSession, not both." };
+        }
+        if (ssoSession === undefined) {
+          return { ok: false, errorKind: "bad_input", error: "startUrl and ssoRegion are only valid with ssoSession." };
+        }
+        if ((startUrl === undefined) !== (ssoRegion === undefined)) {
+          return {
+            ok: false,
+            errorKind: "bad_input",
+            error:
+              "Pass startUrl and ssoRegion together (to create or repoint the block), or neither (to use the existing block).",
+          };
+        }
+        return startSessionLogin({ ssoSession, startUrl, ssoRegion });
+      }
       const useProfile = profile || getProfile();
 
       // If a login is already in flight for this profile, surface its
@@ -369,7 +569,7 @@ export const authTools: readonly Tool[] = [
   {
     name: "aws_login_complete",
     description:
-      "Block until the SSO login started by aws_login_start finishes (user completed auth in browser, or subprocess exited with error). Returns the new identity on success, or a structured error.",
+      "Block until the SSO login started by aws_login_start finishes (user completed auth in browser, or subprocess exited with error). Returns the new identity on success, or a structured error. For an ssoSession login there is no profile yet, so it returns the token status and points to aws_sso_list_assignments instead of an identity.",
     annotations: {
       title: "Wait for AWS SSO login to finish",
       readOnlyHint: false,
@@ -387,12 +587,37 @@ export const authTools: readonly Tool[] = [
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
       const { sessionId, profile, region } = input as { sessionId: string; profile?: string; region?: string };
+      // Read BEFORE waitForLogin, which claims (deletes) the session entry.
+      const target = getLoginTarget(sessionId);
       const waitResult = await waitForLogin(sessionId);
       if (!waitResult.ok) {
         return {
           ok: false,
           error: waitResult.error ?? `aws sso login exited with code ${waitResult.exitCode}`,
           rawBody: waitResult.rawOutput,
+        };
+      }
+
+      if (target?.kind === "sso-session") {
+        // No sts get-caller-identity: there is no profile to run it as (it
+        // would fail, or worse answer as whatever AWS_PROFILE points at). The
+        // token-cache status is the honest confirmation for this kind.
+        const startUrl = startUrlForSsoSession(target.name);
+        const cachedToken = startUrl ? findCachedSsoToken(undefined, { startUrl }) : null;
+        return {
+          ok: true,
+          data: {
+            loggedIn: true,
+            ssoSession: target.name,
+            startUrl,
+            ssoToken: projectSsoToken(cachedToken),
+            next: `Call aws_sso_list_assignments with ssoSession='${target.name}' to see your accounts and roles.`,
+            ...(profile !== undefined || region !== undefined
+              ? {
+                  note: "profile / region are ignored for an ssoSession login: there is no profile to check an identity against yet.",
+                }
+              : {}),
+          },
         };
       }
 

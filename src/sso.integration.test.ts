@@ -14,7 +14,9 @@ import {
   _clearCliVersionCache,
   _clearSessions,
   _hasSession,
+  findActiveSession,
   findActiveSessionByProfile,
+  getLoginTarget,
   startSsoLogin,
   waitForLogin,
 } from "./sso.js";
@@ -1036,5 +1038,58 @@ describe("clampRawOutput -- the raw `aws sso login` output forwarded to the mode
     // The count is still measured in code units, so it is off by one relative
     // to "characters" in the human sense. Pinned so the arithmetic is explicit.
     assert.equal(omitted, payload.length - MAX_RAW_OUTPUT_CHARS);
+  });
+});
+
+describe("startSsoLogin -- sso-session targets", () => {
+  it("refuses an sso-session login on a CLI older than 2.9.0, before spawning the login", async () => {
+    _clearCliVersionCache();
+    const base = fakeOpts("happy_hold");
+    const r = await startSsoLogin(
+      { kind: "sso-session", name: "acme" },
+      // useDeviceCode pinned: the gate must still probe for an sso-session target.
+      { ...base, useDeviceCode: true, env: { ...base.env, AWS_MCP_FAKE_CLI_VERSION: "2.8.12" } },
+    );
+    _clearCliVersionCache();
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /aws CLI 2\.8\.12 predates --sso-session \(2\.9\.0\)/);
+  });
+
+  it("does not gate a profile login on the same old CLI", async () => {
+    _clearCliVersionCache();
+    // Expects the URL to arrive, so it needs the generous hang guard (see the
+    // fakeOpts comment): 500 ms lost to a cold fake under a parallel run.
+    const base = fakeOpts("happy_hold", 10_000);
+    const r = await startSsoLogin("old-cli-prof", {
+      ...base,
+      env: { ...base.env, AWS_MCP_FAKE_CLI_VERSION: "2.8.12" },
+    });
+    _clearCliVersionCache();
+    assert.equal(r.ok, true);
+  });
+
+  it("findActiveSession does not cross kinds", async () => {
+    const r = await startSsoLogin({ kind: "sso-session", name: "same-name" }, fakeOpts("happy_hold", 10_000));
+    assert.equal(r.ok, true);
+    if (!r.ok) return;
+    assert.equal(findActiveSession({ kind: "sso-session", name: "same-name" })?.sessionId, r.sessionId);
+    assert.equal(findActiveSessionByProfile("same-name"), null, "a profile lookup must not see an sso-session login");
+    assert.deepEqual(getLoginTarget(r.sessionId), { kind: "sso-session", name: "same-name" });
+    // And a concurrent profile start with the same name is a separate login.
+    const p = await startSsoLogin("same-name", fakeOpts("happy_hold", 10_000));
+    assert.equal(p.ok, true);
+    if (p.ok) assert.notEqual(p.sessionId, r.sessionId);
+  });
+
+  it("the profile path still passes --profile and never --sso-session", async () => {
+    const start = await startSsoLogin("argv-prof", {
+      ...fakeOpts("device_code_flag_echo", 10_000),
+      useDeviceCode: true,
+    });
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    const wait = await waitForLogin(start.sessionId);
+    assert.match(wait.rawOutput ?? "", /ARGV:.*--profile argv-prof/);
+    assert.doesNotMatch(wait.rawOutput ?? "", /--sso-session/);
   });
 });

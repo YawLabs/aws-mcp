@@ -25,6 +25,10 @@ import { join } from "node:path";
  *
  * Both are read per call, never cached: the environment is the configuration.
  */
+/** What a tool says when AWS_CONFIG_FILE is set but empty (no config file). */
+export const EMPTY_CONFIG_FILE_ERROR =
+  "AWS_CONFIG_FILE is set to an empty value, so the AWS CLI loads no config file and no profiles are configured. Unset it to use ~/.aws/config, or point it at a config file.";
+
 export function resolveAwsConfigPath(): string {
   return fromEnvOrDefault(process.env.AWS_CONFIG_FILE, "config");
 }

@@ -34,89 +34,16 @@
  * into a critical section.
  */
 
-import { randomUUID } from "node:crypto";
-import {
-  closeSync,
-  existsSync,
-  fchmodSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  unlinkSync,
-  writeSync,
-} from "node:fs";
-import { setTimeout as delay } from "node:timers/promises";
-import { assertPrivateMode } from "./private-file.js";
+import { sectionName, splitSections, withLockedAtomicWrite } from "./ini-file.js";
+
+// Moved to ini-file.ts (shared with the config-file writer) and re-exported so
+// existing importers keep working.
+export { sectionName, splitSections };
 
 interface AssumedCredentials {
   aws_access_key_id: string;
   aws_secret_access_key: string;
   aws_session_token: string;
-}
-
-/**
- * Parse an INI-style credentials file into an ordered list of sections.
- * We keep the list ordered so a round-trip preserves the user's layout.
- */
-interface Section {
-  // The raw header line including brackets, e.g. "[profile foo]" or "[default]".
-  // null for the pre-first-section preamble (comments / blank lines).
-  header: string | null;
-  // Raw text of the section body, including trailing newline.
-  body: string;
-}
-
-// Single source of truth for what counts as a section header line. Both
-// splitSections (which decides where a section starts) and sectionName (which
-// extracts the name back out of the stored raw line) MUST use this -- they
-// previously disagreed, see the sectionName comment below.
-const SECTION_HEADER_RE = /^\[(.+)\]\s*$/;
-
-function splitSections(text: string): Section[] {
-  const sections: Section[] = [];
-  let current: Section = { header: null, body: "" };
-  for (const rawLine of text.split(/\r?\n/)) {
-    const headerMatch = SECTION_HEADER_RE.exec(rawLine);
-    if (headerMatch) {
-      if (current.header !== null || current.body !== "") {
-        sections.push(current);
-      }
-      current = { header: rawLine, body: "" };
-    } else {
-      // Preserve line + trailing newline; skip the trailing fake line from
-      // split on a terminating newline.
-      current.body += `${rawLine}\n`;
-    }
-  }
-  // split adds an empty final entry on a trailing newline; that produced an
-  // extra \n above. Trim one trailing \n from the last section's body so a
-  // round-trip on a file ending with one newline is idempotent.
-  if (current.body.endsWith("\n")) current.body = current.body.slice(0, -1);
-  if (current.header !== null || current.body !== "") sections.push(current);
-  return sections;
-}
-
-/**
- * Extract the profile name from a stored raw header line.
- *
- * MUST parse with SECTION_HEADER_RE, not `slice(1, -1)`. splitSections stores
- * the RAW line, and the regex tolerates trailing whitespace after the closing
- * bracket (`\s*$`). A naive slice(1, -1) on `"[mcp-dev]  "` drops the final
- * SPACE instead of the bracket, yielding `"mcp-dev]"` -- which matched no
- * profile, so upsertProfileIntoText appended a SECOND `[mcp-dev]` section and
- * left the stale credentials sitting in the first one. `[mcp-dev]\t` failed the
- * same way; `[ mcp-dev ]` and CRLF files happened to work, which is why this
- * hid for so long.
- *
- * Callers only ever pass lines splitSections stored, which by construction
- * matched SECTION_HEADER_RE -- so the exec always matches. The `?? ""` is a
- * type-level floor, not a second parsing path (a second path is exactly what
- * produced the bug above); "" matches no profile name, all of which are
- * non-empty.
- */
-function sectionName(header: string): string {
-  return (SECTION_HEADER_RE.exec(header)?.[1] ?? "").trim();
 }
 
 function buildProfileBody(creds: AssumedCredentials): string {
@@ -210,257 +137,38 @@ export function profileExistsInText(text: string, profile: string): boolean {
   return splitSections(text).some((s) => s.header !== null && sectionName(s.header) === profile);
 }
 
-/** Max wall-clock spent trying to acquire the lock before giving up. */
-const LOCK_MAX_WAIT_MS = 10_000;
-/**
- * Lock files older than this are considered stale (prior holder crashed
- * before unlinking). 30s is a generous upper bound on a healthy
- * read-modify-rename cycle; anything older was almost certainly orphaned.
- */
-const LOCK_STALE_AFTER_MS = 30_000;
-/** Base retry delay; jittered + scaled per attempt up to a cap. */
-const LOCK_BASE_RETRY_MS = 25;
-const LOCK_MAX_RETRY_MS = 250;
-
-/**
- * Acquire a sidecar lock file via O_EXCL. Honored cross-process: both POSIX
- * `openSync(p, 'wx')` and Windows `_open` reject a `CREATE | EXCL` request
- * when the file already exists, so a second process loses the race and
- * retries.
- *
- * Stale-lock recovery: if the existing lock is older than
- * `LOCK_STALE_AFTER_MS`, the prior holder is presumed dead and we force-
- * unlink. The stat-then-unlink window is racy in the worst case: two
- * processes both stat the same stale lock and both unlink it (the second
- * unlink hits an already-gone file and swallows ENOENT). NEITHER claims the
- * lock on that iteration -- both just set shouldRetryImmediately and loop.
- * On the next iteration both race a fresh O_EXCL openSync, so one wins and
- * the other falls back to EEXIST. Recovery is clean, just one iteration
- * later than the wording above might suggest.
- *
- * Limitation: a process killed (SIGKILL, power loss) leaves a lock that
- * blocks new writers for up to `LOCK_STALE_AFTER_MS` before recovery kicks
- * in. Acceptable for the assume-role write path; users who hit a permanent
- * "failed to acquire lock" error can manually remove `<credentials>.lock`.
- */
-async function acquireLock(lockPath: string): Promise<void> {
-  const start = Date.now();
-  let attempt = 0;
-  while (true) {
-    // Timeout check at the top of the loop so EVERY iteration -- including
-    // the stale-recovery and stat-failed `continue` paths below -- is bounded
-    // by LOCK_MAX_WAIT_MS. Without this, two processes that keep recreating
-    // the lock between our openSync and statSync could starve us forever.
-    if (Date.now() - start > LOCK_MAX_WAIT_MS) {
-      throw new Error(
-        `upsertProfile: failed to acquire lock at ${lockPath} after ${LOCK_MAX_WAIT_MS}ms. If a previous writer crashed, remove the lock file manually.`,
-      );
-    }
-    // Phase 1: try to atomically claim the lock file. The catch only fires
-    // on openSync failure; write/close errors are handled separately in
-    // Phase 2. Splitting the two paths keeps the cleanup intent explicit --
-    // openSync-fail has nothing to unlink, write/close-fail does.
-    let fd: number | null = null;
-    try {
-      fd = openSync(lockPath, "wx");
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        // openSync itself failed for a non-EEXIST reason (EPERM on a
-        // read-only ~/.aws, ENOENT on a missing parent dir, ENOSPC on a
-        // full disk, ...). No lock file was created; nothing to clean up.
-        // Propagate so the caller sees the real error instead of timing
-        // out later with a misleading "failed to acquire lock" message.
-        throw err;
-      }
-      // EEXIST: another writer holds the lock. Fall through to the
-      // stale-check + backoff below.
-    }
-
-    if (fd !== null) {
-      // Phase 2: lock is ours. Stamp it + close. If either throws, the
-      // lock file exists but may be empty/garbled -- orphan-clean so new
-      // writers don't block on it for LOCK_STALE_AFTER_MS.
-      try {
-        try {
-          writeSync(fd, `pid=${process.pid} time=${Date.now()}\n`);
-        } finally {
-          closeSync(fd);
-        }
-        return;
-      } catch (err) {
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          // best-effort
-        }
-        throw err;
-      }
-    }
-    let shouldRetryImmediately = false;
-    try {
-      const st = statSync(lockPath);
-      if (Date.now() - st.mtimeMs > LOCK_STALE_AFTER_MS) {
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          // Someone else already unlinked this stale lock (swallowed ENOENT).
-          // We don't claim it here -- just loop and race openSync fresh.
-        }
-        shouldRetryImmediately = true;
-      }
-    } catch {
-      // Lock removed under us between EEXIST and statSync; loop and race
-      // openSync fresh (we don't claim it on this iteration).
-      shouldRetryImmediately = true;
-    }
-    if (shouldRetryImmediately) continue;
-    const cappedAttempt = Math.min(attempt, 8);
-    const baseDelay = Math.min(LOCK_BASE_RETRY_MS * (1 + cappedAttempt), LOCK_MAX_RETRY_MS);
-    await delay(baseDelay + Math.random() * baseDelay);
-    attempt++;
-  }
-}
-
-function releaseLock(lockPath: string): void {
-  try {
-    unlinkSync(lockPath);
-  } catch {
-    // Best-effort: the lock may have already been swept by a stale-recovery
-    // pass from another process. Either way we're done with it.
-  }
-}
-
-/**
- * Write EVERY byte of `text` to `fd`, looping until the buffer is drained.
- *
- * writeSync returns how many bytes it actually wrote, and POSIX permits that
- * to be FEWER than requested -- pipes, network filesystems (a ~/.aws on NFS
- * or a mounted share is not exotic) and EINTR-interrupted syscalls all
- * produce short writes. Crucially a short write does NOT throw, so the
- * caller's try/catch never sees it: dropping writeSync's return value would
- * renameSync a TRUNCATED file over the user's real credentials. That is both
- * data loss (the other profiles in the file are gone) and a broken-auth state
- * (the profile we just wrote is half a secret key), and the atomic-rename
- * dance above exists precisely to make that impossible.
- *
- * The loop tracks BYTE offsets into a Buffer rather than string indices: a
- * multi-byte UTF-8 character split across a short write would desync a
- * string-sliced retry and corrupt the output.
- *
- * A non-positive return would spin forever, so it is treated as a hard
- * failure instead. That throws into the caller's catch, which unlinks the tmp
- * file and propagates -- an error beats a hung assume-role call, and beats a
- * truncated credentials file.
- */
-function writeAllSync(fd: number, text: string): void {
-  const buf = Buffer.from(text, "utf-8");
-  let written = 0;
-  while (written < buf.byteLength) {
-    const n = writeSync(fd, buf, written, buf.byteLength - written);
-    if (n <= 0) {
-      throw new Error(
-        `upsertProfile: write stalled after ${written} of ${buf.byteLength} bytes; refusing to rename a truncated credentials file.`,
-      );
-    }
-    written += n;
-  }
-}
-
 /**
  * Read, modify, and atomically rewrite a credentials file. Creates the file
- * if it doesn't exist. The tmp file is opened 0o600 and fchmod-ed to 0o600
- * before a credential byte is written, and renameSync replaces the destination
- * inode, so the resulting credentials file is 0o600 on Unix -- VERIFIED rather
- * than assumed, because a filesystem may accept the fchmod and ignore it (see
- * private-file.ts). On such a mount the write is refused instead.
+ * if it doesn't exist. A thin caller of withLockedAtomicWrite (ini-file.ts),
+ * which owns the lock, the 0o600 tmp file, the short-write loop and the
+ * tmp-file cleanup; see its docs for the reasoning behind each.
  *
- * The fchmod is not redundant belt-and-braces: open's mode argument is honoured
- * by node (and only ever narrowed by umask, never widened), but oam before
- * 0.19.1 DROPPED it -- measured 2026-09-20 on WIN32/ARM64, oam 0.16.2: a file
- * opened 0o400 came back writable where node marks it read-only. oam 0.19.1
- * (the launcher's floor) honours it like node (re-measured 2026-10-30 on
- * WIN32/ARM64: 0o400 comes back read-only), but a client running `oam run`
- * directly bypasses the floor, and a mount with no inode mode ignores both. On POSIX the same divergence WOULD leave this file at the umask
- * default, with an access key, a secret key and a session token in a
- * world-readable `~/.aws/credentials` -- ASSERTED, not measured: oam publishes no
- * linux-arm64 build and there is no Mac here, so no POSIX oam measurement exists
- * anywhere. Note also that a Windows mode argument can only toggle
- * FILE_ATTRIBUTE_READONLY, so that particular row does not transfer cleanly; the
- * `flag: "wx"` row did, being flag-string parsing above the OS layer -- and on
- * oam >= 0.18.0 "wx" is honoured by openSync and writeFileSync alike, as on
- * node. The fchmod stays for the reasons above. fchmodSync itself both runtimes honour. It goes on the fd rather than the
- * path so there is no moment where the file holds credentials at a wider mode.
+ * `requirePrivate: true` is the load-bearing option here: the file carries an
+ * access key, a secret key and a session token in plaintext, so the tmp file's
+ * mode is VERIFIED rather than assumed, and on a filesystem that silently
+ * ignores chmod (a Windows drive under WSL, CIFS, FAT) the write is refused
+ * instead (see private-file.ts).
  *
  * Returns `{ existed: true }` when the profile was already present and its
  * managed keys were overwritten in place, so callers can warn about it.
- *
- * Concurrent callers (multi-process or async) are serialized via a sidecar
- * lock file -- see `acquireLock` for the protocol.
  */
 export async function upsertProfile(
   path: string,
   profile: string,
   creds: AssumedCredentials,
 ): Promise<{ existed: boolean }> {
-  const lockPath = `${path}.lock`;
-  await acquireLock(lockPath);
-  try {
-    const existing = existsSync(path) ? readFileSync(path, "utf-8") : "";
-    const existed = profileExistsInText(existing, profile);
-    const nextText = upsertProfileIntoText(existing, profile, creds);
-    // randomUUID suffix prevents two same-process callers from clobbering
-    // each other's in-flight tmp writes; the lock above prevents cross-
-    // process clobber via the read-modify-rename race.
-    const tmpPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
-    const fd = openSync(tmpPath, "w", 0o600);
-    try {
-      try {
-        // Before writeAllSync, so the credentials never exist on disk at a mode
-        // open(2) set and something ignored (oam before 0.19.1 did). See the
-        // note on this function.
-        fchmodSync(fd, 0o600);
-        // And VERIFY it, before any credential byte exists. fchmod succeeding is
-        // not the same as the mode being set: on a filesystem with no inode mode
-        // it returns success and changes nothing, which would leave all three
-        // plaintext credentials in a world-readable AND world-writable file with
-        // nothing able to detect it. Reachable through a documented, advertised
-        // variable -- AWS_SHARED_CREDENTIALS_FILE pointed at a Windows-side
-        // ~/.aws so a WSL distro and its Windows host share one credentials file.
-        // Measured 0777 there against the real upsertProfile. Throwing here hands
-        // control to the catch below, which unlinks the tmp file, so nothing is
-        // stranded and nothing secret was written.
-        assertPrivateMode(
-          fd,
-          tmpPath,
-          "Point AWS_SHARED_CREDENTIALS_FILE at a path on a native filesystem, or unset it to use ~/.aws/credentials.",
-        );
-        // Loops on the byte count: a partial write must not be renamed over
-        // the real credentials file. See writeAllSync.
-        writeAllSync(fd, nextText);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(tmpPath, path);
-    } catch (err) {
-      // The tmp file holds all three plaintext credentials. A failed
-      // writeSync / closeSync / renameSync would otherwise strand it at
-      // `<path>.tmp-<pid>-<uuid>` forever -- no cleanup path looks for that
-      // name, and the caller (see tools/assume.ts) reports only "the write
-      // failed". Unlink is best-effort and must not mask the real error, so
-      // its own failure is swallowed and `err` is rethrown untouched.
-      //
-      // Only reachable BEFORE a successful rename: once renameSync returns,
-      // tmpPath no longer exists and nothing after it can throw.
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // best-effort
-      }
-      throw err;
-    }
-    return { existed };
-  } finally {
-    releaseLock(lockPath);
-  }
+  let existed = false;
+  await withLockedAtomicWrite(
+    path,
+    (existing) => {
+      existed = profileExistsInText(existing, profile);
+      return upsertProfileIntoText(existing, profile, creds);
+    },
+    {
+      requirePrivate: true,
+      privateHint:
+        "Point AWS_SHARED_CREDENTIALS_FILE at a path on a native filesystem, or unset it to use ~/.aws/credentials.",
+    },
+  );
+  return { existed };
 }

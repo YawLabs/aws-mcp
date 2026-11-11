@@ -3,7 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { type AwsProfile, parseAwsConfig, profilesTools, resolveProfileStartUrl } from "./profiles.js";
+import {
+  type AwsProfile,
+  parseAwsConfig,
+  parseSsoSessions,
+  profilesTools,
+  resolveProfileStartUrl,
+} from "./profiles.js";
 
 const listTool = profilesTools.find((t) => t.name === "aws_list_profiles");
 if (!listTool) throw new Error("profilesTools missing aws_list_profiles");
@@ -15,6 +21,24 @@ describe("parseAwsConfig", () => {
     assert.equal(profiles[0].name, "default");
     assert.equal(profiles[0].region, "us-east-1");
     assert.equal(profiles[0].isSso, false);
+  });
+
+  it("reads a header with a trailing comment as that section (botocore SECTCRE)", () => {
+    const text =
+      "[sso-session acme]\nsso_start_url = https://acme.awsapps.com/start\nsso_region = us-east-1\n" +
+      "[profile prod-Admin]  # my break-glass profile\nsso_account_id = 999999999999\n" +
+      "[profile legacy] ; note\nregion = eu-west-1\n";
+    assert.deepEqual(
+      parseAwsConfig(text).map((p) => [p.name, p.region]),
+      [
+        ["prod-Admin", undefined],
+        ["legacy", "eu-west-1"],
+      ],
+    );
+    assert.deepEqual(
+      parseSsoSessions(text).map((s) => [s.name, s.ssoStartUrl, s.ssoRegion]),
+      [["acme", "https://acme.awsapps.com/start", "us-east-1"]],
+    );
   });
 
   it("strips the 'profile ' prefix from named sections", () => {
@@ -413,5 +437,53 @@ region = us-west-2
     // Inherited from [sso-session my-org]
     assert.equal(prod.ssoStartUrl, "https://d-org.awsapps.com/start");
     assert.equal(prod.ssoRegion, "us-west-2");
+  });
+});
+
+describe("parseAwsConfig -- account / role / managed", () => {
+  it("records sso_account_id, sso_role_name and the aws-mcp marker", () => {
+    const text = `[sso-session acme]
+sso_start_url = https://acme.awsapps.com/start
+sso_region = us-east-1
+
+[profile gen]
+# managed-by: aws-mcp -- delete this line to take ownership; aws-mcp will then never change this section
+sso_session = acme
+sso_account_id = 111111111111
+sso_role_name = Admin
+
+[profile hand]
+sso_session = acme
+sso_account_id = 222222222222
+sso_role_name = ReadOnly
+`;
+    const [gen, hand] = parseAwsConfig(text);
+    assert.equal(gen.ssoAccountId, "111111111111");
+    assert.equal(gen.ssoRoleName, "Admin");
+    assert.equal(gen.managed, true);
+    assert.equal(gen.ssoStartUrl, "https://acme.awsapps.com/start");
+    assert.equal(hand.ssoAccountId, "222222222222");
+    assert.equal(hand.managed, undefined, "absent, not false, on a hand-written profile");
+  });
+});
+
+describe("parseSsoSessions", () => {
+  it("returns every sso-session block with its URL, region and ownership", () => {
+    const text = `[sso-session  hand]
+sso_start_url = https://hand.awsapps.com/start
+sso_region = eu-west-1
+
+[profile x]
+region = us-east-1
+
+[sso-session gen]
+# managed-by: aws-mcp
+sso_start_url = https://gen.awsapps.com/start
+sso_region = us-east-1
+`;
+    assert.deepEqual(parseSsoSessions(text), [
+      { name: "hand", ssoStartUrl: "https://hand.awsapps.com/start", ssoRegion: "eu-west-1", managed: false },
+      { name: "gen", ssoStartUrl: "https://gen.awsapps.com/start", ssoRegion: "us-east-1", managed: true },
+    ]);
   });
 });

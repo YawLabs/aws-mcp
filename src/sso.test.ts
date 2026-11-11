@@ -3,14 +3,17 @@ import type { ChildProcess } from "node:child_process";
 import { describe, it } from "node:test";
 import {
   _buildLoginArgs,
+  _dedupeKey,
   _ttlKillswitchTick,
   CODE_RE,
   DEVICE_CODE_MIN_CLI,
   PKCE_URL_RE,
   parseAwsCliVersion,
   parseLoginOutput,
+  SSO_SESSION_MIN_CLI,
   startSsoLogin,
   supportsDeviceCodeFlag,
+  supportsSsoSession,
   URL_RE,
 } from "./sso.js";
 
@@ -349,5 +352,46 @@ describe("_buildLoginArgs", () => {
   it("keeps --use-device-code ahead of --profile so the value can't be captured", () => {
     const args = _buildLoginArgs("prod", true);
     assert.ok(args.indexOf("--use-device-code") < args.indexOf("--profile"));
+  });
+});
+
+describe("_buildLoginArgs -- sso-session targets", () => {
+  it("emits --sso-session with the name last, and no --profile", () => {
+    const args = _buildLoginArgs({ kind: "sso-session", name: "acme" }, true);
+    assert.deepEqual(args, ["sso", "login", "--no-browser", "--use-device-code", "--sso-session", "acme"]);
+    assert.ok(!args.includes("--profile"));
+  });
+
+  it("a profile target object builds exactly what the bare string does", () => {
+    assert.deepEqual(_buildLoginArgs({ kind: "profile", name: "prod" }, false), _buildLoginArgs("prod", false));
+  });
+});
+
+describe("_dedupeKey", () => {
+  it("differs for profile 'x' and sso-session 'x' with identical opts", () => {
+    assert.notEqual(_dedupeKey({ kind: "profile", name: "x" }, {}), _dedupeKey({ kind: "sso-session", name: "x" }, {}));
+  });
+  it("is stable for the same target and opts", () => {
+    assert.equal(
+      _dedupeKey({ kind: "sso-session", name: "x" }, {}),
+      _dedupeKey({ kind: "sso-session", name: "x" }, {}),
+    );
+  });
+});
+
+describe("supportsSsoSession (2.9.0 gate)", () => {
+  it("accepts 2.9.0 and newer, rejects older, assumes modern when unknown", () => {
+    assert.equal(supportsSsoSession({ major: 2, minor: 9, patch: 0 }), true);
+    assert.equal(supportsSsoSession({ major: 2, minor: 34, patch: 3 }), true);
+    assert.equal(supportsSsoSession({ major: 2, minor: 8, patch: 12 }), false);
+    assert.equal(supportsSsoSession({ major: 1, minor: 99, patch: 0 }), false);
+    assert.equal(supportsSsoSession(null), true);
+    assert.deepEqual(SSO_SESSION_MIN_CLI, { major: 2, minor: 9, patch: 0 });
+  });
+
+  it("startSsoLogin rejects an invalid sso-session name before spawning, naming the kind", async () => {
+    const r = await startSsoLogin({ kind: "sso-session", name: "--evil" }, { command: "never-run" });
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /Invalid sso-session name '--evil'/);
   });
 });

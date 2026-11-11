@@ -454,6 +454,12 @@ describe("redactDisplayArgs", () => {
     assert.deepEqual(redacted.slice(4), ["--profile", "prod"]);
   });
 
+  it("redacts a raw --access-token (defense in depth for the IAM Identity Center bearer token)", () => {
+    const redacted = redactDisplayArgs(["sso", "list-accounts", "--access-token", "SECRET-BEARER", "--region", "x"]);
+    assert.ok(!redacted.includes("SECRET-BEARER"));
+    assert.equal(redacted[3], "<redacted len=13>");
+  });
+
   it("returns the input unchanged when --cli-input-json is absent", () => {
     const args = ["s3api", "list-buckets", "--profile", "prod"];
     assert.deepEqual(redactDisplayArgs(args), args);
