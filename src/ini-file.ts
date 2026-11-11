@@ -25,16 +25,18 @@ import {
   closeSync,
   existsSync,
   fchmodSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertPrivateMode, type ModeProbe } from "./private-file.js";
 
@@ -577,15 +579,41 @@ export interface LockedWriteOptions {
   privateModeOpts?: { platform?: NodeJS.Platform; probe?: ModeProbe };
 }
 
-/** The real file behind `path` (symlinks resolved), or `path` itself when it
- *  does not exist yet. */
+/** Max symlink hops followed by hand for a dangling chain (Linux's MAXSYMLINKS). */
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * The real file behind `path` (symlinks resolved), or `path` itself when
+ * nothing exists there yet.
+ *
+ * realpathSync throws ENOENT for a DANGLING symlink too (a/config -> b/config
+ * with b/config not created yet), so ENOENT alone does not mean "nothing here":
+ * treating it that way renamed the tmp file over the link and replaced it with
+ * a regular file, and b/config was never created. So on ENOENT, lstat the path;
+ * if it is a link, follow it by hand (readlink, resolved relative to the link's
+ * own directory) until reaching a path where nothing exists, and write there.
+ */
 function resolveWriteTarget(path: string): string {
-  try {
-    return realpathSync(path);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return path;
-    throw err;
+  let current = path;
+  for (let hop = 0; hop <= MAX_SYMLINK_HOPS; hop++) {
+    try {
+      return realpathSync(current);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    let isLink: boolean;
+    try {
+      isLink = lstatSync(current).isSymbolicLink();
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return current;
+      throw err;
+    }
+    if (!isLink) return current;
+    current = resolve(dirname(current), readlinkSync(current));
   }
+  const loop = new Error(`Too many levels of symbolic links: ${path}`) as NodeJS.ErrnoException;
+  loop.code = "ELOOP";
+  throw loop;
 }
 
 /**
@@ -634,6 +662,8 @@ export async function withLockedAtomicWrite(
   // TARGET, which also keeps the rename on one filesystem. `aws configure sso`
   // writes in place and keeps the link; this matches it.
   const path = resolveWriteTarget(givenPath);
+  // A dangling link's target directory may not exist yet either.
+  if (opts.ensureDir && path !== givenPath) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const lockPath = `${path}.lock`;
   await acquireLock(lockPath);
   try {

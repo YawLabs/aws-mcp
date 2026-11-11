@@ -14,11 +14,12 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { EMPTY_CONFIG_FILE_ERROR } from "../aws-paths.js";
 import { _resetSession } from "../session.js";
 import { _clearCliVersionCache, _clearSessions, startSsoLogin } from "../sso.js";
 import { MANAGED_MARKER } from "../sso-config.js";
@@ -186,6 +187,39 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
       "the login ran",
     );
     assert.ok(!spawned.some((a) => a[0] === "sts"), "an sso-session login must not run get-caller-identity");
+  });
+
+  it("an empty AWS_CONFIG_FILE makes every bootstrap tool refuse without writing anything", async () => {
+    // Set-but-empty means "no config file" to botocore. dirname("") is ".", so
+    // a write that slipped past the guard would land in the working directory;
+    // a fall-back to the default path would land in HOME/.aws. Run from a
+    // fresh cwd so both are observable.
+    const snapshot = (d: string) => readdirSync(d, { recursive: true }).map(String).sort();
+    seedSession(); // a real token cache in HOME, so nothing short-circuits on "not logged in"
+    rmSync(configPath);
+    const homeBefore = snapshot(home);
+    const cwd = mkdtempSync(join(tmpdir(), "aws-mcp-ssoboot-cwd-"));
+    const prevCwd = process.cwd();
+    process.env.AWS_CONFIG_FILE = "";
+    process.chdir(cwd);
+    try {
+      const runs: Array<[string, unknown]> = [
+        ["aws_login_start", { ssoSession: "acme", startUrl: START, ssoRegion: "us-east-1" }],
+        ["aws_sso_list_assignments", { ssoSession: "acme" }],
+        ["aws_sso_generate_profiles", { ssoSession: "acme" }],
+      ];
+      for (const [name, input] of runs) {
+        const r = await call(name, input);
+        assert.equal(r.ok, false, name);
+        assert.equal(r.error, EMPTY_CONFIG_FILE_ERROR, name);
+      }
+      assert.deepEqual(snapshot(cwd), [], "nothing may be written to the working directory");
+      assert.deepEqual(snapshot(home), homeBefore, "nothing may be written under HOME");
+      assert.deepEqual(calls(), [], "no CLI child may run");
+    } finally {
+      process.chdir(prevCwd);
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("aws_login_complete notes ignored profile/region on an sso-session login", async () => {

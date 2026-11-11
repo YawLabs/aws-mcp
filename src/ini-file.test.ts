@@ -240,6 +240,49 @@ describe("withLockedAtomicWrite", () => {
     assert.deepEqual(readdirSync(dir).sort(), ["config", "dot"], "no lock or tmp file stranded beside the link");
   });
 
+  it("writes through a DANGLING symlink, creating its target and keeping the link", async (t) => {
+    // a/config -> b/config with b/config (and b/) not created yet. realpathSync
+    // throws ENOENT here too; the old code took that as "nothing here" and
+    // renamed the tmp file over the link.
+    const linkDir = join(dir, "a");
+    mkdirSync(linkDir);
+    const link = join(linkDir, "config");
+    const real = join(dir, "b", "config");
+    try {
+      // Relative target, so the readlink-relative-to-the-link's-dir path runs.
+      symlinkSync(join("..", "b", "config"), link, "file");
+    } catch (err) {
+      t.skip(`symlinks unavailable: ${(err as Error).message}`);
+      return;
+    }
+    const r = await withLockedAtomicWrite(link, append(PROD), { requirePrivate: false, ensureDir: true });
+    assert.equal(r.changed, true);
+    assert.ok(lstatSync(link).isSymbolicLink(), "the link must survive the write");
+    assert.match(readFileSync(real, "utf-8"), /\[profile prod-Admin\]/);
+    assert.deepEqual(readdirSync(linkDir), ["config"], "no lock or tmp file stranded beside the link");
+  });
+
+  it("follows a dangling symlink CHAIN to its final target", async (t) => {
+    const first = join(dir, "config");
+    const middle = join(dir, "middle");
+    const real = join(dir, "real-config");
+    try {
+      symlinkSync(middle, first, "file");
+      symlinkSync(real, middle, "file");
+    } catch (err) {
+      t.skip(`symlinks unavailable: ${(err as Error).message}`);
+      return;
+    }
+    await withLockedAtomicWrite(first, append(PROD), { requirePrivate: false });
+    assert.ok(lstatSync(first).isSymbolicLink());
+    assert.ok(lstatSync(middle).isSymbolicLink());
+    assert.match(readFileSync(real, "utf-8"), /\[profile prod-Admin\]/);
+  });
+
+  it("refuses an empty path instead of writing into the working directory", async () => {
+    await assert.rejects(withLockedAtomicWrite("", append(PROD), { requirePrivate: false, ensureDir: true }), /empty/);
+  });
+
   it("creates a nonexistent file", async () => {
     const r = await withLockedAtomicWrite(path, append(PROD), { requirePrivate: false });
     assert.equal(r.changed, true);
