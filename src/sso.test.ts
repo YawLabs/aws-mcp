@@ -58,6 +58,10 @@ describe("URL_RE", () => {
       "https://team-example.awsapps.com/start/#/authorize",
       "https://team-example.awsapps.com/start/#/device-extra",
       "https://team-example.awsapps.com/start/#/device/other",
+      "https://signin.aws/authorize?client_id=x",
+      "https://us-east-1.signin.aws/platform/d-example/authorize?client_id=x",
+      "https://signin.aws/device-extra",
+      "https://signin.aws/device/other",
     ]) {
       assert.doesNotMatch(url, URL_RE);
     }

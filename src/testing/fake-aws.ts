@@ -256,6 +256,17 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "split_portal_url": {
+      // The portal URL arrives across two pipe chunks, split inside its query
+      // string. The parser must surface the whole URL, not the first chunk's.
+      process.stdout.write("Open the following URL:\n\nhttps://team-example.awsapps.com/start/#/device?user_co");
+      await sleep(100);
+      process.stdout.write("de=ABCD-EFGH\n\nThen enter the code:\n\nABCD-EFGH\n");
+      await sleep(200);
+      process.exit(0);
+      return;
+    }
+
     case "happy": {
       // Realistic aws-cli output: banner text, URL, code, then successful auth.
       // HARD CONSTRAINT: the default 200ms exit timing is the contract that

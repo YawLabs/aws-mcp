@@ -94,6 +94,16 @@ describe("startSsoLogin — happy path", () => {
     });
   }
 
+  it("surfaces the whole URL when it is split across stdout chunks", async () => {
+    const start = await startSsoLogin("test-profile", fakeOpts("split_portal_url", 30_000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    assert.equal(start.verificationUrl, "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH");
+    assert.equal(start.userCode, "ABCD-EFGH");
+    const completed = await waitForLogin(start.sessionId);
+    assert.equal(completed.ok, true);
+  });
+
   it("parses URL + code from fake output and returns a session", async () => {
     const result = await startSsoLogin("test-profile", fakeOpts("happy", 30_000));
     assert.equal(result.ok, true);
