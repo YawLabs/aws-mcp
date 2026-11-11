@@ -617,6 +617,15 @@ export async function withLockedAtomicWrite(
   transform: (text: string) => string | null,
   opts: LockedWriteOptions,
 ): Promise<{ changed: boolean }> {
+  // An empty path is what aws-paths returns for a set-but-empty
+  // AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE ("no file" to botocore).
+  // dirname("") is ".", so without this guard the write would land in the
+  // working directory. Callers turn this into a user-facing message first;
+  // this is the backstop.
+  if (givenPath === "")
+    throw new Error(
+      "Refusing to write: the AWS file path is empty (its environment variable is set to an empty value).",
+    );
   if (opts.ensureDir) mkdirSync(dirname(givenPath), { recursive: true, mode: 0o700 });
   // Write THROUGH a symlink, not over it. A dotfiles-managed ~/.aws/config ->
   // ~/dotfiles/aws/config would otherwise be replaced by a regular file: rename

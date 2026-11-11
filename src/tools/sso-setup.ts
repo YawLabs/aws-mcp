@@ -23,7 +23,7 @@
 
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { resolveAwsConfigPath } from "../aws-paths.js";
+import { EMPTY_CONFIG_FILE_ERROR, resolveAwsConfigPath } from "../aws-paths.js";
 import { type ManagedSectionSpec, planConfigUpserts, readSections, withLockedAtomicWrite } from "../ini-file.js";
 import { findActiveSession } from "../sso.js";
 import {
@@ -67,6 +67,7 @@ function resolveSession(ssoSession: string): { ok: true; s: SessionInfo } | { ok
   const nameErr = ssoSessionNameProblem(ssoSession);
   if (nameErr) return { ok: false, r: { ok: false, errorKind: "bad_input", error: nameErr } };
   const configPath = resolveAwsConfigPath();
+  if (configPath === "") return { ok: false, r: { ok: false, errorKind: "bad_input", error: EMPTY_CONFIG_FILE_ERROR } };
   const block = parseSsoSessions(readConfigText(configPath)).find((b) => b.name === ssoSession);
   if (!block?.ssoStartUrl || !block.ssoRegion) {
     return {

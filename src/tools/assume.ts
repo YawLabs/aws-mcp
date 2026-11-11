@@ -423,6 +423,13 @@ export const assumeTools: readonly Tool[] = [
       const creds = outcome.credentials;
 
       const credentialsPath = resolveCredentialsPath();
+      if (credentialsPath === "") {
+        return {
+          ok: false,
+          error:
+            "AWS_SHARED_CREDENTIALS_FILE is set to an empty value, so there is no credentials file to write the assumed-role profile to. Unset it to use ~/.aws/credentials, or point it at a file.",
+        };
+      }
       let existed = false;
       try {
         ({ existed } = await upsertProfile(credentialsPath, targetProfile, {

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { resolveAwsConfigPath } from "../aws-paths.js";
+import { EMPTY_CONFIG_FILE_ERROR, resolveAwsConfigPath } from "../aws-paths.js";
 import { MANAGED_MARKER_RE, readSections } from "../ini-file.js";
 import type { Tool, ToolResult } from "./tool.js";
 
@@ -198,6 +198,11 @@ export const profilesTools: readonly Tool[] = [
     inputSchema: z.object({}),
     handler: async (_input: unknown): Promise<ToolResult> => {
       const configPath = resolveAwsConfigPath();
+      if (configPath === "") {
+        // Set but empty: the aws CLI loads no config file at all, so there are
+        // no profiles it can use. Say so instead of reading some other file.
+        return { ok: false, error: EMPTY_CONFIG_FILE_ERROR };
+      }
       try {
         const text = readFileSync(configPath, "utf-8");
         const profiles = parseAwsConfig(text);

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-import { resolveAwsConfigPath } from "../aws-paths.js";
+import { EMPTY_CONFIG_FILE_ERROR, resolveAwsConfigPath } from "../aws-paths.js";
 import { planConfigUpserts, withLockedAtomicWrite } from "../ini-file.js";
 import { getProfile, getRegion } from "../session.js";
 import {
@@ -122,6 +122,7 @@ async function ensureSsoSessionBlock(
   | { ok: false; error: string }
 > {
   const configPath = resolveAwsConfigPath();
+  if (configPath === "") return { ok: false, error: EMPTY_CONFIG_FILE_ERROR };
   let result:
     | { ok: true; outcome: SessionBlockOutcome; startUrl: string; ssoRegion: string; configPath: string }
     | { ok: false; error: string } = { ok: false, error: "internal: session block not evaluated" };
