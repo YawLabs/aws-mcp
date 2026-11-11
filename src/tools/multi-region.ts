@@ -331,6 +331,9 @@ export const multiRegionTools: readonly Tool[] = [
             region,
             outputFormat: i.outputFormat,
             timeoutMs: i.timeoutMs,
+            // A cancel kills a region still in flight, reported as errorKind
+            // "cancelled" like the regions onCancelled covers below.
+            signal: ctx?.signal,
           });
           if (!r.ok) {
             return {

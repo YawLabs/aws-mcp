@@ -699,6 +699,94 @@ describe("runAwsCall — failure paths", () => {
   });
 });
 
+/** Poll `predicate` every 10 ms (no fixed sleeps); mirrors sso-setup.test.ts. */
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`waitUntil timed out after ${timeoutMs}ms waiting for: ${label}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** Pids the abort_* fake scenarios appended to `path`, one per line. */
+function announcedPids(path: string): number[] {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf-8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => Number(l));
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe("runAwsCall — AbortSignal", () => {
+  it("an abort mid-call kills the child and settles as cancelled, well before the timeout", async () => {
+    const readyPath = join(tmpdir(), `aws-mcp-abort-${process.pid}-${randomUUID()}`);
+    try {
+      const ac = new AbortController();
+      // 60s per-call timeout: the abort, not the timeout, has to end this call.
+      const pending = runAwsCall({
+        service: "s3api",
+        operation: "list-buckets",
+        ...fakeOpts("abort_hang", { timeoutMs: 60_000, env: { AWS_MCP_FAKE_READY_OUT: readyPath } }),
+        signal: ac.signal,
+      });
+      // Abort only once the child is provably running -- a cold start under a
+      // parallel run can take seconds, and aborting before it would test the
+      // pre-spawn path instead.
+      await waitUntil(() => announcedPids(readyPath).length > 0, "fake-aws announced its pid");
+      const [pid] = announcedPids(readyPath);
+      const abortedAt = Date.now();
+      ac.abort();
+      const r = await pending;
+      const elapsed = Date.now() - abortedAt;
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "cancelled");
+      assert.match(r.error, /Cancelled by the client/);
+      assert.ok(r.command, "a call that did spawn still reports what it ran");
+      // Generous for a loaded machine, and still far below the 60s timeout and
+      // the fake's own 60s hang -- either of which is what a missing kill hits.
+      assert.ok(elapsed < 15_000, `settled ${elapsed}ms after the abort`);
+      await waitUntil(() => !pidAlive(pid), `child ${pid} to be dead`);
+    } finally {
+      rmSync(readyPath, { force: true });
+    }
+  });
+
+  it("an already-aborted signal never spawns the CLI", async () => {
+    const callsPath = join(tmpdir(), `aws-mcp-abort-calls-${process.pid}-${randomUUID()}`);
+    try {
+      const ac = new AbortController();
+      ac.abort();
+      const r = await runAwsCall({
+        service: "s3api",
+        operation: "list-buckets",
+        // Large enough to take the params temp-file path, which the abort check
+        // has to precede.
+        params: { Blob: "x".repeat(10_000) },
+        ...fakeOpts("abort_hang", { env: { AWS_MCP_FAKE_CALLS_OUT: callsPath } }),
+        signal: ac.signal,
+      });
+      assert.equal(r.ok, false);
+      if (r.ok) return;
+      assert.equal(r.kind, "cancelled");
+      assert.match(r.error, /before the aws CLI was started/);
+      assert.equal(r.command, undefined, "nothing ran, so there is no command to show");
+      assert.equal(existsSync(callsPath), false, "fake-aws must never have been spawned");
+    } finally {
+      rmSync(callsPath, { force: true });
+    }
+  });
+});
+
 describe("spawn-hardening: the pinned child environment", () => {
   it("pins the CLI settings this server parses, over hostile values in the caller's env", async () => {
     const r = await runAwsCall({

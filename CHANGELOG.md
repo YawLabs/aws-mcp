@@ -11,6 +11,9 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Fixed
+- **A client cancel now stops the `aws` CLI child already in flight**, instead of leaving it to run to its per-call timeout (60s by default). `runAwsCall` takes an `AbortSignal`: already aborted, nothing is spawned; aborted mid-call, the child is killed through the same path the timeout uses and the call settles at once as `cancelled`. Wired into `aws_sso_list_assignments` / `aws_sso_generate_profiles` discovery, `aws_multi_region` and `aws_multi_account`, where an in-flight entry now comes back as `errorKind: "cancelled"`.
+
 ## [2.7.0] — 2026-11-11
 
 ### Added

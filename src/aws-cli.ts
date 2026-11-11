@@ -372,6 +372,15 @@ interface AwsCallOptions {
    * re-authenticate something unrelated to the failure.
    */
   omitProfile?: boolean;
+  /**
+   * Cancels the call (typically ToolContext.signal, which aborts when the MCP
+   * client cancels the request). Already aborted: nothing is spawned and the
+   * call settles at once. Aborted while the child runs: the child is killed
+   * through the same killProc path the timeout uses, and the call settles with
+   * kind `cancelled` -- never `timeout` or `nonzero_exit` -- without waiting for
+   * timeoutMs.
+   */
+  signal?: AbortSignal;
 }
 
 // AuthErrorKind MINUS "other". classifyAuthError returns "other" for anything
@@ -383,6 +392,7 @@ export type AwsCallFailureKind =
   | "bad_input"
   | "spawn_failure"
   | "timeout"
+  | "cancelled"
   | "output_too_large"
   | "malformed_json"
   | "nonzero_exit";
@@ -545,6 +555,12 @@ function validateNames(service: string, operationTokens: string[]): string | nul
     return `Refusing to run '${command}': it ${disclosure}, and that output would land in this conversation. It sends no request to AWS, so no IAM policy can limit it. Run it yourself in a terminal if you need those values.`;
   }
   return null;
+}
+
+function cancelledMessage(started: boolean): string {
+  return started
+    ? "Cancelled by the client: the aws CLI was stopped before it finished. If the operation changes state, check whether the request reached AWS before retrying."
+    : "Cancelled by the client before the aws CLI was started. Nothing was sent to AWS.";
 }
 
 export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
@@ -713,6 +729,13 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     }
     inputDir = null;
   };
+
+  // Checked here -- after every input check, before the params temp file is
+  // written or anything is spawned -- so an already-cancelled request costs no
+  // child process and leaves no file behind.
+  if (opts.signal?.aborted) {
+    return Promise.resolve({ ok: false, kind: "cancelled", error: cancelledMessage(false) });
+  }
 
   // Set when the params went to a file: the argv index of the `file://` value and
   // the inline JSON to show there instead, so `command` reads the same whichever
@@ -931,6 +954,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     let stderrBytes = 0;
     let killed = false;
     let timedOut = false;
+    let cancelled = false;
     let tooLarge = false;
     let settled = false;
     // Handle + absolute deadline for the pipe-close fallback (armPipeCloseGrace
@@ -952,6 +976,7 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutHandle);
+      opts.signal?.removeEventListener("abort", onAbort);
       if (graceHandle !== null) {
         clearTimeout(graceHandle);
         graceHandle = null;
@@ -984,6 +1009,18 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
           ok: false,
           kind: "timeout",
           error: `aws CLI timed out after ${Math.round(timeoutMs / 1000)}s. Raise timeoutMs or narrow the query (filters, --max-items).`,
+          command: displayCommand,
+          commandArgv: displayArgv,
+          rawStdout: stdoutBuf,
+          rawStderr: stderrBuf,
+        });
+        return;
+      }
+      if (cancelled) {
+        settle({
+          ok: false,
+          kind: "cancelled",
+          error: cancelledMessage(true),
           command: displayCommand,
           commandArgv: displayArgv,
           rawStdout: stdoutBuf,
@@ -1165,6 +1202,28 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
       // shortens it the moment the child is actually reaped.
       armPipeCloseGrace(KILL_ESCALATION_MS + PIPE_CLOSE_GRACE_MS);
     }, timeoutMs);
+
+    // The client-cancel kill site. Same shape as the timeout above: the same
+    // procHasExited guard (a child that already exited keeps its natural
+    // result), the same killProc, the same pipe-close bound. A function
+    // declaration so settle() above can remove it by reference.
+    function onAbort(): void {
+      if (killed || settled) return;
+      if (procHasExited(proc)) {
+        armPipeCloseGrace(PIPE_CLOSE_GRACE_MS);
+        return;
+      }
+      killed = true;
+      cancelled = true;
+      killProc(proc);
+      armPipeCloseGrace(KILL_ESCALATION_MS + PIPE_CLOSE_GRACE_MS);
+    }
+    if (opts.signal) {
+      // Defensive: an 'abort' listener added to an already-aborted signal never
+      // fires, so re-check rather than rely on the pre-spawn check above.
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     proc.stdout?.on("data", (chunk: Buffer) => {
       stdoutBytes += chunk.length;
