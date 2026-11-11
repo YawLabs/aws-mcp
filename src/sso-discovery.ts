@@ -73,11 +73,36 @@ export interface DiscoveryOptions {
   includeRoles: boolean;
   /** Test seam for the overall deadline. */
   deadlineMs?: number;
+  /** Test seam for the list-account-roles fan-out width. */
+  concurrency?: number;
+  /**
+   * Aborts when the MCP client cancels the request (ToolContext.signal). Once
+   * aborted, no further `aws sso` call is LAUNCHED and the result is a
+   * `cancelled` error. A call already in flight runs to its own timeout:
+   * runAwsCall takes no signal, so it cannot be killed early.
+   */
+  signal?: AbortSignal;
+  /**
+   * Called once per account as its role listing settles (ToolContext's
+   * reportProgress, typically). `done` rises 1..total. The message carries the
+   * account ID and an outcome only -- never the token.
+   */
+  onProgress?: (done: number, total: number, message: string) => void;
 }
 
 /** Last-ditch guard: no string leaving this module may contain the token. */
 export function scrubToken(text: string, token: string): string {
   return token.length > 0 ? text.split(token).join("<redacted-token>") : text;
+}
+
+function cancelledResult(done: number, total: number | null): DiscoveryResult {
+  const where =
+    total === null ? "before the account list was read" : `after ${done} of ${total} account(s) had their roles listed`;
+  return {
+    ok: false,
+    errorKind: "cancelled",
+    error: `Cancelled by the client ${where}. No further aws sso calls were started; re-run aws_sso_list_assignments (or aws_sso_generate_profiles) to get the full result.`,
+  };
 }
 
 function noTokenMessage(o: { ssoSession: string; startUrl: string }, rejected: boolean): string {
@@ -198,13 +223,19 @@ async function listAll(
   operation: "list-accounts" | "list-account-roles",
   baseInput: Record<string, string>,
   listKey: string,
-  o: { ssoRegion: string; accessToken: string; deadline: number },
-): Promise<{ ok: true; items: unknown[] } | (CallOutcome & { ok: false }) | { ok: false; badOutput: string }> {
+  o: { ssoRegion: string; accessToken: string; deadline: number; signal?: AbortSignal },
+): Promise<
+  | { ok: true; items: unknown[] }
+  | (CallOutcome & { ok: false })
+  | { ok: false; badOutput: string }
+  | { ok: false; cancelled: true }
+> {
   const items: unknown[] = [];
   const seenTokens = new Set<string>();
   let nextToken: string | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
     const remaining = o.deadline - Date.now();
+    if (o.signal?.aborted) return { ok: false, cancelled: true };
     if (remaining <= 0) return { ok: false, unauthorized: false, message: "deadline exceeded" };
     const input = nextToken ? { ...baseInput, nextToken } : baseInput;
     const r = await ssoCall(operation, input, { ...o, timeoutMs: Math.min(PER_CALL_TIMEOUT_MS, remaining) });
@@ -230,9 +261,11 @@ async function listAll(
  */
 export async function listAssignments(o: DiscoveryOptions): Promise<DiscoveryResult> {
   const deadline = Date.now() + (o.deadlineMs ?? OVERALL_DEADLINE_MS);
-  const common = { ssoRegion: o.ssoRegion, accessToken: o.accessToken, deadline };
+  const common = { ssoRegion: o.ssoRegion, accessToken: o.accessToken, deadline, signal: o.signal };
+  if (o.signal?.aborted) return cancelledResult(0, null);
   const accountsRes = await listAll("list-accounts", { accessToken: o.accessToken }, "accountList", common);
   if (!accountsRes.ok) {
+    if ("cancelled" in accountsRes) return cancelledResult(0, null);
     if ("badOutput" in accountsRes) {
       return { ok: false, errorKind: "bad_output", error: scrubToken(accountsRes.badOutput, o.accessToken) };
     }
@@ -264,14 +297,40 @@ export async function listAssignments(o: DiscoveryOptions): Promise<DiscoveryRes
     });
   }
 
+  if (o.signal?.aborted) return cancelledResult(0, accounts.length);
+
   if (o.includeRoles) {
+    const total = accounts.length;
     let next = 0;
+    let done = 0;
+    const settled = (acct: DiscoveredAccount): void => {
+      // On COMPLETION, never on dispatch (same rule as aws_multi_account): with
+      // six in flight, counting at dispatch would reach `total` early. No lock
+      // needed -- workers interleave only at await boundaries.
+      done++;
+      try {
+        o.onProgress?.(
+          done,
+          total,
+          `${acct.accountId}: ${acct.rolesError === null ? `${acct.roles.length} role(s)` : "failed"} (${done}/${total})`,
+        );
+      } catch {
+        // Progress is advisory; a throwing notifier must not abandon the sweep.
+      }
+    };
     const worker = async (): Promise<void> => {
       while (next < accounts.length) {
+        // Checked before CLAIMING an account, so a cancelled request launches
+        // no further CLI call -- the client has already stopped listening.
+        if (o.signal?.aborted) return;
         const acct = accounts[next++];
-        if (acct.rolesError !== null) continue;
+        if (acct.rolesError !== null) {
+          settled(acct);
+          continue;
+        }
         if (Date.now() >= deadline) {
           acct.rolesError = "deadline exceeded";
+          settled(acct);
           continue;
         }
         const r = await listAll(
@@ -285,6 +344,10 @@ export async function listAssignments(o: DiscoveryOptions): Promise<DiscoveryRes
             const rn = role && typeof role === "object" ? (role as Record<string, unknown>).roleName : undefined;
             if (typeof rn === "string") acct.roles.push({ roleName: rn });
           }
+        } else if ("cancelled" in r) {
+          // Aborted between pages of this account: it is not settled, and the
+          // whole call comes back cancelled below.
+          return;
         } else if ("badOutput" in r) {
           acct.rolesError = scrubToken(r.badOutput, o.accessToken);
         } else if (r.unauthorized) {
@@ -292,9 +355,12 @@ export async function listAssignments(o: DiscoveryOptions): Promise<DiscoveryRes
         } else {
           acct.rolesError = r.message;
         }
+        settled(acct);
       }
     };
-    await Promise.all(Array.from({ length: Math.min(ROLE_CONCURRENCY, accounts.length) }, worker));
+    const width = Math.max(1, o.concurrency ?? ROLE_CONCURRENCY);
+    await Promise.all(Array.from({ length: Math.min(width, accounts.length) }, worker));
+    if (o.signal?.aborted) return cancelledResult(done, total);
   }
   return { ok: true, accounts };
 }

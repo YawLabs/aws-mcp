@@ -40,7 +40,7 @@ import {
 import { type DiscoveredAccount, listAssignments } from "../sso-discovery.js";
 import { readSsoAccessToken } from "../sso-token.js";
 import { type AwsProfile, parseAwsConfig, parseSsoSessions } from "./profiles.js";
-import type { Tool, ToolResult } from "./tool.js";
+import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /** Generate's default (no selection) cap. Beyond it, the rest are reported as
  *  dropped rather than written: hundreds of profiles nobody chose is a config
@@ -88,6 +88,7 @@ async function discover(
   s: SessionInfo,
   accountIds: readonly string[] | undefined,
   includeRoles: boolean,
+  ctx: ToolContext | undefined,
 ): Promise<{ ok: true; accounts: DiscoveredAccount[] } | { ok: false; r: ToolResult }> {
   const token = readSsoAccessToken({ ssoSession: s.ssoSession, startUrl: s.startUrl });
   if (!token) {
@@ -107,6 +108,8 @@ async function discover(
     accessToken: token.accessToken,
     accountIds,
     includeRoles,
+    signal: ctx?.signal,
+    onProgress: (done, total, message) => ctx?.reportProgress(done, total, message),
   });
   if (!res.ok) return { ok: false, r: { ok: false, errorKind: res.errorKind, error: res.error } };
   return { ok: true, accounts: res.accounts };
@@ -261,7 +264,7 @@ export const ssoSetupTools: readonly Tool[] = [
         .describe("Only these 12-digit account IDs. Default: every assigned account."),
       includeRoles: z.boolean().optional().describe("Default true. false returns accounts only (one AWS call)."),
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as { ssoSession: string; accountIds?: string[]; includeRoles?: boolean };
       const idErr = validateAccountIds(i.accountIds);
       if (idErr) return { ok: false, errorKind: "bad_input", error: idErr };
@@ -269,7 +272,7 @@ export const ssoSetupTools: readonly Tool[] = [
       if (!sess.ok) return sess.r;
       const s = sess.s;
       const includeRoles = i.includeRoles ?? true;
-      const found = await discover(s, i.accountIds, includeRoles);
+      const found = await discover(s, i.accountIds, includeRoles, ctx);
       if (!found.ok) return found.r;
       const profiles = parseAwsConfig(readConfigText(s.configPath));
       let roles = 0;
@@ -342,7 +345,7 @@ export const ssoSetupTools: readonly Tool[] = [
         .describe("Default region written into each new profile. Default: the sso-session's sso_region."),
       dryRun: z.boolean().optional().describe("Report what would be written without touching the file."),
     }),
-    handler: async (input: unknown): Promise<ToolResult> => {
+    handler: async (input: unknown, ctx?: ToolContext): Promise<ToolResult> => {
       const i = input as {
         ssoSession: string;
         selection?: Array<{ accountId: string; roleName: string; profileName?: string }>;
@@ -389,7 +392,7 @@ export const ssoSetupTools: readonly Tool[] = [
       const region = i.region ?? s.ssoRegion;
 
       const selIds = i.selection ? [...new Set(i.selection.map((x) => x.accountId))] : undefined;
-      const found = await discover(s, selIds, true);
+      const found = await discover(s, selIds, true, ctx);
       if (!found.ok) return found.r;
 
       const skipped: Array<PlannedItem & { reason: string }> = [];

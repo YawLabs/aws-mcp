@@ -23,10 +23,11 @@ import { EMPTY_CONFIG_FILE_ERROR } from "../aws-paths.js";
 import { _resetSession } from "../session.js";
 import { _clearCliVersionCache, _clearSessions, startSsoLogin } from "../sso.js";
 import { MANAGED_MARKER } from "../sso-config.js";
+import { listAssignments } from "../sso-discovery.js";
 import { _resetStartSsoLoginImpl, _sessionStartQueueDepth, _setStartSsoLoginImpl, authTools } from "./auth.js";
 import { profilesTools } from "./profiles.js";
 import { ssoSetupTools } from "./sso-setup.js";
-import type { ToolResult } from "./tool.js";
+import type { ToolContext, ToolResult } from "./tool.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
@@ -77,8 +78,8 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
   let saved: Record<string, string | undefined>;
   let results: unknown[];
 
-  async function call(name: string, input: unknown): Promise<ToolResult & { data?: Json }> {
-    const r = await tool(name).handler(input);
+  async function call(name: string, input: unknown, ctx?: ToolContext): Promise<ToolResult & { data?: Json }> {
+    const r = await tool(name).handler(input, ctx);
     results.push(r);
     return r as ToolResult & { data?: Json };
   }
@@ -497,6 +498,80 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
     assert.deepEqual(dev.roles, []);
     assert.equal(r.data.accounts[0].rolesError, null);
     assert.equal(r.data.accounts[0].roles.length, 2);
+  });
+
+  it("reports role-discovery progress once per account with rising counts, token-free", async () => {
+    seedSession();
+    const seen: Array<{ progress: number; total?: number; message?: string }> = [];
+    const ctx: ToolContext = { reportProgress: (progress, total, message) => seen.push({ progress, total, message }) };
+    const r = await call("aws_sso_list_assignments", { ssoSession: "acme" }, ctx);
+    assert.equal(r.ok, true, r.error ?? "");
+    assert.deepEqual(
+      seen.map((p) => [p.progress, p.total]),
+      [
+        [1, 3],
+        [2, 3],
+        [3, 3],
+      ],
+    );
+    assert.deepEqual(seen.map((p) => p.message?.split(":")[0]).sort(), [
+      "111111111111",
+      "222222222222",
+      "333333333333",
+    ]);
+    assert.ok(!JSON.stringify(seen).includes(SENTINEL), "the token leaked into a progress message");
+    // generate_profiles threads the same context.
+    const seenGen: number[] = [];
+    const g = await call(
+      "aws_sso_generate_profiles",
+      { ssoSession: "acme", dryRun: true },
+      { reportProgress: (p) => seenGen.push(p) },
+    );
+    assert.equal(g.ok, true, g.error ?? "");
+    assert.deepEqual(seenGen, [1, 2, 3]);
+  });
+
+  it("a cancelled request launches no aws sso call and returns a cancelled error", async () => {
+    seedSession();
+    const ac = new AbortController();
+    ac.abort();
+    for (const [name, input] of [
+      ["aws_sso_list_assignments", { ssoSession: "acme" }],
+      ["aws_sso_generate_profiles", { ssoSession: "acme", dryRun: true }],
+    ] as const) {
+      const r = await call(name, input, { reportProgress: () => {}, signal: ac.signal });
+      assert.equal(r.ok, false, name);
+      assert.equal(r.errorKind, "cancelled", name);
+      assert.match(r.error ?? "", /Cancelled by the client/);
+    }
+    assert.equal(calls().filter((a) => a[0] === "sso").length, 0);
+  });
+
+  it("an abort mid-sweep stops launching list-account-roles calls", async () => {
+    seedSession();
+    const ac = new AbortController();
+    const progress: number[] = [];
+    const res = await listAssignments({
+      ssoSession: "acme",
+      startUrl: START,
+      ssoRegion: "us-east-1",
+      accessToken: SENTINEL,
+      includeRoles: true,
+      concurrency: 1,
+      signal: ac.signal,
+      onProgress: (done) => {
+        progress.push(done);
+        ac.abort();
+      },
+    });
+    assert.equal(res.ok, false);
+    assert.equal(!res.ok && res.errorKind, "cancelled");
+    assert.match(!res.ok ? res.error : "", /after 1 of 3 account/);
+    assert.deepEqual(progress, [1]);
+    const ops = calls()
+      .filter((a) => a[0] === "sso")
+      .map((a) => a[1]);
+    assert.deepEqual(ops, ["list-accounts", "list-account-roles"]);
   });
 
   it("scrubs a token the CLI echoed into its error text", async () => {
