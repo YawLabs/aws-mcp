@@ -74,6 +74,8 @@ import type { Tool, ToolResult } from "./tool.js";
  * Intentionally NOT bound (run as separate MCP tool calls):
  *   - aws_list_profiles, aws_whoami, aws_login_start, aws_login_complete,
  *     aws_refresh_if_expiring_soon, aws_session_*
+ *   - aws_sso_list_assignments, aws_sso_generate_profiles (they read the SSO
+ *     bearer token and write the user's config file -- not script material)
  *   - aws_script itself (no self-recursion)
  * Auth/session/profile tools are intentionally not bound -- they reshape
  * process-wide state that doesn't compose with scripted orchestration.

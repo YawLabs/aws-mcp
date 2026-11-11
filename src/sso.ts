@@ -49,12 +49,38 @@ function clampRawOutput(text: string): string {
   return `${text.slice(0, MAX_RAW_OUTPUT_CHARS)}\n... [truncated ${text.length - MAX_RAW_OUTPUT_CHARS} chars of 'aws sso login' output]`;
 }
 
+/**
+ * What an `aws sso login` authenticates: a named profile (the original flow),
+ * or an `[sso-session <name>]` block directly, with no profile at all (the
+ * IAM Identity Center bootstrap -- a brand-new user has no profile yet, only a
+ * start URL). The two share every bit of the spawn/parse/TTL/reap machinery
+ * below; only the argv flag and the dedupe identity differ.
+ */
+export type LoginTarget = { kind: "profile"; name: string } | { kind: "sso-session"; name: string };
+
+/** A bare string is a profile name, so every existing caller keeps working. */
+function toTarget(target: LoginTarget | string): LoginTarget {
+  return typeof target === "string" ? { kind: "profile", name: target } : target;
+}
+
+/** "profile 'x'" / "sso-session 'x'", for messages. */
+function describeTarget(t: LoginTarget): string {
+  return `${t.kind} '${t.name}'`;
+}
+
+/** The argv selector for a target. */
+function targetFlag(t: LoginTarget): [string, string] {
+  return t.kind === "profile" ? ["--profile", t.name] : ["--sso-session", t.name];
+}
+
 interface LoginStartResult {
   ok: true;
   sessionId: string;
   verificationUrl: string;
   userCode: string;
+  /** The target's name. Kept under this key for the profile flow's callers. */
   profile: string;
+  target: LoginTarget;
 }
 
 interface LoginStartError {
@@ -71,7 +97,7 @@ interface LoginWaitResult {
 }
 
 interface LoginSession {
-  profile: string;
+  target: LoginTarget;
   proc: ChildProcess;
   verificationUrl: string;
   userCode: string;
@@ -81,7 +107,7 @@ interface LoginSession {
   ttlTimer: NodeJS.Timeout | null;
   // True once the subprocess has exited. A completed session still holds the
   // wait result for waitForLogin to consume, but is excluded from
-  // findActiveSessionByProfile so a follow-up aws_login_start spawns fresh
+  // findActiveSession so a follow-up aws_login_start spawns fresh
   // instead of re-surfacing stale URL+code.
   completed: boolean;
   // Reap timer, armed once the subprocess exits. `sessions` is otherwise only
@@ -133,9 +159,13 @@ const pendingStarts = new Map<string, Promise<LoginStartResult | LoginStartError
  * here have a fixed shape and we sort env entries explicitly. The hash keeps
  * the map key compact even when `opts.env` carries process.env.
  */
-function dedupeKey(profile: string, opts: SsoLoginOptions): string {
+export function _dedupeKey(target: LoginTarget, opts: SsoLoginOptions): string {
   const payload = JSON.stringify({
-    profile,
+    // `kind` keeps profile 'x' and sso-session 'x' from sharing one subprocess:
+    // they are different logins (different argv, different token cache entry),
+    // and a dedupe that merged them would hand one caller the other's URL+code.
+    kind: target.kind,
+    profile: target.name,
     command: opts.command ?? null,
     prefixArgs: opts.prefixArgs ?? null,
     urlWaitMs: opts.urlWaitMs ?? null,
@@ -189,7 +219,7 @@ export function parseLoginOutput(text: string): { url: string | null; code: stri
  */
 export const DEVICE_CODE_MIN_CLI = { major: 2, minor: 22, patch: 0 } as const;
 
-interface CliVersion {
+export interface CliVersion {
   major: number;
   minor: number;
   patch: number;
@@ -213,24 +243,44 @@ export function parseAwsCliVersion(text: string): CliVersion | null {
  */
 export function supportsDeviceCodeFlag(v: CliVersion | null): boolean {
   if (!v) return true;
-  if (v.major !== DEVICE_CODE_MIN_CLI.major) return v.major > DEVICE_CODE_MIN_CLI.major;
-  if (v.minor !== DEVICE_CODE_MIN_CLI.minor) return v.minor > DEVICE_CODE_MIN_CLI.minor;
-  return v.patch >= DEVICE_CODE_MIN_CLI.patch;
+  return versionAtLeast(v, DEVICE_CODE_MIN_CLI);
 }
 
 /**
  * Build the argv tail for `aws sso login` (everything after any test prefix).
  *
- * `profile` is always non-empty here: startSsoLogin rejects an empty profile at
- * the isValidProfileName gate (PROFILE_NAME_RE requires >=1 char) before this
- * runs, so `--profile` is unconditional. It stays ahead of the profile value
- * and after `--use-device-code` so the value can never be read as a flag.
+ * The name is always non-empty here: startSsoLogin rejects an empty one at the
+ * isValidProfileName gate (PROFILE_NAME_RE requires >=1 char) before this runs,
+ * so the selector flag is unconditional. `--profile` / `--sso-session` comes
+ * after `--use-device-code` and the name goes LAST, so the value can never be
+ * read as a flag. A bare string is a profile name (the existing unit tests).
  */
-export function _buildLoginArgs(profile: string, useDeviceCode: boolean): string[] {
+export function _buildLoginArgs(target: LoginTarget | string, useDeviceCode: boolean): string[] {
   const args = ["sso", "login", "--no-browser"];
   if (useDeviceCode) args.push("--use-device-code");
-  args.push("--profile", profile);
+  args.push(...targetFlag(toTarget(target)));
   return args;
+}
+
+/**
+ * First AWS CLI version with `aws sso login --sso-session` (and the
+ * `[sso-session]` config block it reads). An sso-session login on an older CLI
+ * is refused up front with an upgrade message rather than left to fail with an
+ * argparse error the model would have to decode.
+ */
+export const SSO_SESSION_MIN_CLI = { major: 2, minor: 9, patch: 0 } as const;
+
+function versionAtLeast(v: CliVersion, min: CliVersion): boolean {
+  if (v.major !== min.major) return v.major > min.major;
+  if (v.minor !== min.minor) return v.minor > min.minor;
+  return v.patch >= min.patch;
+}
+
+/** Can this CLI run `--sso-session`? Unparseable -> assume modern, the same
+ *  asymmetry as supportsDeviceCodeFlag: a wrong "yes" fails loudly in the CLI's
+ *  own output, a wrong "no" would block a working install. */
+export function supportsSsoSession(v: CliVersion | null): boolean {
+  return v === null || versionAtLeast(v, SSO_SESSION_MIN_CLI);
 }
 
 // Deliberately tight. This runs IN FRONT of the 15s URL wait on the one call
@@ -245,24 +295,30 @@ const VERSION_PROBE_TIMEOUT_MS = 2_000;
 const MAX_VERSION_PROBE_BYTES = 64 * 1024;
 
 /**
- * probe key -> in-flight/settled device-code-support promise.
+ * probe key -> in-flight/settled parsed-version promise (null = unknown).
  * Cached because the answer is a property of the binary on PATH, not of the
  * login attempt: paying a spawn per login would put ~200-400ms on the one
  * interaction where the user is already waiting.
  */
-const deviceCodeSupport = new Map<string, Promise<boolean>>();
+const cliVersions = new Map<string, Promise<CliVersion | null>>();
 
 /** Test seam — drop the cached `aws --version` probe. */
 export function _clearCliVersionCache(): void {
-  deviceCodeSupport.clear();
+  cliVersions.clear();
 }
 
-function probeDeviceCodeSupport(
+/**
+ * `aws --version`, parsed. Resolves null for "unknown" (spawn failure, timeout,
+ * unparseable output); every consumer treats unknown as "assume modern". Was
+ * `probeDeviceCodeSupport` returning a boolean; it returns the version now so
+ * the same single cached probe also answers the 2.9.0 `--sso-session` gate.
+ */
+function probeCliVersion(
   command: string,
   prefixArgs: string[],
   env?: NodeJS.ProcessEnv,
   timeoutMs: number = VERSION_PROBE_TIMEOUT_MS,
-): Promise<boolean> {
+): Promise<CliVersion | null> {
   // `command` is an absolute path by the time it gets here (doStartSsoLogin
   // resolves it), so PATH no longer decides which binary this answer is about.
   // It stays in the key anyway: it is a cheap identity input, and a caller that
@@ -270,10 +326,10 @@ function probeDeviceCodeSupport(
   // one verdict would be the wrong default. Same rule dedupeKey follows.
   // (envLookup because a Windows env object may spell it `Path`.)
   const key = JSON.stringify([command, prefixArgs, envLookup(env ?? {}, "PATH") ?? null]);
-  const cached = deviceCodeSupport.get(key);
+  const cached = cliVersions.get(key);
   if (cached) return cached;
 
-  const probe = new Promise<boolean>((resolve) => {
+  const probe = new Promise<CliVersion | null>((resolve) => {
     let proc: ChildProcess;
     try {
       proc = spawn(command, [...prefixArgs, "--version"], {
@@ -297,14 +353,14 @@ function probeDeviceCodeSupport(
     } catch {
       // Can't even spawn — let the login attempt itself report the missing
       // binary, with the flag included per the asymmetry above.
-      resolve(true);
+      resolve(null);
       return;
     }
 
     let out = "";
     let outBytes = 0;
     let done = false;
-    const finish = (value: boolean): void => {
+    const finish = (value: CliVersion | null): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
@@ -312,7 +368,7 @@ function probeDeviceCodeSupport(
     };
     const timer = setTimeout(() => {
       killProc(proc);
-      finish(true);
+      finish(null);
     }, timeoutMs);
     timer.unref();
 
@@ -331,15 +387,15 @@ function probeDeviceCodeSupport(
     // both rather than guessing which one this install writes to.
     proc.stdout?.on("data", (c: Buffer) => append(c, stdoutDecoder));
     proc.stderr?.on("data", (c: Buffer) => append(c, stderrDecoder));
-    proc.on("error", () => finish(true));
+    proc.on("error", () => finish(null));
     // 'close' rather than 'exit' so both pipes have flushed before parsing.
     proc.on("close", () => {
       out += stdoutDecoder.end() + stderrDecoder.end();
-      finish(supportsDeviceCodeFlag(parseAwsCliVersion(out)));
+      finish(parseAwsCliVersion(out));
     });
   });
 
-  deviceCodeSupport.set(key, probe);
+  cliVersions.set(key, probe);
   return probe;
 }
 
@@ -419,23 +475,26 @@ interface SsoLoginOptions {
  * profile per in-flight start.
  */
 export function startSsoLogin(
-  profile: string,
+  targetIn: LoginTarget | string,
   opts: SsoLoginOptions = {},
 ): Promise<LoginStartResult | LoginStartError> {
-  // Argv-safety: the resolved value lands in `aws sso login --profile X`.
-  // Reject up front so a malicious `profile` can't pose as a flag, AND so
-  // an invalid profile never enters the pendingStarts dedupe map (where a
-  // cached rejection would block legitimate retries for the same key).
-  if (!isValidProfileName(profile)) {
+  const target = toTarget(targetIn);
+  // Argv-safety: the resolved value lands in `aws sso login --profile X` (or
+  // `--sso-session X`). Reject up front so a malicious name can't pose as a
+  // flag, AND so an invalid name never enters the pendingStarts dedupe map
+  // (where a cached rejection would block legitimate retries for the same key).
+  // Both kinds share one rule: an sso-session name lands in the same argv slot
+  // and in an INI header, so it needs everything a profile name does.
+  if (!isValidProfileName(target.name)) {
     return Promise.resolve({
       ok: false,
-      error: `Invalid profile name '${profile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '=').`,
+      error: `Invalid ${target.kind === "profile" ? "profile" : "sso-session"} name '${target.name}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '=').`,
     });
   }
-  const key = dedupeKey(profile, opts);
+  const key = _dedupeKey(target, opts);
   const pending = pendingStarts.get(key);
   if (pending) return pending;
-  const promise = doStartSsoLogin(profile, opts);
+  const promise = doStartSsoLogin(target, opts);
   pendingStarts.set(key, promise);
   void promise.finally(() => {
     if (pendingStarts.get(key) === promise) {
@@ -445,7 +504,10 @@ export function startSsoLogin(
   return promise;
 }
 
-async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<LoginStartResult | LoginStartError> {
+async function doStartSsoLogin(
+  target: LoginTarget,
+  opts: SsoLoginOptions,
+): Promise<LoginStartResult | LoginStartError> {
   // Same resolution as every aws_call, so `aws sso login` cannot be a different
   // binary than the rest of the server runs -- and so AWS_MCP_AWS_CLI covers
   // the login too. Resolved before the version probe: with no CLI to run there
@@ -459,11 +521,24 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
   const sessionTtlMs = opts.sessionTtlMs ?? SESSION_TTL_MS;
   const completedReapMs = opts.completedReapMs ?? COMPLETED_SESSION_REAP_MS;
   const spawnEnv = opts.env;
-  const useDeviceCode =
-    opts.useDeviceCode ?? (await probeDeviceCodeSupport(command, prefixArgs, spawnEnv, opts.versionProbeTimeoutMs));
+  // The version is needed for the device-code flag (unless a test pinned it)
+  // and, for an sso-session target, for the 2.9.0 gate -- which a pinned
+  // useDeviceCode must not skip, or a too-old CLI would get past it in exactly
+  // the configuration the gate exists for.
+  const needVersion = opts.useDeviceCode === undefined || target.kind === "sso-session";
+  const version = needVersion ? await probeCliVersion(command, prefixArgs, spawnEnv, opts.versionProbeTimeoutMs) : null;
+  if (target.kind === "sso-session" && !supportsSsoSession(version)) {
+    const v = version ? `${version.major}.${version.minor}.${version.patch}` : "unknown";
+    const min = SSO_SESSION_MIN_CLI;
+    return {
+      ok: false,
+      error: `aws CLI ${v} predates --sso-session (${min.major}.${min.minor}.${min.patch}). Upgrade the AWS CLI v2 (2.22.0 or newer recommended).`,
+    };
+  }
+  const useDeviceCode = opts.useDeviceCode ?? supportsDeviceCodeFlag(version);
 
   return new Promise((resolve) => {
-    const args = [...prefixArgs, ..._buildLoginArgs(profile, useDeviceCode)];
+    const args = [...prefixArgs, ..._buildLoginArgs(target, useDeviceCode)];
 
     let proc: ChildProcess;
     try {
@@ -549,7 +624,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         killProc(proc);
         resolve({
           ok: false,
-          error: `Timed out after ${urlWaitMs / 1000}s waiting for 'aws sso login' to print a verification URL. The AWS CLI may be misconfigured, or the profile '${profile}' may not be set up for SSO.`,
+          error: `Timed out after ${urlWaitMs / 1000}s waiting for 'aws sso login' to print a verification URL. The AWS CLI may be misconfigured, or the ${describeTarget(target)} may not be set up for SSO.`,
           rawOutput: clampRawOutput(stdoutBuf + stderrBuf),
         });
       }
@@ -576,7 +651,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
           useDeviceCode
             ? "aws-mcp passed --use-device-code and this AWS CLI did not honor it."
             : "aws-mcp omitted --use-device-code because this AWS CLI reported a version older than 2.22.0."
-        } Upgrade the AWS CLI to 2.22.0 or newer, or run 'aws sso login --use-device-code --profile ${profile}' in a terminal and retry.`,
+        } Upgrade the AWS CLI to 2.22.0 or newer, or run 'aws sso login --use-device-code ${targetFlag(target).join(" ")}' in a terminal and retry.`,
         rawOutput: clampRawOutput(stdoutBuf + stderrBuf),
       });
       return true;
@@ -607,7 +682,7 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
         const ttlTimer = setTimeout(() => _ttlKillswitchTick(sessions.get(sessionId), proc), sessionTtlMs);
         ttlTimer.unref();
         const session: LoginSession = {
-          profile,
+          target,
           proc,
           verificationUrl: urlSeen,
           userCode: codeSeen,
@@ -628,7 +703,8 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
           sessionId,
           verificationUrl: urlSeen,
           userCode: codeSeen,
-          profile,
+          profile: target.name,
+          target,
         });
       }
     });
@@ -745,7 +821,9 @@ async function doStartSsoLogin(profile: string, opts: SsoLoginOptions): Promise<
 
 interface ActiveSession {
   sessionId: string;
+  /** The target's name (kept under this key for the profile flow's callers). */
   profile: string;
+  target: LoginTarget;
   verificationUrl: string;
   userCode: string;
 }
@@ -760,18 +838,38 @@ interface ActiveSession {
  * and code are stale; a follow-up start should spawn fresh rather than hand
  * out a finished session's verification details.
  */
-export function findActiveSessionByProfile(profile: string): ActiveSession | null {
+export function findActiveSession(target: LoginTarget): ActiveSession | null {
   for (const [sessionId, s] of sessions) {
-    if (s.profile === profile && !s.completed) {
+    // Kind AND name: a live sso-session login 'x' is not a login for profile
+    // 'x', and re-surfacing its code to a profile caller would complete the
+    // wrong login.
+    if (s.target.kind === target.kind && s.target.name === target.name && !s.completed) {
       return {
         sessionId,
-        profile: s.profile,
+        profile: s.target.name,
+        target: s.target,
         verificationUrl: s.verificationUrl,
         userCode: s.userCode,
       };
     }
   }
   return null;
+}
+
+/** The profile flow's original lookup; aws_refresh_if_expiring_soon and the
+ *  profile path of aws_login_start still call it. */
+export function findActiveSessionByProfile(profile: string): ActiveSession | null {
+  return findActiveSession({ kind: "profile", name: profile });
+}
+
+/**
+ * What a login session is for, read WITHOUT claiming it. aws_login_complete
+ * needs this before waitForLogin consumes the entry: an sso-session login has no
+ * profile to run the post-login identity check against, so the handler branches
+ * on it.
+ */
+export function getLoginTarget(sessionId: string): LoginTarget | null {
+  return sessions.get(sessionId)?.target ?? null;
 }
 
 /**

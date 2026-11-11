@@ -82,13 +82,15 @@ The rest -- SSO device-code re-login, CCAPI CRUD with dry-run diffs, multi-regio
 | Tool | What it does |
 |------|--------------|
 | `aws_whoami` | Current identity (account, ARN) + SSO token expiry countdown. Call this first. |
-| `aws_login_start` | Start `aws sso login --no-browser --use-device-code`, returns a verification URL + short code and a `sessionId`. (`--use-device-code` is omitted on AWS CLI older than 2.22.0, where the device grant is already the default.) |
-| `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity. |
+| `aws_login_start` | Start `aws sso login --no-browser --use-device-code`, returns a verification URL + short code and a `sessionId`. (`--use-device-code` is omitted on AWS CLI older than 2.22.0, where the device grant is already the default.) Or, with `ssoSession` + `startUrl` + `ssoRegion`, bootstrap an IAM Identity Center login with no profile -- see [First-time setup without a profile](#first-time-setup-without-a-profile-iam-identity-center). |
+| `aws_login_complete` | Block until the SSO subprocess finishes (you auth in your browser), returns the new identity (or, for an `ssoSession` login, the token status). |
 | `aws_refresh_if_expiring_soon` | Check the cached SSO token and auto-start a refresh when < `thresholdMinutes` remain (default 10). One round-trip for "am I about to expire? if so, re-login." |
 | `aws_session_set` | Set the default profile and/or region for the rest of this MCP session. "Switch to prod," "use us-west-2." |
 | `aws_session_get` | Show the current session defaults and where each value came from (`session`/`env`/`default`). |
 | `aws_session_clear` | Remove session profile/region overrides so env vars / defaults take over again. No args clears both. |
 | `aws_list_profiles` | List profiles configured in `~/.aws/config` -- names, regions, and SSO metadata. Use before switching profiles or when an SSO error names one you haven't seen. |
+| `aws_sso_list_assignments` | List the accounts and roles your Identity Center login can use, flagging which already have a profile. |
+| `aws_sso_generate_profiles` | Write `[profile ...]` sections for chosen (or all) account/role assignments into the AWS config file; never touches sections it did not create. |
 | `aws_assume_role` | Call STS AssumeRole with your current identity and stash the temp creds as a new profile (`mcp-<sessionName>`) in `~/.aws/credentials`. Use for cross-account access. The secret/session token stay on disk -- not returned to the model. Optional `timeoutMs` (default 120s) for slow SAML / `credential_process` cold starts. |
 | `aws_call` | Run any AWS API operation. `service: 's3api', operation: 'list-buckets'`, optional `params` (PascalCase JSON), optional `query` (JMESPath). Returns parsed JSON. Hand-written CLI commands (`s3 cp/ls/sync`, `logs tail`) and operations that stream their response to a file (`s3api get-object`, `bedrock-runtime invoke-model`, `bedrock-agentcore invoke-agent-runtime`, `lambda invoke`) never accept `--cli-input-json`, so `aws_call` cannot reach them; the error says so and names the alternative (`aws_lambda_invoke`, `aws_logs_tail`, `bedrock-runtime converse`, or a shell). Waiters work as `operation: 'wait <name>'`. Blob-typed params take base64. |
 | `aws_paginate` | Fetch one page of a paginated list/describe operation. Supports `query` too. Returns `nextToken`/`hasMore`; call again with the token to continue. |
@@ -240,12 +242,13 @@ For multi-region reads:
 ## Requirements
 
 - Node.js 22+ (or [oam.js](https://oamjs.org) -- see [Runtime](#runtime))
-- AWS CLI v2 on `PATH`. Every tool that talks to AWS shells out to it (all but `aws_docs_*`, `aws_session_*` and `aws_list_profiles`), so the CLI you have installed decides which services, operations and parameters are reachable. No minimum version is enforced:
+- AWS CLI v2 on `PATH`. Every tool that talks to AWS shells out to it (all but `aws_docs_*`, `aws_session_*` and `aws_list_profiles`), so the CLI you have installed decides which services, operations and parameters are reachable. (`aws_sso_generate_profiles` writes the config file in-process but still shells out for the account/role discovery it runs first.) No minimum version is enforced, with one exception:
   - **2.22.0+ recommended.** That release added `--use-device-code`, which this server needs to keep the SSO short-code flow working. Older 2.x still works -- the server detects the version and adapts.
+  - **2.9.0+ for a profile-free Identity Center login** (`aws_login_start` with `ssoSession`), which needs `aws sso login --sso-session`. On an older CLI that call is refused with an upgrade message; profile logins are unaffected.
   - **Developed and tested against 2.34.3.** Anything newer than your CLI is rejected by the CLI itself before a request is sent: an unknown service or operation as an "invalid choice" (the error then says to upgrade), a new parameter as `Unknown parameter in input`. Upgrade with `aws update` (CLI 2.36.0+, for installs made with AWS's installer or install script), otherwise with [the installer](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) or your package manager.
   - **Security, as of 2026-09:** CLI 2.35.3 or newer clears every published AWS CLI v2 advisory ([GHSA-747p-wmpv-9c78](https://github.com/aws/aws-cli/security/advisories/GHSA-747p-wmpv-9c78), [CVE-2026-13769](https://github.com/aws/aws-cli/security/advisories/GHSA-wfp6-f47h-hxc3), [CVE-2026-18654](https://github.com/aws/aws-cli/security/advisories/GHSA-hqvf-45jj-mccq)). None of the affected paths is reachable through this server: the four commands (`emr ssh/socks/put/get`, `codeartifact login`, `deploy register`, `iam create-virtual-mfa-device`) all register no `--cli-input-json`, which is the only way `aws_call` passes parameters, and the third advisory is about the opt-in `cli_history` database, which this server never enables. You do share that CLI install with everything else on the machine, though. Worth checking [the advisory list](https://github.com/aws/aws-cli/security/advisories) for newer ones: v2 ships as an installer, so a dependency scanner will never flag it.
   - AWS CLI **v1 is unsupported**; it entered maintenance mode on 2026-07-15 and reaches end of support on 2027-07-15.
-- An AWS profile the CLI can already use -- see [Environment](#environment) for how the profile is chosen. SSO / IAM Identity Center profiles also get the device-code re-login tools.
+- An AWS profile the CLI can already use -- see [Environment](#environment) for how the profile is chosen. SSO / IAM Identity Center profiles also get the device-code re-login tools. No profile yet? An Identity Center start URL is enough -- see [First-time setup without a profile](#first-time-setup-without-a-profile-iam-identity-center).
 
 ## Runtime
 
@@ -337,7 +340,7 @@ directory -- already in `.gitignore`.
 |----------|---------|---------|
 | `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | `default` | Profile used when a tool call omits `profile`. `AWS_DEFAULT_PROFILE` is the legacy spelling. `AWS_PROFILE` wins if both are set, as in AWS CLI v2 (standalone botocore and boto3 check `AWS_DEFAULT_PROFILE` first). An empty value counts as unset. |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` | Region used when a tool call omits `region`. `AWS_REGION` wins if both are set. |
-| `AWS_CONFIG_FILE` | `~/.aws/config` | The AWS config file. The CLI reads it for every call; `aws_list_profiles` and the SSO start-URL lookup in `aws_whoami` / `aws_login_complete` / `aws_refresh_if_expiring_soon` read the same file, with `~` expansion like botocore. |
+| `AWS_CONFIG_FILE` | `~/.aws/config` | The AWS config file. The CLI reads it for every call; `aws_list_profiles` and the SSO start-URL lookup in `aws_whoami` / `aws_login_complete` / `aws_refresh_if_expiring_soon` read the same file, with `~` expansion like botocore. aws-mcp also WRITES it: the `[sso-session]` block from `aws_login_start` with `ssoSession`, and the profiles from `aws_sso_generate_profiles` -- same semantics as the AWS CLI. The SSO token cache has no such variable: it always lives under the home directory (`HOME` on macOS / Linux, `USERPROFILE` on Windows), so a per-user gateway on Windows must set `USERPROFILE`, not only `HOME`. |
 | `AWS_SHARED_CREDENTIALS_FILE` | `~/.aws/credentials` | Where `aws_assume_role` writes the profile it creates. Honored (with `~` expansion, like botocore) so the write lands in the same file the CLI later reads. |
 | `AWS_MCP_AWS_CLI` | unset | Absolute path to the `aws` executable to run instead of the one found on `PATH`. For MCP hosts started from a GUI, which often inherit none of your shell's `PATH` -- and AWS's recommended installer now defaults to `~/.local/bin` on macOS and Linux, which such hosts rarely see. Find the path with `command -v aws` (macOS/Linux) or `where.exe aws` (Windows). In Git Bash on Windows use `where.exe aws`, not `command -v aws`: the latter prints a POSIX-style path (`/c/Program Files/...`) that this variable refuses, because it must be a native absolute path. It applies to every call and to `aws sso login`. Must be absolute, and on Windows must name `aws.exe`: a `.cmd` or `.bat` shim cannot be started without a shell. An unusable value fails every call with a message naming this variable, rather than quietly running a different CLI than you configured. Unset, the server walks the absolute directories on `PATH`; it never runs an `aws` from its working directory. |
 
@@ -381,7 +384,7 @@ Give each user's process its own environment. The `aws` CLI that every tool spaw
 | `HOME` (macOS / Linux) or `USERPROFILE` (Windows) | Locates `~/.aws/sso/cache`, where `aws sso login` writes the user's SSO token. There is no separate variable for the cache directory, so this is what keeps tokens apart. It is also the default location of the two files below. |
 | `AWS_CONFIG_FILE` | The user's profiles and `sso-session` blocks. Optional if it lives at `$HOME/.aws/config`. |
 | `AWS_SHARED_CREDENTIALS_FILE` | Where `aws_assume_role` writes the profiles it creates. Optional if it lives at `$HOME/.aws/credentials`. |
-| `TMPDIR` (macOS / Linux) or `TEMP` / `TMP` (Windows) | Scratch files for large `aws_call` payloads and Lambda packaging. |
+| `TMPDIR` (macOS / Linux) or `TEMP` / `TMP` (Windows) | Scratch files for large `aws_call` payloads and Lambda packaging, and the short-lived 0600 file that carries the SSO token to `aws sso list-*` during `aws_sso_list_assignments` / `aws_sso_generate_profiles`. |
 
 Lifecycle notes:
 
@@ -405,6 +408,48 @@ Lifecycle notes:
 
 The token is cached in `~/.aws/sso/cache/<hash>.json` the same way a normal `aws sso login` would, so the AWS CLI, the SDK, and every other tool on your machine pick it up transparently.
 
+### First-time setup without a profile (IAM Identity Center)
+
+A brand-new user often has no `~/.aws/config` at all -- just the start URL from their Identity Center portal. Four calls take them from that to working profiles:
+
+```
+1. aws_login_start({ ssoSession: "acme",
+                     startUrl: "https://acme.awsapps.com/start", ssoRegion: "us-east-1" })
+     -> writes the [sso-session acme] block, then runs
+        aws sso login --no-browser --use-device-code --sso-session acme
+     -> returns the URL + code, exactly like a profile login
+2. aws_login_complete({ sessionId })        -> { loggedIn, ssoSession, ssoToken, next }
+3. aws_sso_list_assignments({ ssoSession: "acme" })
+     -> every account and role you can use, and which already have a profile
+4. aws_sso_generate_profiles({ ssoSession: "acme" })      (or with `selection`, or `dryRun: true`)
+     -> writes one [profile] per assignment; use them with `profile` on any tool
+```
+
+What gets written to the config file (`AWS_CONFIG_FILE`, else `~/.aws/config`):
+
+```ini
+[sso-session acme]
+# managed-by: aws-mcp -- delete this line to take ownership; aws-mcp will then never change this section
+sso_start_url = https://acme.awsapps.com/start
+sso_region = us-east-1
+sso_registration_scopes = sso:account:access
+
+[profile prod-AdministratorAccess]
+# managed-by: aws-mcp -- delete this line to take ownership; aws-mcp will then never change this section
+sso_session = acme
+sso_account_id = 123456789012
+sso_role_name = AdministratorAccess
+region = us-east-1
+```
+
+- **Ownership.** aws-mcp only ever changes a section that carries the `managed-by: aws-mcp` marker line, and only its own keys (`sso_session`, `sso_account_id`, `sso_role_name`; `sso_start_url`, `sso_region`, `sso_registration_scopes` for the session block). Keys you add -- `output = table`, say -- survive. `region` is written when a profile is created and never changed afterwards. Delete the marker and the section is yours: aws-mcp will never touch it again. Add the marker by hand to hand a section to aws-mcp. A section without the marker is never modified -- there is no overwrite option -- so a name clash with a hand-written profile is reported under `skipped`, and a hand-written `[sso-session]` with a different start URL is refused. Everything else in the file is preserved byte for byte, CRLF included.
+- **Names.** `{accountName}-{roleName}` by default (`nameTemplate` changes it; placeholders `{accountName}` `{accountId}` `{roleName}` `{ssoSession}`). When two accounts share a name, every one of them gets the account ID inserted (`prod-111111111111-Admin`), so names do not depend on the order AWS lists accounts in. Characters outside the profile charset become `-`. An assignment that already has a profile -- generated or hand-written -- is not written twice.
+- **Defaults.** With no `selection`, every assignment is written, up to 200; the rest come back as `dropped`. `dryRun: true` previews the plan without touching the file.
+- **Authority.** IAM Identity Center and IAM remain the only authority. A generated profile is a pointer (session + account + role) and grants nothing on its own; the CLI exchanges the SSO token for role credentials, and IAM decides. Checking a `selection` against your live assignments only catches typos.
+- **The token.** Discovery calls `aws sso list-accounts` and `aws sso list-account-roles` with the cached bearer token. It is handed to the CLI through a 0600 temp file (`--cli-input-json file://...`) that is deleted as soon as the call returns -- never on the command line, so it does not show up in the process list on a shared host -- and it never appears in any tool result or error.
+- **Gateways.** In a one-process-per-user deployment (see [Multi-user gateways](#multi-user-gateways-one-process-per-user)) give each process its own `HOME`, `USERPROFILE` (Windows) and `AWS_CONFIG_FILE`. The session block, the generated profiles and the token all land in that user's files, and `.aws` is created on first use.
+- **CLI version.** `--sso-session` needs AWS CLI 2.9.0 or newer; 2.22.0+ is recommended for the device-code flow.
+
 ## Why this server must run locally (not on mcp.hosting)
 
 SSO tokens live in `~/.aws/sso/cache/` on *your* device. A remote MCP server can't read them. So this is a stdio server, not a hosted one. That's a constraint of AWS SSO, not a limitation of mcp.hosting.
@@ -415,7 +460,7 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
 
 **Stable in 1.x (anything below is a breaking change requiring a major bump):**
 
-- **Tool names** -- the 28 tool names listed in the Tools table above will not be renamed or removed.
+- **Tool names** -- the 30 tool names listed in the Tools table above will not be renamed or removed.
 - **Tool annotations** -- `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. These signal to MCP hosts how to gate calls; flipping them silently would break host UIs. Note the direction of the guarantee: an annotation may be tightened (made more cautious) in a patch release when it was previously understating what a tool can do -- v2.0.1 set `destructiveHint: true` on `aws_call`, `aws_multi_region` and `aws_resource_update` for exactly that reason. It will not be *loosened* outside a major. If your host suppresses confirmation prompts based on these, treat `aws_call` and `aws_multi_region` as able to invoke any AWS API the caller's IAM identity permits, including deletes.
 - **Required input fields** -- the required fields per tool will not change shape or be removed. New *optional* fields may be added.
 - **Success envelope shape per tool** -- the `data` object on `{ok: true, data}` responses, specifically:
@@ -424,11 +469,14 @@ From 1.0 onward this package follows [Semantic Versioning](https://semver.org/sp
   - `aws_multi_region` -> `{service, operation, regionCount, okCount, errorCount, results: [{region, ok, data?, command?, error?, errorKind?, truncated?}]}` (the aggregate response is capped; entries past the budget keep their `region`/`ok` but drop `data` and are flagged `truncated: true`. Error entries are never dropped, and `okCount`/`errorCount` are computed before capping, so they always describe what the calls did rather than what survived the cap.)
   - `aws_multi_account` -> `{service, operation, roleName, accountCount, okCount, errorCount, results: [{accountId, ok, data?, command?, error?, errorKind?, truncated?}]}` plus `truncated`, `truncatedAccounts` and `maxTotalResultBytes` when the 5 MB aggregate cap fired. Mirrors `aws_multi_region` field for field with `accountId` in place of `region`, including that `okCount`/`errorCount` are computed BEFORE capping so they describe what the calls did rather than what survived. Duplicate account IDs collapse, so `results.length` may be under `accounts.length`; use `accountCount`. Credentials are never written to `~/.aws/credentials` and never appear in `command`, `error` or `rawBody`.
   - `aws_whoami` -> `{account, userId, arn, profile, region, ssoToken: {expiresAt, minutesLeft, startUrl?} | null}` (`startUrl` is omitted when the cached token didn't record one)
-  - `aws_login_start` -> `{sessionId, profile, verificationUrl, userCode, instructions, reused?}` (`reused: true` when re-surfacing an in-flight login for the same profile)
-  - `aws_login_complete` -> `{loggedIn, account, userId, arn, profile, region, ssoToken}` (same `ssoToken` shape as `aws_whoami`, including the optional `startUrl`)
+  - `aws_login_start` -> `{sessionId, profile, verificationUrl, userCode, instructions, reused?}` (`reused: true` when re-surfacing an in-flight login for the same profile). With `ssoSession`: `{sessionId, ssoSession, startUrl, ssoRegion, configPath, sessionBlock: "created" | "existing" | "updated", verificationUrl, userCode, instructions, reused?}`
+  - `aws_login_complete` -> `{loggedIn, account, userId, arn, profile, region, ssoToken}` (same `ssoToken` shape as `aws_whoami`, including the optional `startUrl`). For an `ssoSession` login: `{loggedIn, ssoSession, startUrl, ssoToken, next, note?}`
+  - `aws_sso_list_assignments` -> `{ssoSession, startUrl, ssoRegion, accounts: [{accountId, accountName, roles?: [{roleName, profile: string | null, managed?}], rolesError?: string | null}], totals: {accounts, roles, configured}}` (`roles` / `rolesError` are absent with `includeRoles: false`)
+  - `aws_sso_generate_profiles` -> `{configPath, dryRun, written: [{profile, accountId, roleName, action: "created" | "updated"}], unchanged: [{profile, accountId, roleName}], skipped: [{profile, accountId, roleName, reason}], stale: [{profile, accountId, roleName}], dropped?, droppedReason?, next}` (`stale`: managed profiles for this session whose assignment no longer exists -- reported, never deleted)
+  - The config-file ownership marker `# managed-by: aws-mcp` (any comment character, any text after it) is part of this contract: aws-mcp changes a section only when its body carries that line.
   - `aws_refresh_if_expiring_soon` -> **one of two shapes by branch:** `{status: "ok", minutesLeft, expiresAt, profile}` when the cached token has more than `thresholdMinutes` left, or `{status: "refreshing", reason, sessionId, profile, verificationUrl, userCode, reused?, instructions}` when a refresh is in flight. Discriminate on `status`.
   - `aws_assume_role` -> `{profile, credentialsPath, expiration, assumedRoleArn, assumedRoleId, sourceProfile, hint, warning?}` (`warning` is present only when the target profile already existed and its three credential keys were overwritten in place; `credentialsPath` follows `AWS_SHARED_CREDENTIALS_FILE` when that is set)
-  - `aws_list_profiles` -> `{configPath, profiles: [{name, region?, ssoStartUrl?, ssoRegion?, ssoSession?, isSso}]}`
+  - `aws_list_profiles` -> `{configPath, profiles: [{name, region?, ssoStartUrl?, ssoRegion?, ssoSession?, ssoAccountId?, ssoRoleName?, managed?, isSso}]}`
   - `aws_session_get` / `aws_session_set` / `aws_session_clear` -> `{profile, region, profileSource, regionSource}` where `*Source` is `"session" | "env" | "default"`. All three return the same shape (set/clear return the post-mutation state).
   - `aws_resource_get` -> `{command, typeName, identifier, properties, propertiesRaw?}`
   - `aws_resource_list` -> `{command, typeName, resources: [{identifier, properties, propertiesRaw?}], nextToken, hasMore}` (`propertiesRaw` rides along on an entry whose `Properties` string didn't parse, matching `aws_resource_get`)

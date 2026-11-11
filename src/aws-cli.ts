@@ -157,6 +157,11 @@ const REDACTED_VALUE_FLAGS: ReadonlySet<string> = new Set([
   "--desired-state", // aws_resource_create
   "--patch-document", // aws_resource_update
   "--resource-model", // aws_resource_list (parent identifiers)
+  // Defense in depth. No caller passes it: the Identity Center discovery calls
+  // (sso-discovery.ts) put the bearer token in a 0600 --cli-input-json file.
+  // Listed so a future `aws sso list-* --access-token <t>` caller cannot echo
+  // the token back through `command`.
+  "--access-token",
 ]);
 
 /**

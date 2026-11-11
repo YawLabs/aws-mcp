@@ -11,6 +11,12 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Added
+- **IAM Identity Center bootstrap for a user with no profile yet** (#65). `aws_login_start` takes `ssoSession` + `startUrl` + `ssoRegion`: it writes a managed `[sso-session]` block to the AWS config file and runs `aws sso login --sso-session` (AWS CLI 2.9.0+, with `AWS_PROFILE` stripped from the child so a stale one cannot fail it). `aws_login_complete` on such a login returns the token status instead of running an identity check there is no profile for. Two new tools follow it: `aws_sso_list_assignments` (read-only; every account and role the login can use, flagging which already have a profile) and `aws_sso_generate_profiles` (writes `[profile ...]` sections for all assignments, up to 200, or a `selection`; `dryRun` previews). Generated sections carry a `managed-by: aws-mcp` marker and are the only sections aws-mcp ever changes -- a hand-written section is never modified, and every other byte of the file is preserved. The SSO bearer token reaches the CLI only through a 0600 temp file and never appears in a tool result. `aws_list_profiles` gains `ssoAccountId`, `ssoRoleName` and `managed`.
+
+### Changed
+- The locked atomic writer behind `aws_assume_role`'s credentials file moved to `src/ini-file.ts` and is shared with the config-file writer. No behaviour change for `aws_assume_role`.
+
 ## [2.6.1] — 2026-10-30
 
 ### Changed
