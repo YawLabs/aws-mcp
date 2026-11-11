@@ -75,6 +75,14 @@ async function writeStdoutThenMarkReady(chunk: string): Promise<void> {
   }
 }
 
+/** abort_* scenarios: append this process's pid to AWS_MCP_FAKE_READY_OUT. */
+async function abortAnnouncePid(): Promise<void> {
+  const readyPath = process.env.AWS_MCP_FAKE_READY_OUT;
+  if (!readyPath) return;
+  const fs = await import("node:fs");
+  fs.appendFileSync(readyPath, `${process.pid}\n`);
+}
+
 // The exact stdout the `happy` scenario emits up to and including the URL +
 // code lines. Shared so `happy_hold` is guaranteed byte-for-byte identical
 // through the point findActiveSessionByProfile parses (verificationUrl +
@@ -3191,6 +3199,34 @@ async function main(): Promise<void> {
       // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
       // and exiting in the same breath truncates it on POSIX.
       process.stdout.write(`${JSON.stringify({ Region: region, Blob: "x".repeat(2_750_000) })}\n`);
+      return;
+    }
+
+    case "abort_hang": {
+      // For the AbortSignal tests: announce our pid, then hang far past any
+      // timeout the caller sets, so only the caller's abort can end us. The pid
+      // is APPENDED (one per line) to AWS_MCP_FAKE_READY_OUT, so a test can wait
+      // for the child to be running before it aborts, then prove each child it
+      // started is dead. The 60s exit keeps a regression that never kills us
+      // from hanging the test runner.
+      await abortAnnouncePid();
+      await sleep(60_000);
+      process.stdout.write("{}\n");
+      process.exit(0);
+      return;
+    }
+
+    case "abort_sso_roles_hang": {
+      // list-accounts answers normally (the sso_list contract); every
+      // list-account-roles call hangs like abort_hang, so a discovery cancel
+      // lands while a role call is in flight.
+      if (process.argv[3] === "list-account-roles") {
+        await abortAnnouncePid();
+        await sleep(60_000);
+        process.exit(0);
+        return;
+      }
+      await ssoListScenario("sso_list");
       return;
     }
 

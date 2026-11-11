@@ -77,9 +77,8 @@ export interface DiscoveryOptions {
   concurrency?: number;
   /**
    * Aborts when the MCP client cancels the request (ToolContext.signal). Once
-   * aborted, no further `aws sso` call is LAUNCHED and the result is a
-   * `cancelled` error. A call already in flight runs to its own timeout:
-   * runAwsCall takes no signal, so it cannot be killed early.
+   * aborted, no further `aws sso` call is LAUNCHED, any call already in flight
+   * is killed (runAwsCall's `signal`), and the result is a `cancelled` error.
    */
   signal?: AbortSignal;
   /**
@@ -101,7 +100,7 @@ function cancelledResult(done: number, total: number | null): DiscoveryResult {
   return {
     ok: false,
     errorKind: "cancelled",
-    error: `Cancelled by the client ${where}. No further aws sso calls were started; re-run aws_sso_list_assignments (or aws_sso_generate_profiles) to get the full result.`,
+    error: `Cancelled by the client ${where}. No further aws sso calls were started, and any still running were stopped; re-run aws_sso_list_assignments (or aws_sso_generate_profiles) to get the full result.`,
   };
 }
 
@@ -121,7 +120,10 @@ function describeFailure(stderr: string, fallback: string, token: string): strin
   return scrubToken(text, token).slice(0, 500);
 }
 
-type CallOutcome = { ok: true; data: Record<string, unknown> } | { ok: false; unauthorized: boolean; message: string };
+type CallOutcome =
+  | { ok: true; data: Record<string, unknown> }
+  | { ok: false; unauthorized: boolean; message: string }
+  | { ok: false; cancelled: true };
 
 /**
  * One `aws sso <operation>` call with `input` (token included) delivered in a
@@ -142,7 +144,7 @@ type CallOutcome = { ok: true; data: Record<string, unknown> } | { ok: false; un
 async function ssoCall(
   operation: "list-accounts" | "list-account-roles",
   input: Record<string, string>,
-  o: { ssoRegion: string; accessToken: string; timeoutMs: number },
+  o: { ssoRegion: string; accessToken: string; timeoutMs: number; signal?: AbortSignal },
 ): Promise<CallOutcome> {
   const base = tmpdir();
   if (!isCliSafeFilePath(base)) {
@@ -179,11 +181,13 @@ async function ssoCall(
       timeoutMs: o.timeoutMs,
       extraFlags: ["--cli-input-json", fileArg],
       trustedParamFileArgs: [fileArg],
+      signal: o.signal,
     });
     if (r.ok) {
       const data = r.data && typeof r.data === "object" ? (r.data as Record<string, unknown>) : {};
       return { ok: true, data };
     }
+    if (r.kind === "cancelled") return { ok: false, cancelled: true };
     const stderr = r.rawStderr || r.rawStdout || "";
     const unauthorized = /UnauthorizedException|ForbiddenException/.test(stderr) || r.kind === "sso_expired";
     // r.error is NOT used verbatim: for omitProfile calls runAwsCall's auth
@@ -224,12 +228,7 @@ async function listAll(
   baseInput: Record<string, string>,
   listKey: string,
   o: { ssoRegion: string; accessToken: string; deadline: number; signal?: AbortSignal },
-): Promise<
-  | { ok: true; items: unknown[] }
-  | (CallOutcome & { ok: false })
-  | { ok: false; badOutput: string }
-  | { ok: false; cancelled: true }
-> {
+): Promise<{ ok: true; items: unknown[] } | (CallOutcome & { ok: false }) | { ok: false; badOutput: string }> {
   const items: unknown[] = [];
   const seenTokens = new Set<string>();
   let nextToken: string | undefined;
@@ -345,8 +344,9 @@ export async function listAssignments(o: DiscoveryOptions): Promise<DiscoveryRes
             if (typeof rn === "string") acct.roles.push({ roleName: rn });
           }
         } else if ("cancelled" in r) {
-          // Aborted between pages of this account: it is not settled, and the
-          // whole call comes back cancelled below.
+          // Aborted between pages of this account, or while its call was in
+          // flight (killed by runAwsCall): it is not settled, and the whole
+          // call comes back cancelled below.
           return;
         } else if ("badOutput" in r) {
           acct.rolesError = scrubToken(r.badOutput, o.accessToken);

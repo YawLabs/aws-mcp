@@ -68,6 +68,7 @@ const ENV_KEYS = [
   "AWS_MCP_FAKE_CLI_VERSION",
   "AWS_MCP_FAKE_RELEASE_FILE",
   "AWS_MCP_FAKE_SSO_TOKEN",
+  "AWS_MCP_FAKE_READY_OUT",
 ] as const;
 
 describe("IAM Identity Center bootstrap (fake-aws)", () => {
@@ -545,6 +546,47 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
       assert.match(r.error ?? "", /Cancelled by the client/);
     }
     assert.equal(calls().filter((a) => a[0] === "sso").length, 0);
+  });
+
+  it("a cancel kills the list-account-roles calls already in flight", async () => {
+    seedSession();
+    process.env.AWS_MCP_FAKE_SCENARIO = "abort_sso_roles_hang";
+    const readyPath = join(home, "abort-pids.txt");
+    process.env.AWS_MCP_FAKE_READY_OUT = readyPath;
+    const pids = (): number[] =>
+      existsSync(readyPath)
+        ? readFileSync(readyPath, "utf-8")
+            .split("\n")
+            .filter(Boolean)
+            .map((l) => Number(l))
+        : [];
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const ac = new AbortController();
+    // Through the tool, so the ctx.signal -> listAssignments -> runAwsCall
+    // wiring is what is under test. Every role call hangs for 60s (the per-call
+    // timeout too), so only killing them can settle this quickly.
+    const pending = call(
+      "aws_sso_list_assignments",
+      { ssoSession: "acme" },
+      { reportProgress: () => {}, signal: ac.signal },
+    );
+    await waitUntil(() => pids().length > 0, "a list-account-roles call to be running", 20_000);
+    const abortedAt = Date.now();
+    ac.abort();
+    const r = await pending;
+    const elapsed = Date.now() - abortedAt;
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "cancelled");
+    assert.match(r.error ?? "", /Cancelled by the client after 0 of 3 account/);
+    assert.ok(elapsed < 15_000, `settled ${elapsed}ms after the abort`);
+    for (const pid of pids()) await waitUntil(() => !alive(pid), `role-call child ${pid} to be dead`);
   });
 
   it("an abort mid-sweep stops launching list-account-roles calls", async () => {
