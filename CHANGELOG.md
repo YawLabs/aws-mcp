@@ -11,6 +11,9 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+### Changed
+- **A `tools/call` whose undeclared arguments total more than 64 KiB is refused with JSON-RPC `-32602`** instead of being processed with those arguments silently dropped. Undeclared arguments are never read by any tool, so no legitimate input is lost: declared arguments are never measured, and large ones (an `aws_lambda_invoke` payload, `aws_call` params, `aws_script` code, an `aws_resource_*` desired state) go through as before. A small stray argument is still ignored. The refusal names the undeclared keys (at most 10, each cut to 64 characters) and the tool's declared ones. This clears the `security-oversized-input` warning from `@yawlabs/mcp-compliance` on both the Node and oam legs.
+
 ## [2.7.0] — 2026-11-11
 
 ### Added

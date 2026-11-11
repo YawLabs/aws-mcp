@@ -2,8 +2,9 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 /**
- * The most an UNDECLARED tools/call argument may weigh, in bytes of its JSON
- * serialization, summed over every undeclared key of one call.
+ * The most the UNDECLARED tools/call arguments of one call may weigh: the UTF-8
+ * bytes of each undeclared key plus its value's JSON serialization, summed.
+ * Keys count too, or a megabyte-long key name with a tiny value would slip by.
  *
  * Undeclared arguments are never read: zod strips them before a handler runs.
  * So no legitimate input is lost by refusing a large one -- the big inputs this
@@ -15,6 +16,10 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
  * clear error instead of shipping megabytes the server would throw away.
  */
 export const UNDECLARED_ARGUMENTS_LIMIT_BYTES = 64 * 1024;
+
+/** How many undeclared key names a refusal lists, and how much of each. */
+const MAX_NAMES_SHOWN = 10;
+const MAX_NAME_CHARS = 64;
 
 /** JSON-RPC "Invalid params". */
 const INVALID_PARAMS = -32602;
@@ -49,11 +54,16 @@ export function rejectOversizedUndeclaredArguments(
   for (const [key, value] of Object.entries(args)) {
     if (declared.has(key)) continue;
     undeclared.push(key);
-    bytes += Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+    bytes += Buffer.byteLength(key, "utf8") + Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
   }
   if (bytes <= limitBytes) return undefined;
 
-  const names = undeclared.map((k) => JSON.stringify(k)).join(", ");
+  // Bounded, so a refusal over many or huge key names does not echo them back.
+  const shown = undeclared
+    .slice(0, MAX_NAMES_SHOWN)
+    .map((k) => JSON.stringify(k.length > MAX_NAME_CHARS ? `${k.slice(0, MAX_NAME_CHARS)}...` : k));
+  const more = undeclared.length - shown.length;
+  const names = shown.join(", ") + (more > 0 ? ` and ${more} more` : "");
   return {
     jsonrpc: "2.0",
     id: message.id,

@@ -23,7 +23,7 @@ describe("rejectOversizedUndeclaredArguments", () => {
     assert.ok(refusal && "error" in refusal, "expected a JSON-RPC error");
     assert.equal(refusal.id, "abc");
     assert.equal(refusal.error.code, -32602);
-    assert.match(refusal.error.message, /aws_whoami: undeclared argument\(s\) "data" carry 1048578 bytes/);
+    assert.match(refusal.error.message, /aws_whoami: undeclared argument\(s\) "data" carry 1048582 bytes/);
     assert.match(refusal.error.message, /Declared arguments: profile, region\./);
   });
 
@@ -31,6 +31,23 @@ describe("rejectOversizedUndeclaredArguments", () => {
     const half = "B".repeat(UNDECLARED_ARGUMENTS_LIMIT_BYTES / 2);
     assert.ok(rejectOversizedUndeclaredArguments(call("aws_whoami", { a: half, b: half }), declared));
     assert.equal(rejectOversizedUndeclaredArguments(call("aws_whoami", { a: half }), declared), undefined);
+  });
+
+  it("counts undeclared key names, so a huge key with a tiny value is refused", () => {
+    const refusal = rejectOversizedUndeclaredArguments(call("aws_whoami", { [ONE_MB]: 0 }), declared);
+    assert.ok(refusal && "error" in refusal, "expected a JSON-RPC error");
+    // The echoed name is truncated, not the megabyte it was.
+    assert.ok(refusal.error.message.length < 1024, `message is ${refusal.error.message.length} chars`);
+    assert.match(refusal.error.message, /"A{64}\.\.\."/);
+  });
+
+  it("lists at most 10 undeclared names in a refusal", () => {
+    const args: Record<string, string> = {};
+    for (let i = 0; i < 25; i++) args[`k${i}`] = "C".repeat(4096);
+    const refusal = rejectOversizedUndeclaredArguments(call("aws_whoami", args), declared);
+    assert.ok(refusal && "error" in refusal, "expected a JSON-RPC error");
+    assert.match(refusal.error.message, /"k9" and 15 more carry/);
+    assert.doesNotMatch(refusal.error.message, /"k10"/);
   });
 
   it("lets a small stray argument through, to be ignored as before", () => {
