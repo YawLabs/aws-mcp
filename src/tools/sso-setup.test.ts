@@ -23,7 +23,7 @@ import { EMPTY_CONFIG_FILE_ERROR } from "../aws-paths.js";
 import { _resetSession } from "../session.js";
 import { _clearCliVersionCache, _clearSessions, startSsoLogin } from "../sso.js";
 import { MANAGED_MARKER } from "../sso-config.js";
-import { _resetStartSsoLoginImpl, _setStartSsoLoginImpl, authTools } from "./auth.js";
+import { _resetStartSsoLoginImpl, _sessionStartQueueDepth, _setStartSsoLoginImpl, authTools } from "./auth.js";
 import { profilesTools } from "./profiles.js";
 import { ssoSetupTools } from "./sso-setup.js";
 import type { ToolResult } from "./tool.js";
@@ -36,6 +36,17 @@ const START = "https://acme.awsapps.com/start";
 // Tool results are untyped JSON here; one loose alias keeps the assertions readable.
 // biome-ignore lint/suspicious/noExplicitAny: test-only view of untyped tool output.
 type Json = any;
+
+/** Poll `predicate` every 10 ms (no fixed sleeps); mirrors auth.test.ts's helper. */
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error(`waitUntil timed out after ${timeoutMs}ms waiting for: ${label}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 const tool = (name: string) => {
   const t = [...authTools, ...ssoSetupTools, ...profilesTools].find((x) => x.name === name);
@@ -290,6 +301,63 @@ describe("IAM Identity Center bootstrap (fake-aws)", () => {
       assert.equal(done.ok, true, done.error ?? "");
       assert.equal(done.data.ssoToken?.startUrl, START, "the token is for the repointed URL");
     } finally {
+      delete process.env.AWS_MCP_FAKE_RELEASE_FILE;
+    }
+  });
+
+  it("concurrent starts that repoint the same sso-session are serialized: the earlier login is superseded", async () => {
+    // A's start is held at the spawn seam -- standing in for the
+    // `await probeCliVersion` window before its child spawns -- until B has
+    // either written its block (the race) or is queued behind A (the fix).
+    // Unserialized, B repoints the block under A's unspawned child and cannot
+    // see A to cancel it: A's child reads B's URL while labelled with A's, and
+    // A's login "succeeds" instead of being superseded.
+    process.env.AWS_MCP_FAKE_RELEASE_FILE = join(home, "release");
+    const DEV = "https://dev-org.awsapps.com/start";
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    let n = 0;
+    _setStartSsoLoginImpl(async (target, extra) => {
+      if (n++ === 0) await gateA;
+      return startSsoLogin(target, {
+        command: process.execPath,
+        prefixArgs: [FAKE_AWS],
+        urlWaitMs: 20_000,
+        sessionTtlMs: 60_000,
+        versionProbeTimeoutMs: 30_000,
+        env: { ...(extra?.env ?? process.env), AWS_MCP_FAKE_SCENARIO: "sso_session_login" },
+        dedupeTag: extra?.dedupeTag,
+      });
+    });
+    try {
+      const pA = call("aws_login_start", { ssoSession: "acme", startUrl: DEV, ssoRegion: "us-east-1" });
+      const pB = call("aws_login_start", { ssoSession: "acme", startUrl: START, ssoRegion: "us-east-1" });
+      await waitUntil(
+        () =>
+          _sessionStartQueueDepth("acme") >= 2 ||
+          (existsSync(configPath) && readFileSync(configPath, "utf-8").includes(START)),
+        "B queued behind A, or B's block written",
+      );
+      releaseA();
+      const [a, b] = await Promise.all([pA, pB]);
+      assert.equal(a.ok, true, a.error ?? "");
+      assert.equal(b.ok, true, b.error ?? "");
+      assert.equal(a.data.startUrl, DEV);
+      assert.equal(b.data.startUrl, START);
+      assert.equal(b.data.sessionBlock, "updated", "B repointed the block A's child had already read");
+      assert.notEqual(b.data.sessionId, a.data.sessionId);
+      assert.equal(_sessionStartQueueDepth("acme"), 0, "the lock is released");
+      const old = await call("aws_login_complete", { sessionId: a.data.sessionId });
+      assert.equal(old.ok, false, "A's login must be superseded, not completed against B's URL");
+      assert.match(old.error ?? "", /Superseded/);
+      writeFileSync(join(home, "release"), "");
+      const done = await call("aws_login_complete", { sessionId: b.data.sessionId });
+      assert.equal(done.ok, true, done.error ?? "");
+      assert.equal(done.data.ssoToken?.startUrl, START);
+    } finally {
+      releaseA();
       delete process.env.AWS_MCP_FAKE_RELEASE_FILE;
     }
   });

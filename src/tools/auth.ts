@@ -211,9 +211,57 @@ function loginConfigKey(startUrl: string, ssoRegion: string): string {
 }
 
 /**
+ * Per-sso-session-name start serialization: name -> tail of the chain of
+ * starts holding or waiting for that name, plus how many there are.
+ *
+ * Without it, two concurrent starts that repoint the same block race: the
+ * child is spawned only after startSsoLogin's `await probeCliVersion`, and a
+ * start that has not registered its session yet is invisible to the supersede
+ * loop. So B could write the new URL while A's child was still unspawned; A's
+ * child then read B's block while labelled with A's URL, B could not see A to
+ * cancel it, and two `aws sso login --sso-session X` children ran. Holding the
+ * lock across write-block + supersede + start (until the start registers or
+ * fails) means the block a holder wrote is the block its child reads -- no
+ * other aws-mcp start can write that name in between -- and a later repoint
+ * finds the earlier login registered and cancels it through the normal path.
+ * Profile logins never take it.
+ */
+const sessionStartChains = new Map<string, Promise<void>>();
+const sessionStartDepth = new Map<string, number>();
+
+async function withSessionStartLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const prev = sessionStartChains.get(name) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => {
+    release = r;
+  });
+  // `prev` only ever resolves (each link is a bare release promise), so a
+  // failed holder cannot wedge the chain.
+  const tail = prev.then(() => mine);
+  sessionStartChains.set(name, tail);
+  sessionStartDepth.set(name, (sessionStartDepth.get(name) ?? 0) + 1);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    const depth = (sessionStartDepth.get(name) ?? 1) - 1;
+    if (depth <= 0) sessionStartDepth.delete(name);
+    else sessionStartDepth.set(name, depth);
+    if (sessionStartChains.get(name) === tail) sessionStartChains.delete(name);
+  }
+}
+
+/** For tests -- how many sso-session starts for `name` hold or await the lock. */
+export function _sessionStartQueueDepth(name: string): number {
+  return sessionStartDepth.get(name) ?? 0;
+}
+
+/**
  * aws_login_start's sso-session branch: validate, ensure the block, then reuse
  * an in-flight login or spawn `aws sso login --sso-session <name>` with the
- * profile selectors stripped from the child env.
+ * profile selectors stripped from the child env. Everything after validation
+ * runs under the per-name start lock (withSessionStartLock).
  */
 async function startSessionLogin(i: {
   ssoSession: string;
@@ -232,7 +280,15 @@ async function startSessionLogin(i: {
     const regionErr = regionProblem("ssoRegion", i.ssoRegion);
     if (regionErr) return { ok: false, errorKind: "bad_input", error: regionErr };
   }
+  // Taken synchronously (no await above), so concurrent calls queue in call order.
+  return withSessionStartLock(i.ssoSession, () => startSessionLoginLocked(i, startUrl));
+}
 
+/** startSessionLogin's body, with `startUrl` already normalized; runs under the lock. */
+async function startSessionLoginLocked(
+  i: { ssoSession: string; ssoRegion?: string },
+  startUrl: string | undefined,
+): Promise<ToolResult> {
   const block = await ensureSsoSessionBlock(i.ssoSession, startUrl, i.ssoRegion);
   if (!block.ok) return { ok: false, error: block.error };
 
