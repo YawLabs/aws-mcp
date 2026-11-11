@@ -16,6 +16,14 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ### Changed
 - The locked atomic writer behind `aws_assume_role`'s credentials file moved to `src/ini-file.ts` and is shared with the config-file writer. No behaviour change for `aws_assume_role`.
+- README: new section "Multi-user gateways: one process per user" (#65) -- run one aws-mcp process per user, each with its own `HOME`/`USERPROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` and `TMPDIR`, routed by the gateway's verified principal.
+
+### Fixed
+- **`AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` are honoured everywhere the server reads those files itself** (#67). `aws_list_profiles`, the profile start-URL lookup that picks the cached SSO token for `aws_whoami`, `aws_login_complete` and `aws_refresh_if_expiring_soon`, and `aws_assume_role` read `~/.aws/config` / `~/.aws/credentials` directly, so with either variable set they disagreed with the `aws` CLI they spawn. Paths now resolve as botocore resolves them: `$NAME` / `${NAME}` (and `%NAME%` on Windows) are expanded, then `~`; an unset reference is left as written; the value is not trimmed; and a set-but-empty value means "no file", which `aws_list_profiles` reports as an error and `aws_assume_role` refuses, instead of falling back to the default path.
+- **SSO device login recognizes the newer verification URLs** (#66, thanks @SolomonHD). `aws_login_start` now accepts the IAM Identity Center portal (`https://<id>.awsapps.com/start/#/device`) and AWS sign-in (`https://...signin.aws/.../device`) forms. A `signin.aws` URL must end in `/device`, so an unrelated sign-in URL cannot suppress the PKCE fallback, and the URL is re-read from the full output when the login settles, so a stdout chunk split inside `?user_code=...` no longer drops the code.
+
+### Security
+- Lockfile-only bumps, within existing ranges, clearing all open Dependabot alerts and `npm audit` findings (#70): undici 8.12.4 (3 high), fast-uri 3.1.9, hono 4.13.18, `@hono/node-server` 2.1.7, zod 4.6.7, body-parser 2.4.0, qs 6.17.1, ip-address 10.7.6.
 
 ## [2.6.1] — 2026-10-30
 
