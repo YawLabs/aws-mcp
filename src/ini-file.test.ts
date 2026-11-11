@@ -279,6 +279,71 @@ describe("withLockedAtomicWrite", () => {
     assert.match(readFileSync(real, "utf-8"), /\[profile prod-Admin\]/);
   });
 
+  it("resolves a relative `..` link target against the link's PHYSICAL directory", async (t) => {
+    // home/.aws -> data/awscfg (exists); data/awscfg/config -> ../shared/config
+    // (dangling). The kernel resolves `..` from data/awscfg, so the target is
+    // data/shared/config -- NOT home/shared/config, which a lexical resolve
+    // from home/.aws produces.
+    const home = join(dir, "home");
+    const data = join(dir, "data");
+    mkdirSync(home);
+    mkdirSync(join(data, "awscfg"), { recursive: true });
+    mkdirSync(join(data, "shared"));
+    const awsDir = join(home, ".aws");
+    try {
+      symlinkSync(join(data, "awscfg"), awsDir, "dir");
+      symlinkSync(join("..", "shared", "config"), join(data, "awscfg", "config"), "file");
+    } catch (err) {
+      t.skip(`symlinks unavailable: ${(err as Error).message}`);
+      return;
+    }
+    const link = join(awsDir, "config");
+    await withLockedAtomicWrite(link, append(PROD), { requirePrivate: false, ensureDir: true });
+    assert.match(readFileSync(join(data, "shared", "config"), "utf-8"), /\[profile prod-Admin\]/);
+    assert.equal(existsSync(join(home, "shared")), false, "no stray file beside home");
+    assert.ok(lstatSync(link).isSymbolicLink(), "the link must survive the write");
+    assert.match(readFileSync(link, "utf-8"), /\[profile prod-Admin\]/, "the link now resolves");
+  });
+
+  for (const type of ["dir", "junction"] as const) {
+    it(`ensureDir creates the target of a DANGLING ${type} link in the parent (~/.aws -> missing dir)`, async (t) => {
+      if (type === "junction" && process.platform !== "win32") {
+        t.skip("junctions are Windows-only");
+        return;
+      }
+      const home = join(dir, "home");
+      mkdirSync(home);
+      const target = join(dir, "dotfiles", "aws");
+      const awsDir = join(home, ".aws");
+      try {
+        symlinkSync(target, awsDir, type);
+      } catch (err) {
+        t.skip(`symlinks unavailable: ${(err as Error).message}`);
+        return;
+      }
+      const link = join(awsDir, "config");
+      const r = await withLockedAtomicWrite(link, append(PROD), { requirePrivate: false, ensureDir: true });
+      assert.equal(r.changed, true);
+      assert.ok(lstatSync(awsDir).isSymbolicLink(), "the directory link must survive");
+      assert.match(readFileSync(join(target, "config"), "utf-8"), /\[profile prod-Admin\]/);
+      assert.match(readFileSync(link, "utf-8"), /\[profile prod-Admin\]/, "readable through the link");
+      assert.deepEqual(readdirSync(target), ["config"], "no lock or tmp file stranded");
+    });
+  }
+
+  it("a symlink loop ends in ELOOP instead of spinning", async (t) => {
+    const a = join(dir, "loop-a");
+    const b = join(dir, "loop-b");
+    try {
+      symlinkSync(b, a, "file");
+      symlinkSync(a, b, "file");
+    } catch (err) {
+      t.skip(`symlinks unavailable: ${(err as Error).message}`);
+      return;
+    }
+    await assert.rejects(withLockedAtomicWrite(a, append(PROD), { requirePrivate: false }), { code: "ELOOP" });
+  });
+
   it("refuses an empty path instead of writing into the working directory", async () => {
     await assert.rejects(withLockedAtomicWrite("", append(PROD), { requirePrivate: false, ensureDir: true }), /empty/);
   });

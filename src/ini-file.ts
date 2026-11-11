@@ -36,7 +36,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertPrivateMode, type ModeProbe } from "./private-file.js";
 
@@ -590,12 +590,25 @@ const MAX_SYMLINK_HOPS = 40;
  * with b/config not created yet), so ENOENT alone does not mean "nothing here":
  * treating it that way renamed the tmp file over the link and replaced it with
  * a regular file, and b/config was never created. So on ENOENT, lstat the path;
- * if it is a link, follow it by hand (readlink, resolved relative to the link's
- * own directory) until reaching a path where nothing exists, and write there.
+ * if it is a link, follow it by hand until reaching a path where nothing
+ * exists, and write there.
+ *
+ * Two details keep the hand walk agreeing with the kernel:
+ *  - A relative link target is resolved against the PHYSICAL directory holding
+ *    the link (realpath of the parent), not the textual one. With ~/.aws ->
+ *    data/awscfg and data/awscfg/config -> ../shared/config, the OS reads
+ *    data/shared/config; resolving `..` lexically from ~/.aws gave
+ *    ~/shared/config, a stray file, and the link stayed dangling.
+ *  - When nothing exists at the path, its PARENT may still be a dangling
+ *    directory link (~/.aws -> a dotfiles dir not created yet, symlink or
+ *    junction). The parent is resolved the same way and the basename rejoined,
+ *    so ensureDir creates the link's target directory instead of failing to
+ *    mkdir over the dangling link.
+ * All recursion shares one hop budget, so a loop anywhere ends in ELOOP.
  */
-function resolveWriteTarget(path: string): string {
+function resolveWriteTarget(path: string, budget = { hops: MAX_SYMLINK_HOPS }): string {
   let current = path;
-  for (let hop = 0; hop <= MAX_SYMLINK_HOPS; hop++) {
+  for (;;) {
     try {
       return realpathSync(current);
     } catch (err) {
@@ -605,15 +618,21 @@ function resolveWriteTarget(path: string): string {
     try {
       isLink = lstatSync(current).isSymbolicLink();
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return current;
-      throw err;
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      const parent = dirname(current);
+      if (parent === current) return current;
+      return join(resolveWriteTarget(parent, budget), basename(current));
     }
     if (!isLink) return current;
-    current = resolve(dirname(current), readlinkSync(current));
+    if (--budget.hops < 0) {
+      const loop = new Error(`Too many levels of symbolic links: ${path}`) as NodeJS.ErrnoException;
+      loop.code = "ELOOP";
+      throw loop;
+    }
+    // The link exists, so its parent directory does; realpath it so `..` in a
+    // relative target climbs the physical tree, as the kernel does.
+    current = resolve(realpathSync(dirname(current)), readlinkSync(current));
   }
-  const loop = new Error(`Too many levels of symbolic links: ${path}`) as NodeJS.ErrnoException;
-  loop.code = "ELOOP";
-  throw loop;
 }
 
 /**
@@ -654,7 +673,6 @@ export async function withLockedAtomicWrite(
     throw new Error(
       "Refusing to write: the AWS file path is empty (its environment variable is set to an empty value).",
     );
-  if (opts.ensureDir) mkdirSync(dirname(givenPath), { recursive: true, mode: 0o700 });
   // Write THROUGH a symlink, not over it. A dotfiles-managed ~/.aws/config ->
   // ~/dotfiles/aws/config would otherwise be replaced by a regular file: rename
   // swaps the directory entry, so the link is lost and the dotfiles copy never
@@ -662,8 +680,10 @@ export async function withLockedAtomicWrite(
   // TARGET, which also keeps the rename on one filesystem. `aws configure sso`
   // writes in place and keeps the link; this matches it.
   const path = resolveWriteTarget(givenPath);
-  // A dangling link's target directory may not exist yet either.
-  if (opts.ensureDir && path !== givenPath) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  // mkdir AFTER resolving: a dangling link's target directory may not exist
+  // yet, and a recursive mkdir onto a dangling directory link (~/.aws ->
+  // missing dir) fails, so create the resolved directory instead.
+  if (opts.ensureDir) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const lockPath = `${path}.lock`;
   await acquireLock(lockPath);
   try {
