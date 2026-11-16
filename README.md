@@ -2,7 +2,7 @@
 
 [![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=AWS&command=npx&args=-y%2C%40yawlabs%2Faws-mcp&env=AWS_PROFILE%2CAWS_REGION&description=Call%20any%20AWS%20API%20from%20one%20server%20-%20CCAPI%20CRUD%2C%20multi-region%2C%20SSO%20re-login&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Faws-mcp)
 
-One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Tested with Yaw MCP 1.1.13 or newer. Or install manually below.
 
 A small AWS MCP for AI assistants: **one server, one config entry, SSO re-auth baked in, generic CRUD over 1,300+ resource types, live docs lookup, server-side scripting for batched workflows.**
 
