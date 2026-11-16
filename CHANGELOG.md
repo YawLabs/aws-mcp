@@ -13,6 +13,7 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ### Changed
 - **The oam floor moves from 0.19.5 to 0.20.2, so the `aws-mcp` launcher no longer runs the server on oam 0.19.5-0.20.1.** 0.20.2 is verified on the installed aarch64-pc-windows-msvc binary through the launcher with `OAM_BIN` pointing at it and `AWS_MCP_RUNTIME=oam`, and again hosted as `oam run bin/aws-mcp.mjs`: a full MCP handshake listing all 30 tools, `aws_list_profiles` served, and the documented `aws_script` sandbox divergence re-measured on it (`eval('1+1')` returns 2 and `Function('return 7')()` returns 7 under oam; `Function('return this')()` yields a global with no `process` and no `require`; both raise the code-generation error under Node). No server code changes with it: the server spawns the `aws` CLI with `spawn` only, so oam 0.20.0's 1 MiB `maxBuffer` default does not reach it, and the `windowsHide` it already passes is unchanged for a console child.
+- `@modelcontextprotocol/sdk` (dev dependency, bundled into `dist/index.js`) moves from `^1.32.1` to `^1.32.2`, the range Yaw MCP 1.1.13 pins; `@yawlabs/mcp-compliance` was already on the same `^0.20.4`.
 
 ## [2.7.1] — 2026-11-11
 

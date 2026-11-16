@@ -6,8 +6,8 @@
 // (`yaw-mcp audit`) and can refuse to spawn one graded below its floor
 // (YAW_MCP_MIN_COMPLIANCE), so this repo runs the suite here rather than finding
 // out from a user's refused spawn. The version is pinned in devDependencies at
-// the current release line (^0.20.4); yaw-mcp itself still pins ^0.17.1, so its
-// rubric is the older of the two.
+// the current release line (^0.20.4), the same range yaw-mcp 1.1.13 pins, so its
+// audit grades with the same rubric.
 //
 //   node scripts/check-compliance.mjs        both legs: AWS_MCP_RUNTIME=node, then =oam
 //
