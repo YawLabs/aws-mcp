@@ -84,7 +84,7 @@ describe("startSsoLogin — happy path", () => {
     const start = await startSsoLogin("test-profile", fakeOpts("regional_device_split", 30_000));
     assert.equal(start.ok, true);
     if (!start.ok) return;
-    assert.equal(start.verificationUrl, "https://us-east-1.signin.aws/platform/authorize?client_id=synthetic");
+    assert.equal(start.verificationUrl, "https://EU-West-1.SignIn.AWS/platform/authorize?client_id=synthetic");
     assert.equal(start.userCode, "WXYZ-1234");
     const completed = await waitForLogin(start.sessionId);
     assert.equal(completed.ok, true);

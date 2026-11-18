@@ -29,17 +29,47 @@ describe("regional device banner", () => {
     assert.equal(parseRegionalDeviceBanner(banner(url).slice(0, -1)), null);
   });
 
-  it("rejects unproven regions, malformed authorities and paths", () => {
+  it("accepts signin.aws and valid DNS subdomains across regions without changing the URL", () => {
+    for (const host of [
+      "signin.aws",
+      "us-west-2.signin.aws",
+      "eu-west-1.signin.aws",
+      "ap-southeast-2.signin.aws",
+      "a.b.signin.aws",
+      "US-East-1.SignIn.AWS",
+      `${"a".repeat(63)}.signin.aws`,
+    ]) {
+      const link = `https://${host}/platform/authorize?client_id=synthetic#fragment`;
+      assert.deepEqual(parseRegionalDeviceBanner(banner(link)), { url: link, code: "WXYZ-1234" });
+    }
+  });
+
+  it("rejects malformed authorities, lookalikes and paths", () => {
     for (const invalid of [
       "http://us-east-1.signin.aws/platform/authorize",
-      "https://us-west-2.signin.aws/platform/authorize",
+      "https://.signin.aws/platform/authorize",
+      "https://a..signin.aws/platform/authorize",
+      `https://${"a".repeat(64)}.signin.aws/platform/authorize`,
+      `https://${Array(4).fill("a".repeat(63)).join(".")}.signin.aws/platform/authorize`,
+      "https://-a.signin.aws/platform/authorize",
+      "https://a-.signin.aws/platform/authorize",
+      "https://a_b.signin.aws/platform/authorize",
+      "https://signin.aws./platform/authorize",
+      "https://evilsignin.aws/platform/authorize",
+      "https://signin.aws.evil.example/platform/authorize",
+      "https://%73ignin.aws/platform/authorize",
+      "https://sıgnin.aws/platform/authorize",
       "https://us-east-1.signin.aws.evil.example/platform/authorize",
       "https://user@us-east-1.signin.aws/platform/authorize",
+      "https://@signin.aws/platform/authorize",
       "https://us-east-1.signin.aws:443/platform/authorize",
+      "https://signin.aws:/platform/authorize",
       "https://us-east-1.signin.aws/platform/authorize/extra",
       "https://us-east-1.signin.aws/platform/authorize%2fextra",
       "https://us-east-1.signin.aws/platform/../platform/authorize",
       "https://us-east-1.signin.aws/platform/authorize?bad=with space",
+      "https://signin.aws/platform/authorize?bad=\u0000",
+      "https://signin.aws/platform/authorize?bad=\u007f",
     ])
       assert.equal(parseRegionalDeviceBanner(banner(invalid)), null, invalid);
   });

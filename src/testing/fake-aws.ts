@@ -456,7 +456,7 @@ async function main(): Promise<void> {
   switch (scenario) {
     case "regional_device_split": {
       process.stdout.write(
-        "Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\nhttps://us-east-1.signin.aws/platform/auth",
+        "Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\nhttps://EU-West-1.SignIn.AWS/platform/auth",
       );
       await sleep(100);
       process.stdout.write("orize?client_id=synthetic\n\nThen enter the code:\n\nWXYZ-");

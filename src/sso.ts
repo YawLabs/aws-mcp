@@ -205,18 +205,23 @@ const REGIONAL_DEVICE_BANNER_RE =
 
 export function parseRegionalDeviceBanner(text: string): { url: string; code: string } | null {
   const match = text.match(REGIONAL_DEVICE_BANNER_RE);
+  // Check the literal authority and path before WHATWG URL normalization can
+  // hide default ports, encoded host characters, or dot segments.
+  const authority = match?.[1].match(/^https:\/\/([^/]+)\/platform\/authorize(?:[?#]|$)/)?.[1];
   if (
     !match ||
+    !authority ||
     /\s/.test(match[1]) ||
     [...match[1]].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
-    !/^https:\/\/us-east-1\.signin\.aws\/platform\/authorize(?:[?#]|$)/.test(match[1])
+    authority.length > 253 ||
+    !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*signin\.aws$/i.test(authority)
   )
     return null;
   try {
     const url = new URL(match[1]);
     if (
       url.protocol !== "https:" ||
-      url.hostname !== "us-east-1.signin.aws" ||
+      url.hostname !== authority.toLowerCase() ||
       url.port ||
       url.username ||
       url.password ||
