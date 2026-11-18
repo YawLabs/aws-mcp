@@ -10,12 +10,51 @@ import {
   PKCE_URL_RE,
   parseAwsCliVersion,
   parseLoginOutput,
+  parseRegionalDeviceBanner,
   SSO_SESSION_MIN_CLI,
   startSsoLogin,
   supportsDeviceCodeFlag,
   supportsSsoSession,
   URL_RE,
 } from "./sso.js";
+
+describe("regional device banner", () => {
+  const banner = (url: string, code = "WXYZ-1234") =>
+    `Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\n${url}\n\nThen enter the code:\n\n${code}\n`;
+  const url = "https://us-east-1.signin.aws/platform/authorize?client_id=synthetic#fragment";
+
+  it("pairs the complete banner, including CRLF and the full URL", () => {
+    assert.deepEqual(parseRegionalDeviceBanner(banner(url).replaceAll("\n", "\r\n")), { url, code: "WXYZ-1234" });
+    assert.deepEqual(parseLoginOutput(banner(url)), { url, code: "WXYZ-1234" });
+    assert.equal(parseRegionalDeviceBanner(banner(url).slice(0, -1)), null);
+  });
+
+  it("rejects unproven regions, malformed authorities and paths", () => {
+    for (const invalid of [
+      "http://us-east-1.signin.aws/platform/authorize",
+      "https://us-west-2.signin.aws/platform/authorize",
+      "https://us-east-1.signin.aws.evil.example/platform/authorize",
+      "https://user@us-east-1.signin.aws/platform/authorize",
+      "https://us-east-1.signin.aws:443/platform/authorize",
+      "https://us-east-1.signin.aws/platform/authorize/extra",
+      "https://us-east-1.signin.aws/platform/authorize%2fextra",
+      "https://us-east-1.signin.aws/platform/../platform/authorize",
+      "https://us-east-1.signin.aws/platform/authorize?bad=with space",
+    ])
+      assert.equal(parseRegionalDeviceBanner(banner(invalid)), null, invalid);
+  });
+
+  it("requires the exact adjacent banner and valid code", () => {
+    assert.equal(parseRegionalDeviceBanner(banner(url, "abcd-efgh")), null);
+    assert.equal(
+      parseRegionalDeviceBanner(
+        banner(url).replace("Then enter the code:", "Unrelated message:\nThen enter the code:"),
+      ),
+      null,
+    );
+    assert.equal(parseRegionalDeviceBanner(`Open ${url}\nABCD-EFGH\n`), null);
+  });
+});
 
 describe("URL_RE", () => {
   it("matches standard AWS SSO device URLs across regions", () => {

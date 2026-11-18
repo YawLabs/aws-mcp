@@ -198,6 +198,36 @@ export function _dedupeKey(target: LoginTarget, opts: SsoLoginOptions): string {
 export const URL_RE =
   /https:\/\/(?:device\.sso[.\w-]*\.amazonaws\.com\/[^\s<>"']*|[a-z0-9-]+\.awsapps\.com\/start\/?#\/device(?:\?[^\s<>"']*)?(?=$|[\s<>"'])|(?:[a-z0-9-]+\.)*signin\.aws\/(?:[^\s<>"'?#/]+\/)*device(?:\?[^\s<>"']*)?(?=$|[\s<>"']))/i;
 export const CODE_RE = /\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
+// The regional authorization endpoint is also used outside device login, so
+// accept it only with the complete PrintOnlyHandler URL-and-code banner.
+const REGIONAL_DEVICE_BANNER_RE =
+  /(?:^|\n)Browser will not be automatically opened\.\r?\nPlease visit the following URL:\r?\n\r?\n([^\r\n]+)\r?\n\r?\nThen enter the code:\r?\n\r?\n([A-Z0-9]{4}-[A-Z0-9]{4})\r?\n/;
+
+export function parseRegionalDeviceBanner(text: string): { url: string; code: string } | null {
+  const match = text.match(REGIONAL_DEVICE_BANNER_RE);
+  if (
+    !match ||
+    /\s/.test(match[1]) ||
+    [...match[1]].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
+    !/^https:\/\/us-east-1\.signin\.aws\/platform\/authorize(?:[?#]|$)/.test(match[1])
+  )
+    return null;
+  try {
+    const url = new URL(match[1]);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "us-east-1.signin.aws" ||
+      url.port ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/platform/authorize"
+    )
+      return null;
+    return { url: match[1], code: match[2] };
+  } catch {
+    return null;
+  }
+}
 // The authorize URL the PKCE flow prints instead. Never a success shape for
 // this server — no short code accompanies it — so matching it buys nothing but
 // the ability to fail with the real cause instead of a generic URL timeout.
@@ -216,6 +246,8 @@ const SESSION_TTL_MS = 10 * 60_000;
 const COMPLETED_SESSION_REAP_MS = 10 * 60_000;
 
 export function parseLoginOutput(text: string): { url: string | null; code: string | null } {
+  const regional = parseRegionalDeviceBanner(text);
+  if (regional) return regional;
   const urlMatch = text.match(URL_RE);
   const codeMatch = text.match(CODE_RE);
   return {
@@ -678,6 +710,11 @@ async function doStartSsoLogin(
 
     proc.stdout?.on("data", (chunk: Buffer) => {
       stdoutBuf += stdoutDecoder.write(chunk);
+      const regional = parseRegionalDeviceBanner(stdoutBuf);
+      if (regional) {
+        urlSeen = regional.url;
+        codeSeen = regional.code;
+      }
       if (!urlSeen) {
         const m = stdoutBuf.match(URL_RE);
         if (m) urlSeen = m[0];
@@ -694,7 +731,7 @@ async function doStartSsoLogin(
         // chunk that matched, and a pipe chunk can end mid-URL (URL_RE accepts
         // end-of-buffer as a terminator), dropping e.g. `?user_code=...`. The
         // code always prints after the URL, so by now the URL line is whole.
-        urlSeen = stdoutBuf.match(URL_RE)?.[0] ?? urlSeen;
+        if (!regional) urlSeen = stdoutBuf.match(URL_RE)?.[0] ?? urlSeen;
         const sessionId = randomUUID();
         // Deliberate handoff: the TTL killswitch is armed HERE, at the same
         // moment the urlWaitMs timeout is cleared, so the subprocess is under

@@ -454,6 +454,18 @@ async function main(): Promise<void> {
   if (await handleVersionProbe()) return;
   await recordCall();
   switch (scenario) {
+    case "regional_device_split": {
+      process.stdout.write(
+        "Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\nhttps://us-east-1.signin.aws/platform/auth",
+      );
+      await sleep(100);
+      process.stdout.write("orize?client_id=synthetic\n\nThen enter the code:\n\nWXYZ-");
+      await sleep(100);
+      process.stdout.write("1234\n");
+      await sleep(200);
+      process.exit(0);
+      return;
+    }
     case "portal_device_url":
     case "signin_device_url": {
       const url =
