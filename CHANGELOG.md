@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.7.3] — 2026-11-21
+
 ### Changed
 - The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs` (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13, the README's "Yaw MCP 1.1.13 or newer" and the `@yawlabs/mcp-compliance` devDependency (`^0.20.4`, the range Yaw MCP 1.1.13 pins), and warns without failing when a newer @yawlabs/mcp is published. Release tooling and docs only.
 - **The oam floor moves from 0.20.2 to 0.21.1, so the `aws-mcp` launcher no longer runs the server on oam 0.20.2-0.21.0.** 0.21.1 is verified on the installed aarch64-pc-windows-msvc binary through the launcher with `OAM_BIN` pointing at it and `AWS_MCP_RUNTIME=oam`, and again hosted as `oam run bin/aws-mcp.mjs`: a full MCP handshake listing all 30 tools, `aws_list_profiles` served, and the documented `aws_script` sandbox divergence re-measured on it (`eval('1+1')` returns 2 and `Function('return 7')()` returns 7 under oam; `Function('return this')()` yields a global with no `process` and no `require`; both raise the code-generation error under Node).
@@ -1208,7 +1210,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.2...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.3...HEAD
+[2.7.3]: https://github.com/YawLabs/aws-mcp/compare/v2.7.2...v2.7.3
 [2.7.2]: https://github.com/YawLabs/aws-mcp/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/YawLabs/aws-mcp/compare/v2.7.0...v2.7.1
 [2.7.0]: https://github.com/YawLabs/aws-mcp/compare/v2.6.1...v2.7.0
