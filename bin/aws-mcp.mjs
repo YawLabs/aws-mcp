@@ -71,9 +71,9 @@
  * AWS_* settings) and break.
  *
  * MINIMUM OAM VERSION
- * The floor, bumped to each new oam release. Currently 0.20.2, verified on it:
+ * The floor, bumped to each new oam release. Currently 0.21.1, verified on it:
  * full MCP handshake listing all 30 tools, a local tool call and the aws_script
- * sandbox check (2026-11-15, oam 0.20.2 aarch64-pc-windows-msvc, the installed
+ * sandbox check (2026-11-21, oam 0.21.1 aarch64-pc-windows-msvc, the installed
  * ~/.oam/bin/oam.exe, run as OAM_BIN). It is a FLOOR, not a pin: the
  * launcher runs the newest oam it finds at or above it, and falls back to Node
  * rather than serving on an older one -- which is the point, because an older oam
@@ -107,7 +107,7 @@ import { fileURLToPath } from "node:url";
  * The oam release this server is verified on; the launcher never serves below
  * it. See MINIMUM OAM VERSION above.
  */
-const OAM_MIN = [0, 20, 2];
+const OAM_MIN = [0, 21, 1];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -361,8 +361,8 @@ function chooseOam() {
 /**
  * The `oam self-update` advice, for an oam that is by construction below the
  * floor. When the floor was 0.18.0 that also made it older than the first signed
- * release; with the floor past it, a below-floor oam may be a signed 0.18.x, 0.19.x or
- * 0.20.x, so the ssh-keygen note is scoped to the oam it applies to. An oam that
+ * release; with the floor past it, a below-floor oam may be a signed 0.18.x, 0.19.x,
+ * 0.20.x or 0.21.0, so the ssh-keygen note is scoped to the oam it applies to. An oam that
  * predates signing still pipes an installer that verifies the signed release and
  * needs ssh-keygen 8.1 or later to do it (macOS and Linux ship it; on Windows it
  * is the inbox OpenSSH client).
