@@ -19,14 +19,19 @@ import {
 } from "./sso.js";
 
 describe("regional device banner", () => {
+  // Mirrors aws-cli's PrintOnlyHandler output byte for byte: opening message,
+  // URL, code, then the trailing autofill link the CLI always appends after
+  // the code.
   const banner = (url: string, code = "WXYZ-1234") =>
-    `Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\n${url}\n\nThen enter the code:\n\n${code}\n`;
+    `Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\n${url}\n\nThen enter the code:\n\n${code}\n\nAlternatively, you may visit the following URL which will autofill the code upon loading:\nhttps://signin.aws/platform/authorize?user_code=${code}\n`;
   const url = "https://us-east-1.signin.aws/platform/authorize?client_id=synthetic#fragment";
 
   it("pairs the complete banner, including CRLF and the full URL", () => {
     assert.deepEqual(parseRegionalDeviceBanner(banner(url).replaceAll("\n", "\r\n")), { url, code: "WXYZ-1234" });
     assert.deepEqual(parseLoginOutput(banner(url)), { url, code: "WXYZ-1234" });
-    assert.equal(parseRegionalDeviceBanner(banner(url).slice(0, -1)), null);
+    // Truncated before the code line's own newline: no match. The parser waits
+    // for the complete banner, so a half-delivered chunk settles nothing.
+    assert.equal(parseRegionalDeviceBanner(banner(url).split("\n\nAlternatively")[0]), null);
   });
 
   it("accepts signin.aws and valid DNS subdomains across regions without changing the URL", () => {

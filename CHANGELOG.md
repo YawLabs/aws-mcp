@@ -14,6 +14,9 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 ### Changed
 - The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs` (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13, the README's "Yaw MCP 1.1.13 or newer" and the `@yawlabs/mcp-compliance` devDependency (`^0.20.4`, the range Yaw MCP 1.1.13 pins), and warns without failing when a newer @yawlabs/mcp is published. Release tooling and docs only.
 
+### Fixed
+- **`aws_login_start` now recognizes the regional `signin.aws` device-code banner instead of timing out waiting for a verification URL.** An AWS CLI login that prints a regional `https://<region>.signin.aws/platform/authorize` URL plus its adjacent one-time code was parsed by `CODE_RE` but never by `URL_RE` (which only accepts paths ending in `device`), so the start sat through the full 15-second URL timeout with the banner already on stdout. The new parser accepts only the CLI's complete `PrintOnlyHandler` URL-and-code banner -- the standalone authorization URL without its adjacent code still never counts as a device login, so the PKCE code-less failure keeps its actionable message -- with the authority restricted to `signin.aws` and valid ASCII DNS subdomains under an exact `/platform/authorize` path; lookalike hosts, embedded credentials, explicit ports, malformed DNS labels and percent-encoded or Unicode host forms are all rejected. The full URL is preserved across split subprocess chunks.
+
 ## [2.7.2] — 2026-11-15
 
 ### Changed

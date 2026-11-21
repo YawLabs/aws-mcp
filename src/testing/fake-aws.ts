@@ -461,7 +461,11 @@ async function main(): Promise<void> {
       await sleep(100);
       process.stdout.write("orize?client_id=synthetic\n\nThen enter the code:\n\nWXYZ-");
       await sleep(100);
-      process.stdout.write("1234\n");
+      // Trailing autofill line, exactly as aws-cli's PrintOnlyHandler appends
+      // it after the code.
+      process.stdout.write(
+        "1234\n\nAlternatively, you may visit the following URL which will autofill the code upon loading:\nhttps://EU-West-1.SignIn.AWS/platform/authorize?user_code=WXYZ-1234\n",
+      );
       await sleep(200);
       process.exit(0);
       return;
