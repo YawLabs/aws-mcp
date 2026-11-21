@@ -10,12 +10,86 @@ import {
   PKCE_URL_RE,
   parseAwsCliVersion,
   parseLoginOutput,
+  parseRegionalDeviceBanner,
   SSO_SESSION_MIN_CLI,
   startSsoLogin,
   supportsDeviceCodeFlag,
   supportsSsoSession,
   URL_RE,
 } from "./sso.js";
+
+describe("regional device banner", () => {
+  // Mirrors aws-cli's PrintOnlyHandler output byte for byte: opening message,
+  // URL, code, then the trailing autofill link the CLI always appends after
+  // the code.
+  const banner = (url: string, code = "WXYZ-1234") =>
+    `Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\n${url}\n\nThen enter the code:\n\n${code}\n\nAlternatively, you may visit the following URL which will autofill the code upon loading:\nhttps://signin.aws/platform/authorize?user_code=${code}\n`;
+  const url = "https://us-east-1.signin.aws/platform/authorize?client_id=synthetic#fragment";
+
+  it("pairs the complete banner, including CRLF and the full URL", () => {
+    assert.deepEqual(parseRegionalDeviceBanner(banner(url).replaceAll("\n", "\r\n")), { url, code: "WXYZ-1234" });
+    assert.deepEqual(parseLoginOutput(banner(url)), { url, code: "WXYZ-1234" });
+    // Truncated before the code line's own newline: no match. The parser waits
+    // for the complete banner, so a half-delivered chunk settles nothing.
+    assert.equal(parseRegionalDeviceBanner(banner(url).split("\n\nAlternatively")[0]), null);
+  });
+
+  it("accepts signin.aws and valid DNS subdomains across regions without changing the URL", () => {
+    for (const host of [
+      "signin.aws",
+      "us-west-2.signin.aws",
+      "eu-west-1.signin.aws",
+      "ap-southeast-2.signin.aws",
+      "a.b.signin.aws",
+      "US-East-1.SignIn.AWS",
+      `${"a".repeat(63)}.signin.aws`,
+    ]) {
+      const link = `https://${host}/platform/authorize?client_id=synthetic#fragment`;
+      assert.deepEqual(parseRegionalDeviceBanner(banner(link)), { url: link, code: "WXYZ-1234" });
+    }
+  });
+
+  it("rejects malformed authorities, lookalikes and paths", () => {
+    for (const invalid of [
+      "http://us-east-1.signin.aws/platform/authorize",
+      "https://.signin.aws/platform/authorize",
+      "https://a..signin.aws/platform/authorize",
+      `https://${"a".repeat(64)}.signin.aws/platform/authorize`,
+      `https://${Array(4).fill("a".repeat(63)).join(".")}.signin.aws/platform/authorize`,
+      "https://-a.signin.aws/platform/authorize",
+      "https://a-.signin.aws/platform/authorize",
+      "https://a_b.signin.aws/platform/authorize",
+      "https://signin.aws./platform/authorize",
+      "https://evilsignin.aws/platform/authorize",
+      "https://signin.aws.evil.example/platform/authorize",
+      "https://%73ignin.aws/platform/authorize",
+      "https://sıgnin.aws/platform/authorize",
+      "https://us-east-1.signin.aws.evil.example/platform/authorize",
+      "https://user@us-east-1.signin.aws/platform/authorize",
+      "https://@signin.aws/platform/authorize",
+      "https://us-east-1.signin.aws:443/platform/authorize",
+      "https://signin.aws:/platform/authorize",
+      "https://us-east-1.signin.aws/platform/authorize/extra",
+      "https://us-east-1.signin.aws/platform/authorize%2fextra",
+      "https://us-east-1.signin.aws/platform/../platform/authorize",
+      "https://us-east-1.signin.aws/platform/authorize?bad=with space",
+      "https://signin.aws/platform/authorize?bad=\u0000",
+      "https://signin.aws/platform/authorize?bad=\u007f",
+    ])
+      assert.equal(parseRegionalDeviceBanner(banner(invalid)), null, invalid);
+  });
+
+  it("requires the exact adjacent banner and valid code", () => {
+    assert.equal(parseRegionalDeviceBanner(banner(url, "abcd-efgh")), null);
+    assert.equal(
+      parseRegionalDeviceBanner(
+        banner(url).replace("Then enter the code:", "Unrelated message:\nThen enter the code:"),
+      ),
+      null,
+    );
+    assert.equal(parseRegionalDeviceBanner(`Open ${url}\nABCD-EFGH\n`), null);
+  });
+});
 
 describe("URL_RE", () => {
   it("matches standard AWS SSO device URLs across regions", () => {

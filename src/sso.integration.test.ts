@@ -80,6 +80,16 @@ afterEach(() => {
 });
 
 describe("startSsoLogin — happy path", () => {
+  it("pairs the regional banner across URL and code chunks", async () => {
+    const start = await startSsoLogin("test-profile", fakeOpts("regional_device_split", 30_000));
+    assert.equal(start.ok, true);
+    if (!start.ok) return;
+    assert.equal(start.verificationUrl, "https://EU-West-1.SignIn.AWS/platform/authorize?client_id=synthetic");
+    assert.equal(start.userCode, "WXYZ-1234");
+    const completed = await waitForLogin(start.sessionId);
+    assert.equal(completed.ok, true);
+    assert.equal(completed.exitCode, 0);
+  });
   for (const [scenario, expectedUrl] of [
     ["portal_device_url", "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH"],
     ["signin_device_url", "https://us-east-1.signin.aws/platform/d-example/device?user_code=ABCD-EFGH"],
