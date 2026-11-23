@@ -132,8 +132,8 @@ describe("resolveLogGroupName", () => {
 });
 
 describe("relativeTimeMs (shared with aws_metrics_query)", () => {
-  // The pattern lives here and metrics.ts imports it -- previously the two
-  // files each carried a byte-identical copy.
+  // The pattern lives here; metrics.ts reaches it through resolveTime --
+  // previously the two files each carried a byte-identical copy.
   it("converts each documented unit", () => {
     assert.equal(relativeTimeMs("30s"), 30_000);
     assert.equal(relativeTimeMs("15m"), 15 * 60_000);
@@ -647,9 +647,11 @@ describe("aws_logs_tail schema", () => {
     // A caller reading the description has to know which floor explains
     // `totalEvents: null` and which one explains an ARN rejection, and the whole
     // string has to stay inside the 2,000-byte budget every tool is held to.
-    const escaped = (v: string) => v.replaceAll(".", ".");
-    assert.match(tool.description, new RegExp(`AWS CLI ${escaped(START_FROM_HEAD_MIN_CLI)}+`));
-    assert.match(tool.description, new RegExp(`AWS CLI ${escaped(LOG_GROUP_IDENTIFIER_MIN_CLI)}+`));
+    // Literal substring checks: a RegExp built from '2.35.8+' reads each dot as
+    // any character and the '+' as a quantifier, so it never checked the '+'.
+    for (const floor of [START_FROM_HEAD_MIN_CLI, LOG_GROUP_IDENTIFIER_MIN_CLI]) {
+      assert.ok(tool.description.includes(`AWS CLI ${floor}+`), `description must name 'AWS CLI ${floor}+'`);
+    }
     assert.ok(
       Buffer.byteLength(tool.description) < 2000,
       `description is ${Buffer.byteLength(tool.description)} bytes`,
@@ -690,6 +692,19 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     assert.match(r.error ?? "", /not both/);
   });
 
+  it("treats an EMPTY logStreamNames beside a prefix as no list, not a conflict", async () => {
+    // buildTailParams drops `[]` as "no stream filter", and models often send an
+    // empty array for an unused optional list -- so this is not "both".
+    _resetLogsTailCliModelCache();
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_current_empty";
+    const r = (await tool.handler({
+      logGroupName: "/aws/lambda/my-fn",
+      logStreamNames: [],
+      logStreamNamePrefix: "2026/09/",
+    })) as { ok: boolean; error?: string };
+    assert.equal(r.ok, true, `expected the call to go through, got: ${r.error ?? ""}`);
+  });
+
   it("rejects logStreamNames containing a flag-like entry", async () => {
     const r = (await tool.handler({
       logGroupName: "/aws/lambda/my-fn",
@@ -728,9 +743,8 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     assert.match(r.error ?? "", /Invalid logStreamNamePrefix/);
   });
 
-  it("accepts a log-group ARN where a bare name is expected", async () => {
-    // Reaches the spawn path, so only assert that validation let it through --
-    // the ARN branch itself is pinned by the resolveLogGroupName cases above.
+  it("rejects a hostile group name inside a well-formed ARN", async () => {
+    // The accept case is in the region-check suite below.
     const r = (await tool.handler({
       logGroupName: "arn:aws:logs:us-east-1:123456789012:log-group:-force",
     })) as { ok: boolean; error?: string };
@@ -767,7 +781,7 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
   it("still runs the windows the description documents (boundary: 4w in, 5w out)", async () => {
     // The cap must not shrink the vocabulary the tool advertises ('1w', '3d').
     // 4w (28 days) is inside the 30-day ceiling and runs; 5w (35 days) is not.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_current_empty";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_current_empty";
     const inside = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "4w" })) as {
       ok: boolean;
       error?: string;
@@ -787,7 +801,7 @@ describe("aws_logs_tail handler — input validation (no spawn)", () => {
     // instead of `>`) survives it. The cap is inclusive: sinceMs > MAX_SINCE_MS
     // rejects, so exactly 30 days must still run.
     assert.equal(relativeTimeMs("30d"), MAX_SINCE_MS, "precondition: '30d' is exactly the ceiling");
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_current_empty";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_current_empty";
     const atMax = (await tool.handler({ logGroupName: "/aws/lambda/my-fn", since: "30d" })) as {
       ok: boolean;
       error?: string;
@@ -867,7 +881,7 @@ describe("aws_logs_tail handler — log-group ARN region check (no spawn)", () =
   it("lets a matching region through to the call", async () => {
     process.env.AWS_REGION = "us-east-1";
     delete process.env.AWS_DEFAULT_REGION;
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_current_empty";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_current_empty";
     const r = (await tool.handler({
       logGroupName: "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn",
       region: "us-east-1",
@@ -1114,20 +1128,19 @@ describe("pollQueryUntilTerminal", () => {
 
   it("stops at the budget without making a call past maxWaitMs, and names the queryId", async () => {
     const { call, calls } = scriptedCaller(["Running"]);
-    let now = 0;
     const r = await pollQueryUntilTerminal(
       { queryId: "q-budget", pollIntervalMs: 20, maxWaitMs: 100 },
       call,
-      async (ms: number) => {
-        now += ms;
-      },
+      // The loop reads the real Date.now(), so wait for real -- briefly -- rather
+      // than resolving instantly and busy-spinning scripted calls for 100 ms.
+      (ms: number) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
     );
     assert.equal(r.reason, "budget");
+    assert.ok(r.attempts >= 1, "at least one poll ran before the budget expired");
     assert.equal(calls.length, r.attempts, "no AWS call after the budget expired");
     assert.match(r.error ?? "", /q-budget/);
     assert.match(r.error ?? "", /maxWaitMs/);
     assert.match(r.error ?? "", /7 days/, "the resume hint must survive onto the budget arm");
-    assert.ok(now >= 0);
   });
 
   it("makes ZERO AWS calls when the signal is already aborted", async () => {
@@ -1218,9 +1231,8 @@ describe("pollQueryUntilTerminal", () => {
   });
 
   it("clamps the inter-poll sleep to the REMAINING budget, never the raw interval", async () => {
-    // The budget test above looks like it covers this but does not: its `now`
-    // accumulator is never compared against anything (its closing assertion is
-    // vacuous) and the loop reads real Date.now(). The only other test that
+    // The budget test above looks like it covers this but does not: it never
+    // inspects sleep durations, and the loop reads real Date.now(). The only other test that
     // inspects sleep durations uses maxWaitMs 60000 against pollIntervalMs
     // 1234, where the clamp never binds. This is a single-threaded stdio
     // server, so a 30s sleep past a sub-second budget blocks every other tool
@@ -1394,5 +1406,75 @@ describe("aws_logs_query handler — input validation (no spawn)", () => {
     };
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /must be after startTime/);
+  });
+
+  it("rejects an oversized relative startTime instead of skipping the 90-day cap", async () => {
+    // '20000000w' resolved to an Invalid Date: truthy, and NaN compares false
+    // against the range cap, so the window check was skipped and startTime went
+    // out as null in the StartQuery payload.
+    const r = (await queryTool.handler(okQuery({ startTime: "20000000w" }))) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startTime '20000000w'/);
+  });
+});
+
+describe("aws_logs_query handler — log-group ARN region check", () => {
+  // StartQuery is regional and this tool sends bare names, so an ARN for another
+  // region used to start a billed query over the same-named group in the call's
+  // region. Regions are pinned explicitly so a developer shell's AWS_REGION
+  // cannot change the answer.
+  let prevRegion: string | undefined;
+  let prevDefaultRegion: string | undefined;
+  before(() => {
+    prevRegion = process.env.AWS_REGION;
+    prevDefaultRegion = process.env.AWS_DEFAULT_REGION;
+  });
+  after(() => {
+    if (prevRegion === undefined) delete process.env.AWS_REGION;
+    else process.env.AWS_REGION = prevRegion;
+    if (prevDefaultRegion === undefined) delete process.env.AWS_DEFAULT_REGION;
+    else process.env.AWS_DEFAULT_REGION = prevDefaultRegion;
+  });
+
+  it("refuses a cross-region ARN before start-query, naming both regions", async () => {
+    // A scenario that would SUCCEED if reached, so only the guard can make this fail.
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_complete";
+    const r = (await queryTool.handler(
+      okQuery({
+        logGroupNames: ["/aws/lambda/ok", "arn:aws:logs:us-west-2:123456789012:log-group:/aws/lambda/my-fn:*"],
+        region: "us-east-1",
+        pollIntervalMs: 500,
+      }),
+    )) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /region 'us-west-2', but this call runs in 'us-east-1'/);
+    assert.match(r.error ?? "", /StartQuery is regional/);
+    assert.match(r.error ?? "", /pass the bare name '\/aws\/lambda\/my-fn'/);
+    // Nothing was spawned, so nothing classified this failure.
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+
+  it("names the session/default region when the call named none", async () => {
+    process.env.AWS_REGION = "eu-west-1";
+    delete process.env.AWS_DEFAULT_REGION;
+    const r = (await queryTool.handler(
+      okQuery({ logGroupNames: ["arn:aws:logs:us-west-2:123456789012:log-group:/aws/lambda/my-fn"] }),
+    )) as { ok: boolean; error?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /'eu-west-1' \(the session\/default region\)/);
+  });
+
+  it("still accepts a same-region ARN and sends its bare name", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_complete";
+    const r = (await queryTool.handler(
+      okQuery({
+        logGroupNames: ["arn:aws:logs:us-west-2:123456789012:log-group:/aws/lambda/my-fn:*"],
+        region: "us-west-2",
+        pollIntervalMs: 500,
+      }),
+    )) as { ok: boolean; error?: string; data?: { region: string } };
+    assert.equal(r.ok, true, `expected the ARN to be accepted, got: ${r.error ?? ""}`);
+    assert.equal(r.data?.region, "us-west-2");
   });
 });

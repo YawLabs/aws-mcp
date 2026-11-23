@@ -10,16 +10,28 @@ if (!setTool || !getTool || !clearTool) throw new Error("sessionTools missing ex
 
 const savedEnv = { ...process.env };
 
+// Restore per key rather than `process.env = { ...savedEnv }`: reassigning
+// swaps Node's env proxy for a plain object, so later writes would stop
+// reaching the real environment (child processes, os.homedir()) and Windows'
+// case-insensitive lookup would be gone for the rest of the file.
+function restoreEnv(): void {
+  for (const k of Object.keys(process.env)) if (!(k in savedEnv)) delete process.env[k];
+  for (const [k, v] of Object.entries(savedEnv)) if (process.env[k] !== v) process.env[k] = v;
+}
+
 beforeEach(() => {
   _resetSession();
   delete process.env.AWS_PROFILE;
+  // getProfile honours AWS_DEFAULT_PROFILE too; an ambient one would turn
+  // every "profileSource: default" assertion below red.
+  delete process.env.AWS_DEFAULT_PROFILE;
   delete process.env.AWS_REGION;
   delete process.env.AWS_DEFAULT_REGION;
 });
 
 afterEach(() => {
   _resetSession();
-  process.env = { ...savedEnv };
+  restoreEnv();
 });
 
 type SessionData = {

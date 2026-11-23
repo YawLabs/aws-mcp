@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { runAwsCall } from "../aws-cli.js";
-import type { Tool, ToolResult } from "./tool.js";
+import { type AwsCallFailure, runAwsCall } from "../aws-cli.js";
+import { failureToolResult, type Tool, type ToolResult } from "./tool.js";
 
 /** The AWS CLI v2's exit code for every argument-parsing failure: argparser.py
  * `self.exit(252, ...)` since 2.0.0; measured on 2.22.0 and 2.34.3. */
@@ -65,6 +65,8 @@ export interface CliArgParseContext {
   operation: string;
   sentParams: boolean;
   exitCode: number | null | undefined;
+  /** The tool the caller used, named in the hint. Default "aws_call". */
+  tool?: string;
 }
 
 /**
@@ -103,13 +105,14 @@ export interface CliArgParseContext {
  */
 export function cliArgParseHint(stderr: string, ctx: CliArgParseContext): string | undefined {
   if (ctx.exitCode !== CLI_PARSE_EXIT_CODE) return undefined;
+  const tool = ctx.tool ?? "aws_call";
   // Mirrors runAwsCall's own operation tokenization so 'wait  object-exists'
   // and ' get-object ' resolve the same key the CLI was given.
   const key = `${ctx.service} ${ctx.operation.trim().split(/\s+/).filter(Boolean).join(" ")}`;
   // Before the two sentences below, because the group case carries neither of
   // them. See JSON_AS_SUBCOMMAND_RE.
   if (ctx.sentParams && JSON_AS_SUBCOMMAND_RE.test(stderr)) {
-    return `\`aws ${key}\` is a subcommand group, not an operation, so it needs one more name in \`operation\` -- for a waiter, the waiter's own name ('wait instance-running'). \`aws ${key} help\` lists them. The name argparse called an invalid choice is the \`params\` JSON, not anything you passed as \`operation\`: aws_call sends params through --cli-input-json, a group's parser does not register that flag, and argparse read its value as the missing subcommand.`;
+    return `\`aws ${key}\` is a subcommand group, not an operation, so it needs one more name in \`operation\` -- for a waiter, the waiter's own name ('wait instance-running'). \`aws ${key} help\` lists them. The name argparse called an invalid choice is the \`params\` JSON, not anything you passed as \`operation\`: ${tool} sends params through --cli-input-json, a group's parser does not register that flag, and argparse read its value as the missing subcommand.`;
   }
   const required = ARGPARSE_REQUIRED_RE.exec(stderr);
   let unreachable: boolean;
@@ -137,12 +140,35 @@ export function cliArgParseHint(stderr: string, ctx: CliArgParseContext): string
   if (unreachable) {
     const alternative =
       CLI_INPUT_JSON_ALTERNATIVES.get(key) ?? `Run it in a shell with explicit flags (\`aws ${key} help\` lists them).`;
-    return `\`aws ${key}\` cannot run through aws_call. aws_call passes \`params\` only through --cli-input-json and cannot supply positional arguments, and the AWS CLI registers --cli-input-json on neither the operations that stream their response to a positional output file (s3api get-object, bedrock-runtime invoke-model, bedrock-agentcore invoke-agent-runtime, lambda invoke) nor its hand-written commands (logs tail, s3 cp/ls/sync, cloudformation deploy). ${alternative}`;
+    return `\`aws ${key}\` cannot run through ${tool}. ${tool} passes \`params\` only through --cli-input-json and cannot supply positional arguments, and the AWS CLI registers --cli-input-json on neither the operations that stream their response to a positional output file (s3api get-object, bedrock-runtime invoke-model, bedrock-agentcore invoke-agent-runtime, lambda invoke) nor its hand-written commands (logs tail, s3 cp/ls/sync, cloudformation deploy). ${alternative}`;
   }
   // No guessed member names here on purpose: converting --cluster to Cluster is
   // wrong for ECS, EKS, ECR, Logs, Step Functions, API Gateway, Batch and
   // Bedrock, and a wrong name stated as an instruction is worse than the rule.
-  return 'aws_call sent no `params`, and this operation has required members. The CLI names them as flags; pass them in `params` by API member name instead: PascalCase for most services (--bucket -> Bucket), camelCase for some (--model-id -> modelId on bedrock-runtime). If a name is wrong, the CLI\'s "Unknown parameter in input" error lists the valid ones.';
+  return `${tool} sent no \`params\`, and this operation has required members. The CLI names them as flags; pass them in \`params\` by API member name instead: PascalCase for most services (--bucket -> Bucket), camelCase for some (--model-id -> modelId on bedrock-runtime). If a name is wrong, the CLI's "Unknown parameter in input" error lists the valid ones.`;
+}
+
+/**
+ * cliArgParseHint, gated the way both aws_call and aws_paginate need it: only
+ * where runAwsCall found no remedy of its own. parseAwsError's suggestion is
+ * derived from the AWS error code and is the more specific of the two whenever
+ * it fired at all.
+ */
+export function cliParseFailureHint(
+  result: AwsCallFailure,
+  ctx: { service: string; operation: string; params?: Record<string, unknown>; tool?: string },
+): string | undefined {
+  if (result.kind !== "nonzero_exit" || result.suggestion !== undefined) return undefined;
+  return cliArgParseHint(result.rawStderr ?? "", {
+    service: ctx.service,
+    operation: ctx.operation,
+    // MUST mirror the --cli-input-json condition in aws-cli.ts (the only place
+    // the flag is added). Pinned by the call_echo_args test in call.test.ts,
+    // which asserts the argv both ways.
+    sentParams: ctx.params !== undefined && Object.keys(ctx.params).length > 0,
+    exitCode: result.exitCode,
+    tool: ctx.tool,
+  });
 }
 
 export const callTools: readonly Tool[] = [
@@ -227,43 +253,9 @@ export const callTools: readonly Tool[] = [
         timeoutMs: i.timeoutMs,
       });
       if (!result.ok) {
-        // Only where runAwsCall found no remedy of its own: parseAwsError's
-        // suggestion is derived from the AWS error code and is the more specific
-        // of the two whenever it fired at all.
-        const hint =
-          result.kind === "nonzero_exit" && result.suggestion === undefined
-            ? cliArgParseHint(result.rawStderr ?? "", {
-                service: i.service,
-                operation: i.operation,
-                // MUST mirror the --cli-input-json condition in aws-cli.ts (the
-                // only place the flag is added). Pinned by the call_echo_args
-                // test in call.test.ts, which asserts the argv both ways.
-                sentParams: i.params !== undefined && Object.keys(i.params).length > 0,
-                exitCode: result.exitCode,
-              })
-            : undefined;
-        return {
-          ok: false,
-          // Embedded in `error` AND carried in `suggestion`, the same convention
-          // runAwsCall's nonzero_exit branch uses -- toMcpResult renders only
-          // `error`, so a hint that lived in the field alone would never reach
-          // the model. `error` still OPENS with the stderr trim, which is what
-          // keeps toMcpResult from appending rawBody a second time.
-          error: hint ? `${result.error}\n\nSuggestion: ${hint}` : result.error,
-          // runAwsCall already classified this failure; forwarding the kind is
-          // what lets a caller branch on it without regexing the message. The
-          // hint does not change it: this IS a nonzero exit.
-          errorKind: result.kind,
-          suggestion: result.suggestion ?? hint,
-          // Treat an empty-string rawStderr as "no stderr" so a nonzero exit
-          // that wrote its diagnostic to stdout (rare but observed: some
-          // `aws` operations route through stdout when stderr is closed or
-          // when a wrapper script swallows stderr) still surfaces the
-          // stdout body. Pinned by call.test.ts -- the failure-shape
-          // contract is "diagnostic text first, stdout second" rather
-          // than "stderr always wins even when empty".
-          rawBody: result.rawStderr ? result.rawStderr : result.rawStdout,
-        };
+        // errorKind forwards runAwsCall's classification; the hint does not
+        // change it: this IS a nonzero exit.
+        return failureToolResult(result, cliParseFailureHint(result, i));
       }
       return {
         ok: true,

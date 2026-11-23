@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { Agent, request } from "node:http";
 import { connect } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -87,6 +87,7 @@ describe("isolateAwsEnv", () => {
       all_proxy: "socks5://proxy.invalid:1080",
       no_proxy: "example.invalid",
       PythonHome: "nowhere",
+      BOTO_CONFIG: join(tmpdir(), "aws-mcp-realcli-selftest-not-a-boto-config"),
     };
     // POSIX names are case-sensitive, so both spellings can coexist there and
     // both must go. On Windows they are one variable.
@@ -121,6 +122,11 @@ describe("isolateAwsEnv", () => {
           ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"],
           "each proxy variable exists once, in the upper-case spelling the harness set",
         );
+        assert.deepEqual(
+          names.filter((k) => k.toUpperCase() === "BOTO_CONFIG"),
+          [],
+          "BOTO_CONFIG is gone",
+        );
       } finally {
         iso.restore();
       }
@@ -145,6 +151,11 @@ describe("isolateAwsEnv", () => {
       assert.equal(process.env.AWS_CONFIG_FILE, iso.configFile);
       assert.equal(process.env.AWS_SHARED_CREDENTIALS_FILE, iso.credentialsFile);
       assert.ok(iso.configFile.startsWith(iso.dir) && iso.credentialsFile.startsWith(iso.dir));
+      // The home directory as well, so ~/.aws/sso/cache, ~/.aws/cli/cache and
+      // the rest resolve into the throwaway dir and never the developer's own.
+      assert.equal(process.env.HOME, iso.dir);
+      assert.equal(process.env.USERPROFILE, iso.dir);
+      assert.equal(homedir(), iso.dir, "os.homedir() follows, so in-process readers agree with the CLI");
       assert.match(readFileSync(iso.configFile, "utf8"), /^\[default\]\nregion = us-east-1\n$/);
       const creds = readFileSync(iso.credentialsFile, "utf8");
       assert.match(creds, /^\[default\]\n/);
@@ -318,8 +329,11 @@ describe("detectRealAwsCli", () => {
     const { cli } = installed;
     // An absolute path, from the same resolver runAwsCall uses -- a bare name
     // would mean the suite and the server could run different binaries.
+    // No basename check: AWS_MCP_AWS_CLI accepts any file name (aws-2.22.0.exe,
+    // /opt/awscli/aws-2.22), which is how the older-CLI release check runs. On
+    // Windows the resolver still requires an .exe.
     assert.equal(isAbsolute(cli.command), true, cli.command);
-    assert.match(cli.command, process.platform === "win32" ? /[\\/]aws\.exe$/i : /\/aws$/);
+    if (process.platform === "win32") assert.match(cli.command, /\.exe$/i);
     assert.equal(cli.version[0], 2);
     assert.ok(cli.versionLine.startsWith(`aws-cli/${cli.version.join(".")}`), cli.versionLine);
     const tooNew: [number, number, number] = [cli.version[0], cli.version[1], cli.version[2] + 1];

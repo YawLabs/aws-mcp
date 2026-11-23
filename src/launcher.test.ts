@@ -428,6 +428,19 @@ describe("launcher with no usable oam", () => {
     assert.match(run.stderr, /no Node was found on PATH/);
   });
 
+  it("names AWS_MCP_RUNTIME=node, not a self-update, when a supported oam host has no Node", { timeout }, async () => {
+    // The supported-host handoff carries an EMPTY reason. It used to be spliced
+    // in anyway ("aws-mcp: , and no Node was found...") and followed by
+    // self-update advice that cannot help a host already at the floor.
+    const noNode = mkdtempSync(join(tmpdir(), "aws-mcp-launcher-nopath-"));
+    const run = await runLauncher("0.21.1", { ...isolated(), PATH: noNode, AWS_MCP_RUNTIME: "node" });
+    assert.equal(run.code, 1, JSON.stringify(run));
+    assert.equal(run.stdout.trim(), "", "nothing may be served");
+    assert.match(run.stderr, /^aws-mcp: AWS_MCP_RUNTIME=node was requested, but no Node was found on PATH/m);
+    assert.doesNotMatch(run.stderr, /aws-mcp: ,/);
+    assert.doesNotMatch(run.stderr, /self-update/);
+  });
+
   it("hands AWS_MCP_RUNTIME=node off to Node even on a supported oam host", { timeout }, async () => {
     // At the floor, so this is the supported-host branch: a handoff with no
     // below-floor reason. (It used 0.15.2, which each floor bump since has made a
@@ -462,5 +475,9 @@ describe("launcher with no usable oam", () => {
     assert.equal(run.code, 0, JSON.stringify(run));
     assert.equal(run.stdout.trim(), PACKAGE_VERSION, "the Node fallback must still serve");
     assert.match(run.stderr, /failed to launch oam at .*using Node instead/);
+    // The handoff reason names the failed launch; "no newer oam was found" is
+    // false here -- one was found, it just would not start.
+    assert.match(run.stderr, /older than 0\.21\.1, and the newer oam at .* could not be launched; running on /);
+    assert.doesNotMatch(run.stderr, /no newer oam was found/);
   });
 });

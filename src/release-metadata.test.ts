@@ -5,8 +5,8 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 // Resolve via import.meta.url so this works regardless of process.cwd(). The
-// file lives one level below the repo root in both layouts -- src/ under vitest,
-// dist/ for the compiled node:test run -- so the same hop reaches the root.
+// file is authored in src/ and run from dist/ by node:test; both sit one level
+// below the repo root, so the same hop reaches it.
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function readJson(rel: string): Record<string, unknown> {
@@ -163,5 +163,62 @@ describe("release.sh MCP Registry calls", () => {
   // environment must not stand in for that.
   it("sets the time limit up itself, whatever the environment carries", () => {
     assert.match(releaseSh, /^MCP_TIMEOUT_READY=""$/m);
+  });
+});
+
+describe("release.sh pre-flight and supply chain", () => {
+  const releaseSh = readFileSync(resolve(repoRoot, "release.sh"), "utf-8");
+  // Code lines only: a comment that names a removed variable is history, not a path.
+  const code = releaseSh
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+  const before = (needle: string, marker: string) => {
+    const at = releaseSh.indexOf(needle);
+    const end = releaseSh.indexOf(marker);
+    assert.ok(at >= 0, `release.sh: ${needle} not found`);
+    assert.ok(end >= 0, `release.sh: ${marker} not found`);
+    return at < end;
+  };
+
+  // Step 4 pushes `main` by name; from another branch the tag lands on a commit
+  // that is never pushed and the GitHub release points elsewhere than npm.
+  it("refuses to release from any branch but main, before anything changes", () => {
+    assert.match(code, /git symbolic-ref --quiet --short HEAD/);
+    assert.match(code, /if \[ "\$RELEASE_BRANCH" != "main" \]; then\n\s*fail /);
+    assert.ok(before('RELEASE_BRANCH" != "main"', 'step 1 "Lint"'), "the branch check must run in the pre-flight");
+  });
+
+  // jq is step 3 and gh is step 6, after the npm publish; both are checked up front.
+  it("pre-flights jq, gh and a gh login beside node and npm", () => {
+    for (const needle of ["command -v jq", "command -v gh", "gh auth status"]) {
+      assert.ok(code.includes(needle), `release.sh pre-flight lacks ${needle}`);
+      assert.ok(before(needle, 'step 1 "Lint"'), `${needle} must run before step 1`);
+    }
+  });
+
+  // There is no CI; an ambient CI=true used to skip the clean-tree check and the
+  // commit/tag/push, then publish with --provenance.
+  it("has no CI mode an ambient CI=true could switch on", () => {
+    assert.doesNotMatch(code, /\$\{?CI\b|IS_CI|GITHUB_REF_NAME|--provenance/);
+  });
+
+  // mcp-publisher gets an org-scoped token, so it is pinned and its tarball is
+  // checked against the release's checksums file, and the token never rides argv.
+  it("pins mcp-publisher, verifies its sha256, and passes the token by environment", () => {
+    assert.match(code, /^\s*MCP_PUBLISHER_VERSION="\d+\.\d+\.\d+"$/m);
+    assert.doesNotMatch(code, /releases\/latest/);
+    assert.match(code, /releases\/download\/v\$\{MCP_PUBLISHER_VERSION\}/);
+    assert.match(code, /registry_\$\{MCP_PUBLISHER_VERSION\}_checksums\.txt/);
+    assert.match(code, /if \[ "\$MP_GOT" != "\$MP_WANT" \]; then/);
+    assert.ok(
+      before('"$MP_GOT" != "$MP_WANT"', 'tar xzf "$TMP/mp.tar.gz"'),
+      "the checksum must be verified before the tarball is extracted",
+    );
+    for (const line of code.split("\n").filter((l) => /curl .*mp\.tar\.gz|curl .*sums\.txt/.test(l))) {
+      assert.match(line, /curl -f/, `download must fail on HTTP errors: ${line.trim()}`);
+    }
+    assert.doesNotMatch(code, /-token\b/, "a token on the mcp-publisher command line is visible to every process");
+    assert.match(code, /export MCP_GITHUB_TOKEN="\$MCP_REGISTRY_TOKEN"/);
   });
 });

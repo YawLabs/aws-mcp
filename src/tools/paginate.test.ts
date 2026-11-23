@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runAwsCall } from "../aws-cli.js";
 import { _resetSession } from "../session.js";
-import { extractNextToken, paginateTools, wrapQueryForPagination } from "./paginate.js";
+import { clampMaxItems, extractNextToken, paginateTools, wrapQueryForPagination } from "./paginate.js";
 import { validateCursorToken } from "./resource.js";
 
 const tool = paginateTools.find((t) => t.name === "aws_paginate");
@@ -146,6 +146,107 @@ describe("aws_paginate handler — startingToken validation (no spawn)", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /Invalid startingToken/);
   });
+
+  it("leaves errorKind UNSET when the handler's own startingToken guard rejects before any CLI call", async () => {
+    // The NEGATIVE half of the contract, and the reason ToolResult.errorKind is
+    // optional rather than defaulted: this guard returns before runAwsCall, so
+    // nothing classified the failure. An ABSENT errorKind means "unclassified"
+    // -- stamping "bad_input" here would make it indistinguishable from
+    // runAwsCall's own bad_input, which aws_call DOES surface. Lives in this
+    // pinned describe for the hazard rule above.
+    const r = (await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      startingToken: "-evil",
+    })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startingToken/);
+    assert.equal(r.errorKind, undefined);
+    assert.equal(r.suggestion, undefined);
+  });
+});
+
+describe("clampMaxItems (direct callers that bypass the schema)", () => {
+  it("defaults when absent, NaN, infinite or not a number", () => {
+    assert.equal(clampMaxItems(undefined), 100);
+    assert.equal(clampMaxItems(Number.NaN), 100);
+    assert.equal(clampMaxItems(Number.POSITIVE_INFINITY), 100);
+    assert.equal(clampMaxItems("50"), 100);
+  });
+
+  it("truncates fractions and clamps to 1-10000", () => {
+    assert.equal(clampMaxItems(2.5), 2);
+    assert.equal(clampMaxItems(0.5), 1);
+    assert.equal(clampMaxItems(-3), 1);
+    assert.equal(clampMaxItems(10_001), 10_000);
+    assert.equal(clampMaxItems(50), 50);
+  });
+});
+
+describe("aws_paginate handler — argv it hands the CLI (call_echo_args)", () => {
+  // Every other handler test drives a scenario that prints fixed bytes whatever
+  // argv it got, so a handler that dropped --max-items, --starting-token or the
+  // query wrap would pass them all. These read back what was actually spawned.
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_echo_args";
+    _resetSession();
+  });
+  afterEach(() => {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+  });
+
+  type Echo = { ok: boolean; error?: string; data?: { result?: { argv?: string[] } | null; commandArgv?: string[] } };
+  const valueAfter = (argv: readonly string[], flag: string): string | undefined => {
+    const idx = argv.indexOf(flag);
+    return idx === -1 ? undefined : argv[idx + 1];
+  };
+
+  it("sends --max-items 100 by default and no --starting-token on the first page", async () => {
+    const r = (await tool.handler({ service: "s3api", operation: "list-buckets" })) as Echo;
+    assert.equal(r.ok, true, String(r.error));
+    const argv = r.data?.result?.argv ?? [];
+    assert.equal(valueAfter(argv, "--max-items"), "100");
+    assert.ok(!argv.includes("--starting-token"));
+  });
+
+  it("forwards maxItems and startingToken verbatim", async () => {
+    const r = (await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      maxItems: 7,
+      startingToken: "eyJuZXh0IjoiYWJjIn0=",
+    })) as Echo;
+    assert.equal(r.ok, true, String(r.error));
+    const argv = r.data?.result?.argv ?? [];
+    assert.equal(valueAfter(argv, "--max-items"), "7");
+    assert.equal(valueAfter(argv, "--starting-token"), "eyJuZXh0IjoiYWJjIn0=");
+  });
+
+  it("treats an empty or whitespace-only startingToken as the first page", async () => {
+    for (const startingToken of ["", "   "]) {
+      const r = (await tool.handler({ service: "s3api", operation: "list-buckets", startingToken })) as Echo;
+      assert.equal(r.ok, true, `startingToken ${JSON.stringify(startingToken)}: ${r.error}`);
+      assert.ok(!(r.data?.result?.argv ?? []).includes("--starting-token"));
+    }
+  });
+
+  it("clamps a NaN or fractional maxItems from a direct caller instead of passing it to argv", async () => {
+    const nan = (await tool.handler({ service: "s3api", operation: "list-buckets", maxItems: Number.NaN })) as Echo;
+    assert.equal(valueAfter(nan.data?.result?.argv ?? [], "--max-items"), "100");
+    const frac = (await tool.handler({ service: "s3api", operation: "list-buckets", maxItems: 2.5 })) as Echo;
+    assert.equal(valueAfter(frac.data?.result?.argv ?? [], "--max-items"), "2");
+  });
+
+  it("wraps the user query as {NextToken, items: <query>} on the way in", async () => {
+    const r = (await tool.handler({ service: "s3api", operation: "list-buckets", query: " Buckets[].Name " })) as Echo;
+    assert.equal(r.ok, true, String(r.error));
+    // `items` of the echo is absent, so read the argv runAwsCall built.
+    assert.equal(valueAfter(r.data?.commandArgv ?? [], "--query"), "{NextToken: NextToken, items: Buckets[].Name}");
+  });
 });
 
 describe("aws_paginate handler — normal startingToken passes through (fake-aws)", () => {
@@ -246,13 +347,11 @@ describe("wrapQueryForPagination", () => {
   });
 });
 
-describe("aws_paginate handler — query+NextToken round-trip via fake-aws", () => {
-  it("unwraps `items` and surfaces nextToken when query is supplied (truncated page)", async () => {
-    // The handler always calls runAwsCall with the real `aws` binary. Fake out
-    // the binary by routing through process.execPath + fake-aws via a per-test
-    // env var the wrapper can't normally inject -- handler doesn't expose
-    // command/prefixArgs, so we exercise the wrap+unwrap path through
-    // runAwsCall directly with the same wrapped query the handler builds.
+describe("runAwsCall — parsing a wrapped-query page (fake-aws canned bytes)", () => {
+  // runAwsCall only: what the CLI prints for the {NextToken, items} wrapper
+  // parses into both fields. The handler's own wrap and unwrap are driven in
+  // the end-to-end describe below and the call_echo_args describe above.
+  it("parses NextToken and items out of a truncated wrapped page", async () => {
     const wrapped = wrapQueryForPagination("Buckets[].Name");
     const r = await runAwsCall({
       service: "s3api",
@@ -373,8 +472,8 @@ describe("aws_paginate handler — end-to-end via AWS_MCP_TEST_AWS_* env overrid
     // call_access_denied scenario writes the AWS error to stderr and exits
     // 255, so runAwsCall returns ok:false with rawStderr populated. The
     // handler's failure branch must propagate ok:false and surface the
-    // stderr blob under rawBody (the `result.rawStderr ?? result.rawStdout`
-    // half of the envelope) -- the error path callers rely on to see what
+    // stderr blob under rawBody (the stderr half of tool.ts's rawBodyOf) --
+    // the error path callers rely on to see what
     // AWS actually said.
     beforeEachEnv();
     try {
@@ -449,20 +548,42 @@ describe("aws_paginate handler — end-to-end via AWS_MCP_TEST_AWS_* env overrid
     }
   });
 
-  it("leaves errorKind UNSET when the handler's own startingToken guard rejects before any CLI call", async () => {
-    // The NEGATIVE half of the contract, and the reason ToolResult.errorKind is
-    // optional rather than defaulted: this guard returns before runAwsCall, so
-    // nothing classified the failure. An ABSENT errorKind means "unclassified"
-    // -- stamping "bad_input" here would make it indistinguishable from
-    // runAwsCall's own bad_input, which aws_call DOES surface.
-    const r = (await tool.handler({
-      service: "s3api",
-      operation: "list-buckets",
-      startingToken: "-evil",
-    })) as { ok: boolean; error?: string; errorKind?: string; suggestion?: string };
-    assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /Invalid startingToken/);
-    assert.equal(r.errorKind, undefined);
-    assert.equal(r.suggestion, undefined);
+  // --- parse-failure remedies (shared with aws_call) ---
+
+  it("says the operation is not paginated when the CLI rejects --max-items", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "paginate_unknown_max_items";
+      const r = (await tool.handler({ service: "sts", operation: "get-caller-identity" })) as {
+        ok: boolean;
+        error?: string;
+        errorKind?: string;
+        suggestion?: string;
+      };
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "nonzero_exit");
+      assert.match(r.suggestion ?? "", /`aws sts get-caller-identity` is not a paginated operation/);
+      assert.match(r.suggestion ?? "", /aws_call/);
+      assert.ok((r.error ?? "").endsWith(`\n\nSuggestion: ${r.suggestion}`), String(r.error));
+    } finally {
+      afterEachEnv();
+    }
+  });
+
+  it("gives aws_call's unreachable-command remedy, naming aws_paginate", async () => {
+    beforeEachEnv();
+    try {
+      process.env.AWS_MCP_FAKE_SCENARIO = "call_argparse_required_bucket_key";
+      const r = (await tool.handler({
+        service: "s3api",
+        operation: "get-object",
+        params: { Bucket: "b", Key: "k" },
+      })) as { ok: boolean; errorKind?: string; suggestion?: string };
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "nonzero_exit");
+      assert.match(r.suggestion ?? "", /cannot run through aws_paginate\. aws_paginate passes/);
+    } finally {
+      afterEachEnv();
+    }
   });
 });

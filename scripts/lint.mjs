@@ -200,7 +200,9 @@ function emulatedX64Binary(version) {
     );
   }
 
-  console.error(`[lint] routing biome through the x64 build under emulation on Windows ARM64; provisioning x64 ${version}`);
+  console.error(
+    `[lint] routing biome through the x64 build under emulation on Windows ARM64; provisioning x64 ${version}`,
+  );
   const install = spawnSync(
     process.execPath,
     [npmCli, "i", "--no-save", "--force", "--prefix", prefix, `@biomejs/cli-win32-x64@${version}`],
@@ -273,14 +275,14 @@ const isBatch = /\.(cmd|bat)$/i.test(binary);
 const forwarded = process.argv.slice(2);
 // Only a space needs it here (biome's own flags carry none), and quoting
 // unconditionally would change arguments that are currently passed verbatim.
-const quoteForCmd = (value) => (/\s/.test(value) ? "\"" + value + "\"" : value);
+const quoteForCmd = (value) => (/\s/.test(value) ? `"${value}"` : value);
 let spawnTarget = binary;
 let spawnArgs = forwarded;
-let spawnOpts = { stdio: 'inherit', shell: false, timeout: LINT_TIMEOUT_MS };
+let spawnOpts = { stdio: "inherit", shell: false, timeout: LINT_TIMEOUT_MS };
 if (isBatch) {
-  const inner = [quoteForCmd(binary), ...forwarded.map(quoteForCmd)].join(' ');
-  spawnTarget = process.env.ComSpec || 'cmd.exe';
-  spawnArgs = ['/d', '/s', '/c', "\"" + inner + "\""];
+  const inner = [quoteForCmd(binary), ...forwarded.map(quoteForCmd)].join(" ");
+  spawnTarget = process.env.ComSpec || "cmd.exe";
+  spawnArgs = ["/d", "/s", "/c", `"${inner}"`];
   spawnOpts = { ...spawnOpts, windowsVerbatimArguments: true };
 }
 const run = spawnSync(spawnTarget, spawnArgs, spawnOpts);

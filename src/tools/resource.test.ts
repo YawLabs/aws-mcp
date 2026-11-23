@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { after, afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AwsCallResult } from "../aws-cli.js";
 import { _resetSession } from "../session.js";
 import {
   CURSOR_MAX_LEN,
   extractProgressFields,
+  isTransientPollFailure,
   isValidIdentifier,
   isValidOpaqueToken,
+  MAX_TRANSIENT_POLL_RETRIES,
   parseResourceProperties,
   pollUntilTerminal,
   resourceTools,
@@ -65,10 +69,16 @@ describe("TYPE_NAME_RE", () => {
     }
   });
 
-  it("accepts Custom:: and third-party namespaces", () => {
-    for (const tn of ["Custom::MyCorp::Thing", "ThirdParty::Service::Resource"]) {
+  it("accepts three-segment third-party registry namespaces", () => {
+    for (const tn of ["MyCorp::Service::Thing", "ThirdParty::Service::Resource"]) {
       assert.match(tn, TYPE_NAME_RE);
     }
+  });
+
+  it("does NOT accept a two-segment CloudFormation custom resource type", () => {
+    // Custom::MyResource is a CloudFormation custom resource, which Cloud
+    // Control cannot address; the old comment and test name claimed support.
+    assert.doesNotMatch("Custom::MyResource", TYPE_NAME_RE);
   });
 
   it("rejects missing segments or wrong separators", () => {
@@ -388,76 +398,140 @@ describe("handler input validation (no spawn)", () => {
 });
 
 /**
- * Fake-aws integration: we can't swap the CLI inside tool handlers (they call
- * runAwsCall directly without a command override), so these tests drive
- * runAwsCall with the same extraFlags the handlers assemble and assert the
- * argv shape + response parsing. Handler-level integration is covered by the
- * live integration test file (resource.integration.test.ts, opt-in via env).
+ * Point every handler's runAwsCall at the fake-aws shim for the duration of
+ * `fn`, through the documented AWS_MCP_TEST_AWS_* hook, and ALWAYS restore the
+ * environment afterwards. process.env is file-global, so one test that forgot
+ * its own `finally` would silently point every later handler test here at the
+ * fake; owning the try/finally in one place makes that mistake impossible.
  */
-describe("runAwsCall invocation shape (fake-aws)", () => {
-  it("get-resource places --type-name and --identifier between operation and --output", async () => {
-    const { runAwsCall } = await import("../aws-cli.js");
-    const r = await runAwsCall({
-      service: "cloudcontrol",
-      operation: "get-resource",
-      extraFlags: ["--type-name", "AWS::Lambda::Function", "--identifier", "my-fn"],
-      command: process.execPath,
-      prefixArgs: [FAKE_AWS],
-      env: { ...process.env, AWS_MCP_FAKE_SCENARIO: "call_echo_args" },
-    });
-    assert.equal(r.ok, true);
-    if (!r.ok) return;
-    const { argv } = r.data as { argv: string[] };
+async function withFakeAws<T>(
+  scenario: string,
+  fn: () => Promise<T>,
+  extraEnv: Record<string, string> = {},
+): Promise<T> {
+  process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+  process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+  process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+  for (const [k, v] of Object.entries(extraEnv)) process.env[k] = v;
+  _resetSession();
+  try {
+    return await fn();
+  } finally {
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    for (const k of Object.keys(extraEnv)) delete process.env[k];
+    _resetSession();
+  }
+}
+
+/**
+ * The argv each HANDLER actually emits, read off `commandArgv` while the CLI is
+ * the call_echo_args fake. Payload flags (--desired-state, --patch-document,
+ * --resource-model) are redacted in commandArgv to `<redacted len=N>`, so a
+ * payload is checked by its length: one entry whose length is the JSON's
+ * proves it was serialized into a single argv entry.
+ */
+describe("handler argv shape (fake-aws call_echo_args)", () => {
+  const argvOf = (r: { ok: boolean; data?: unknown; error?: string }): string[] => {
+    assert.equal(r.ok, true, `handler failed: ${r.error}`);
+    const argv = (r.data as { commandArgv?: string[] }).commandArgv;
+    assert.ok(Array.isArray(argv), "every envelope carrying `command` carries `commandArgv`");
+    return argv;
+  };
+  const valueAfter = (argv: string[], flag: string): string | undefined => {
+    const i = argv.indexOf(flag);
+    return i < 0 ? undefined : argv[i + 1];
+  };
+
+  it("aws_resource_get puts --type-name and --identifier between the operation and --output", async () => {
+    const argv = argvOf(
+      await withFakeAws("call_echo_args", () =>
+        getResource.handler({ typeName: "AWS::Lambda::Function", identifier: "my-fn" }),
+      ),
+    );
     const opIdx = argv.indexOf("get-resource");
-    const tnIdx = argv.indexOf("--type-name");
-    const idIdx = argv.indexOf("--identifier");
     const outputIdx = argv.indexOf("--output");
     assert.ok(opIdx > 0);
-    assert.ok(tnIdx > opIdx && tnIdx < outputIdx, "--type-name must sit between operation and --output");
-    assert.ok(idIdx > opIdx && idIdx < outputIdx);
-    assert.equal(argv[tnIdx + 1], "AWS::Lambda::Function");
-    assert.equal(argv[idIdx + 1], "my-fn");
+    for (const flag of ["--type-name", "--identifier"]) {
+      const at = argv.indexOf(flag);
+      assert.ok(at > opIdx && at < outputIdx, `${flag} must sit between the operation and --output`);
+    }
+    assert.equal(valueAfter(argv, "--type-name"), "AWS::Lambda::Function");
+    assert.equal(valueAfter(argv, "--identifier"), "my-fn");
   });
 
-  it("create-resource serializes desiredState into a single --desired-state argv entry", async () => {
-    const { runAwsCall } = await import("../aws-cli.js");
-    const r = await runAwsCall({
-      service: "cloudcontrol",
-      operation: "create-resource",
-      extraFlags: [
-        "--type-name",
-        "AWS::SSM::Parameter",
-        "--desired-state",
-        JSON.stringify({ Name: "/my/p", Type: "String", Value: "v" }),
-      ],
-      command: process.execPath,
-      prefixArgs: [FAKE_AWS],
-      env: { ...process.env, AWS_MCP_FAKE_SCENARIO: "call_echo_args" },
-    });
-    assert.equal(r.ok, true);
-    if (!r.ok) return;
-    const { argv } = r.data as { argv: string[] };
-    const flagIdx = argv.indexOf("--desired-state");
-    assert.ok(flagIdx > 0);
-    const payload = argv[flagIdx + 1];
-    const parsed = JSON.parse(payload);
-    assert.deepEqual(parsed, { Name: "/my/p", Type: "String", Value: "v" });
+  it("aws_resource_create sends desiredState as ONE --desired-state entry, plus --client-token", async () => {
+    const desiredState = { Name: "/my/p", Type: "String", Value: "v" };
+    const argv = argvOf(
+      await withFakeAws("call_echo_args", () =>
+        createResource.handler({ typeName: "AWS::SSM::Parameter", desiredState, clientToken: "ct-1" }),
+      ),
+    );
+    assert.ok(argv.includes("create-resource"));
+    assert.equal(valueAfter(argv, "--desired-state"), `<redacted len=${JSON.stringify(desiredState).length}>`);
+    assert.equal(valueAfter(argv, "--client-token"), "ct-1");
   });
-});
 
-describe("handler response parsing (fake-aws via handler-level dispatch)", () => {
-  // The handlers themselves call runAwsCall directly, which can't be swapped
-  // out from here. Instead, we verify parseResourceProperties (the response
-  // shape transformer) handles the fake-aws-shaped payload correctly. The
-  // on-the-wire shape is covered by the handler code that threads it through.
-  it("unwraps a GetResource-style response", () => {
-    const raw = {
-      Identifier: "my-fn",
-      Properties: JSON.stringify({ FunctionName: "my-fn", MemorySize: 256 }),
-    };
-    const parsed = parseResourceProperties(raw);
-    assert.equal(parsed.Identifier, "my-fn");
-    assert.deepEqual(parsed.Properties, { FunctionName: "my-fn", MemorySize: 256 });
+  it("aws_resource_update sends --identifier, ONE --patch-document entry, and --client-token", async () => {
+    const patchDocument = [{ op: "replace", path: "/MemorySize", value: 512 }];
+    const argv = argvOf(
+      await withFakeAws("call_echo_args", () =>
+        updateResource.handler({
+          typeName: "AWS::Lambda::Function",
+          identifier: "my-fn",
+          patchDocument,
+          clientToken: "ct-2",
+        }),
+      ),
+    );
+    assert.ok(argv.includes("update-resource"));
+    assert.equal(valueAfter(argv, "--identifier"), "my-fn");
+    assert.equal(valueAfter(argv, "--patch-document"), `<redacted len=${JSON.stringify(patchDocument).length}>`);
+    assert.equal(valueAfter(argv, "--client-token"), "ct-2");
+  });
+
+  it("aws_resource_delete sends --type-name and --identifier, and no --client-token unless given", async () => {
+    const argv = argvOf(
+      await withFakeAws("call_echo_args", () =>
+        deleteResource.handler({ typeName: "AWS::S3::Bucket", identifier: "my-bucket" }),
+      ),
+    );
+    assert.ok(argv.includes("delete-resource"));
+    assert.equal(valueAfter(argv, "--type-name"), "AWS::S3::Bucket");
+    assert.equal(valueAfter(argv, "--identifier"), "my-bucket");
+    assert.equal(argv.includes("--client-token"), false);
+  });
+
+  it("aws_resource_list sends --max-results (default 100), --next-token and --resource-model", async () => {
+    const resourceModel = { ClusterArn: "arn:aws:ecs:us-east-1:123456789012:cluster/c" };
+    const argv = argvOf(
+      await withFakeAws("call_echo_args", () =>
+        listResource.handler({ typeName: "AWS::ECS::Service", nextToken: "cursor-2", resourceModel }),
+      ),
+    );
+    assert.equal(valueAfter(argv, "--max-results"), "100");
+    assert.equal(valueAfter(argv, "--next-token"), "cursor-2");
+    assert.equal(valueAfter(argv, "--resource-model"), `<redacted len=${JSON.stringify(resourceModel).length}>`);
+  });
+
+  it("aws_resource_list treats an EMPTY nextToken as the first page instead of rejecting it", async () => {
+    // The schema admits "", the handler used to validate it (1-8192 chars)
+    // while forwarding only a truthy one -- so the common "echo an empty
+    // cursor for page 1" shape failed with a length error.
+    const r = await withFakeAws("call_echo_args", () =>
+      listResource.handler({ typeName: "AWS::SSM::Parameter", nextToken: "", maxResults: 5 }),
+    );
+    const argv = argvOf(r);
+    assert.equal(argv.includes("--next-token"), false);
+    assert.equal(valueAfter(argv, "--max-results"), "5");
+  });
+
+  it("aws_resource_status sends the --request-token and carries commandArgv", async () => {
+    const r = await withFakeAws("call_echo_args", () => statusResource.handler({ requestToken: "req-tok-echo" }));
+    const argv = argvOf(r);
+    assert.equal(valueAfter(argv, "--request-token"), "req-tok-echo");
+    assert.equal(typeof (r.data as { command?: unknown }).command, "string");
   });
 });
 
@@ -563,25 +637,33 @@ describe("pollUntilTerminal", () => {
     assert.equal((r.progressEvent as Record<string, unknown>)?.OperationStatus, "IN_PROGRESS");
   });
 
-  it("never issues an AWS call once the budget is spent", async () => {
+  it("never issues an AWS call once the budget is spent", async (t) => {
     // The budget check used to run AFTER the call: the final sleep clamps to
     // land exactly on maxWaitMs, the loop re-entered, and one more request
-    // went out past the deadline the caller set. Uses the real sleep so
-    // elapsed time is real; asserts the property (every call starts inside
-    // the budget) rather than an exact call count, which is timing-sensitive.
-    const start = Date.now();
+    // went out past the deadline the caller set.
+    //
+    // Deterministic clock: Date.now is mocked and only the injected sleep
+    // advances it. This used to race real timers against a 120 ms budget --
+    // one event-loop stall under a parallel `node --test` run left a single
+    // poll and failed the "several polls" assertion.
+    let now = 1_000_000;
+    t.mock.method(Date, "now", () => now);
+    const start = now;
     const offsets: number[] = [];
     const awsCall = async (): Promise<AwsCallResult> => {
-      offsets.push(Date.now() - start);
+      offsets.push(now - start);
       return progressResponse({ OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" });
     };
+    const sleep = async (ms: number): Promise<void> => {
+      now += ms;
+    };
     const maxWaitMs = 120;
-    const r = await pollUntilTerminal({ requestToken: "tok-1", pollIntervalMs: 20, maxWaitMs }, awsCall);
+    const r = await pollUntilTerminal({ requestToken: "tok-1", pollIntervalMs: 20, maxWaitMs }, awsCall, sleep);
     assert.equal(r.ok, false);
-    assert.ok(offsets.length >= 2, `expected several polls, got ${offsets.length}`);
-    for (const off of offsets) {
-      assert.ok(off < maxWaitMs, `a poll started at ${off}ms, past the ${maxWaitMs}ms budget: ${offsets.join(",")}`);
-    }
+    assert.match(r.error ?? "", /without reaching a terminal state/);
+    // Polls at 0, 20, ..., 100; the last sleep clamps to land on 120, and the
+    // budget check then stops the loop -- the buggy order polled at 120 too.
+    assert.deepEqual(offsets, [0, 20, 40, 60, 80, 100]);
   });
 
   it("propagates an error from the underlying CLI call", async () => {
@@ -673,22 +755,8 @@ describe("pollUntilTerminal", () => {
 });
 
 describe("aws_resource_create handler — awaitCompletion mid-poll auth lapse (fake-aws)", () => {
-  const beforeEachEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    _resetSession();
-  };
-  const afterEachEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
-
   it("surfaces a structured re-login + aws_resource_status hint when SSO expires mid-poll", async () => {
-    beforeEachEnv();
-    try {
-      process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_then_status_sso_expired";
+    await withFakeAws("resource_create_then_status_sso_expired", async () => {
       const r = (await createResource.handler({
         typeName: "AWS::SSM::Parameter",
         desiredState: { Name: "/my/p", Type: "String", Value: "v" },
@@ -706,9 +774,7 @@ describe("aws_resource_create handler — awaitCompletion mid-poll auth lapse (f
       assert.match(r.error ?? "", /tester/);
       assert.match(r.error ?? "", /aws_resource_status/);
       assert.match(r.error ?? "", /req-tok-abc/);
-    } finally {
-      afterEachEnv();
-    }
+    });
   });
 });
 
@@ -717,22 +783,9 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
   // buildMutationResponse recovery hint is shared, but each verb has its own
   // initial CLI call (update-resource / delete-resource); these tests pin
   // both verbs' paths through the same hint shape.
-  const beforeEachEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    _resetSession();
-  };
-  const afterEachEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
 
   it("aws_resource_update surfaces the SSO recovery hint with the requestToken", async () => {
-    beforeEachEnv();
-    try {
-      process.env.AWS_MCP_FAKE_SCENARIO = "resource_update_sso_expired_mid_poll";
+    await withFakeAws("resource_update_sso_expired_mid_poll", async () => {
       const r = (await updateResource.handler({
         typeName: "AWS::Lambda::Function",
         identifier: "my-fn",
@@ -757,15 +810,11 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
       // of parsing the sentence.
       assert.equal(r.errorKind, "sso_expired");
       assert.equal(r.suggestion, undefined);
-    } finally {
-      afterEachEnv();
-    }
+    });
   });
 
   it("aws_resource_delete surfaces the SSO recovery hint with the requestToken", async () => {
-    beforeEachEnv();
-    try {
-      process.env.AWS_MCP_FAKE_SCENARIO = "resource_delete_sso_expired_mid_poll";
+    await withFakeAws("resource_delete_sso_expired_mid_poll", async () => {
       const r = (await deleteResource.handler({
         typeName: "AWS::S3::Bucket",
         identifier: "my-bucket",
@@ -782,9 +831,7 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
       assert.match(r.error ?? "", /req-tok-del/);
       assert.equal(r.errorKind, "sso_expired");
       assert.equal(r.suggestion, undefined);
-    } finally {
-      afterEachEnv();
-    }
+    });
   });
 
   it("aws_resource_delete surfaces the no_creds recovery hint (different wording from sso_expired)", async () => {
@@ -792,9 +839,7 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
     // produces a different hint ("After fixing credentials..." rather than
     // "Call aws_login_start..."). Delete is the destructive verb, so it's
     // the most important to cover.
-    beforeEachEnv();
-    try {
-      process.env.AWS_MCP_FAKE_SCENARIO = "resource_delete_no_creds_mid_poll";
+    await withFakeAws("resource_delete_no_creds_mid_poll", async () => {
       const r = (await deleteResource.handler({
         typeName: "AWS::S3::Bucket",
         identifier: "my-bucket",
@@ -817,9 +862,7 @@ describe("aws_resource_update + aws_resource_delete handlers — awaitCompletion
       // prose AND in kind, so a caller need not tell them apart by wording.
       assert.equal(r.errorKind, "no_creds");
       assert.equal(r.suggestion, undefined);
-    } finally {
-      afterEachEnv();
-    }
+    });
   });
 });
 
@@ -828,25 +871,12 @@ describe("buildMutationResponse auth-recovery — expired_creds and invalid_cred
   // no_creds tests above cover. All four exist for one reason: the mutation
   // may already have landed server-side, so the requestToken MUST reach the
   // caller. Each arm differs only in how it says "fix your auth".
-  const beforeEachEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    _resetSession();
-  };
-  const afterEachEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
 
   it("aws_resource_update surfaces the expired_creds hint with the requestToken", async () => {
-    beforeEachEnv();
-    try {
+    await withFakeAws("resource_update_expired_creds_mid_poll", async () => {
       // ExpiredToken is the ORIGIN-AGNOSTIC expiry wrapper -- an assume-role
       // or web-identity session, not necessarily SSO -- so the hint names both
       // remedies rather than assuming SSO.
-      process.env.AWS_MCP_FAKE_SCENARIO = "res2_update_expired_creds_mid_poll";
       const r = (await updateResource.handler({
         typeName: "AWS::Lambda::Function",
         identifier: "my-fn",
@@ -872,20 +902,16 @@ describe("buildMutationResponse auth-recovery — expired_creds and invalid_cred
       // mentions aws_login_start as one of two remedies, so the discriminating
       // string is the SSO arm's own opening clause.)
       assert.doesNotMatch(r.error ?? "", /SSO session expired while awaiting completion/);
-    } finally {
-      afterEachEnv();
-    }
+    });
   });
 
   it("aws_resource_create surfaces the invalid_creds hint with the requestToken", async () => {
-    beforeEachEnv();
-    try {
+    await withFakeAws("resource_create_invalid_creds_mid_poll", async () => {
       // A key rotated or deleted MID-POLL. The credentials resolved and AWS
       // REJECTED them, so this is neither an expiry (nothing to refresh) nor a
       // missing profile. Before the invalid_creds arm existed, this kind fell
       // through to the bare poll error and DROPPED the requestToken -- the
       // identical defect that was fixed for expired_creds.
-      process.env.AWS_MCP_FAKE_SCENARIO = "res2_create_invalid_creds_mid_poll";
       const r = (await createResource.handler({
         typeName: "AWS::SSM::Parameter",
         desiredState: { Name: "/my/p", Type: "String", Value: "v" },
@@ -910,9 +936,7 @@ describe("buildMutationResponse auth-recovery — expired_creds and invalid_cred
       assert.doesNotMatch(r.error ?? "", /aws_login_start/);
       assert.doesNotMatch(r.error ?? "", /No credentials available/);
       assert.doesNotMatch(r.error ?? "", /expired while awaiting completion/);
-    } finally {
-      afterEachEnv();
-    }
+    });
   });
 });
 
@@ -1321,22 +1345,9 @@ describe("aws_resource_create handler — progress threading (fake-aws)", () => 
   // buildMutationResponse -> pollUntilTerminal chain. The unit tests above
   // call pollUntilTerminal directly, so a handler that dropped `ctx` on the
   // floor would leave every one of them green.
-  const beforeEachEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    _resetSession();
-  };
-  const afterEachEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
 
   it("reports poll progress through awaitCompletion, and a no-op ctx returns the same result", async () => {
-    beforeEachEnv();
-    try {
-      process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_then_status_success";
+    await withFakeAws("resource_create_then_status_success", async () => {
       const calls: { progress: number; total?: number; message?: string }[] = [];
       const input = {
         typeName: "AWS::SSM::Parameter",
@@ -1368,8 +1379,264 @@ describe("aws_resource_create handler — progress threading (fake-aws)", () => 
         return d;
       };
       assert.deepEqual(strip(silent), strip(reported));
-    } finally {
-      afterEachEnv();
+    });
+  });
+});
+
+const THROTTLE_STDERR =
+  "\nAn error occurred (ThrottlingException) when calling the GetResourceRequestStatus operation (reached max retries: 2): Rate exceeded\n";
+const throttled = (): AwsCallResult => ({
+  ok: false,
+  kind: "nonzero_exit",
+  error: "throttled",
+  command: "aws cloudcontrol get-resource-request-status --request-token tok-1",
+  commandArgv: ["aws", "cloudcontrol", "get-resource-request-status", "--request-token", "tok-1"],
+  rawStderr: THROTTLE_STDERR,
+});
+
+describe("isTransientPollFailure", () => {
+  const fail = (kind: string, rawStderr = ""): Parameters<typeof isTransientPollFailure>[0] =>
+    ({ ok: false, kind, error: "x", rawStderr }) as Parameters<typeof isTransientPollFailure>[0];
+
+  it("retries a throttle, a 5xx, a transport timeout, our own timeout and a spawn hiccup", () => {
+    assert.equal(isTransientPollFailure(fail("nonzero_exit", THROTTLE_STDERR)), true);
+    assert.equal(
+      isTransientPollFailure(
+        fail("nonzero_exit", "An error occurred (ServiceUnavailableException) when calling the X operation: down"),
+      ),
+      true,
+    );
+    assert.equal(
+      isTransientPollFailure(fail("nonzero_exit", 'Read timeout on endpoint URL: "https://cloudcontrolapi"')),
+      true,
+    );
+    assert.equal(isTransientPollFailure(fail("timeout")), true);
+    assert.equal(isTransientPollFailure(fail("spawn_failure")), true);
+  });
+
+  it("never retries auth, validation, cancellation or a bad body", () => {
+    for (const kind of ["sso_expired", "expired_creds", "invalid_creds", "no_creds", "cancelled", "malformed_json"]) {
+      assert.equal(isTransientPollFailure(fail(kind, THROTTLE_STDERR)), false, kind);
     }
+    assert.equal(
+      isTransientPollFailure(
+        fail("nonzero_exit", "An error occurred (ValidationException) when calling the X operation: bad"),
+      ),
+      false,
+    );
+  });
+});
+
+describe("pollUntilTerminal -- bounded transient retries", () => {
+  it("absorbs transient failures and still reaches the terminal state", async () => {
+    const script: AwsCallResult[] = [
+      throttled(),
+      progressResponse({ OperationStatus: "IN_PROGRESS", RequestToken: "tok-1" }),
+      throttled(),
+      throttled(),
+      progressResponse({ OperationStatus: "SUCCESS", RequestToken: "tok-1" }),
+    ];
+    let i = 0;
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 60_000 },
+      async () => script[i++],
+      async () => undefined,
+    );
+    assert.equal(r.ok, true, r.error ?? "");
+    assert.equal(r.attempts, 5);
+    assert.equal(r.transientRetries, 3, "the streak resets on a good poll, so 3 total is fine");
+  });
+
+  it(`gives up after ${MAX_TRANSIENT_POLL_RETRIES} consecutive transient failures`, async () => {
+    let calls = 0;
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 60_000 },
+      async () => {
+        calls++;
+        return throttled();
+      },
+      async () => undefined,
+    );
+    assert.equal(r.ok, false);
+    assert.equal(calls, MAX_TRANSIENT_POLL_RETRIES + 1);
+    assert.equal(r.transientRetries, MAX_TRANSIENT_POLL_RETRIES);
+    assert.equal(r.kind, "nonzero_exit");
+  });
+
+  it("does not retry a non-transient failure", async () => {
+    let calls = 0;
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 10, maxWaitMs: 60_000 },
+      async () => {
+        calls++;
+        return {
+          ok: false,
+          kind: "nonzero_exit",
+          error: "bad",
+          rawStderr: "An error occurred (ValidationException) when calling the X operation: no",
+        };
+      },
+      async () => undefined,
+    );
+    assert.equal(r.ok, false);
+    assert.equal(calls, 1);
+    assert.equal(r.transientRetries, 0);
+  });
+
+  it("does not retry when a poll interval no longer fits in the budget", async (t) => {
+    let now = 5_000_000;
+    t.mock.method(Date, "now", () => now);
+    let calls = 0;
+    const r = await pollUntilTerminal(
+      { requestToken: "tok-1", pollIntervalMs: 50, maxWaitMs: 100 },
+      async () => {
+        calls++;
+        return throttled();
+      },
+      async (ms: number) => {
+        now += ms;
+      },
+    );
+    // Retry at 0 -> sleep to 50 -> 50 + 50 is not < 100, so the second
+    // failure is returned rather than retried past the deadline.
+    assert.equal(r.ok, false);
+    assert.equal(calls, 2);
+    assert.equal(r.kind, "nonzero_exit");
+  });
+});
+
+describe("awaited mutations -- non-auth poll failures keep the requestToken (fake-aws)", () => {
+  const awaitedCreate = {
+    typeName: "AWS::SSM::Parameter",
+    desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+    awaitCompletion: true,
+    pollIntervalMs: 20,
+    maxWaitMs: 60_000,
+  };
+  // Each poll is a fresh fake-aws process, so the scenario counts polls in a
+  // file; one per test, all under a directory removed when the block ends.
+  const counterDir = mkdtempSync(join(tmpdir(), "aws-mcp-pollfail-"));
+  after(() => rmSync(counterDir, { recursive: true, force: true }));
+  let counterSeq = 0;
+  const counterEnv = (): Record<string, string> => ({
+    AWS_MCP_FAKE_POLL_COUNTER: join(counterDir, `polls-${++counterSeq}`),
+  });
+  const pollsOf = (env: Record<string, string>): number => Number(readFileSync(env.AWS_MCP_FAKE_POLL_COUNTER, "utf8"));
+
+  it("a throttle that outlives the retries returns ok:false WITH the requestToken and last status", async () => {
+    const env = counterEnv();
+    const r = await withFakeAws(
+      "resource_create_pollfail_throttle_always",
+      () => createResource.handler(awaitedCreate),
+      env,
+    );
+    assert.equal(r.ok, false);
+    // The load-bearing assertions: the bare poll error carried neither.
+    assert.match(r.error ?? "", /aws_resource_status with requestToken='req-tok-pf'/);
+    assert.match(r.error ?? "", /last status: IN_PROGRESS/);
+    assert.match(r.error ?? "", /identifier: \/my\/p/);
+    assert.match(r.error ?? "", /already accepted/);
+    assert.match(r.error ?? "", new RegExp(`after ${MAX_TRANSIENT_POLL_RETRIES} transient-failure retries`));
+    // The underlying throttle is kept, not swallowed.
+    assert.match(r.error ?? "", /ThrottlingException/);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(pollsOf(env), MAX_TRANSIENT_POLL_RETRIES + 1, "bounded: the cap plus the first try");
+  });
+
+  it("a throttle that clears within the retries completes the wait", async () => {
+    const env = counterEnv();
+    const r = await withFakeAws(
+      "resource_create_pollfail_throttle_then_success",
+      () => createResource.handler(awaitedCreate),
+      env,
+    );
+    assert.equal(r.ok, true, r.error ?? "");
+    const d = r.data as { operationStatus?: string; requestToken?: string; awaited?: { attempts: number } };
+    assert.equal(d.operationStatus, "SUCCESS");
+    assert.equal(d.requestToken, "req-tok-pf");
+    assert.equal(d.awaited?.attempts, 3, "two throttles, then the SUCCESS poll");
+    assert.equal(pollsOf(env), 3);
+  });
+
+  it("a non-transient poll failure is not retried, and still hands back the requestToken", async () => {
+    const env = counterEnv();
+    const r = await withFakeAws(
+      "resource_create_pollfail_validation",
+      () => createResource.handler(awaitedCreate),
+      env,
+    );
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /requestToken='req-tok-pf'/);
+    assert.match(r.error ?? "", /ValidationException/);
+    assert.doesNotMatch(r.error ?? "", /transient-failure retr/);
+    assert.equal(r.errorKind, "nonzero_exit");
+    assert.equal(pollsOf(env), 1);
+  });
+});
+
+describe("create / update / delete / status envelopes carry commandArgv", () => {
+  it("not awaited: commandArgv is the mutation's own argv", async () => {
+    const r = await withFakeAws("resource_create_then_status_success", () =>
+      createResource.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+      }),
+    );
+    assert.equal(r.ok, true, r.error ?? "");
+    const d = r.data as { command: string; commandArgv?: string[] };
+    assert.ok(Array.isArray(d.commandArgv));
+    assert.ok(d.commandArgv.includes("create-resource"));
+    assert.match(d.command, /create-resource/);
+  });
+
+  it("awaited: commandArgv is the last poll's argv, matching `command`", async () => {
+    const r = await withFakeAws("resource_create_then_status_success", () =>
+      createResource.handler({
+        typeName: "AWS::SSM::Parameter",
+        desiredState: { Name: "/my/p", Type: "String", Value: "v" },
+        awaitCompletion: true,
+        pollIntervalMs: 20,
+        maxWaitMs: 60_000,
+      }),
+    );
+    assert.equal(r.ok, true, r.error ?? "");
+    const d = r.data as { command: string; commandArgv?: string[] };
+    assert.ok(Array.isArray(d.commandArgv));
+    assert.ok(d.commandArgv.includes("get-resource-request-status"));
+    assert.ok(d.commandArgv.includes("req-tok-ok"));
+    assert.match(d.command, /get-resource-request-status/);
+  });
+
+  it("aws_resource_status: commandArgv rides beside command", async () => {
+    const r = await withFakeAws("resource_create_then_status_success", () =>
+      statusResource.handler({ requestToken: "req-tok-ok" }),
+    );
+    assert.equal(r.ok, true, r.error ?? "");
+    const d = r.data as { commandArgv?: string[]; operationStatus?: string };
+    assert.ok(d.commandArgv?.includes("get-resource-request-status"));
+    assert.equal(d.operationStatus, "SUCCESS");
+  });
+});
+
+describe("tool descriptions say what ok:true does not mean", () => {
+  it("every mutation verb and status says FAILED / CANCEL_COMPLETE did not apply", () => {
+    for (const t of [createResource, updateResource, deleteResource, statusResource]) {
+      assert.match(t.description, /FAILED or CANCEL_COMPLETE means (it|the mutation) did NOT apply/, t.name);
+    }
+  });
+});
+
+describe("aws_resource_update schema -- RFC 6902 required members", () => {
+  const parse = (op: Record<string, unknown>) =>
+    updateResource.inputSchema.safeParse({ typeName: "AWS::Lambda::Function", identifier: "f", patchDocument: [op] })
+      .success;
+  it("requires `value` on test, and `from` on move / copy", () => {
+    assert.equal(parse({ op: "test", path: "/A" }), false);
+    assert.equal(parse({ op: "test", path: "/A", value: 1 }), true);
+    assert.equal(parse({ op: "move", path: "/B" }), false);
+    assert.equal(parse({ op: "copy", path: "/B" }), false);
+    assert.equal(parse({ op: "move", path: "/B", from: "/A" }), true);
+    assert.equal(parse({ op: "copy", path: "/B", from: "/A" }), true);
+    assert.equal(parse({ op: "remove", path: "/A" }), true);
   });
 });

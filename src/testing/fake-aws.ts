@@ -5,7 +5,18 @@
  *
  * Reads the `AWS_MCP_FAKE_SCENARIO` env var to decide what to emit.
  * Exercises the full subprocess path in sso.ts (spawn, pipe stdout, exit
- * handling) without requiring a real AWS CLI or SSO setup in CI.
+ * handling) without requiring a real AWS CLI, credentials or SSO setup on the
+ * machine running the suite.
+ *
+ * Naming: a scenario that models one tool is named for that tool without the
+ * aws_ prefix, then the case: lambda_invoke_throttled, iam_simulate_scp_deny,
+ * resource_create_already_terminal, multi_account_env_probe. Scenarios that
+ * model the shared CLI layer rather than one tool are named for that layer:
+ * call_ for runAwsCall as aws_call reaches it, spawn-hardening_ for the child
+ * environment pins (aws-spawn.ts), and the unprefixed login family (happy,
+ * malformed, regional_device_split, ...) plus sso2_raw_ and sso_list_ for
+ * sso.ts. metrics_ is aws_metrics_query's. Grep a tool's prefix to find every
+ * scenario that drives it; a new scenario follows the same rule.
  *
  * Concurrency note: AWS_MCP_FAKE_SCENARIO is read out of the parent's env
  * via the spawn inherit, but the PARENT sets it via `process.env.AWS_MCP_
@@ -17,17 +28,158 @@
  * concurrently, callers will need a serial guard. See metrics.test.ts for
  * the matching note on the test side.
  *
- * Scenario classes: argv-branching scenarios (e.g. ccapi_list_resources_paginated,
- * mr_partial_failure, metrics_paginated) are per-process safe -- they carry all
+ * Scenario classes: argv-branching scenarios (e.g. resource_list_paginated,
+ * multi_region_partial_failure, metrics_paginated) are per-process safe -- they carry all
  * state in argv, not in a shared env var. The env-var scenario dispatch
  * (AWS_MCP_FAKE_SCENARIO itself) is the shared-state surface that requires
  * the sequential guard above.
  */
 
+import { SSO2_TAIL } from "./fake-aws-fixtures.js";
+
 const scenario = process.env.AWS_MCP_FAKE_SCENARIO;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** `value` as one line of JSON on stdout -- the shape every `--output json` answer here takes. */
+function writeJsonLine(value: unknown): void {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+// The stderr of the three credential failures most scenarios reuse, each the
+// real CLI's wording.
+/** botocore's SSO-token expiry, for a profile named my-profile. */
+const SSO_EXPIRED_STDERR = "Error loading SSO Token: Token for my-profile is expired.\n";
+/** botocore's NoCredentialsError: nothing in the provider chain resolved. */
+const NO_CREDS_STDERR = "Unable to locate credentials. You can configure credentials by running 'aws configure'.\n";
+
+/** The successful `aws sts assume-role --output json` payload (Credentials, AssumedRoleUser, PackedPolicySize). */
+const ASSUME_ROLE_OK = {
+  Credentials: {
+    AccessKeyId: "ASIA1234EXAMPLE",
+    SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    SessionToken: "FQoGZXIvYXdzEXAMPLETOKENBLAHBLAH",
+    Expiration: "2099-12-31T23:59:59+00:00",
+  },
+  AssumedRoleUser: {
+    AssumedRoleId: "AROA1234EXAMPLE:my-session",
+    Arn: "arn:aws:sts::123456789012:assumed-role/Admin/my-session",
+  },
+  PackedPolicySize: 6,
+};
+
+/**
+ * aws_multi_account phase 1: the `sts assume-role` answer, with credentials
+ * whose values ENCODE `account` so phase 2 (a separate process, handed them
+ * through its environment) can prove which session it was given. `sessionTag`
+ * names the session in AssumedRoleUser; it is payload, not a scenario name.
+ */
+function writeAccountCredentials(account: string, sessionToken: string, sessionTag: string): void {
+  writeJsonLine({
+    Credentials: {
+      AccessKeyId: `ASIAFAKE${account}`,
+      SecretAccessKey: `fake-secret-${account}`,
+      SessionToken: sessionToken,
+      Expiration: "2099-12-31T23:59:59+00:00",
+    },
+    AssumedRoleUser: {
+      AssumedRoleId: `AROAFAKE${account}:${sessionTag}`,
+      Arn: `arn:aws:sts::${account}:assumed-role/Fake/${sessionTag}`,
+    },
+    PackedPolicySize: 6,
+  });
+}
+
+/** The value after `--region` in a runAwsCall argv, or "" when absent. */
+function regionFromArgv(): string {
+  // Coupling: runAwsCall's argv assembly appends the `--region <region>` pair
+  // after --output and --profile, so the value is always the next entry. If
+  // that placement ever changes, this silently resolves to the wrong token.
+  const argv = process.argv.slice(2);
+  const regionIdx = argv.indexOf("--region");
+  return regionIdx >= 0 ? argv[regionIdx + 1] : "";
+}
+
+/**
+ * One Cloud Control ProgressEvent, with its keys in the order CCAPI prints
+ * them. `RequestToken` undefined drops the key, as JSON.stringify does.
+ */
+interface ProgressEventFields {
+  TypeName: string;
+  Identifier: string;
+  RequestToken?: string;
+  OperationStatus: string;
+  Operation: string;
+}
+
+function writeProgressEvent(e: ProgressEventFields): void {
+  writeJsonLine({
+    ProgressEvent: {
+      TypeName: e.TypeName,
+      Identifier: e.Identifier,
+      RequestToken: e.RequestToken,
+      OperationStatus: e.OperationStatus,
+      Operation: e.Operation,
+    },
+  });
+}
+
+/** The AWS::SSM::Parameter `/my/p` CREATE event most create scenarios answer with. */
+function ssmCreateEvent(requestToken: string | undefined, status: string): ProgressEventFields {
+  return {
+    TypeName: "AWS::SSM::Parameter",
+    Identifier: "/my/p",
+    RequestToken: requestToken,
+    OperationStatus: status,
+    Operation: "CREATE",
+  };
+}
+
+/** The AWS::S3::Bucket `my-bucket` IN_PROGRESS DELETE event the delete scenarios answer with. */
+function bucketDeleteEvent(requestToken: string): ProgressEventFields {
+  return {
+    TypeName: "AWS::S3::Bucket",
+    Identifier: "my-bucket",
+    RequestToken: requestToken,
+    OperationStatus: "IN_PROGRESS",
+    Operation: "DELETE",
+  };
+}
+
+/**
+ * The two-call shape of an awaited Cloud Control mutation, which most
+ * resource scenarios model: `cloudcontrol <verb>` answers with `initial`, and
+ * `cloudcontrol get-resource-request-status` runs `onPoll` (which must exit).
+ * Any other argv is a test written wrong, and fails loudly naming `who`.
+ */
+async function ccapiMutationThenPoll(
+  who: string,
+  verb: "create-resource" | "update-resource" | "delete-resource",
+  initial: ProgressEventFields,
+  onPoll: () => void | Promise<void>,
+): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes(verb)) {
+    writeProgressEvent(initial);
+    process.exit(0);
+    return;
+  }
+  if (argv.includes("get-resource-request-status")) {
+    await onPoll();
+    return;
+  }
+  process.stderr.write(`fake-aws: ${who} hit unexpected argv: ${argv.join(" ")}\n`);
+  process.exit(2);
+}
+
+/** Poll answer: fail with `stderr` and exit code `code`. */
+function failPoll(stderr: string, code = 255): () => void {
+  return () => {
+    process.stderr.write(stderr);
+    process.exit(code);
+  };
 }
 
 /**
@@ -72,6 +224,57 @@ async function writeStdoutThenMarkReady(chunk: string): Promise<void> {
   if (readyPath) {
     const fs = await import("node:fs");
     fs.writeFileSync(readyPath, "flushed");
+  }
+}
+
+/**
+ * Wait for the file `releasePath` to appear: the parent's go-ahead. A file that
+ * never appears is a FAILURE (exit 6) once the wait runs out -- 60 s, or
+ * AWS_MCP_FAKE_RELEASE_TIMEOUT_MS -- rather than the scenario carrying on as if
+ * released, which would hand a "must not happen before release" test a
+ * spontaneous pass.
+ */
+async function waitForReleaseFile(releasePath: string, who: string): Promise<void> {
+  const fs = await import("node:fs");
+  const parsedTimeout = Number(process.env.AWS_MCP_FAKE_RELEASE_TIMEOUT_MS ?? "60000");
+  const timeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 60_000;
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(releasePath) && Date.now() < deadline) await sleep(20);
+  if (!fs.existsSync(releasePath)) {
+    failWith(6, `${who}: release file ${releasePath} never appeared within ${timeoutMs} ms`);
+  }
+}
+
+/**
+ * Write `chunks` to stdout so the parent is guaranteed to READ them as separate
+ * 'data' events, for the scenarios whose whole point is a boundary falling
+ * between two reads (a split UTF-8 sequence, a URL cut mid-query).
+ *
+ * A sleep between the writes cannot guarantee that: when the parent's event
+ * loop is busy for longer than the gap -- routine under a parallel `node --test`
+ * run -- both halves are waiting in the pipe by the time it reads, arrive as one
+ * chunk, and the test passes without ever exercising the split. So after
+ * flushing chunk i (i = 1..n-1) this creates `<AWS_MCP_FAKE_READY_OUT>.<i>` and
+ * writes nothing more until the parent creates `<AWS_MCP_FAKE_RELEASE_FILE>.<i>`,
+ * which it does only once its own event loop has drained the pipe (see
+ * splitHandshake in split-handshake.ts). Both variables are REQUIRED: without
+ * them the scenario would silently fall back to the vacuous timing it exists to
+ * replace, so it refuses (exit 2) instead.
+ */
+async function writeSplitStdout(who: string, chunks: ReadonlyArray<string | Buffer>): Promise<void> {
+  const readyPath = process.env.AWS_MCP_FAKE_READY_OUT;
+  const releasePath = process.env.AWS_MCP_FAKE_RELEASE_FILE;
+  if (!readyPath || !releasePath) {
+    failWith(2, `${who} needs AWS_MCP_FAKE_READY_OUT and AWS_MCP_FAKE_RELEASE_FILE (use splitHandshake)`);
+  }
+  const fs = await import("node:fs");
+  for (let i = 0; i < chunks.length; i++) {
+    await new Promise<void>((resolve) => process.stdout.write(chunks[i], () => resolve()));
+    if (i === chunks.length - 1) break;
+    // Created only after the write callback, so its presence can never outrun
+    // the bytes it vouches for -- the writeStdoutThenMarkReady contract.
+    fs.writeFileSync(`${readyPath}.${i + 1}`, "flushed");
+    await waitForReleaseFile(`${releasePath}.${i + 1}`, who);
   }
 }
 
@@ -263,6 +466,13 @@ const FAKE_SSO_TOKEN = "FAKE-SSO-TOKEN-7f3c9a-DO-NOT-LEAK";
  * Append this invocation's argv to AWS_MCP_FAKE_CALLS_OUT, one JSON array per
  * line, so a test can assert what was (and was NOT) spawned -- e.g. that an
  * sso-session aws_login_complete never runs `sts get-caller-identity`.
+ *
+ * `aws --version` spawns are NOT recorded here: main() answers them in
+ * handleVersionProbe before this runs, so sso.ts's per-binary version probe
+ * does not show up in the calls a test counts (sso-setup.test.ts asserts exact
+ * call lists that a probe line would break). Count probes with
+ * AWS_MCP_FAKE_VERSION_COUNT_OUT instead -- a "nothing was spawned" assertion
+ * that must also rule out a probe needs both files.
  */
 async function recordCall(): Promise<void> {
   const out = process.env.AWS_MCP_FAKE_CALLS_OUT;
@@ -322,8 +532,39 @@ async function readSessionBlock(name: string): Promise<Record<string, string> | 
  * AWS_MCP_FAKE_RELEASE_FILE appears, or 200 ms when that is unset) writes the
  * token to <home>/.aws/sso/cache/<sha1(n)>.json -- the modern cache key -- with
  * the start URL read back out of the config file.
+ *
+ * PRECONDITION: the caller must point HOME and USERPROFILE (os.homedir()) at a
+ * throwaway directory, as sso-setup.test.ts does. The token file lands under
+ * the same sha1 key a real session of that name uses, so run against the real
+ * home it would overwrite a real login. Enforced: when os.homedir() is the
+ * account's own home directory (os.userInfo(), which reads the passwd entry /
+ * Windows profile rather than the environment) the scenario refuses with exit
+ * 5 before reading or writing anything.
+ *
+ * A release file that never appears is a FAILURE (exit 6) once the wait runs
+ * out -- 60 s, or AWS_MCP_FAKE_RELEASE_TIMEOUT_MS -- rather than a login that
+ * completes on its own, which would hand a "must not complete before release"
+ * test a spontaneous success.
  */
 async function ssoSessionLoginScenario(): Promise<void> {
+  const os = await import("node:os");
+  const path = await import("node:path");
+  let ownHome: string | undefined;
+  try {
+    ownHome = os.userInfo().homedir;
+  } catch {
+    // No passwd entry (some containers): cannot prove HOME was redirected.
+  }
+  // Windows and default macOS volumes are case-insensitive: a HOME that differs
+  // from the real profile path only in case is still the real home.
+  const norm = (p: string) =>
+    process.platform === "win32" || process.platform === "darwin" ? path.resolve(p).toLowerCase() : path.resolve(p);
+  if (ownHome === undefined || norm(os.homedir()) === norm(ownHome)) {
+    failWith(
+      5,
+      `sso_session_login: refusing to write an SSO token under the real home directory (${os.homedir()}); point HOME and USERPROFILE at a temp dir`,
+    );
+  }
   const argv = process.argv.slice(2);
   if (argv.includes("--profile")) failWith(2, "sso_session_login: --profile must not be passed");
   const name = argAfter("--sso-session");
@@ -338,13 +579,10 @@ async function ssoSessionLoginScenario(): Promise<void> {
   const fs = await import("node:fs");
   const release = process.env.AWS_MCP_FAKE_RELEASE_FILE;
   if (release) {
-    const deadline = Date.now() + 60_000;
-    while (!fs.existsSync(release) && Date.now() < deadline) await sleep(20);
+    await waitForReleaseFile(release, "sso_session_login");
   } else {
     await sleep(200);
   }
-  const os = await import("node:os");
-  const path = await import("node:path");
   const crypto = await import("node:crypto");
   const cacheDir = path.join(os.homedir(), ".aws", "sso", "cache");
   fs.mkdirSync(cacheDir, { recursive: true });
@@ -385,22 +623,22 @@ function fakeRolesFor(accountId: string): string[] {
  * `aws sso list-accounts` / `list-account-roles`. Refuses (exit 4) params that
  * did not arrive through a `file://` --cli-input-json -- the token must never be
  * on argv -- and checks the same profile-free invariants as the login scenario,
- * plus `--region` matching AWS_MCP_FAKE_SSO_REGION (default us-east-1). A wrong
+ * plus `--region` being us-east-1 (the sso_region every sso_list* test
+ * configures). A wrong
  * token is the real CLI's UnauthorizedException, exit 254.
  */
 async function ssoListScenario(variant: string): Promise<void> {
-  const fs = await import("node:fs");
+  const { readCliInputJson } = await import("./cli-input.js");
   const argv = process.argv.slice(2);
   if (argv[0] !== "sso") failWith(2, `${variant}: expected 'sso <op>', got ${argv.slice(0, 2).join(" ")}`);
   if (argv.includes("--profile")) failWith(2, `${variant}: --profile must not be passed`);
   if ("AWS_PROFILE" in process.env || "AWS_DEFAULT_PROFILE" in process.env) {
     failWith(3, `${variant}: AWS_PROFILE / AWS_DEFAULT_PROFILE leaked into the child env`);
   }
-  const wantRegion = process.env.AWS_MCP_FAKE_SSO_REGION ?? "us-east-1";
-  if (argAfter("--region") !== wantRegion) failWith(2, `${variant}: --region ${argAfter("--region")} != ${wantRegion}`);
-  const raw = argAfter("--cli-input-json") ?? "";
-  if (!raw.startsWith("file://")) failWith(4, `${variant}: --cli-input-json must be a file:// path`);
-  const input = JSON.parse(fs.readFileSync(raw.slice("file://".length), "utf-8")) as Record<string, string>;
+  if (argAfter("--region") !== "us-east-1") failWith(2, `${variant}: --region ${argAfter("--region")} != us-east-1`);
+  const payload = readCliInputJson(argv);
+  if (payload?.source !== "file") failWith(4, `${variant}: --cli-input-json must be a file:// path`);
+  const input = payload.params as Record<string, string>;
   const op = argv[1];
   const opName = op === "list-accounts" ? "ListAccounts" : "ListAccountRoles";
   const expected = process.env.AWS_MCP_FAKE_SSO_TOKEN ?? FAKE_SSO_TOKEN;
@@ -455,17 +693,15 @@ async function main(): Promise<void> {
   await recordCall();
   switch (scenario) {
     case "regional_device_split": {
-      process.stdout.write(
+      // Three reads: the URL is cut mid-path between the first two, the code
+      // mid-token between the last two. See writeSplitStdout.
+      await writeSplitStdout(scenario, [
         "Earlier code ABCD-EFGH\nBrowser will not be automatically opened.\nPlease visit the following URL:\n\nhttps://EU-West-1.SignIn.AWS/platform/auth",
-      );
-      await sleep(100);
-      process.stdout.write("orize?client_id=synthetic\n\nThen enter the code:\n\nWXYZ-");
-      await sleep(100);
-      // Trailing autofill line, exactly as aws-cli's PrintOnlyHandler appends
-      // it after the code.
-      process.stdout.write(
+        "orize?client_id=synthetic\n\nThen enter the code:\n\nWXYZ-",
+        // Trailing autofill line, exactly as aws-cli's PrintOnlyHandler appends
+        // it after the code.
         "1234\n\nAlternatively, you may visit the following URL which will autofill the code upon loading:\nhttps://EU-West-1.SignIn.AWS/platform/authorize?user_code=WXYZ-1234\n",
-      );
+      ]);
       await sleep(200);
       process.exit(0);
       return;
@@ -485,9 +721,11 @@ async function main(): Promise<void> {
     case "split_portal_url": {
       // The portal URL arrives across two pipe chunks, split inside its query
       // string. The parser must surface the whole URL, not the first chunk's.
-      process.stdout.write("Open the following URL:\n\nhttps://team-example.awsapps.com/start/#/device?user_co");
-      await sleep(100);
-      process.stdout.write("de=ABCD-EFGH\n\nThen enter the code:\n\nABCD-EFGH\n");
+      // See writeSplitStdout for why the two reads are guaranteed separate.
+      await writeSplitStdout(scenario, [
+        "Open the following URL:\n\nhttps://team-example.awsapps.com/start/#/device?user_co",
+        "de=ABCD-EFGH\n\nThen enter the code:\n\nABCD-EFGH\n",
+      ]);
       await sleep(200);
       process.exit(0);
       return;
@@ -495,21 +733,13 @@ async function main(): Promise<void> {
 
     case "happy": {
       // Realistic aws-cli output: banner text, URL, code, then successful auth.
-      // HARD CONSTRAINT: the default 200ms exit timing is the contract that
+      // HARD CONSTRAINT: the 200ms exit timing is the contract that
       // auth.test.ts and several sso.integration.test.ts cases (TTL
-      // killswitch, completed-session exclusion) depend on. Do not change
-      // the default. AWS_MCP_FAKE_HAPPY_EXIT_MS exists only for slow-CI
-      // widening -- it must not be set in normal test runs. If you need a
-      // session that stays active deterministically, use `happy_hold`.
-      // A garbage env value would make Number() return NaN (and "" parses to
-      // 0, negatives are equally bogus) -- setTimeout with any of those fires
-      // immediately, silently shrinking the 200ms window the timing tests
-      // anchor on. Fall back to the contract default unless the value is a
-      // positive finite number.
-      const parsedExitMs = Number(process.env.AWS_MCP_FAKE_HAPPY_EXIT_MS ?? "200");
-      const exitMs = Number.isFinite(parsedExitMs) && parsedExitMs > 0 ? parsedExitMs : 200;
+      // killswitch, completed-session exclusion) depend on. Do not change it.
+      // If you need a session that stays active deterministically, use
+      // `happy_hold`.
       process.stdout.write(HAPPY_URL_CODE_BANNER);
-      await sleep(exitMs); // Simulate user auth delay
+      await sleep(200); // Simulate user auth delay
       process.stdout.write("Successfully logged into Start URL: https://d-test.awsapps.com/start\n");
       process.exit(0);
       return;
@@ -578,7 +808,8 @@ async function main(): Promise<void> {
       // a loaded machine see the exit first and report "exited before printing
       // a URL", failing tests that require the URL+code to land first. Observed
       // under a full parallel `npm test`; never reproduced running this file
-      // alone. 250ms matches the `happy` scenario's 200ms exit convention.
+      // alone. 250ms rather than 200ms so it stays a little past the `happy`
+      // scenario's 200ms exit, the window the sso tests already budget for.
       // Production is unaffected: the real CLI blocks on the user, it does not
       // print and exit in the same breath.
       await sleep(250);
@@ -652,7 +883,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "new-tools_argparse_required_bucket_key": {
+    case "call_argparse_required_bucket_key": {
       // Verbatim stderr from real aws-cli 2.34.3 for
       //   aws s3api get-object --cli-input-json '{"Bucket":"b","Key":"k"}'
       // -- the CLI naming, as missing, the two values the caller DID supply in
@@ -664,7 +895,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "new-tools_argparse_required_outfile": {
+    case "call_argparse_required_outfile": {
       // Real 2.34.3 stderr for `aws s3api get-object` with NO params: the
       // required list now includes the positional `outfile`, which is what
       // proves the command is unreachable rather than under-supplied.
@@ -673,7 +904,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "new-tools_unknown_cli_input_json": {
+    case "call_unknown_cli_input_json": {
       // Real 2.34.3 stderr for `aws logs tail g --cli-input-json '{"logGroupName":"g"}'`
       // -- a hand-written (BasicCommand) command, which registers no
       // --cli-input-json at all. `aws s3 ls` and `aws configure get` emit the
@@ -685,19 +916,30 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "paginate_unknown_max_items": {
+      // Real 2.34.3 stderr for `aws sts get-caller-identity --max-items 100
+      // --starting-token abc` -- --max-items on an operation the CLI does not
+      // paginate. Flags first, then their values.
+      writeStderrWithPlatformEol(
+        "\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\nTo see help text, you can run:\n\n  aws help\n  aws <command> help\n  aws <command> <subcommand> help\n\n\naws: [ERROR]: Unknown options: --max-items, --starting-token, abc, 100\n",
+      );
+      process.exit(CLI_PARSE_EXIT);
+      return;
+    }
+
     case "call_sso_expired": {
-      process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+      process.stderr.write(SSO_EXPIRED_STDERR);
       process.exit(255);
       return;
     }
 
     case "call_no_creds": {
-      process.stderr.write("Unable to locate credentials. You can configure credentials by running 'aws configure'.\n");
+      process.stderr.write(NO_CREDS_STDERR);
       process.exit(255);
       return;
     }
 
-    case "awscli_expired_token": {
+    case "call_expired_token": {
       // The service-side expiry wrapper, as emitted for an expired STS session
       // that has NOTHING to do with SSO. Sibling of call_sso_expired, and the
       // pair is the point: both are "expired", but only one of them can be
@@ -710,7 +952,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "readme-positioning_cli_invalid_choice": {
+    case "call_cli_invalid_choice": {
       // Verbatim stderr from real aws-cli 2.34.3 for
       //   aws batch cancel-jobs --output json --profile <one that exists>
       //       --region us-east-1 --cli-input-json {...}
@@ -814,26 +1056,20 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "mr_partial_failure": {
+    case "multi_region_partial_failure": {
       // Multi-region test: vary output by --region argv so a single scenario
       // produces ok for one region and an sso_expired failure for another.
       // Lets the multi-region handler exercise the partial-failure result
       // shape end-to-end -- one region returns {ok: true, data, command},
       // another returns {ok: false, errorKind: "sso_expired", error, command}.
-      const argv = process.argv.slice(2);
-      // Coupling: --region position here must match the fixed argv layout in
-      // runAwsCall (aws-cli.ts:208-209), which places --region immediately
-      // before the region value. If that placement ever changes, regionIdx+1
-      // will silently resolve to the wrong token.
-      const regionIdx = argv.indexOf("--region");
-      const region = regionIdx >= 0 ? argv[regionIdx + 1] : "";
+      const region = regionFromArgv();
       if (region === "us-west-2") {
-        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.stderr.write(SSO_EXPIRED_STDERR);
         process.exit(255);
         return;
       }
       // Default: success with a small JSON payload tagged by region.
-      process.stdout.write(`${JSON.stringify({ Buckets: [{ Name: `bucket-${region}` }] })}\n`);
+      writeJsonLine({ Buckets: [{ Name: `bucket-${region}` }] });
       process.exit(0);
       return;
     }
@@ -846,7 +1082,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "awscli_utf8_split": {
+    case "call_utf8_split": {
       // Exercises the per-stream StringDecoder in runAwsCall: emit a multi-byte
       // UTF-8 character split across two stdout.write() calls so the decoder
       // must buffer the partial sequence across data events. Using "𠮷"
@@ -856,14 +1092,14 @@ async function main(): Promise<void> {
       // sees U+FFFD U+FFFD instead of the intact codepoint.
       const fourByteChar = Buffer.from("\u{20BB7}", "utf8"); // F0 A0 AE B7
       // Write enough JSON shell to satisfy --output json parsing AND split the
-      // multi-byte char across two distinct 'data' events. The sleep gives
-      // the parent's stdout.on('data') a chance to fire on the first chunk
-      // before the second arrives -- without it the kernel may coalesce the
-      // two writes into a single chunk and the split-boundary path doesn't
-      // exercise.
-      process.stdout.write(Buffer.concat([Buffer.from('{"name":"'), fourByteChar.slice(0, 2)]));
-      await sleep(50);
-      process.stdout.write(Buffer.concat([fourByteChar.slice(2), Buffer.from('"}\n')]));
+      // multi-byte char across two distinct 'data' events. writeSplitStdout
+      // holds the second half back until the parent has read the first, so the
+      // two can never coalesce into one chunk that would leave the
+      // split-boundary path unexercised.
+      await writeSplitStdout(scenario, [
+        Buffer.concat([Buffer.from('{"name":"'), fourByteChar.subarray(0, 2)]),
+        Buffer.concat([fourByteChar.subarray(2), Buffer.from('"}\n')]),
+      ]);
       process.exit(0);
       return;
     }
@@ -965,8 +1201,8 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "awscli_orphan_holds_pipes":
-    case "awscli_orphan_outlives_exit": {
+    case "call_orphan_holds_pipes":
+    case "call_orphan_outlives_exit": {
       // Both model the shape that hangs runAwsCall when it settles ONLY on
       // 'close': a descendant that inherited our stdio and outlives us, so the
       // write ends of the parent's pipes never close and 'close' never fires.
@@ -975,11 +1211,11 @@ async function main(): Promise<void> {
       // aws_call (validateNames permits them; there is no interactive denylist).
       //
       // The two cases cover the two DISTINCT failure paths in runAwsCall:
-      //   awscli_orphan_holds_pipes  -- we stay alive past the caller's
+      //   call_orphan_holds_pipes  -- we stay alive past the caller's
       //     timeoutMs, so the timeout callback kills US and then waits on
       //     'close'. killProc guarantees this process dies; it says nothing
       //     about the orphan holding the pipes.
-      //   awscli_orphan_outlives_exit -- we exit CLEANLY and fast, long before
+      //   call_orphan_outlives_exit -- we exit CLEANLY and fast, long before
       //     timeoutMs. The timeout callback's procHasExited() guard then returns
       //     early and never attempts a kill at all, so nothing bounds the wait.
       //
@@ -1037,7 +1273,7 @@ async function main(): Promise<void> {
         fs.writeFileSync(pidPath, String(orphan.pid));
       }
 
-      if (scenario === "awscli_orphan_outlives_exit") {
+      if (scenario === "call_orphan_outlives_exit") {
         // Valid, complete JSON: the assertion is that the caller gets this
         // NATURAL result (exit 0, parsed payload) rather than hanging, which
         // pins that the bound does not simply rewrite every held-pipe call as a
@@ -1048,7 +1284,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      // awscli_orphan_holds_pipes: emit a fragment, then hang past timeoutMs so
+      // call_orphan_holds_pipes: emit a fragment, then hang past timeoutMs so
       // the timeout path runs. The fragment doubles as proof that buffered bytes
       // still reach rawStdout when the fallback settles instead of 'close'. It
       // is written AFTER the orphan is spawned, so the ready file also proves
@@ -1136,7 +1372,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "ccapi_list_resources_paginated": {
+    case "resource_list_paginated": {
       // Mimics `aws cloudcontrol list-resources` for the aws_resource_list
       // pagination path. Stateful by argv: when `--next-token` is present the
       // caller is resuming, so emit the FINAL page (ResourceDescriptions with
@@ -1192,7 +1428,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "res2_diff_get_ok": {
+    case "resource_diff_get_ok": {
       // Feeds aws_resource_diff's HANDLER (not just its schema): one
       // `cloudcontrol get-resource` whose ResourceDescription.Properties is a
       // JSON-ENCODED STRING, exactly as CCAPI emits it. The handler then runs
@@ -1226,7 +1462,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "res2_ccapi_initial_fail_stderr": {
+    case "resource_initial_fail_stderr": {
       // Fails EVERY cloudcontrol verb on the INITIAL call, with a populated
       // stderr and empty stdout. Drives get/list/create/update/delete/diff into
       // ccapiFailure -- the `if (!result.ok) return ccapiFailure(result)` line
@@ -1239,7 +1475,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "res2_ccapi_initial_fail_stdout_only": {
+    case "resource_initial_fail_stdout_only": {
       // The OTHER half of rawBodyOf: nonzero exit, deliberately EMPTY stderr,
       // diagnostic on stdout (a wrapper swallowing stderr, or stderr closed).
       // Truthiness is what makes this work -- `rawStderr ?? rawStdout` would
@@ -1253,7 +1489,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "res2_invalid_creds_stderr": {
+    case "assume_role_invalid_creds": {
       // Generic (argv-independent) invalid_creds failure: credentials WERE
       // resolved and sent, and the service refused them. Sibling of
       // call_sso_expired / call_no_creds, for the classification arm neither
@@ -1266,7 +1502,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "res2_props_unparseable": {
+    case "resource_props_unparseable": {
       // A CCAPI Properties string that is NOT valid JSON, served for BOTH
       // get-resource and list-resources. parseResourceProperties keeps the raw
       // string under propertiesRaw; the two verbs' handlers must each surface
@@ -1293,110 +1529,66 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "res2_update_expired_creds_mid_poll": {
+    case "resource_update_expired_creds_mid_poll": {
       //   1) cloudcontrol update-resource             -> IN_PROGRESS, RequestToken=req-tok-upd-exp
       //   2) cloudcontrol get-resource-request-status -> ExpiredToken
       // The expired_creds arm of buildMutationResponse's auth-recovery branch.
       // ExpiredToken is the ORIGIN-AGNOSTIC expiry wrapper (an assume-role or
       // web-identity session, not necessarily SSO), so it classifies as
       // expired_creds rather than sso_expired.
-      const argv = process.argv.slice(2);
-      if (argv.includes("update-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::Lambda::Function",
-              Identifier: "my-fn",
-              RequestToken: "req-tok-upd-exp",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "UPDATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write(
+      await ccapiMutationThenPoll(
+        scenario,
+        "update-resource",
+        {
+          TypeName: "AWS::Lambda::Function",
+          Identifier: "my-fn",
+          RequestToken: "req-tok-upd-exp",
+          OperationStatus: "IN_PROGRESS",
+          Operation: "UPDATE",
+        },
+        failPoll(
           "An error occurred (ExpiredToken) when calling the GetResourceRequestStatus operation: The provided token has expired.\n",
-        );
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: res2_update_expired_creds_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+        ),
+      );
       return;
     }
 
-    case "res2_create_invalid_creds_mid_poll": {
+    case "resource_create_invalid_creds_mid_poll": {
       //   1) cloudcontrol create-resource             -> IN_PROGRESS, RequestToken=req-tok-inv
       //   2) cloudcontrol get-resource-request-status -> UnrecognizedClientException
       // A key rotated or deleted MID-POLL: the credentials resolved and AWS
       // refused them, which classifies as invalid_creds -- neither an expiry
       // nor a missing profile. The mutation may still land server-side, so the
       // recovery hint has to carry the requestToken like its sibling arms.
-      const argv = process.argv.slice(2);
-      if (argv.includes("create-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::SSM::Parameter",
-              Identifier: "/my/p",
-              RequestToken: "req-tok-inv",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "CREATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write(
+      await ccapiMutationThenPoll(
+        scenario,
+        "create-resource",
+        ssmCreateEvent("req-tok-inv", "IN_PROGRESS"),
+        failPoll(
           "An error occurred (UnrecognizedClientException) when calling the GetResourceRequestStatus operation: The security token included in the request is invalid.\n",
-        );
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: res2_create_invalid_creds_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+        ),
+      );
       return;
     }
 
-    case "res2_create_no_request_token": {
+    case "resource_create_no_request_token": {
       // create-resource returns a NON-TERMINAL ProgressEvent with NO
       // RequestToken -- so a caller who passed awaitCompletion:true gets the
       // not-awaited shape plus the explanatory `awaitSkipped` string, because
       // there is nothing to poll. To PROVE no poll was attempted, the
       // get-resource-request-status branch errors out: reaching it flips the
-      // result to ok:false. Sibling of ccapi_create_already_terminal, which
+      // result to ok:false. Sibling of resource_create_already_terminal, which
       // skips the poll for the other reason (already terminal).
-      const argv = process.argv.slice(2);
-      if (argv.includes("create-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::SSM::Parameter",
-              Identifier: "/my/p",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "CREATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write("fake-aws: res2_create_no_request_token polled, but there was no token to poll with\n");
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: res2_create_no_request_token hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+      await ccapiMutationThenPoll(
+        scenario,
+        "create-resource",
+        ssmCreateEvent(undefined, "IN_PROGRESS"),
+        failPoll(`fake-aws: ${scenario} polled, but there was no token to poll with\n`),
+      );
       return;
     }
 
-    case "ccapi_create_then_status_success": {
+    case "resource_create_then_status_success": {
       // Routes a single AWS_MCP_FAKE_SCENARIO across the two CLI calls the
       // create-with-awaitCompletion HAPPY path makes:
       //   1) cloudcontrol create-resource             -> IN_PROGRESS (success), RequestToken=req-tok-ok
@@ -1404,44 +1596,15 @@ async function main(): Promise<void> {
       // Drives buildMutationResponse + pollUntilTerminal end-to-end to a
       // terminal SUCCESS in one handler call. The status-poll branch reaches a
       // TERMINAL_STATUSES member ("SUCCESS") on the first poll, so attempts==1.
-      // Companion to ccapi_create_then_status_sso_expired (the failure path).
-      const argv = process.argv.slice(2);
-      if (argv.includes("create-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::SSM::Parameter",
-              Identifier: "/my/p",
-              RequestToken: "req-tok-ok",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "CREATE",
-            },
-          })}\n`,
-        );
+      // Companion to resource_create_then_status_sso_expired (the failure path).
+      await ccapiMutationThenPoll(scenario, "create-resource", ssmCreateEvent("req-tok-ok", "IN_PROGRESS"), () => {
+        writeProgressEvent(ssmCreateEvent("req-tok-ok", "SUCCESS"));
         process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::SSM::Parameter",
-              Identifier: "/my/p",
-              RequestToken: "req-tok-ok",
-              OperationStatus: "SUCCESS",
-              Operation: "CREATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      process.stderr.write(`fake-aws: ccapi_create_then_status_success hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+      });
       return;
     }
 
-    case "ccapi_create_already_terminal": {
+    case "resource_create_already_terminal": {
       // The create-resource call returns a ProgressEvent that is ALREADY in a
       // terminal state (SUCCESS) on the very first response -- some CCAPI
       // resource types complete synchronously. With awaitCompletion:true the
@@ -1450,46 +1613,76 @@ async function main(): Promise<void> {
       // block, attempts never run). To PROVE the poll was skipped, the
       // get-resource-request-status branch errors out -- if the handler ever
       // reaches it, the test sees ok:false instead of a clean SUCCESS.
-      const argv = process.argv.slice(2);
-      if (argv.includes("create-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::SSM::Parameter",
-              Identifier: "/my/p",
-              RequestToken: "req-tok-term",
-              OperationStatus: "SUCCESS",
-              Operation: "CREATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
+      await ccapiMutationThenPoll(
+        scenario,
+        "create-resource",
+        ssmCreateEvent("req-tok-term", "SUCCESS"),
         // Should be unreachable: the initial SUCCESS short-circuits the poll.
-        process.stderr.write("fake-aws: ccapi_create_already_terminal poll was called but should have been skipped\n");
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: ccapi_create_already_terminal hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+        failPoll(`fake-aws: ${scenario} poll was called but should have been skipped\n`),
+      );
       return;
     }
 
-    case "logs-tail_current_basic":
-    case "logs-tail_current_bulk":
-    case "logs-tail_current_empty":
-    case "logs-tail_current_unicode":
-    case "logs-tail_legacy_basic":
-    case "logs-tail_legacy_bulk":
-    case "logs-tail_legacy_empty":
-    case "logs-tail_ancient_basic":
-    case "logs-tail_ignored_bulk":
-    case "logs-tail_jsonfmt_bulk":
-    case "logs-tail_echo_argv":
-    case "logs-tail_api_error":
-    case "logs-tail_real_tail_text": {
+    case "resource_create_pollfail_throttle_always":
+    case "resource_create_pollfail_throttle_then_success":
+    case "resource_create_pollfail_validation": {
+      // Mid-poll NON-auth failures for an awaited create:
+      //   1) cloudcontrol create-resource -> IN_PROGRESS, RequestToken=req-tok-pf
+      //   2) cloudcontrol get-resource-request-status ->
+      //      throttle_always:       ThrottlingException on every poll (outlives
+      //                             the bounded transient retries)
+      //      throttle_then_success: ThrottlingException on the first two polls,
+      //                             then SUCCESS (absorbed by the retries)
+      //      validation:            ValidationException (never retried)
+      // The poll count lives in the file named by AWS_MCP_FAKE_POLL_COUNTER
+      // (each poll is a fresh process); throttle_then_success requires it.
+      await ccapiMutationThenPoll(
+        scenario,
+        "create-resource",
+        ssmCreateEvent("req-tok-pf", "IN_PROGRESS"),
+        async () => {
+          const counterPath = process.env.AWS_MCP_FAKE_POLL_COUNTER;
+          let polls = 0;
+          if (counterPath) {
+            const fs = await import("node:fs");
+            polls = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, "utf8")) || 0 : 0;
+            polls++;
+            fs.writeFileSync(counterPath, String(polls));
+          }
+          if (scenario === "resource_create_pollfail_validation") {
+            process.stderr.write(
+              "\nAn error occurred (ValidationException) when calling the GetResourceRequestStatus operation: Request token is malformed\n",
+            );
+            process.exit(254);
+            return;
+          }
+          if (scenario === "resource_create_pollfail_throttle_always" || polls <= 2) {
+            process.stderr.write(
+              "\nAn error occurred (ThrottlingException) when calling the GetResourceRequestStatus operation (reached max retries: 2): Rate exceeded\n",
+            );
+            process.exit(254);
+            return;
+          }
+          writeProgressEvent(ssmCreateEvent("req-tok-pf", "SUCCESS"));
+          process.exit(0);
+        },
+      );
+      return;
+    }
+
+    case "logs_tail_current_basic":
+    case "logs_tail_current_bulk":
+    case "logs_tail_current_empty":
+    case "logs_tail_current_unicode":
+    case "logs_tail_legacy_basic":
+    case "logs_tail_legacy_bulk":
+    case "logs_tail_legacy_empty":
+    case "logs_tail_ancient_basic":
+    case "logs_tail_ignored_bulk":
+    case "logs_tail_jsonfmt_bulk":
+    case "logs_tail_echo_argv":
+    case "logs_tail_api_error":
+    case "logs_tail_real_tail_text": {
       // aws_logs_tail's FilterLogEvents scenarios. The datasets, the verbatim
       // real-CLI captures and the emulator live in logs-tail-fake.ts, which is
       // imported lazily so no other scenario pays for a ~600-line module at
@@ -1660,7 +1853,7 @@ async function main(): Promise<void> {
         process.exit(0);
         return;
       }
-      process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+      process.stderr.write(SSO_EXPIRED_STDERR);
       process.exit(255);
       return;
     }
@@ -1677,7 +1870,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lq2_poll_access_denied": {
+    case "logs_query_poll_access_denied": {
       // start-query succeeds; every get-query-results call is denied. Reaches
       // aws_logs_query's `call_failed` poll arm on a NON-auth kind, which is the
       // half logs_query_poll_sso_expired cannot reach -- that scenario takes the
@@ -1700,7 +1893,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lq2_terminal_status": {
+    case "logs_query_terminal_status": {
       // Drives terminalQueryFailure's per-status message arms through the real
       // handler: start-query hands back a fixed queryId and get-query-results
       // answers with whatever AWS_MCP_FAKE_QUERY_STATUS names. The var UNSET
@@ -1720,12 +1913,12 @@ async function main(): Promise<void> {
         process.exit(0);
         return;
       }
-      process.stderr.write(`fake-aws: lq2_terminal_status hit unexpected argv: ${argv.join(" ")}\n`);
+      process.stderr.write(`fake-aws: logs_query_terminal_status hit unexpected argv: ${argv.join(" ")}\n`);
       process.exit(2);
       return;
     }
 
-    case "lq2_start_bad_query_id": {
+    case "logs_query_start_bad_query_id": {
       // start-query EXITS 0 but its body carries no usable queryId, so the
       // handler has to bail before polling rather than hand `--query-id
       // undefined` to the CLI once per attempt for the whole wait budget.
@@ -1744,7 +1937,7 @@ async function main(): Promise<void> {
         process.exit(0);
         return;
       }
-      process.stderr.write(`fake-aws: lq2_start_bad_query_id hit unexpected argv: ${argv.join(" ")}\n`);
+      process.stderr.write(`fake-aws: logs_query_start_bad_query_id hit unexpected argv: ${argv.join(" ")}\n`);
       process.exit(2);
       return;
     }
@@ -1762,7 +1955,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "awscli2_invalid_creds_unrecognized_client": {
+    case "call_invalid_creds_unrecognized_client": {
       // Credentials RESOLVED and were sent; the service refused them. The
       // canonical shape for a deleted/rotated access key, or a key issued in a
       // different partition. Sibling of call_no_creds, and the pair is the
@@ -1775,7 +1968,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "awscli2_invalid_creds_client_token_id": {
+    case "call_invalid_creds_client_token_id": {
       // Same family, the STS/IAM spelling of it. Kept as its own scenario
       // rather than folded into the one above because INVALID_CREDS_PATTERNS
       // is a three-way alternation and a regex edit can drop one arm without
@@ -1787,7 +1980,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "awscli2_invalid_creds_signature_mismatch": {
+    case "call_invalid_creds_signature_mismatch": {
       // The third arm: a wrong secret key, or -- the classic -- a machine clock
       // that has drifted far enough to invalidate the SigV4 signature. Real
       // shape, including the two timestamps the service echoes back, which is
@@ -1799,36 +1992,19 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "ccapi_create_then_status_sso_expired": {
+    case "resource_create_then_status_sso_expired": {
       // Routes a single AWS_MCP_FAKE_SCENARIO across the two CLI calls the
       // create-with-awaitCompletion flow makes:
       //   1) cloudcontrol create-resource         -> IN_PROGRESS (success)
       //   2) cloudcontrol get-resource-request-status -> SSO expired
       // Lets us drive the buildMutationResponse recovery-hint path through
       // the real handler without two-step env-var juggling.
-      const argv = process.argv.slice(2);
-      if (argv.includes("create-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::SSM::Parameter",
-              Identifier: "/my/p",
-              RequestToken: "req-tok-abc",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "CREATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: ccapi_create_then_status_sso_expired hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+      await ccapiMutationThenPoll(
+        scenario,
+        "create-resource",
+        ssmCreateEvent("req-tok-abc", "IN_PROGRESS"),
+        failPoll(SSO_EXPIRED_STDERR),
+      );
       return;
     }
 
@@ -1888,7 +2064,7 @@ async function main(): Promise<void> {
     // Where EvalResourceName reads "arn:${...}:..." below, the ${...} are IAM's
     // OWN placeholders inside a plain string -- the ARN template it now returns
     // for any action that has an ARN format. Nothing here is JS interpolation.
-    case "iam-simulate_rsr_split": {
+    case "iam_simulate_rsr_split": {
       // Two actions x three resources. s3:GetObject gets ONE EvaluationResult
       // whose top-level EvalDecision is the most restrictive answer across all
       // three buckets and whose EvalResourceName is the template -- the real
@@ -1946,7 +2122,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "iam-simulate_scp_deny": {
+    case "iam_simulate_scp_deny": {
       // An SCP deny, which is the shape the description's "SCP statements never
       // appear in matchedStatementIds" sentence is about: explicitDeny with
       // MatchedStatements EMPTY, and the only tell is AllowedByOrganizations
@@ -1978,7 +2154,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "iam-simulate_rsr_boundary": {
+    case "iam_simulate_rsr_boundary": {
       // ResourceSpecificResult carries its OWN PermissionsBoundaryDecisionDetail
       // (it is in the model aws-cli 2.34.3 bundles, unlike a per-entry
       // OrganizationsDecisionDetail, which that CLI silently drops). The two
@@ -2022,7 +2198,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "iam-simulate_nores_template": {
+    case "iam_simulate_nores_template": {
       // DEFENSIVE, not observed: the API reference permits a result with the ARN
       // template and NO ResourceSpecificResults at all, and it puts a '*'
       // simulation's missing context keys on the top-level result. That is the
@@ -2052,21 +2228,7 @@ async function main(): Promise<void> {
     case "assume_role_success": {
       // Mimics `aws sts assume-role --output json` on a successful assume.
       // Mirrors the real CLI shape: Credentials, AssumedRoleUser, PackedPolicySize.
-      process.stdout.write(
-        `${JSON.stringify({
-          Credentials: {
-            AccessKeyId: "ASIA1234EXAMPLE",
-            SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            SessionToken: "FQoGZXIvYXdzEXAMPLETOKENBLAHBLAH",
-            Expiration: "2099-12-31T23:59:59+00:00",
-          },
-          AssumedRoleUser: {
-            AssumedRoleId: "AROA1234EXAMPLE:my-session",
-            Arn: "arn:aws:sts::123456789012:assumed-role/Admin/my-session",
-          },
-          PackedPolicySize: 6,
-        })}\n`,
-      );
+      writeJsonLine(ASSUME_ROLE_OK);
       process.exit(0);
       return;
     }
@@ -2091,7 +2253,7 @@ async function main(): Promise<void> {
       // successful assume-role payload so the handler returns ok:true and the
       // post-success path runs. Lets a test assert that DurationSeconds /
       // ExternalId reached the CLI inside --cli-input-json AND that the source
-      // profile reached --profile. Modeled on iam_sim_echo_argv.
+      // profile reached --profile. Modeled on iam_simulate_echo_argv.
       //
       // The handler sends assume-role params (RoleArn / RoleSessionName /
       // DurationSeconds / ExternalId) via --cli-input-json; the source profile
@@ -2102,21 +2264,7 @@ async function main(): Promise<void> {
         const fs = await import("node:fs");
         fs.writeFileSync(outPath, JSON.stringify(process.argv.slice(2)));
       }
-      process.stdout.write(
-        `${JSON.stringify({
-          Credentials: {
-            AccessKeyId: "ASIA1234EXAMPLE",
-            SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            SessionToken: "FQoGZXIvYXdzEXAMPLETOKENBLAHBLAH",
-            Expiration: "2099-12-31T23:59:59+00:00",
-          },
-          AssumedRoleUser: {
-            AssumedRoleId: "AROA1234EXAMPLE:my-session",
-            Arn: "arn:aws:sts::123456789012:assumed-role/Admin/my-session",
-          },
-          PackedPolicySize: 6,
-        })}\n`,
-      );
+      writeJsonLine(ASSUME_ROLE_OK);
       process.exit(0);
       return;
     }
@@ -2171,8 +2319,8 @@ async function main(): Promise<void> {
       //
       // COUPLING: sso.integration.test.ts mirrors SSO2_TAIL byte-for-byte to
       // compute the expected rawOutput. Change one, change both -- the
-      // byte-identical passthrough assertion there fails loudly if they drift.
-      const SSO2_TAIL = "\nhttps://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n";
+      // SSO2_TAIL lives in fake-aws-fixtures.ts, which sso.integration.test.ts
+      // imports to compute the expected rawOutput -- one constant, no mirror.
       const raw = process.env.AWS_MCP_FAKE_SSO2_FILLER;
       const filler = Number(raw ?? "-1");
       if (!Number.isInteger(filler) || filler < 0) {
@@ -2195,7 +2343,6 @@ async function main(): Promise<void> {
       // 3999 filler chars means the first U+20BB7 occupies UTF-16 indices 3999
       // and 4000, so a slice(0, 4000) keeps only its HIGH surrogate. Same tail
       // and drain contract as sso2_raw_sized.
-      const SSO2_TAIL = "\nhttps://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n";
       process.stdout.write(`${"x".repeat(3999)}${"\u{20BB7}".repeat(8)}${SSO2_TAIL}`);
       await sleep(250);
       process.exit(0);
@@ -2212,62 +2359,34 @@ async function main(): Promise<void> {
     }
 
     case "resource_update_sso_expired_mid_poll": {
-      // Mirrors `ccapi_create_then_status_sso_expired` for the update path:
+      // Mirrors `resource_create_then_status_sso_expired` for the update path:
       //   1) cloudcontrol update-resource         -> IN_PROGRESS (success)
       //   2) cloudcontrol get-resource-request-status -> SSO expired
       // Drives the buildMutationResponse recovery-hint path for
       // aws_resource_update through the real handler.
-      const argv = process.argv.slice(2);
-      if (argv.includes("update-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::Lambda::Function",
-              Identifier: "my-fn",
-              RequestToken: "req-tok-upd",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "UPDATE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: resource_update_sso_expired_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+      await ccapiMutationThenPoll(
+        scenario,
+        "update-resource",
+        {
+          TypeName: "AWS::Lambda::Function",
+          Identifier: "my-fn",
+          RequestToken: "req-tok-upd",
+          OperationStatus: "IN_PROGRESS",
+          Operation: "UPDATE",
+        },
+        failPoll(SSO_EXPIRED_STDERR),
+      );
       return;
     }
 
     case "resource_delete_sso_expired_mid_poll": {
       // Same pattern for the delete path.
-      const argv = process.argv.slice(2);
-      if (argv.includes("delete-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::S3::Bucket",
-              Identifier: "my-bucket",
-              RequestToken: "req-tok-del",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "DELETE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: resource_delete_sso_expired_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+      await ccapiMutationThenPoll(
+        scenario,
+        "delete-resource",
+        bucketDeleteEvent("req-tok-del"),
+        failPoll(SSO_EXPIRED_STDERR),
+      );
       return;
     }
 
@@ -2277,31 +2396,12 @@ async function main(): Promise<void> {
       // (it points at fixing credentials rather than re-running aws_login_start).
       // Delete is the right verb to test: it's destructive, so a buried
       // mid-poll failure has the highest blast radius.
-      const argv = process.argv.slice(2);
-      if (argv.includes("delete-resource")) {
-        process.stdout.write(
-          `${JSON.stringify({
-            ProgressEvent: {
-              TypeName: "AWS::S3::Bucket",
-              Identifier: "my-bucket",
-              RequestToken: "req-tok-del-nc",
-              OperationStatus: "IN_PROGRESS",
-              Operation: "DELETE",
-            },
-          })}\n`,
-        );
-        process.exit(0);
-        return;
-      }
-      if (argv.includes("get-resource-request-status")) {
-        process.stderr.write(
-          "Unable to locate credentials. You can configure credentials by running 'aws configure'.\n",
-        );
-        process.exit(255);
-        return;
-      }
-      process.stderr.write(`fake-aws: resource_delete_no_creds_mid_poll hit unexpected argv: ${argv.join(" ")}\n`);
-      process.exit(2);
+      await ccapiMutationThenPoll(
+        scenario,
+        "delete-resource",
+        bucketDeleteEvent("req-tok-del-nc"),
+        failPoll(NO_CREDS_STDERR),
+      );
       return;
     }
 
@@ -2561,7 +2661,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lam2_invoke_echo_payload": {
+    case "lambda_invoke_echo_payload": {
       // Echoes the REQUEST back as the response: reads the fileb:// payload
       // file this child was handed and writes those exact bytes into its own
       // outfile. That makes every response caller-specific, which is what lets
@@ -2589,7 +2689,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lam2_invoke_multibyte_large_response": {
+    case "lambda_invoke_multibyte_large_response": {
       // Same over-cap shape as lambda_invoke_large_response, but the body is
       // 3-byte UTF-8 characters (U+5B57) instead of ASCII. On an all-ASCII body
       // a cut by BYTE and a cut by CHARACTER are indistinguishable; here they
@@ -2616,10 +2716,10 @@ async function main(): Promise<void> {
     // slow tests. EOL, because the real CLI writes \r\n on Windows and a fake
     // should not invent a line ending it never produces on this machine.
 
-    case "lambda-invoke_read_timeout": {
+    case "lambda_invoke_read_timeout": {
       // The invoke WAS sent: the unanswered URL is the Invoke path, so the
       // handler must say the function may still be running (`rt_max1`).
-      requireSingleAttempt("lambda-invoke_read_timeout");
+      requireSingleAttempt("lambda_invoke_read_timeout");
       const { EOL } = await import("node:os");
       process.stderr.write(
         `${EOL}aws: [ERROR]: Read timeout on endpoint URL: "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-fn/invocations"${EOL}`,
@@ -2628,11 +2728,11 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lambda-invoke_sts_read_timeout": {
+    case "lambda_invoke_sts_read_timeout": {
       // The same sentence for a request that never reached Lambda: a role_arn
       // profile whose STS endpoint hangs (`sts_hang_rt3`, zero Invoke POSTs). The
       // URL is the only thing that distinguishes it from the case above.
-      requireSingleAttempt("lambda-invoke_sts_read_timeout");
+      requireSingleAttempt("lambda_invoke_sts_read_timeout");
       const { EOL } = await import("node:os");
       process.stderr.write(
         `${EOL}aws: [ERROR]: Read timeout on endpoint URL: "https://sts.us-east-1.amazonaws.com/"${EOL}`,
@@ -2641,10 +2741,10 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lambda-invoke_throttled": {
+    case "lambda_invoke_throttled": {
       // Lambda refused before running anything, and with retries off it reaches
       // the caller on the first failure instead of being re-sent (`throttle_max1`).
-      requireSingleAttempt("lambda-invoke_throttled");
+      requireSingleAttempt("lambda_invoke_throttled");
       const { EOL } = await import("node:os");
       process.stderr.write(
         `${EOL}aws: [ERROR]: An error occurred (TooManyRequestsException) when calling the Invoke operation (reached max retries: 0): Rate Exceeded.${EOL}${EOL}Additional error details:${EOL}Type: User${EOL}message: Rate Exceeded.${EOL}Reason: ConcurrentInvocationLimitExceeded${EOL}`,
@@ -2653,11 +2753,11 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "lambda-invoke_connection_closed": {
+    case "lambda_invoke_connection_closed": {
       // Dropped mid-invoke, so the function may have run. Note the trailing "."
       // after the quoted URL -- it is in the real message and the connection-closed
       // pattern must not depend on the URL ending the line (`reset_max1`).
-      requireSingleAttempt("lambda-invoke_connection_closed");
+      requireSingleAttempt("lambda_invoke_connection_closed");
       const { EOL } = await import("node:os");
       process.stderr.write(
         `${EOL}aws: [ERROR]: Connection was closed before we received a valid response from endpoint URL: "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-fn/invocations".${EOL}`,
@@ -2741,6 +2841,14 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "metrics_opaque_failure": {
+      // A failure parseAwsError has no remedy for, so runAwsCall sets no
+      // suggestion -- pins that aws_metrics_query leaves the key absent.
+      process.stderr.write("metrics fake: something unrecognizable went wrong\n");
+      process.exit(1);
+      return;
+    }
+
     case "metrics_bad_metric": {
       // Real-world shape for an invalid namespace or malformed query.
       process.stderr.write(
@@ -2759,18 +2867,53 @@ async function main(): Promise<void> {
       // rather than substring-matching '"NextToken"' -- a metric label,
       // dimension value, or expression containing that literal would
       // otherwise silently switch branches.
+      //
+      // It also models the real CLI's auto-pagination (measured on aws-cli
+      // 2.34.3 against a loopback stub): GetMetricData is a paginated
+      // operation, so with neither --no-paginate nor MaxDatapoints/NextToken in
+      // the payload the CLI drains every page itself and prints them merged --
+      // one MetricDataResults entry per page, all with the same Id, and no
+      // NextToken. Only with pagination off does the first page's NextToken
+      // reach stdout.
       const argv = process.argv.slice(2);
       const jsonIdx = argv.indexOf("--cli-input-json");
       const payload = jsonIdx >= 0 ? argv[jsonIdx + 1] : "";
       let isResume = false;
+      let hasMaxDatapoints = false;
       try {
-        const parsed = JSON.parse(payload) as { NextToken?: unknown };
+        const parsed = JSON.parse(payload) as { NextToken?: unknown; MaxDatapoints?: unknown };
         isResume = parsed.NextToken !== undefined;
+        hasMaxDatapoints = parsed.MaxDatapoints !== undefined;
       } catch {
         // Malformed JSON shouldn't reach us in a real call (runAwsCall
         // serializes the payload). If it does, default to the first-page
         // branch so the test fails loud rather than silently resuming.
         isResume = false;
+      }
+      if (!isResume && !hasMaxDatapoints && !argv.includes("--no-paginate")) {
+        process.stdout.write(
+          `${JSON.stringify({
+            MetricDataResults: [
+              {
+                Id: "cpu",
+                Label: "CPUUtilization",
+                Timestamps: ["2026-05-16T11:00:00Z", "2026-05-16T10:00:00Z"],
+                Values: [42.5, 38.1],
+                StatusCode: "PartialData",
+              },
+              {
+                Id: "cpu",
+                Label: "CPUUtilization",
+                Timestamps: ["2026-05-16T09:00:00Z"],
+                Values: [33.3],
+                StatusCode: "Complete",
+              },
+            ],
+            Messages: [],
+          })}\n`,
+        );
+        process.exit(0);
+        return;
       }
       if (isResume) {
         process.stdout.write(
@@ -2823,13 +2966,14 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "iam_sim_echo_argv": {
+    case "iam_simulate_echo_argv": {
       // Capture-and-echo variant for iam_simulate: writes the full argv as
       // JSON to the path in AWS_MCP_FAKE_ARGV_OUT (side channel that survives
       // the handler discarding everything except EvaluationResults), then
       // emits a normal-shaped EvaluationResults on stdout so the handler
       // returns ok:true. Lets tests verify that the handler's
-      // camelCase -> PascalCase mapping (iam-simulate.ts:215-220) produces
+      // camelCase -> PascalCase mapping (the `params.ContextEntries = ...`
+      // contextEntries map in iam-simulate.ts's handler) produces
       // the right CLI flags (ContextKeyName/ContextKeyType/ContextKeyValues
       // inside --cli-input-json). Modeled on call_echo_args.
       const outPath = process.env.AWS_MCP_FAKE_ARGV_OUT;
@@ -2853,7 +2997,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "obs2_iam_sim_truncated": {
+    case "iam_simulate_truncated": {
       // IAM paginates SimulatePrincipalPolicy with IsTruncated + Marker, but the
       // CLI FOLLOWS that itself, so what this scenario used to emit -- a
       // truncated first page with IsTruncated:true and a Marker -- is a format
@@ -2871,10 +3015,14 @@ async function main(): Promise<void> {
       //                              IsTruncated:true plus the next Marker.
       //   any other Marker        -> the LAST page: IsTruncated:false, no Marker.
       //
-      // Stateful by argv, the same way metrics_paginated is: parse the
-      // --cli-input-json payload and read its Marker. Parsing the payload rather
-      // than substring-matching '"Marker"' keeps a resource ARN or action name
-      // containing that literal from flipping the branch.
+      // Stateful by argv: parse the --cli-input-json payload and read its
+      // Marker. Parsing the payload rather than substring-matching '"Marker"'
+      // keeps a resource ARN or action name containing that literal from
+      // flipping the branch. Read through readCliInputJson, because runAwsCall
+      // passes params as a file:// path past INLINE_CLI_INPUT_JSON_MAX_CHARS;
+      // parsing the argv entry inline turned that literal path into a parse
+      // failure answered as page 1, i.e. an endless first page. A payload that
+      // cannot be read now throws, failing the test loud.
       const getObject = {
         EvalActionName: "s3:GetObject",
         EvalResourceName: "arn:aws:s3:::my-bucket/*",
@@ -2893,18 +3041,8 @@ async function main(): Promise<void> {
         EvalDecision: "allowed",
         MatchedStatements: [{ SourcePolicyId: "ReadWriteAccess", SourcePolicyType: "IAM Policy" }],
       };
-      const argv = process.argv.slice(2);
-      const jsonIdx = argv.indexOf("--cli-input-json");
-      let marker: unknown;
-      try {
-        const parsed = JSON.parse(jsonIdx >= 0 ? argv[jsonIdx + 1] : "") as { Marker?: unknown };
-        marker = parsed.Marker;
-      } catch {
-        // Malformed JSON can't reach us from runAwsCall (it serializes the
-        // payload itself). Default to the first-call branch so a test fails
-        // loud rather than silently looking like a resume.
-        marker = undefined;
-      }
+      const { readCliInputJson } = await import("./cli-input.js");
+      const marker = (readCliInputJson(process.argv.slice(2))?.params as { Marker?: unknown } | undefined)?.Marker;
       if (marker === undefined) {
         process.stdout.write(`${JSON.stringify({ EvaluationResults: [getObject, deleteObject, putObject] })}\n`);
         process.exit(0);
@@ -2926,11 +3064,12 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "macct_success":
-    case "macct_partial_failure":
-    case "macct_leaky_stderr":
-    case "macct_big_payload": {
-      // The four aws_multi_account scenarios share one block because every one
+    case "multi_account_success":
+    case "multi_account_partial_failure":
+    case "multi_account_leaky_stderr":
+    case "multi_account_big_payload":
+    case "multi_account_abort_hang": {
+      // The aws_multi_account scenarios share one block because every one
       // of them needs the same two-PHASE behaviour, and duplicating the phase
       // split four times is how the copies drift apart. Each account drives two
       // spawns:
@@ -2953,31 +3092,18 @@ async function main(): Promise<void> {
       const isAssume = argv[0] === "sts" && argv[1] === "assume-role";
 
       if (isAssume) {
-        const inputIdx = argv.indexOf("--cli-input-json");
-        const payload = inputIdx >= 0 ? (JSON.parse(argv[inputIdx + 1]) as { RoleArn?: string }) : {};
+        // readCliInputJson: inline or file:// (runAwsCall's large-params path).
+        const { readCliInputJson } = await import("./cli-input.js");
+        const payload = (readCliInputJson(argv)?.params ?? {}) as { RoleArn?: string };
         const account = /:([0-9]{12}):role\//.exec(payload.RoleArn ?? "")?.[1] ?? "unknown";
-        if (scenario === "macct_partial_failure" && account === "222222222222") {
+        if (scenario === "multi_account_partial_failure" && account === "222222222222") {
           // One account whose ASSUME fails, so the batch proves an account can
           // drop out before its operation ever runs.
-          process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+          process.stderr.write(SSO_EXPIRED_STDERR);
           process.exit(255);
           return;
         }
-        process.stdout.write(
-          `${JSON.stringify({
-            Credentials: {
-              AccessKeyId: `ASIAFAKE${account}`,
-              SecretAccessKey: `fake-secret-${account}`,
-              SessionToken: `fake-token-${account}`,
-              Expiration: "2099-12-31T23:59:59+00:00",
-            },
-            AssumedRoleUser: {
-              AssumedRoleId: `AROAFAKE${account}:macct`,
-              Arn: `arn:aws:sts::${account}:assumed-role/Fake/macct`,
-            },
-            PackedPolicySize: 6,
-          })}\n`,
-        );
+        writeAccountCredentials(account, `fake-token-${account}`, "macct");
         process.exit(0);
         return;
       }
@@ -2986,7 +3112,7 @@ async function main(): Promise<void> {
       const account = accessKeyId.startsWith("ASIAFAKE") ? accessKeyId.slice("ASIAFAKE".length) : "unknown";
       const sawProfileFlag = argv.includes("--profile");
 
-      if (scenario === "macct_leaky_stderr") {
+      if (scenario === "multi_account_leaky_stderr") {
         // Adversarial: a subprocess that dumps the credentials it was handed to
         // BOTH streams and then fails. Nothing real does this -- the point is
         // that aws_multi_account's response must not contain them even when the
@@ -3001,7 +3127,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (scenario === "macct_partial_failure" && account === "333333333333") {
+      if (scenario === "multi_account_partial_failure" && account === "333333333333") {
         // A second account that assumed fine and then failed the OPERATION, so
         // the batch carries both failure stages plus a success at once.
         process.stderr.write(
@@ -3011,7 +3137,18 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (scenario === "macct_big_payload") {
+      if (scenario === "multi_account_abort_hang") {
+        // The assume above answered at once; the OPERATION hangs like
+        // abort_hang, announcing its pid, so a cancel lands while every
+        // account is in phase 2 -- the half of the flow ctx.signal reaches.
+        await abortAnnouncePid();
+        await sleep(60_000);
+        process.stdout.write("{}\n");
+        process.exit(0);
+        return;
+      }
+
+      if (scenario === "multi_account_big_payload") {
         // ~2.75 MB per account: under the 5 MB PER-CALL stdout cap in
         // aws-cli.ts, but two of them cross the 5 MB AGGREGATE budget.
         // No process.exit here -- see call_large: 2.75 MB is far past a pipe buffer,
@@ -3035,25 +3172,26 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "macct2_expired_after_assume":
-    case "macct2_env_probe":
-    case "macct2_source_profile":
-    case "macct2_echo_args": {
-      // A second aws_multi_account block, shaped exactly like the macct one
+    case "multi_account_expired_after_assume":
+    case "multi_account_env_probe":
+    case "multi_account_source_profile":
+    case "multi_account_echo_args": {
+      // A second aws_multi_account block, shaped exactly like the one
       // above: two spawns per account, with phase 1 minting credentials that
       // ENCODE what it saw so phase 2 can prove what it was actually handed.
       //
       // Kept separate from that block rather than folded into it because every
       // scenario here needs phase 1 to do something the four above do not --
       // refuse to mint for a spawn carrying the wrong argv, or carry an extra
-      // field across to phase 2 -- while the existing macct assertions read
+      // field across to phase 2 -- while the assertions on the block above read
       // named fields off a phase-2 payload whose shape must not move.
       const argv = process.argv.slice(2);
       const isAssume = argv[0] === "sts" && argv[1] === "assume-role";
+      // Inline or file:// (runAwsCall's large-params path) alike.
+      const { readCliInputJson } = await import("./cli-input.js");
 
       if (isAssume) {
-        const assumeInputIdx = argv.indexOf("--cli-input-json");
-        const payload = assumeInputIdx >= 0 ? (JSON.parse(argv[assumeInputIdx + 1]) as Record<string, unknown>) : {};
+        const payload = (readCliInputJson(argv)?.params ?? {}) as Record<string, unknown>;
         const roleArn = typeof payload.RoleArn === "string" ? payload.RoleArn : "";
         const account = /:([0-9]{12}):role\//.exec(roleArn)?.[1] ?? "unknown";
 
@@ -3071,7 +3209,7 @@ async function main(): Promise<void> {
           return;
         }
 
-        if (scenario === "macct2_echo_args") {
+        if (scenario === "multi_account_echo_args") {
           // The caller's params/query belong to the OPERATION spawn and
           // nowhere else -- leaking them onto the AssumeRole input would
           // corrupt the STS call for every account in the batch. Checked here
@@ -3089,25 +3227,11 @@ async function main(): Promise<void> {
           }
         }
 
-        process.stdout.write(
-          `${JSON.stringify({
-            Credentials: {
-              AccessKeyId: `ASIAFAKE${account}`,
-              SecretAccessKey: `fake-secret-${account}`,
-              // The source profile rides across on the session token, which is
-              // the same channel the macct block uses for the account id, one
-              // field wider. Phase 2 is a separate process and has no other way
-              // to report which identity did the assuming.
-              SessionToken: `fake-token-${account}|${assumeProfile}`,
-              Expiration: "2099-12-31T23:59:59+00:00",
-            },
-            AssumedRoleUser: {
-              AssumedRoleId: `AROAFAKE${account}:macct2`,
-              Arn: `arn:aws:sts::${account}:assumed-role/Fake/macct2`,
-            },
-            PackedPolicySize: 6,
-          })}\n`,
-        );
+        // The source profile rides across on the session token, which is the
+        // same channel the block above uses for the account id, one field
+        // wider. Phase 2 is a separate process and has no other way to report
+        // which identity did the assuming.
+        writeAccountCredentials(account, `fake-token-${account}|${assumeProfile}`, "macct2");
         process.exit(0);
         return;
       }
@@ -3121,12 +3245,12 @@ async function main(): Promise<void> {
       // subprocess is handed a mismatched pair from two different accounts.
       const sessionTokenMatches = sessionToken.startsWith(`fake-token-${account}|`);
 
-      if (scenario === "macct2_expired_after_assume") {
+      if (scenario === "multi_account_expired_after_assume") {
         // The post-assume auth failure: credentials really were minted, the
         // operation really ran on them, and AWS rejected them anyway -- an
         // hour-long session expiring mid-batch, an SCP revoking it, clock skew.
         //
-        // The mirror image of macct_leaky_stderr, which is worded so
+        // The mirror image of multi_account_leaky_stderr, which is worded so
         // classifyAuthError does NOT recognize it. Here the ExpiredToken
         // wrapper is deliberate: it classifies as expired_creds (pinned in
         // errors.test.ts), which is what routes the handler through
@@ -3142,7 +3266,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (scenario === "macct2_env_probe") {
+      if (scenario === "multi_account_env_probe") {
         process.stdout.write(
           `${JSON.stringify({
             Account: account,
@@ -3160,13 +3284,13 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (scenario === "macct2_source_profile") {
+      if (scenario === "multi_account_source_profile") {
         process.stdout.write(
           `${JSON.stringify({
             Account: account,
             // Which identity phase 1's sts:AssumeRole actually ran as. The
             // OPERATION spawn carries no profile at all -- that half is the
-            // macct block's SawProfileFlag.
+            // SawProfileFlag of the block above.
             SourceProfile: sourceProfile,
             SessionTokenMatches: sessionTokenMatches,
           })}\n`,
@@ -3175,17 +3299,16 @@ async function main(): Promise<void> {
         return;
       }
 
-      // macct2_echo_args: report the operation flags back, so the test can see
+      // multi_account_echo_args: report the operation flags back, so the test can see
       // the caller's own arguments survived the fan-out to this spawn.
       const outputIdx = argv.indexOf("--output");
       const queryIdx = argv.indexOf("--query");
-      const paramsIdx = argv.indexOf("--cli-input-json");
       process.stdout.write(
         `${JSON.stringify({
           Account: account,
           SawOutput: outputIdx >= 0 ? (argv[outputIdx + 1] ?? null) : null,
           SawQuery: queryIdx >= 0 ? (argv[queryIdx + 1] ?? null) : null,
-          SawParams: paramsIdx >= 0 ? (JSON.parse(argv[paramsIdx + 1]) as unknown) : null,
+          SawParams: readCliInputJson(argv)?.params ?? null,
           SessionTokenMatches: sessionTokenMatches,
         })}\n`,
       );
@@ -3193,22 +3316,18 @@ async function main(): Promise<void> {
       return;
     }
 
-    case "obs2_mr_big_payload": {
+    case "multi_region_big_payload": {
       // Drives aws_multi_region's AGGREGATE byte cap (5 MB across the batch)
-      // through the real handler. Region-branching like mr_partial_failure:
+      // through the real handler. Region-branching like multi_region_partial_failure:
       //   us-west-2 -> an sso_expired FAILURE, so the batch also proves
       //                okCount/errorCount count what the CALLS did, not what
       //                survived the cap.
       //   anything else -> ~2.75 MB of JSON, comfortably under the 5 MB
       //                PER-CALL stdout cap in aws-cli.ts but enough that two
       //                such regions cross the 5 MB aggregate budget.
-      const argv = process.argv.slice(2);
-      // Same coupling as mr_partial_failure: --region is immediately followed
-      // by its value in runAwsCall's fixed argv layout.
-      const regionIdx = argv.indexOf("--region");
-      const region = regionIdx >= 0 ? argv[regionIdx + 1] : "";
+      const region = regionFromArgv();
       if (region === "us-west-2") {
-        process.stderr.write("Error loading SSO Token: Token for my-profile is expired.\n");
+        process.stderr.write(SSO_EXPIRED_STDERR);
         process.exit(255);
         return;
       }

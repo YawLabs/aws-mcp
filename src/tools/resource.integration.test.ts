@@ -8,15 +8,20 @@
  *
  * Exercises the full aws_resource lifecycle end-to-end through the real aws
  * CLI: create -> poll status -> get -> update -> get -> delete -> poll status.
- * The `finally` block always runs delete + wait so a mid-test failure doesn't
- * leave a stray parameter behind.
+ * Once the create call has been ISSUED, the `finally` block attempts a delete
+ * by the parameter name (a NotFound is fine) so a mid-test failure -- a
+ * status-poll timeout, a failed assertion, an awaited create that reported
+ * ok:false after the parameter was in fact created -- doesn't leave a stray
+ * parameter behind.
  *
  * Prereqs when running live:
  *   - aws CLI v2 on PATH
  *   - A configured AWS profile with at minimum:
  *       ssm:PutParameter, ssm:GetParameter, ssm:DeleteParameter
- *       cloudformation:ListResources / the CCAPI permissions
- *       (`cloudcontrol:*Resource` action alias covers the CCAPI verbs)
+ *       plus the Cloud Control actions, which authorize under the
+ *       `cloudformation:` prefix (per the AWS docs; not measured here):
+ *       cloudformation:CreateResource, GetResource, UpdateResource,
+ *       DeleteResource, ListResources and GetResourceRequestStatus
  *   - Profile / region: default to the usual AWS_PROFILE / AWS_REGION chain,
  *     or set AWS_MCP_LIVE_PROFILE / AWS_MCP_LIVE_REGION to override just for
  *     this test without disturbing the rest of the suite.
@@ -99,6 +104,28 @@ async function waitUntilTerminal(requestToken: string, maxMs = 60_000, pollMs = 
   throw new Error(`request ${requestToken} did not reach a terminal state within ${maxMs}ms`);
 }
 
+/**
+ * Best-effort cleanup for the live tests: delete the SSM parameter by NAME (its
+ * CCAPI primary identifier) and wait for the delete. Called whenever the create
+ * was ISSUED, not only when it was seen to succeed -- a poll timeout or an
+ * ok:false awaited create can leave a parameter that did get created. A
+ * NotFound (the create never landed) and any other cleanup error are swallowed
+ * so the original assertion failure is what surfaces.
+ */
+async function deleteParamQuietly(paramName: string): Promise<void> {
+  try {
+    const del = (await deleteRes.handler({
+      typeName: "AWS::SSM::Parameter",
+      identifier: paramName,
+      ...commonOpts(),
+    })) as MutationResult;
+    const delToken = del.ok ? del.data?.requestToken : undefined;
+    if (delToken) await waitUntilTerminal(delToken).catch(() => undefined);
+  } catch {
+    // ignore
+  }
+}
+
 // node:test's describe() honors a skip option in the options object. When
 // AWS_MCP_LIVE_TESTS is unset the whole block is reported as skipped rather
 // than executed, so `npm test` in CI / local dev stays offline by default.
@@ -106,9 +133,11 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
   it("create -> get -> update -> get -> delete on AWS::SSM::Parameter", async () => {
     const paramName = `/aws-mcp-live-test/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let createdIdentifier: string | undefined;
+    let createIssued = false;
 
     try {
       // --- CREATE ---
+      createIssued = true;
       const create = (await createRes.handler({
         typeName: "AWS::SSM::Parameter",
         desiredState: { Name: paramName, Type: "String", Value: "initial" },
@@ -161,31 +190,19 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
       assert.equal(get2.ok, true, `second get failed: ${get2.error}`);
       assert.equal(get2.data?.properties.Value, "updated", "updated Value should reflect the JSON Patch");
     } finally {
-      // Cleanup ALWAYS runs. If assertions in the try block fail, we still
-      // delete the parameter so the next test run starts clean. Swallow
-      // cleanup errors so the original assertion failure is what surfaces.
-      if (createdIdentifier) {
-        try {
-          const del = (await deleteRes.handler({
-            typeName: "AWS::SSM::Parameter",
-            identifier: createdIdentifier,
-            ...commonOpts(),
-          })) as MutationResult;
-          const delToken = del.ok ? del.data?.requestToken : undefined;
-          if (delToken) {
-            await waitUntilTerminal(delToken).catch(() => undefined);
-          }
-        } catch {
-          // ignore
-        }
-      }
+      // Runs whenever the create was issued, even if it was never seen to
+      // succeed: createdIdentifier is only set after SUCCESS, so gating on it
+      // leaked the parameter on a status-poll timeout.
+      if (createIssued) await deleteParamQuietly(createdIdentifier ?? paramName);
     }
   });
 
   it("create with awaitCompletion: true returns a terminal status in one call", async () => {
     const paramName = `/aws-mcp-live-test-await/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let createdIdentifier: string | undefined;
+    let createIssued = false;
     try {
+      createIssued = true;
       const create = (await createRes.handler({
         typeName: "AWS::SSM::Parameter",
         desiredState: { Name: paramName, Type: "String", Value: "awaited" },
@@ -204,19 +221,9 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
       assert.ok((create.data?.awaited?.attempts ?? 0) >= 1);
       createdIdentifier = create.data?.identifier ?? paramName;
     } finally {
-      if (createdIdentifier) {
-        try {
-          await deleteRes.handler({
-            typeName: "AWS::SSM::Parameter",
-            identifier: createdIdentifier,
-            awaitCompletion: true,
-            maxWaitMs: 60_000,
-            ...commonOpts(),
-          });
-        } catch {
-          // ignore
-        }
-      }
+      // An awaited create can return ok:false (poll failure, budget) after the
+      // parameter was in fact created, so clean up whenever it was issued.
+      if (createIssued) await deleteParamQuietly(createdIdentifier ?? paramName);
     }
   });
 });
@@ -231,19 +238,27 @@ describe("aws_resource -- live CCAPI lifecycle", { skip: !LIVE }, () => {
  * including the Phase-1 stateful scenarios (pagination resume, create -> status
  * poll) rather than asserting flag placement.
  */
+
+/**
+ * Shared fake-aws env plumbing for every handler-level block in this file:
+ * one setter taking the scenario and one reset, instead of a private
+ * setEnv/clearEnv copy per describe.
+ */
+const withFakeAws = (scenario: string): void => {
+  process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+  process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+  process.env.AWS_MCP_FAKE_SCENARIO = scenario;
+  _resetSession();
+};
+const clearFakeAws = (): void => {
+  delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+  delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+  delete process.env.AWS_MCP_FAKE_SCENARIO;
+  _resetSession();
+};
+
 describe("aws_resource_list -- pagination via fake-aws", () => {
-  const setEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_list_resources_paginated";
-    _resetSession();
-  };
-  const clearEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
+  const setEnv = (): void => withFakeAws("resource_list_paginated");
 
   interface ListResult {
     ok: boolean;
@@ -274,7 +289,7 @@ describe("aws_resource_list -- pagination via fake-aws", () => {
       assert.equal(d.nextToken, "ccapi-list-cursor-page2");
       assert.equal(d.hasMore, true);
     } finally {
-      clearEnv();
+      clearFakeAws();
     }
   });
 
@@ -299,24 +314,13 @@ describe("aws_resource_list -- pagination via fake-aws", () => {
       assert.equal(d.nextToken, null);
       assert.equal(d.hasMore, false);
     } finally {
-      clearEnv();
+      clearFakeAws();
     }
   });
 });
 
 describe("aws_resource_create -- awaitCompletion happy path via fake-aws", () => {
-  const setEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_then_status_success";
-    _resetSession();
-  };
-  const clearEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
+  const setEnv = (): void => withFakeAws("resource_create_then_status_success");
 
   it("create -> status poll reaches terminal SUCCESS in one handler call", async () => {
     setEnv();
@@ -340,24 +344,13 @@ describe("aws_resource_create -- awaitCompletion happy path via fake-aws", () =>
       assert.ok(r.data?.awaited, "awaited block must be present when awaitCompletion is true");
       assert.equal(r.data?.awaited?.attempts, 1);
     } finally {
-      clearEnv();
+      clearFakeAws();
     }
   });
 });
 
 describe("aws_resource_create -- awaitCompletion short-circuits an already-terminal create via fake-aws", () => {
-  const setEnv = (): void => {
-    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    process.env.AWS_MCP_FAKE_SCENARIO = "ccapi_create_already_terminal";
-    _resetSession();
-  };
-  const clearEnv = (): void => {
-    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-    delete process.env.AWS_MCP_FAKE_SCENARIO;
-    _resetSession();
-  };
+  const setEnv = (): void => withFakeAws("resource_create_already_terminal");
 
   it("returns SUCCESS without polling when the initial create is already terminal", async () => {
     setEnv();
@@ -381,28 +374,10 @@ describe("aws_resource_create -- awaitCompletion short-circuits an already-termi
       // and never enters the poll branch that would attach one.
       assert.equal(r.data?.awaited, undefined, "awaited block must be ABSENT when the initial status is terminal");
     } finally {
-      clearEnv();
+      clearFakeAws();
     }
   });
 });
-
-/**
- * Shared fake-aws env plumbing for the handler-level blocks below. Identical
- * to the setEnv/clearEnv pairs above; hoisted because five describes need it
- * with a different scenario each.
- */
-const withFakeAws = (scenario: string): void => {
-  process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
-  process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-  process.env.AWS_MCP_FAKE_SCENARIO = scenario;
-  _resetSession();
-};
-const clearFakeAws = (): void => {
-  delete process.env.AWS_MCP_TEST_AWS_COMMAND;
-  delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
-  delete process.env.AWS_MCP_FAKE_SCENARIO;
-  _resetSession();
-};
 
 interface DiffResult {
   ok: boolean;
@@ -429,7 +404,7 @@ describe("aws_resource_diff -- handler glue chain via fake-aws", () => {
   // on.
 
   it("returns before/after/changes for a multi-op patch without mutating anything", async () => {
-    withFakeAws("res2_diff_get_ok");
+    withFakeAws("resource_diff_get_ok");
     try {
       const r = (await diffRes.handler({
         typeName: "AWS::Lambda::Function",
@@ -502,7 +477,7 @@ describe("aws_resource_diff -- handler glue chain via fake-aws", () => {
   });
 
   it("returns a 'Patch application failed' error when the patch cannot apply", async () => {
-    withFakeAws("res2_diff_get_ok");
+    withFakeAws("resource_diff_get_ok");
     try {
       // Same successful fetch; the failure is local. `replace` on a key that
       // does not exist throws inside applyJsonPatch, and the handler must
@@ -566,7 +541,7 @@ describe("resource verbs -- initial ccapiCall failure (ccapiFailure + rawBodyOf)
 
   for (const verb of verbs) {
     it(`${verb.name} returns the failure envelope with stderr as rawBody`, async () => {
-      withFakeAws("res2_ccapi_initial_fail_stderr");
+      withFakeAws("resource_initial_fail_stderr");
       try {
         const r = await verb.tool.handler(verb.input);
         assert.equal(r.ok, false, `${verb.name} should surface the CLI failure`);
@@ -598,7 +573,7 @@ describe("resource verbs -- initial ccapiCall failure (ccapiFailure + rawBodyOf)
     // the repo. Truthiness is the point: with `rawStderr ?? rawStdout` the
     // empty-string stderr wins and the only diagnostic bytes are dropped, so
     // the caller gets an error with no body at all.
-    withFakeAws("res2_ccapi_initial_fail_stdout_only");
+    withFakeAws("resource_initial_fail_stdout_only");
     try {
       const r = await getRes.handler({ typeName: "AWS::Lambda::Function", identifier: "my-fn" });
       assert.equal(r.ok, false);
@@ -684,7 +659,7 @@ describe("propertiesRaw survives an unparseable CCAPI Properties string", () => 
   // the shape of the same resource.
 
   it("aws_resource_get surfaces propertiesRaw alongside the unparsed properties", async () => {
-    withFakeAws("res2_props_unparseable");
+    withFakeAws("resource_props_unparseable");
     try {
       const r = await getRes.handler({ typeName: "AWS::SSM::Parameter", identifier: "/my/param-bad" });
       assert.equal(r.ok, true, `get failed: ${r.error}`);
@@ -698,7 +673,7 @@ describe("propertiesRaw survives an unparseable CCAPI Properties string", () => 
   });
 
   it("aws_resource_list surfaces propertiesRaw on the per-resource entry", async () => {
-    withFakeAws("res2_props_unparseable");
+    withFakeAws("resource_props_unparseable");
     try {
       const r = await listRes.handler({ typeName: "AWS::SSM::Parameter" });
       assert.equal(r.ok, true, `list failed: ${r.error}`);
@@ -718,7 +693,7 @@ describe("propertiesRaw survives an unparseable CCAPI Properties string", () => 
     // The key is spread conditionally, so its ABSENCE on the normal path is
     // part of the contract -- a caller checking `if (propertiesRaw)` to detect
     // a parse failure would be wrong if it were always present.
-    withFakeAws("ccapi_list_resources_paginated");
+    withFakeAws("resource_list_paginated");
     try {
       const r = await listRes.handler({ typeName: "AWS::SSM::Parameter" });
       assert.equal(r.ok, true);
@@ -749,7 +724,7 @@ describe("aws_resource_create -- awaitCompletion with no requestToken (awaitSkip
     // poll, so the caller's requested wait silently never happened. Returning
     // the bare IN_PROGRESS shape looked identical to awaitCompletion:false,
     // which is why the explanation exists.
-    withFakeAws("res2_create_no_request_token");
+    withFakeAws("resource_create_no_request_token");
     try {
       const r = (await createRes.handler({
         typeName: "AWS::SSM::Parameter",
@@ -775,7 +750,7 @@ describe("aws_resource_create -- awaitCompletion with no requestToken (awaitSkip
   it("does NOT attach awaitSkipped when awaitCompletion was never requested", async () => {
     // Same response, no awaitCompletion: nothing was skipped, so the key must
     // be absent rather than explaining a wait the caller never asked for.
-    withFakeAws("res2_create_no_request_token");
+    withFakeAws("resource_create_no_request_token");
     try {
       const r = (await createRes.handler({
         typeName: "AWS::SSM::Parameter",

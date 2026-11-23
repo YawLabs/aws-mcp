@@ -75,10 +75,16 @@ const SSO_EXPIRED_PATTERNS: RegExp[] = [
 // this kind names both remedies (re-login for SSO, re-assume for STS) and keeps
 // the raw stderr.
 //
-// Anchored on "An error occurred (" + the code so a bare mention of the word in
-// prose cannot match. Covers the STS spelling (ExpiredToken) and the
-// service-exception spelling (ExpiredTokenException).
-const EXPIRED_CREDS_PATTERNS: RegExp[] = [/An error occurred \(ExpiredToken(?:Exception)?\)/];
+// Anchored on botocore's ClientError MSG_TEMPLATE, "An error occurred (" + the
+// code, so a bare mention of the word in prose cannot match. Covers the STS
+// spelling (ExpiredToken), the service-exception spelling
+// (ExpiredTokenException), and EC2's RequestExpired ("Request has expired.",
+// which EC2 answers for an expired session token; the wrapper captured from
+// 2.34.3 against a stub). EC2 also sends RequestExpired for a request that
+// arrived more than 15 minutes after its signing time, which on a CLI call
+// means a badly drifted clock; that rarer cause gets the expiry message too,
+// since the stderr carries nothing that tells the two apart.
+const EXPIRED_CREDS_PATTERNS: RegExp[] = [/An error occurred \((?:ExpiredToken(?:Exception)?|RequestExpired)\)/];
 
 // Credentials that EXIST but the service refuses. Distinct from no_creds
 // (nothing resolved at all): the fix is different -- rotate / re-issue the key
@@ -91,8 +97,19 @@ const EXPIRED_CREDS_PATTERNS: RegExp[] = [/An error occurred \(ExpiredToken(?:Ex
 //   - InvalidClientTokenId: same family, the STS/IAM spelling.
 //   - SignatureDoesNotMatch: the secret key is wrong, or -- the classic -- the
 //     machine's clock has drifted far enough to invalidate SigV4.
+//   - InvalidAccessKeyId: S3's answer to a deleted or rotated key ("The AWS
+//     Access Key Id you provided does not exist in our records.").
+//   - AuthFailure: EC2's ("AWS was not able to validate the provided access
+//     credentials").
+//   - InvalidSignatureException: the JSON-protocol services' (Lambda, DynamoDB,
+//     Logs, ...) spelling of SignatureDoesNotMatch.
+//   - IncompleteSignature: the signature is malformed, e.g. a key with stray
+//     whitespace or a session token missing from a temporary key pair.
+// The first three were captured as CLI 2.34.3 stderr against a stub; the codes
+// themselves are the services' documented ones. The wrapper is the same
+// MSG_TEMPLATE as above, so the code alternation is the whole anchor.
 const INVALID_CREDS_PATTERNS: RegExp[] = [
-  /An error occurred \((?:UnrecognizedClientException|InvalidClientTokenId|SignatureDoesNotMatch)\)/,
+  /An error occurred \((?:UnrecognizedClientException|InvalidClientTokenId|SignatureDoesNotMatch|InvalidAccessKeyId|AuthFailure|InvalidSignatureException|IncompleteSignature)\)/,
 ];
 // Same treatment as SSO_EXPIRED_PATTERNS -- anchor on the exact strings
 // botocore emits so we don't false-positive on stderr that happens to mention
@@ -359,7 +376,7 @@ export function parseAwsError(stderr: string): ParsedAwsError {
   }
 
   // Not-authorized text OUTSIDE the standard wrapper. Above, NOT_AUTHORIZED_RE
-  // only ever runs against m[3] -- the message captured inside "An error
+  // only ever runs against m[4] -- the message captured inside "An error
   // occurred (...) when calling ...". The same sentence also shows up bare:
   // CCAPI / cloudcontrol surface it without the wrapper, as do several
   // higher-level `aws` customizations. Without this the most actionable

@@ -7,16 +7,22 @@
  * covers them the only way they can be covered: by SPAWNING the built
  * dist/index.js as a child process and speaking MCP over its stdio.
  *
- * Why that matters beyond coverage bookkeeping: npm installs the `aws-mcp` bin
- * as a SYMLINK (`npx -y @yawlabs/aws-mcp`, or a global install), so the
- * realpath branch of the entry-point check is the path essentially every real
- * user hits. Its failure mode is silent -- no transport is connected, nothing
- * is printed, and the MCP host hangs on a handshake that never gets answered.
+ * Why that matters beyond coverage bookkeeping: the entry-point check's failure
+ * mode is silent -- no transport is connected, nothing is printed, and the MCP
+ * host hangs on a handshake that never gets answered. The published entry is
+ * the bin/aws-mcp.mjs launcher (package.json `bin`), which points
+ * process.argv[1] at the resolved dist/index.js before importing it, so a real
+ * install passes the exact-URL compare; the realpath branch is the fallback
+ * for a direct or symlinked dist/index.js launch. The launcher itself is
+ * spawned by src/launcher.test.ts, not here.
  *
  * Note on what is under test: `npm run build` runs tsc and THEN esbuild, so
  * dist/index.js is the bundled artifact that actually ships (package.json
- * `files` publishes dist/index.js alone), not the tsc output. Spawning it here
- * exercises the shipped bundle, including the build-time __VERSION__ define.
+ * `files` publishes it beside the launcher and its source map), not the tsc
+ * output. Spawning it here exercises the shipped bundle, including the
+ * build-time __VERSION__ define -- but only while esbuild ran last: `npm run
+ * dev` (tsc --watch) re-emits the unbundled dist/index.js over it. The
+ * "dist/index.js is the esbuild bundle" test below fails loud in that state.
  *
  * Wire format is newline-delimited JSON-RPC -- NOT LSP Content-Length framing.
  * The client below is deliberately hand-rolled rather than the SDK's, so a
@@ -26,7 +32,7 @@
 
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -592,14 +598,32 @@ describe("spawned server — version subcommand", () => {
   });
 });
 
+describe("dist/index.js is the esbuild bundle, not tsc output", () => {
+  it("carries build.mjs's banner", () => {
+    // Every test that imports ./index.js or spawns SERVER_ENTRY means to
+    // exercise what ships. tsc emits a dist/index.js too, and `npm run dev`
+    // (tsc --watch) rewrites it over the bundle on every save; without this
+    // check the suite would silently run an unbundled file whose __VERSION__
+    // fallback is live. Run `npm run build` to fix a failure here.
+    // Line 2: the shebang esbuild carries over from src/index.ts comes first.
+    const head = readFileSync(SERVER_ENTRY, "utf8").split(/\r?\n/, 3);
+    assert.ok(
+      head.includes("import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);"),
+      "dist/index.js does not start with the esbuild banner from build.mjs -- it is tsc output; run `npm run build`",
+    );
+  });
+});
+
 describe("spawned server — symlinked bin (the realpath branch)", () => {
   it("boots when argv[1] is a SYMLINK to dist/index.js, not the file itself", { skip: symlinkSkip }, async () => {
-    // This is how npm installs a bin: `npx -y @yawlabs/aws-mcp` and every
-    // global install land on a symlink. Node resolves the main entry to its
-    // realpath for import.meta.url but leaves argv[1] as the LINK, so the
-    // exact-string URL compare in index.ts fails and only the realpath
-    // resolution can conclude "yes, this is the entry point". Without it the
-    // server registers nothing, prints nothing, and the host hangs forever.
+    // The fallback for a hand-made link or a direct symlinked launch. The
+    // published bin/aws-mcp.mjs launcher sets argv[1] to the resolved
+    // dist/index.js itself, so real installs take the exact-URL compare. Here
+    // Node resolves the main entry to its realpath for import.meta.url but
+    // leaves argv[1] as the LINK, so the exact-string URL compare in index.ts
+    // fails and only the realpath resolution can conclude "yes, this is the
+    // entry point". Without it the server registers nothing, prints nothing,
+    // and the host hangs forever.
     const dir = mkdtempSync(join(tmpdir(), "aws-mcp-symlink-"));
     const link = join(dir, "aws-mcp-bin.js");
     try {

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { EMPTY_CONFIG_FILE_ERROR, resolveAwsConfigPath } from "../aws-paths.js";
-import { MANAGED_MARKER_RE, readSections } from "../ini-file.js";
+import { readSections } from "../ini-file.js";
 import type { Tool, ToolResult } from "./tool.js";
 
 export interface AwsProfile {
@@ -64,98 +64,73 @@ export function parseSsoSessions(text: string): SsoSessionBlock[] {
  *
  * Keys and values are separated by '=', with leading/trailing whitespace
  * trimmed. Lines starting with '#' or ';' are comments.
+ *
+ * Built on readSections (ini-file.ts), the same reader the config WRITERS use,
+ * so this and parseSsoSessions can never disagree about the same text: a
+ * header is only a header at the start of a line (an indented `[x]` is not
+ * one, as in botocore), header names are normalized the way the writer
+ * matches them, and keys are compared case-insensitively (botocore lowercases
+ * option names, so `SSO_START_URL = ...` is the start URL).
  */
 export function parseAwsConfig(text: string): AwsProfile[] {
   const profiles: AwsProfile[] = [];
   const ssoSessions = new Map<string, SsoSession>();
-  let current: AwsProfile | null = null;
-  let currentSsoSession: { name: string; data: SsoSession } | null = null;
 
-  const finishSection = (): void => {
-    if (current) {
-      profiles.push(current);
-      current = null;
-    }
-    if (currentSsoSession) {
-      ssoSessions.set(currentSsoSession.name, currentSsoSession.data);
-      currentSsoSession = null;
-    }
-  };
-
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    // The ownership marker is a comment, so it has to be recognized before the
-    // comment skip below throws it away.
-    if (current && MANAGED_MARKER_RE.test(rawLine)) current.managed = true;
-    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-
-    // Same shape as ini-file.ts SECTION_HEADER_RE (botocore SECTCRE: unanchored,
-    // greedy to the last `]`), so `[profile x]  # note` is the profile x.
-    const sectionMatch = line.match(/^\[(.+)\]/);
-    if (sectionMatch) {
-      finishSection();
-      const sectionName = sectionMatch[1].trim();
-      if (sectionName.startsWith("sso-session ")) {
-        const ssoName = sectionName.slice("sso-session ".length).trim();
-        currentSsoSession = { name: ssoName, data: {} };
-        continue;
-      }
-      // Allowlist, not denylist: ONLY [default] and [profile X] are profiles.
-      // Every other bracketed section -- [services <name>] endpoint blocks,
-      // [plugins], [preview], a typo'd or unknown keyword, any casing variant --
-      // is NOT a profile and must be ignored so it can't surface in
-      // aws_list_profiles as a bogus entry. This mirrors `aws configure
-      // list-profiles`, which emits only default + profile sections.
-      // finishSection() above already cleared current/currentSsoSession, so a
-      // skipped section's keys fall through the `!current` guard and are dropped.
-      // A real profile literally named "services"/"plugins" is still written
-      // `[profile services]`, so it carries the `profile ` prefix and matches here.
-      if (sectionName !== "default" && !/^profile\s+/.test(sectionName)) {
-        continue;
-      }
-      const name = sectionName === "default" ? "default" : sectionName.replace(/^profile\s+/, "");
-      current = { name, isSso: false };
+  for (const section of readSections(text)) {
+    const sectionName = section.name;
+    if (sectionName.startsWith("sso-session ")) {
+      const data: SsoSession = {};
+      const startUrl = section.values.get("sso_start_url");
+      const region = section.values.get("sso_region");
+      if (startUrl !== undefined) data.ssoStartUrl = startUrl;
+      if (region !== undefined) data.ssoRegion = region;
+      ssoSessions.set(sectionName.slice("sso-session ".length), data);
       continue;
     }
+    // Allowlist, not denylist: ONLY [default] and [profile X] are profiles.
+    // Every other bracketed section -- [services <name>] endpoint blocks,
+    // [plugins], [preview], a typo'd or unknown keyword, any casing variant --
+    // is NOT a profile and must be ignored so it can't surface in
+    // aws_list_profiles as a bogus entry. (`aws configure list-profiles` skips
+    // those sections too, but it ALSO lists profiles found only in the shared
+    // credentials file; this reads the config file alone -- see the tool
+    // description.) A real profile literally named "services"/"plugins" is
+    // still written `[profile services]`, so it carries the `profile ` prefix
+    // and matches here.
+    if (sectionName !== "default" && !/^profile\s+/.test(sectionName)) continue;
+    const current: AwsProfile = {
+      name: sectionName === "default" ? "default" : sectionName.replace(/^profile\s+/, ""),
+      isSso: false,
+    };
+    if (section.managed) current.managed = true;
+    profiles.push(current);
 
-    const eqIdx = line.indexOf("=");
-    if (eqIdx < 0) continue;
-    const key = line.slice(0, eqIdx).trim();
-    const value = line.slice(eqIdx + 1).trim();
-
-    if (currentSsoSession) {
-      if (key === "sso_start_url") currentSsoSession.data.ssoStartUrl = value;
-      else if (key === "sso_region") currentSsoSession.data.ssoRegion = value;
-      continue;
-    }
-
-    if (!current) continue;
-
-    switch (key) {
-      case "sso_start_url":
-        current.ssoStartUrl = value;
-        current.isSso = true;
-        break;
-      case "sso_region":
-        current.ssoRegion = value;
-        current.isSso = true;
-        break;
-      case "sso_session":
-        current.ssoSession = value;
-        current.isSso = true;
-        break;
-      case "region":
-        current.region = value;
-        break;
-      case "sso_account_id":
-        current.ssoAccountId = value;
-        break;
-      case "sso_role_name":
-        current.ssoRoleName = value;
-        break;
+    for (const [key, value] of section.values) {
+      switch (key) {
+        case "sso_start_url":
+          current.ssoStartUrl = value;
+          current.isSso = true;
+          break;
+        case "sso_region":
+          current.ssoRegion = value;
+          current.isSso = true;
+          break;
+        case "sso_session":
+          current.ssoSession = value;
+          current.isSso = true;
+          break;
+        case "region":
+          current.region = value;
+          break;
+        case "sso_account_id":
+          current.ssoAccountId = value;
+          break;
+        case "sso_role_name":
+          current.ssoRoleName = value;
+          break;
+      }
     }
   }
-  finishSection();
 
   // Resolve sso_session references: a profile with `sso_session = my-org`
   // inherits ssoStartUrl + ssoRegion from `[sso-session my-org]`, unless the

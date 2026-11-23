@@ -148,6 +148,49 @@ describe("classifyAuthError — invalid_creds (credentials present but rejected)
     assert.equal(classifyAuthError(new Error("Unable to locate credentials")).kind, "no_creds");
   });
 
+  // Verbatim CLI 2.34.3 stderr, captured against a loopback stub answering each
+  // service's documented error body (CRLF: Windows). The rotated-key answers of
+  // S3, EC2 and the JSON-protocol services used to fall through to "other".
+  for (const [code, stderr] of [
+    [
+      "InvalidAccessKeyId",
+      "\r\naws: [ERROR]: An error occurred (InvalidAccessKeyId) when calling the ListBuckets operation (reached max retries: 0): The AWS Access Key Id you provided does not exist in our records.\r\n",
+    ],
+    [
+      "AuthFailure",
+      "\r\naws: [ERROR]: An error occurred (AuthFailure) when calling the DescribeRegions operation (reached max retries: 0): AWS was not able to validate the provided access credentials\r\n",
+    ],
+    [
+      "InvalidSignatureException",
+      "\r\naws: [ERROR]: An error occurred (InvalidSignatureException) when calling the ListFunctions operation (reached max retries: 0): The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method. Consult the service documentation for details.\r\n",
+    ],
+    // Not captured (the STS stub run crashed the CLI); same wrapper.
+    [
+      "IncompleteSignature",
+      "An error occurred (IncompleteSignature) when calling the GetCallerIdentity operation: Request is missing Authentication Token",
+    ],
+  ] as const) {
+    it(`classifies ${code} as invalid_creds`, () => {
+      assert.equal(classifyAuthError(new Error(stderr)).kind, "invalid_creds");
+    });
+  }
+
+  it("classifies EC2's RequestExpired as expired_creds", () => {
+    const stderr =
+      "\r\naws: [ERROR]: An error occurred (RequestExpired) when calling the DescribeRegions operation (reached max retries: 0): Request has expired.\r\n";
+    assert.equal(classifyAuthError(new Error(stderr)).kind, "expired_creds");
+  });
+
+  it("does not widen the codes by prefix (InvalidAccessKeyIdFoo, AuthFailureX)", () => {
+    for (const code of ["InvalidAccessKeyIdFoo", "AuthFailureX", "RequestExpiredSoon"]) {
+      assert.equal(
+        classifyAuthError(new Error(`An error occurred (${code}) when calling the X operation: y`)).kind,
+        "other",
+        code,
+      );
+    }
+  });
+
   it("requires the wrapper -- prose mentioning the code does not match", () => {
     assert.equal(classifyAuthError(new Error("we saw SignatureDoesNotMatch in the logs last week")).kind, "other");
   });

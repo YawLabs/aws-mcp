@@ -29,8 +29,10 @@ const USER_AGENT = "@yawlabs/aws-mcp (https://github.com/YawLabs/aws-mcp)";
 
 // read_documentation only accepts AWS doc pages, and only .html ones --
 // AWS docs are served as .html; anything else is an asset or an off-site
-// link we shouldn't be fetching.
-const DOCS_URL_RE = /^https:\/\/docs\.aws\.amazon\.com\/[^\s]*\.html(?:[?#][^\s]*)?$/i;
+// link we shouldn't be fetching. The `.html` has to end the PATH: the path class
+// excludes `?` and `#`, so a query or fragment that merely ends in `.html`
+// (`asset.pdf?x=.html`, `guide/#a.html`) cannot carry a non-page past it.
+const DOCS_URL_RE = /^https:\/\/docs\.aws\.amazon\.com\/[^\s?#]*\.html(?:[?#][^\s]*)?$/i;
 
 // The same host and origin DOCS_URL_RE spells, for the checks that parse a URL
 // instead of matching it (classifyFinalDocsUrl, resolveDocsLink).
@@ -41,7 +43,12 @@ const DEFAULT_MAX_LENGTH = 5_000;
 const MAX_MAX_LENGTH = 1_000_000;
 const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
-const FETCH_TIMEOUT_MS = 30_000;
+// One budget for the WHOLE exchange: connect, response headers, and the body
+// read after them (readBodyWithCap, the search handler's JSON parse). Exported
+// so the timeout tests tick the real value instead of mirroring it.
+export const FETCH_TIMEOUT_MS = 30_000;
+
+const SEARCH_HOSTNAME = new URL(SEARCH_API_URL).hostname;
 
 // Hard ceiling on the HTML we will pull down for one page. FETCH_TIMEOUT_MS
 // bounds LATENCY, not SIZE -- a steady multi-hundred-MB body streams in well
@@ -64,21 +71,25 @@ const THIN_PAGE_CHARS = 200;
 // aws_docs_read is paginated: an agent reading a long page calls it N times
 // with different startIndex windows. Without a cache that's N full fetches +
 // N full HTML->markdown conversions of the same document. Cache the
-// *converted markdown* (conversion is the expensive half) keyed by URL,
-// bounded by size + TTL. TTL is short because docs do change -- but not
-// within the seconds-to-minutes window a single paginated read spans.
+// *converted markdown* (conversion is the expensive half) keyed by URL with
+// its fragment stripped (fetch never sends the fragment, so `x.html#a` and
+// `x.html#b` are one document), bounded by size + TTL. TTL is short because
+// docs do change -- but not within the seconds-to-minutes window a single
+// paginated read spans.
 //
 // Cap sized for typical multi-doc agent workflows (read N service overviews
 // in one session) without unbounded memory growth. Each entry is bounded
-// by MAX_MAX_LENGTH (1MB) of converted markdown, so worst-case footprint
-// is ~64MB; typical doc pages are 10-100 KB after chrome stripping.
+// by MAX_MAX_LENGTH (1M) UTF-16 code units of converted markdown. V8 stores
+// an all-Latin-1 string at one byte per unit and anything else at two, so an
+// entry is 1-2 MB and the worst-case footprint ~64-128 MB; typical doc pages
+// are 10-100 KB after chrome stripping.
 //
 // Two things make that bound real rather than aspirational: the body read is
 // capped at MAX_DOC_HTML_BYTES, and the handler only caches a conversion whose
 // markdown fits MAX_MAX_LENGTH (an over-size page is still served in full via
 // pagination -- it just re-fetches per window instead of blowing the bound).
 export const DOC_CACHE_MAX_ENTRIES = 64;
-const DOC_CACHE_TTL_MS = 5 * 60_000;
+export const DOC_CACHE_TTL_MS = 5 * 60_000;
 
 interface DocsSearchResult {
   title: string;
@@ -130,6 +141,13 @@ export function parseSearchResults(json: unknown, limit: number): DocsSearchResu
     return [];
   }
   const out: DocsSearchResult[] = [];
+  // Whether ANY entry carried the `textExcerptSuggestion.link` this parser
+  // keys on. A non-empty `suggestions` where none does is the same drift as a
+  // missing array -- a renamed inner field -- and would otherwise come back as
+  // an empty result with nothing on stderr. Entries that carry a link the
+  // allowlist then drops are not drift: that is the backend's content, not its
+  // shape.
+  let sawLink = false;
   for (const s of suggestions) {
     if (out.length >= limit) break;
     if (!s || typeof s !== "object") continue;
@@ -138,6 +156,7 @@ export function parseSearchResults(json: unknown, limit: number): DocsSearchResu
     const t = tes as Record<string, unknown>;
     const url = typeof t.link === "string" ? t.link : undefined;
     if (!url) continue;
+    sawLink = true;
     // Apply the read-side allowlist here too so search and read agree on
     // what counts as a valid AWS docs URL. The undocumented backend at
     // proxy.search.docs.aws.com is a moving target, and an off-domain or
@@ -149,6 +168,12 @@ export function parseSearchResults(json: unknown, limit: number): DocsSearchResu
     if (typeof t.summary === "string" && t.summary.length > 0) result.summary = t.summary;
     if (typeof t.suggestionBody === "string" && t.suggestionBody.length > 0) result.excerpt = t.suggestionBody;
     out.push(result);
+  }
+  if (!sawLink && suggestions.length > 0 && !schemaWarned) {
+    schemaWarned = true;
+    console.warn(
+      `[aws-mcp] aws_docs_search: response from ${SEARCH_HOSTNAME} carried ${suggestions.length} suggestions but none had the expected 'textExcerptSuggestion.link'. The undocumented backend shape may have changed; aws_docs_search will return empty results until parseSearchResults is updated.`,
+    );
   }
   return out;
 }
@@ -187,6 +212,13 @@ export function isValidDocsUrl(url: string): boolean {
  *     index. Accepting every same-host redirect, which is what an origin-only
  *     check does, would answer a guessed page name with another page's content
  *     echoed under the requested URL.
+ *
+ * Two arms are forward-looking rather than reachable today: aws_docs_read only
+ * accepts a `.html` request (isValidDocsUrl), so the "a directory was requested"
+ * arm never fires through the handler, and a `.md` landing that the site serves
+ * as markdown is refused later by the text/html gate. They are kept so the
+ * classifier stays correct for directory or `.md` input, which no shipped
+ * version accepts.
  */
 export function classifyFinalDocsUrl(
   requestedFetchUrl: string,
@@ -230,7 +262,9 @@ export function classifyFinalDocsUrl(
  * Absolutize a link target found inside a docs page against the URL it came
  * from, and point a docs-host `.md` target at its `.html` twin -- that twin is
  * the form aws_docs_read accepts, so the URL this returns is one a caller can
- * actually pass back in.
+ * actually pass back in. Applied to every `<a href>` in the content that
+ * htmlToMarkdown converts (given the page's final URL) and to a meta-refresh
+ * target in detectUnrenderablePage.
  *
  * Left alone: an empty target, a fragment-only link, and any non-http(s) scheme
  * (`mailto:`, `javascript:`). A target that will not parse is returned unchanged
@@ -470,9 +504,13 @@ export interface ScoredSearchResult extends DocsSearchResult {
 export interface SearchRelevance {
   /** The terms the fraction is computed against -- published so the number is auditable. */
   queryTerms: string[];
+  /**
+   * Query terms absent from EVERY result -- the backend having nothing. Always
+   * present, so the response shape does not change with the query: empty when
+   * every term matched somewhere, and when the query had no scorable terms.
+   */
+  termsMatchedNowhere: string[];
   /** Highest per-result overlap; null when the query had no scorable terms. */
-  /** Query terms absent from EVERY result -- the backend having nothing. */
-  termsMatchedNowhere?: string[];
   bestLexicalOverlap: number | null;
   lowRelevance: boolean;
   relevanceNote?: string;
@@ -498,6 +536,7 @@ export function scoreSearchResults(query: string, results: readonly DocsSearchRe
     // asserts nothing instead.
     return {
       queryTerms: [],
+      termsMatchedNowhere: [],
       bestLexicalOverlap: null,
       lowRelevance: false,
       relevanceNote:
@@ -608,12 +647,26 @@ const STRIP_SELECTORS = [
  * Extract the main content region of an AWS doc page as an HTML string,
  * stripped of nav/script/style chrome. Falls back to the whole body when no
  * known content container matches (better some markdown than none).
+ *
+ * With `baseUrl` (the URL the page was served from), every `<a href>` is
+ * rewritten through resolveDocsLink. The site writes its links relative
+ * (`href="create-bucket.html"`, `../index.html#cli-aws`), and a relative target
+ * in the markdown is one aws_docs_read refuses as an invalid url -- so without
+ * this the agent could not follow a single link out of a page it just read.
  */
-export function extractMainContent(html: string): string {
+export function extractMainContent(html: string, baseUrl?: string): string {
   const root = parseHtml(html);
   for (const sel of STRIP_SELECTORS) {
     for (const el of root.querySelectorAll(sel)) {
       el.remove();
+    }
+  }
+  if (baseUrl !== undefined) {
+    for (const a of root.querySelectorAll("a[href]")) {
+      const href = a.getAttribute("href");
+      if (href === undefined) continue;
+      const resolved = resolveDocsLink(href.trim(), baseUrl);
+      if (resolved !== href) a.setAttribute("href", resolved);
     }
   }
   for (const sel of CONTENT_SELECTORS) {
@@ -653,10 +706,11 @@ function getTurndown(): TurndownService {
 /**
  * Convert an AWS doc page's HTML to markdown. Empty-text links are dropped at
  * the turndown rule level (see getTurndown). Here we just collapse 3+
- * consecutive blank lines that chrome removal can leave behind.
+ * consecutive blank lines that chrome removal can leave behind. `baseUrl`
+ * absolutizes the page's links; see extractMainContent.
  */
-export function htmlToMarkdown(html: string): string {
-  const main = extractMainContent(html);
+export function htmlToMarkdown(html: string, baseUrl?: string): string {
+  const main = extractMainContent(html, baseUrl);
   const md = getTurndown().turndown(main);
   return md.replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -766,18 +820,91 @@ export function paginateContent(markdown: string, startIndex: number, maxLength:
 /** Fetch with an AbortController-backed timeout. Injectable for tests. */
 type FetchImpl = typeof fetch;
 
+/**
+ * A fetch whose timeout is still armed. `signal` aborts when the budget runs
+ * out; `finish()` disarms it and must be called once the body has been read
+ * (or abandoned).
+ */
+interface TimedResponse {
+  response: Response;
+  signal: AbortSignal;
+  finish(): void;
+}
+
+/**
+ * Start a fetch under one timeout that covers the body as well as the headers.
+ *
+ * fetch resolves as soon as response headers arrive, so clearing the timer
+ * there -- what this did up to 2.7.3 -- left the body read unbounded: a server
+ * that sent headers and one chunk and then stalled held the tool call until the
+ * runtime's own body timeout (undici's is 300 s). The timer now stays armed
+ * until the caller's `finish()`, and every body read races `signal` (see
+ * raceAbort) rather than trusting each runtime to wire the signal into the body
+ * stream.
+ */
 async function fetchWithTimeout(
   fetchImpl: FetchImpl,
   url: string,
   init: RequestInit,
   timeoutMs: number,
-): Promise<Response> {
+): Promise<TimedResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal });
-  } finally {
+    const response = await fetchImpl(url, { ...init, signal: controller.signal });
+    return { response, signal: controller.signal, finish: () => clearTimeout(timer) };
+  } catch (err) {
     clearTimeout(timer);
+    throw err;
+  }
+}
+
+function abortError(): Error {
+  return Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+}
+
+/**
+ * Settle with `promise`, or reject with an AbortError the moment `signal`
+ * aborts, whichever comes first. The losing promise is left to settle on its
+ * own; its outcome is observed, so it can never surface as an unhandled
+ * rejection.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => {});
+    return Promise.reject(abortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * Release a response body we are not going to read. Left alone, undici keeps
+ * the socket pinned and goes on buffering the body until the Response is
+ * garbage-collected -- and soft 404s and non-HTML landings are expected,
+ * repeatable inputs in a long-lived stdio process. Fire-and-forget: a cancel
+ * that rejects (an already-errored stream) is not the failure being reported,
+ * and test doubles may have no stream at all.
+ */
+function discardBody(response: Response): void {
+  const body = (response as { body?: ReadableStream<Uint8Array> | null }).body;
+  if (!body || typeof body.cancel !== "function" || body.locked === true) return;
+  try {
+    body.cancel().catch(() => {});
+  } catch {
+    // A synchronous throw from an exotic body is no more interesting.
   }
 }
 
@@ -854,12 +981,45 @@ const CA_TRUST_REMEDY =
  * leaked variable would change what a later test's handler reports.
  */
 export interface FetchEnvFacts {
-  /** HTTPS_PROXY / https_proxy, whichever is set. */
+  /** HTTPS_PROXY / https_proxy, the first one set to a non-empty value. */
   proxyUrl: string | null;
   /** Whether this process actually uses proxyUrl (see readFetchEnvFacts). */
   envProxyEnabled: boolean;
   /** process.versions.oam, set only when the server runs under the oam runtime. */
   oamVersion: string | null;
+  /**
+   * NO_PROXY / no_proxy, the first one set to a non-empty value. Optional so a
+   * test that does not care can leave it out; absent means none.
+   */
+  noProxy?: string | null;
+}
+
+/** The first of `values` that is a non-empty string after trimming, else null. */
+function firstNonEmpty(...values: Array<string | undefined>): string | null {
+  for (const v of values) {
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
+  return null;
+}
+
+/**
+ * Does a NO_PROXY list exempt `host`? The common semantics every major client
+ * agrees on, undici's among them: entries split on commas or whitespace, `*`
+ * exempts everything, a port is ignored, and an entry (with or without a
+ * leading `.` or `*.`) covers that host and every subdomain of it.
+ */
+export function noProxyCovers(noProxy: string | null | undefined, host: string): boolean {
+  if (!noProxy) return false;
+  const target = host.toLowerCase();
+  for (const raw of noProxy.split(/[\s,]+/)) {
+    let entry = raw.trim().toLowerCase();
+    if (entry === "") continue;
+    if (entry === "*") return true;
+    entry = entry.replace(/:\d+$/, "").replace(/^\*/, "").replace(/^\./, "");
+    if (entry === "") continue;
+    if (target === entry || target.endsWith(`.${entry}`)) return true;
+  }
+  return false;
 }
 
 /**
@@ -877,21 +1037,30 @@ export function readFetchEnvFacts(
   // Cast because oam adds the key at runtime and Node's own type does not know
   // it -- the same cast this read has always carried.
   versions: { oam?: string } = process.versions as { oam?: string },
+  execArgv: readonly string[] = process.execArgv,
 ): FetchEnvFacts {
   // Node's fetch ignores HTTPS_PROXY unless it is opted into, by
   // NODE_USE_ENV_PROXY=1 or the equivalent --use-env-proxy flag (both Node
   // 22.21+, and NODE_OPTIONS accepts the flag -- all three verified on 22.22.2:
   // with the opt-in a dead proxy failed the request, with NODE_USE_ENV_PROXY=0
-  // or unset the same request went direct and returned 200). oam honours the
+  // or unset the same request went direct and returned 200). The flag can also
+  // be a plain node argument (`"args": ["--use-env-proxy", "dist/index.js"]` in
+  // an MCP config), which lands in execArgv, not NODE_OPTIONS. oam honours the
   // variable with no opt-in at all (verified on 0.16.2, same dead proxy).
+  //
+  // An EMPTY value is unset: `HTTPS_PROXY=` is the usual way to switch a proxy
+  // off, and with `??` it both counted as a configured proxy and shadowed a real
+  // lower-case https_proxy.
   const nodeOptions = env.NODE_OPTIONS ?? "";
   return {
-    proxyUrl: env.HTTPS_PROXY ?? env.https_proxy ?? null,
+    proxyUrl: firstNonEmpty(env.HTTPS_PROXY, env.https_proxy),
     envProxyEnabled:
       env.NODE_USE_ENV_PROXY === "1" ||
       /(?:^|\s)--use-env-proxy(?:\s|$)/.test(nodeOptions) ||
+      execArgv.includes("--use-env-proxy") ||
       versions.oam !== undefined,
     oamVersion: versions.oam ?? null,
+    noProxy: firstNonEmpty(env.NO_PROXY, env.no_proxy),
   };
 }
 
@@ -925,7 +1094,7 @@ function readFetchFailureCause(err: unknown): FetchFailureCause {
   return { code, message: trimmed.length > 0 ? redactUrlUserinfo(trimmed) : null };
 }
 
-function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): string | null {
+function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts, host: string): string | null {
   if (cause.code !== null && TLS_TRUST_CODES.has(cause.code)) {
     return `A certificate in the chain could not be verified, which on a corporate network means a TLS-inspecting gateway or a private CA rather than a problem at AWS. ${CA_TRUST_REMEDY}`;
   }
@@ -941,12 +1110,21 @@ function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): strin
   // to read: a proxy-only network with the proxy ignored has nothing to connect
   // to, so the request hangs until our own 30s abort.
   const connectFailed = cause.code === null || CONNECT_FAILURE_CODES.has(cause.code);
-  if (env.proxyUrl !== null && connectFailed) {
+  // A host NO_PROXY exempts goes direct whatever HTTPS_PROXY says, so neither
+  // half of the proxy remedy describes what happened to it.
+  if (env.proxyUrl !== null && connectFailed && !noProxyCovers(env.noProxy, host)) {
     const proxy = redactUrlUserinfo(env.proxyUrl);
     if (!env.envProxyEnabled) {
-      return `HTTPS_PROXY is set to '${proxy}', but Node's fetch does not use it unless NODE_USE_ENV_PROXY=1 is set as well (Node 22.21+), so this request tried to reach docs.aws.amazon.com directly. Add NODE_USE_ENV_PROXY=1 to this server's MCP-config \`env\` block -- it is read when the process starts. The aws CLI the other tools shell out to reads HTTPS_PROXY on its own, which is why they can work while these two do not.`;
+      return `HTTPS_PROXY is set to '${proxy}', but Node's fetch does not use it unless NODE_USE_ENV_PROXY=1 (or the --use-env-proxy flag) is set as well (Node 22.21+), so this request tried to reach ${host} directly. Add NODE_USE_ENV_PROXY=1 to this server's MCP-config \`env\` block -- it is read when the process starts. The aws CLI the other tools shell out to reads HTTPS_PROXY on its own, which is why they can work while these two do not.`;
     }
-    return `This request went through the proxy in HTTPS_PROXY ('${proxy}'), so it is that proxy, not docs.aws.amazon.com, that did not answer.`;
+    if (cause.code === null) {
+      // No code: our own timeout, or a rejection that says nothing. The proxy is
+      // the likeliest culprit but not the only one -- a slow upstream behind a
+      // healthy proxy times out the same way -- so this points, it does not
+      // convict.
+      return `This request went through the proxy in HTTPS_PROXY ('${proxy}') and got no usable answer, so check that proxy first: whether it is reachable, and whether it lets this machine through to ${host}.`;
+    }
+    return `This request went through the proxy in HTTPS_PROXY ('${proxy}'), so it is that proxy, not ${host}, that did not answer.`;
   }
   return null;
 }
@@ -965,9 +1143,16 @@ function fetchFailureRemedy(cause: FetchFailureCause, env: FetchEnvFacts): strin
  *
  * Returns "" when there is nothing to add, and otherwise a string that starts
  * with a space -- every caller appends it to a sentence that already ends in a
- * period.
+ * period. `host` is the host the request was for, named in the proxy remedy
+ * and matched against NO_PROXY: aws_docs_search talks to
+ * proxy.search.docs.aws.com, not docs.aws.amazon.com, and a firewall can allow
+ * one and not the other.
  */
-export function describeFetchFailure(err: unknown, env: FetchEnvFacts = readFetchEnvFacts()): string {
+export function describeFetchFailure(
+  err: unknown,
+  env: FetchEnvFacts = readFetchEnvFacts(),
+  host: string = DOCS_HOSTNAME,
+): string {
   const cause = readFetchFailureCause(err);
   const parts: string[] = [];
   if (cause.message !== null) {
@@ -975,7 +1160,7 @@ export function describeFetchFailure(err: unknown, env: FetchEnvFacts = readFetc
   } else if (cause.code !== null) {
     parts.push(`Underlying failure: ${cause.code}.`);
   }
-  const remedy = fetchFailureRemedy(cause, env);
+  const remedy = fetchFailureRemedy(cause, env, host);
   if (remedy !== null) parts.push(remedy);
   return parts.length > 0 ? ` ${parts.join(" ")}` : "";
 }
@@ -988,6 +1173,7 @@ export function describeFetchFailure(err: unknown, env: FetchEnvFacts = readFetc
 type BodyReadOutcome =
   | { kind: "ok"; html: string }
   | { kind: "too_large"; bytes: number | null }
+  | { kind: "timeout" }
   | { kind: "error"; message: string };
 
 /**
@@ -1000,25 +1186,33 @@ type BodyReadOutcome =
  *   3. A Response-like object with no stream body (test doubles, a fetch impl
  *      that only implements text()) is buffered and then measured, which
  *      still enforces the same ceiling on what reaches turndown.
+ *
+ * Every read races `signal`, the fetch's still-armed timeout: a body that
+ * stalls after its headers comes back as `timeout` (and its stream is
+ * cancelled) instead of holding the call open.
  */
-async function readBodyWithCap(response: Response, maxBytes: number): Promise<BodyReadOutcome> {
+async function readBodyWithCap(response: Response, maxBytes: number, signal: AbortSignal): Promise<BodyReadOutcome> {
   const declaredHeader = response.headers.get("content-length");
   if (declaredHeader !== null) {
     const declared = Number(declaredHeader);
     if (Number.isFinite(declared) && declared > maxBytes) {
+      // Rejected before a byte is pulled -- and released, so the transfer the
+      // server already started does not keep the socket busy behind us.
+      discardBody(response);
       return { kind: "too_large", bytes: declared };
     }
   }
 
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     const body = (response as { body?: ReadableStream<Uint8Array> | null }).body;
     if (body && typeof body.getReader === "function") {
-      const reader = body.getReader();
+      reader = body.getReader();
       const decoder = new TextDecoder("utf-8");
       let bytes = 0;
       let html = "";
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await raceAbort(reader.read(), signal);
         if (done) break;
         if (!value) continue;
         bytes += value.byteLength;
@@ -1036,11 +1230,18 @@ async function readBodyWithCap(response: Response, maxBytes: number): Promise<Bo
       html += decoder.decode();
       return { kind: "ok", html };
     }
-    const html = await response.text();
+    const html = await raceAbort(response.text(), signal);
     const bytes = Buffer.byteLength(html, "utf8");
     if (bytes > maxBytes) return { kind: "too_large", bytes };
     return { kind: "ok", html };
   } catch (err) {
+    if (isAbortError(err)) {
+      // Not awaited: a stream stalled badly enough to time out is not one to
+      // wait on a second time.
+      if (reader) reader.cancel().catch(() => {});
+      else discardBody(response);
+      return { kind: "timeout" };
+    }
     return { kind: "error", message: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -1056,10 +1257,26 @@ interface DocCache {
 }
 
 /**
- * Bounded, TTL'd LRU cache of converted markdown keyed by doc URL. Created
- * per `buildDocsTools` call so each instance (and each test) gets an isolated
- * cache -- a module-level cache would leak one test's fetch result into
- * another test reading the same URL with a different injected fetch.
+ * The cache key for a requested docs URL: the URL with its fragment removed.
+ * Only reached after isValidDocsUrl, so the parse cannot fail in practice; a
+ * URL that will not parse is keyed as typed rather than guessed at.
+ */
+export function docCacheKey(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return u.href;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Bounded, TTL'd LRU cache of converted markdown keyed by doc URL (the handler
+ * passes docCacheKey's form). Created per `buildDocsTools` call so each
+ * instance (and each test) gets an isolated cache -- a module-level cache
+ * would leak one test's fetch result into another test reading the same URL
+ * with a different injected fetch.
  */
 export function makeDocCache(): DocCache {
   const map = new Map<string, DocCacheEntry>();
@@ -1132,12 +1349,17 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch, envFacts?: FetchEnv
         // Clamp limit into the valid range. No caller currently reaches this
         // handler unvalidated -- index.ts registers inputSchema at the MCP
         // boundary and the aws_script bridge runs inputSchema.parse first
-        // (script.ts:158-161) -- so this is a local invariant kept next to the
-        // code that depends on it, not a live guard against a known caller.
+        // (the `inputSchema.parse` in script.ts's tool bridge) -- so this is a
+        // local invariant kept next to the code that depends on it, not a live
+        // guard against a known caller.
         const limit = Math.min(Math.max(1, i.limit ?? DEFAULT_SEARCH_LIMIT), MAX_SEARCH_LIMIT);
-        let response: Response;
+        const timedOut = (err: unknown): ToolResult => ({
+          ok: false,
+          error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (${SEARCH_HOSTNAME}) may be slow or unreachable.${describeFetchFailure(err, envFacts, SEARCH_HOSTNAME)}`,
+        });
+        let timed: TimedResponse;
         try {
-          response = await fetchWithTimeout(
+          timed = await fetchWithTimeout(
             fetchImpl,
             `${SEARCH_API_URL}?session=${sessionUuid}`,
             {
@@ -1162,33 +1384,40 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch, envFacts?: FetchEnv
           // backend, so blaming the backend's undocumented shape for it sends
           // whoever is debugging in the wrong direction. That sentence is kept
           // for the case where there is nothing else to say.
-          const why = describeFetchFailure(err, envFacts);
-          if (isAbortError(err)) {
-            return {
-              ok: false,
-              error: `AWS docs search timed out after ${FETCH_TIMEOUT_MS / 1000}s. The search backend (proxy.search.docs.aws.com) may be slow or unreachable.${why}`,
-            };
-          }
+          if (isAbortError(err)) return timedOut(err);
+          const why = describeFetchFailure(err, envFacts, SEARCH_HOSTNAME);
           const msg = err instanceof Error ? err.message : String(err);
           return {
             ok: false,
             error: why
               ? `AWS docs search request failed: ${msg}.${why}`
-              : `AWS docs search request failed: ${msg}. The search backend (proxy.search.docs.aws.com) is undocumented and may have changed or be unreachable.`,
+              : `AWS docs search request failed: ${msg}. The search backend (${SEARCH_HOSTNAME}) is undocumented and may have changed or be unreachable.`,
           };
         }
-        if (!response.ok) {
-          return {
-            ok: false,
-            error: `AWS docs search returned HTTP ${response.status} ${response.statusText}.`,
-          };
-        }
+        const { response } = timed;
         let json: unknown;
         try {
-          json = await response.json();
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          return { ok: false, error: `AWS docs search returned a non-JSON body: ${msg}.` };
+          if (!response.ok) {
+            discardBody(response);
+            return {
+              ok: false,
+              error: `AWS docs search returned HTTP ${response.status} ${response.statusText}.`,
+            };
+          }
+          try {
+            // Raced against the same timeout as the request: headers arriving
+            // says nothing about whether the JSON body ever will.
+            json = await raceAbort(response.json(), timed.signal);
+          } catch (err) {
+            if (isAbortError(err)) {
+              discardBody(response);
+              return timedOut(err);
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            return { ok: false, error: `AWS docs search returned a non-JSON body: ${msg}.` };
+          }
+        } finally {
+          timed.finish();
         }
         const results = parseSearchResults(json, limit);
         // Strictly additive: `count` and every pre-existing per-result field
@@ -1203,9 +1432,7 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch, envFacts?: FetchEnv
             count: results.length,
             results: relevance.results,
             queryTerms: relevance.queryTerms,
-            ...(relevance.termsMatchedNowhere !== undefined
-              ? { termsMatchedNowhere: relevance.termsMatchedNowhere }
-              : {}),
+            termsMatchedNowhere: relevance.termsMatchedNowhere,
             bestLexicalOverlap: relevance.bestLexicalOverlap,
             lowRelevance: relevance.lowRelevance,
             ...(relevance.relevanceNote !== undefined ? { relevanceNote: relevance.relevanceNote } : {}),
@@ -1258,94 +1485,118 @@ export function buildDocsTools(fetchImpl: FetchImpl = fetch, envFacts?: FetchEnv
         const startIndex = Math.max(0, i.startIndex ?? 0);
         // Clamp maxLength into the valid range. Same status as the limit clamp
         // in aws_docs_search above: every entry point parses the schema first
-        // (MCP boundary in index.ts, inputSchema.parse in script.ts:158-161),
-        // so this keeps the invariant local rather than covering a caller that
-        // actually bypasses validation.
+        // (MCP boundary in index.ts, the `inputSchema.parse` in script.ts's
+        // tool bridge), so this keeps the invariant local rather than covering
+        // a caller that actually bypasses validation.
         const maxLength = Math.min(Math.max(1, i.maxLength ?? DEFAULT_MAX_LENGTH), MAX_MAX_LENGTH);
 
         // Paginated reads of the same page hit the cache -- one fetch +
-        // convert per URL, then every subsequent window is a slice.
-        let markdown = docCache.get(i.url);
+        // convert per URL, then every subsequent window is a slice. Keyed
+        // without the fragment: fetch never sends it, so `x.html#a` and
+        // `x.html#b` are the same document and must not cost two entries and
+        // two fetches.
+        const cacheKey = docCacheKey(i.url);
+        let markdown = docCache.get(cacheKey);
         let cached = true;
         if (markdown === undefined) {
           cached = false;
-          let response: Response;
+          const timedOut = (err: unknown): ToolResult => ({
+            ok: false,
+            error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.${describeFetchFailure(err, envFacts)}`,
+          });
+          let timed: TimedResponse;
           try {
-            response = await fetchWithTimeout(
+            timed = await fetchWithTimeout(
               fetchImpl,
               i.url,
               { method: "GET", headers: { "User-Agent": USER_AGENT, Accept: "text/html" } },
               FETCH_TIMEOUT_MS,
             );
           } catch (err) {
-            const why = describeFetchFailure(err, envFacts);
-            if (isAbortError(err)) {
-              return { ok: false, error: `Fetching ${i.url} timed out after ${FETCH_TIMEOUT_MS / 1000}s.${why}` };
-            }
+            if (isAbortError(err)) return timedOut(err);
             const msg = err instanceof Error ? err.message : String(err);
-            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.${why}` };
+            return { ok: false, error: `Failed to fetch ${i.url}: ${msg}.${describeFetchFailure(err, envFacts)}` };
           }
-          if (!response.ok) {
-            return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
+          const { response } = timed;
+          let html: string;
+          let finalUrl: string;
+          try {
+            // Every early return below releases the body it will not read; see
+            // discardBody.
+            if (!response.ok) {
+              discardBody(response);
+              return { ok: false, error: `Fetching ${i.url} returned HTTP ${response.status} ${response.statusText}.` };
+            }
+            // fetch FOLLOWS redirects, so the isValidDocsUrl check on i.url above
+            // only vouches for the first hop. Judge where we actually landed:
+            // without this, an allowlisted docs URL that 302s off-domain gets
+            // fetched and converted with nothing but the content-type gate
+            // between us and arbitrary third-party HTML. A docs-host landing is
+            // then two more things -- the site's `index.html` -> `/` canonical
+            // form, which is fine, and its redirect-to-the-landing-page answer for
+            // a page that does not exist, which is not. See classifyFinalDocsUrl.
+            // `response.url` is absent/empty on a Response-like object that
+            // doesn't set it (test doubles); that means "no redirect
+            // information", so fall back to the URL we already validated.
+            finalUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : i.url;
+            const landing = classifyFinalDocsUrl(i.url, finalUrl);
+            if (landing === "off_allowlist") {
+              discardBody(response);
+              return {
+                ok: false,
+                error: `${i.url} redirected to '${finalUrl}', which is outside the AWS documentation allowlist (https://docs.aws.amazon.com pages). aws_docs_read only follows redirects that stay inside it.`,
+              };
+            }
+            if (landing === "soft_404") {
+              discardBody(response);
+              return {
+                ok: false,
+                error: `${i.url} does not exist: docs.aws.amazon.com redirected it to '${finalUrl}', the landing page of that guide or command group, which is how the site answers a request for a page it does not have at that path. Use aws_docs_search to find the page you want.`,
+              };
+            }
+            // A 200 doesn't guarantee HTML -- a docs URL can redirect to a
+            // login wall, an error page, or an asset. Feeding non-HTML to the
+            // parser produces junk markdown; reject it with a clear message
+            // instead.
+            const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+            if (!contentType.includes("text/html")) {
+              discardBody(response);
+              return {
+                ok: false,
+                error: `${i.url} returned content-type '${contentType || "unknown"}', not text/html -- the URL may have redirected to a non-documentation page (login wall, error page, or asset). aws_docs_read only handles AWS documentation HTML pages.`,
+              };
+            }
+            const body = await readBodyWithCap(response, MAX_DOC_HTML_BYTES, timed.signal);
+            if (body.kind === "timeout") return timedOut(abortError());
+            if (body.kind === "error") {
+              return { ok: false, error: `Failed to read the response body from ${i.url}: ${body.message}.` };
+            }
+            if (body.kind === "too_large") {
+              const observed = body.bytes !== null ? ` (content-length ${body.bytes} bytes)` : "";
+              return {
+                ok: false,
+                error: `${i.url} returned more than ${MAX_DOC_HTML_BYTES / 1024 / 1024} MB of HTML${observed} -- too large to convert. AWS documentation pages are far smaller than this, so the URL is likely a generated dump or a non-documentation asset.`,
+              };
+            }
+            html = body.html;
+          } finally {
+            // Disarmed once the body is in (or abandoned): the conversion below
+            // is synchronous CPU the timeout could not interrupt anyway.
+            timed.finish();
           }
-          // fetch FOLLOWS redirects, so the isValidDocsUrl check on i.url above
-          // only vouches for the first hop. Judge where we actually landed:
-          // without this, an allowlisted docs URL that 302s off-domain gets
-          // fetched and converted with nothing but the content-type gate
-          // between us and arbitrary third-party HTML. A docs-host landing is
-          // then two more things -- the site's `index.html` -> `/` canonical
-          // form, which is fine, and its redirect-to-the-landing-page answer for
-          // a page that does not exist, which is not. See classifyFinalDocsUrl.
-          // `response.url` is absent/empty on a Response-like object that
-          // doesn't set it (test doubles); that means "no redirect
-          // information", so fall back to the URL we already validated.
-          const finalUrl = typeof response.url === "string" && response.url.length > 0 ? response.url : i.url;
-          const landing = classifyFinalDocsUrl(i.url, finalUrl);
-          if (landing === "off_allowlist") {
-            return {
-              ok: false,
-              error: `${i.url} redirected to '${finalUrl}', which is outside the AWS documentation allowlist (https://docs.aws.amazon.com pages). aws_docs_read only follows redirects that stay inside it.`,
-            };
-          }
-          if (landing === "soft_404") {
-            return {
-              ok: false,
-              error: `${i.url} does not exist: docs.aws.amazon.com redirected it to '${finalUrl}', the landing page of that guide or command group, which is how the site answers a request for a page it does not have at that path. Use aws_docs_search to find the page you want.`,
-            };
-          }
-          // A 200 doesn't guarantee HTML -- a docs URL can redirect to a
-          // login wall, an error page, or an asset. Feeding non-HTML to the
-          // parser produces junk markdown; reject it with a clear message
-          // instead.
-          const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
-          if (!contentType.includes("text/html")) {
-            return {
-              ok: false,
-              error: `${i.url} returned content-type '${contentType || "unknown"}', not text/html -- the URL may have redirected to a non-documentation page (login wall, error page, or asset). aws_docs_read only handles AWS documentation HTML pages.`,
-            };
-          }
-          const body = await readBodyWithCap(response, MAX_DOC_HTML_BYTES);
-          if (body.kind === "error") {
-            return { ok: false, error: `Failed to read the response body from ${i.url}: ${body.message}.` };
-          }
-          if (body.kind === "too_large") {
-            const observed = body.bytes !== null ? ` (content-length ${body.bytes} bytes)` : "";
-            return {
-              ok: false,
-              error: `${i.url} returned more than ${MAX_DOC_HTML_BYTES / 1024 / 1024} MB of HTML${observed} -- too large to convert. AWS documentation pages are far smaller than this, so the URL is likely a generated dump or a non-documentation asset.`,
-            };
-          }
-          markdown = htmlToMarkdown(body.html);
+          // Links resolved against the FINAL url, which is the page they were
+          // written relative to.
+          markdown = htmlToMarkdown(html, finalUrl);
           // Before the cache write, so nothing thin is stored and a retry after
           // the page is fixed is not served the empty conversion for 5 minutes.
-          const unrenderable = detectUnrenderablePage(body.html, markdown, i.url, finalUrl);
+          const unrenderable = detectUnrenderablePage(html, markdown, i.url, finalUrl);
           if (unrenderable !== null) return { ok: false, error: unrenderable };
           // Only cache what the DOC_CACHE_MAX_ENTRIES footprint math assumes:
           // at most MAX_MAX_LENGTH of markdown per entry. An over-size page is
           // still served in full (paginateContent slices the whole string
           // below) -- it just costs a fetch + convert per window instead of
           // silently breaking the cache bound.
-          if (markdown.length <= MAX_MAX_LENGTH) docCache.set(i.url, markdown);
+          if (markdown.length <= MAX_MAX_LENGTH) docCache.set(cacheKey, markdown);
         }
 
         const page = paginateContent(markdown, startIndex, maxLength);

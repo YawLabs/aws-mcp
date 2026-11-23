@@ -35,9 +35,10 @@ export interface ToolResult {
    * caller does not have to split it back out of `error`.
    *
    * NOT rendered by toMcpResult, deliberately. Its producers -- runAwsCall's
-   * nonzero_exit branch, aws_lambda_invoke's timeout remap, and aws_call's
-   * parse-failure hint (cliArgParseHint in tools/call.ts, which explains a
-   * command the CLI can never run through --cli-input-json) -- all three already
+   * nonzero_exit branch, aws_lambda_invoke's timeout remap, and the
+   * parse-failure hints aws_call and aws_paginate add through failureToolResult
+   * below (cliArgParseHint in tools/call.ts, which explains a command the CLI
+   * can never run through --cli-input-json) -- all three already
    * append "\n\nSuggestion: <text>" to the message they build, so rendering the
    * field too would print the same sentence twice: the defect v2.0.1 fixed for
    * rawBody. Its consumers are in-process
@@ -48,6 +49,53 @@ export interface ToolResult {
    * not already contain it.
    */
   suggestion?: string;
+}
+
+/**
+ * The slice of an AwsCallFailure (aws-cli.ts) that failureToolResult reads.
+ * Structural so this module keeps no import of aws-cli.ts -- see errorKind.
+ */
+interface CliFailureLike {
+  error: string;
+  kind: string;
+  suggestion?: string;
+  rawStdout?: string;
+  rawStderr?: string;
+}
+
+/**
+ * The CLI body a failure envelope carries as `rawBody`: stderr, or stdout when
+ * stderr is empty. Truthiness, not `??`: an empty-string stderr means "no
+ * stderr", and `??` would return that empty string and drop a stdout body that
+ * does carry the diagnostic (rare but observed: some `aws` operations route
+ * through stdout when stderr is closed or a wrapper swallows it). Pinned by
+ * call.test.ts -- the contract is "diagnostic text first, stdout second", not
+ * "stderr always wins even when empty".
+ */
+export function rawBodyOf(result: { rawStdout?: string; rawStderr?: string }): string | undefined {
+  return result.rawStderr ? result.rawStderr : result.rawStdout;
+}
+
+/**
+ * Map a failed CLI call to the tool's failure envelope, optionally with a
+ * tool-side remedy (`hint`) that runAwsCall could not have known.
+ *
+ * The hint is embedded in `error` AND carried in `suggestion`, the same
+ * convention runAwsCall's nonzero_exit branch uses -- toMcpResult renders only
+ * `error`, so a hint that lived in the field alone would never reach the model.
+ * `error` still OPENS with the CLI's own message, which is what keeps
+ * toMcpResult from appending rawBody a second time. A suggestion runAwsCall
+ * already derived wins over the hint in `suggestion`: callers pass a hint only
+ * when there was none.
+ */
+export function failureToolResult(result: CliFailureLike, hint?: string): ToolResult {
+  return {
+    ok: false,
+    error: hint ? `${result.error}\n\nSuggestion: ${hint}` : result.error,
+    errorKind: result.kind,
+    suggestion: result.suggestion ?? hint,
+    rawBody: rawBodyOf(result),
+  };
 }
 
 interface ToolAnnotations {

@@ -3,8 +3,10 @@
 # Release Script — Build, tag, publish to npm, create GitHub release
 # =============================================================================
 # Usage:
-#   ./release.sh <new-version>    — full release from local machine
-#   ./release.sh                  — CI mode (derives version from git tag)
+#   ./release.sh <new-version>    — full release from local machine, on main
+#
+# There is no CI mode: this repo has no CI by design, so the workstation is
+# always the publisher. An ambient CI=true is ignored.
 #
 # If interrupted, re-run with the same version — each step is idempotent.
 # =============================================================================
@@ -262,17 +264,16 @@ fi
 TOTAL_STEPS=9
 
 VERSION="${1:-}"
-IS_CI="${CI:-false}"
 
+# The version is always an argument. There used to be a CI mode that derived it
+# from GITHUB_REF_NAME and was switched on by CI=true -- unreachable on purpose
+# (no CI), but an ambient CI=true from a shell or harness skipped the dirty-tree
+# check, the confirmation and the commit/tag/push, then ran an npm publish
+# --provenance that cannot work off a CI provider. Removed, not gated.
 if [ -z "$VERSION" ]; then
-  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-    VERSION="${GITHUB_REF_NAME#v}"
-    info "CI mode — version $VERSION from tag $GITHUB_REF_NAME"
-  else
-    echo "Usage: ./release.sh <version>"
-    echo "  e.g. ./release.sh 0.2.0"
-    exit 1
-  fi
+  echo "Usage: ./release.sh <version>"
+  echo "  e.g. ./release.sh 0.2.0"
+  exit 1
 fi
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -286,6 +287,23 @@ cd "$SCRIPT_DIR"
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
+# jq rewrites server.json in step 3, and gh creates the GitHub release in step 6
+# -- AFTER the irreversible npm publish. Both are checked here so a missing or
+# logged-out tool fails before anything is changed, not halfway through.
+command -v jq >/dev/null   || fail "jq not installed (step 3 uses it to sync server.json)"
+command -v gh >/dev/null   || fail "gh not installed (step 6 creates the GitHub release with it)"
+gh auth status --hostname github.com >/dev/null 2>&1 \
+  || fail "gh is not logged in to github.com -- run 'gh auth login' first (step 6 needs it, after the npm publish)"
+
+# Step 4 commits and tags HEAD, then pushes `main`. From any other branch the
+# tag lands on a commit that push never sends, npm publishes that branch's
+# tree, and step 6 creates the missing tag on origin's main -- a GitHub release
+# pointing at a commit npm does not carry. No override: off main the push is
+# wrong by construction, so there is nothing to opt into.
+RELEASE_BRANCH=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+if [ "$RELEASE_BRANCH" != "main" ]; then
+  fail "Releases are cut from main; HEAD is on ${RELEASE_BRANCH:-a detached HEAD}. Check out main and re-run."
+fi
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 # --- oam floor preflight -------------------------------------------------
@@ -300,11 +318,10 @@ CURRENT_VERSION=$(node -p "require('./package.json').version")
 #
 # Exits non-zero when the floor is behind; AWS_MCP_ALLOW_STALE_OAM=1 is the
 # deliberate way past it. A machine with no network is not a failure -- the check
-# says so and continues.
-if [ -f scripts/check-oam-floor.mjs ]; then
-  echo ""
-  node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set AWS_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
-fi
+# says so and continues. Unconditional, like the Yaw MCP check below: a missing
+# checker is a broken tree, not a reason to skip the gate.
+echo ""
+node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set AWS_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
 
 # The Yaw MCP floor: drift (YAW_MCP_MIN vs the README claim and the
 # @yawlabs/mcp-compliance devDependency) fails the release, and `npm test`
@@ -325,15 +342,13 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
   info "Already at v${VERSION} — resuming"
 else
-  if [ "$IS_CI" != "true" ]; then
-    if [ -n "$(git status --porcelain)" ]; then
-      fail "Working directory not clean. Commit or stash changes first."
-    fi
+  if [ -n "$(git status --porcelain)" ]; then
+    fail "Working directory not clean. Commit or stash changes first."
   fi
   info "Current: v${CURRENT_VERSION} → v${VERSION}"
 fi
 
-if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
+if [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Run lint + tests + MCP compliance"
@@ -429,66 +444,54 @@ promote_changelog
 assert_changelog_promoted
 
 step 4 "Commit, tag, and push"
-if [ "$IS_CI" = "true" ]; then
-  info "CI mode — skipping commit/tag/push (already tagged)"
+BUMP_FILES="package.json package-lock.json"
+[ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
+[ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
+  git add $BUMP_FILES
+  git commit -m "v${VERSION}"
+  info "Committed version bump"
 else
-  BUMP_FILES="package.json package-lock.json"
-  [ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
-  [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
-  if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
-    git add $BUMP_FILES
-    git commit -m "v${VERSION}"
-    info "Committed version bump"
-  else
-    info "Nothing to commit"
-  fi
-
-  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-    info "Tag v${VERSION} already exists"
-  else
-    # Annotated (-a) so `git push --follow-tags` below picks it up;
-    # lightweight tags are ignored by --follow-tags and would silently
-    # fail to publish (release commit lands but tag-push is a no-op).
-    git tag -a "v${VERSION}" -m "v${VERSION}"
-    info "Tag v${VERSION} created"
-  fi
-
-  # --follow-tags pushes only annotated tags reachable from the pushed
-  # commits, not every local tag. Avoids accidentally publishing dangling
-  # experimental tags that happen to be lying around.
-  # Tag-drift safety: refuse to push if origin already has a tag at this name
-  # pointing to a different commit (rewound tag elsewhere, parallel release race).
-  # Without this check, `git push --follow-tags` SILENTLY skips updating the
-  # tag on origin (the tag exists, no fast-forward happens). The main push
-  # reports success, but origin's tag stays at the old SHA -- and the later
-  # `gh release create` step then creates a GitHub release linked to that
-  # stale commit while npm carries the new one.
-  ORIGIN_TAG_SHA=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}')
-  if [ -n "$ORIGIN_TAG_SHA" ]; then
-    LOCAL_TAG_SHA=$(git rev-parse "v${VERSION}")
-    if [ "$ORIGIN_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
-      fail "Tag v${VERSION} exists on origin at $ORIGIN_TAG_SHA but local tag points to $LOCAL_TAG_SHA -- resolve the drift before re-running"
-    fi
-  fi
-
-  git push origin main --follow-tags
-  info "Pushed to origin"
+  info "Nothing to commit"
 fi
 
+if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+  info "Tag v${VERSION} already exists"
+else
+  # Annotated (-a) so `git push --follow-tags` below picks it up;
+  # lightweight tags are ignored by --follow-tags and would silently
+  # fail to publish (release commit lands but tag-push is a no-op).
+  git tag -a "v${VERSION}" -m "v${VERSION}"
+  info "Tag v${VERSION} created"
+fi
+
+# --follow-tags pushes only annotated tags reachable from the pushed
+# commits, not every local tag. Avoids accidentally publishing dangling
+# experimental tags that happen to be lying around.
+# Tag-drift safety: refuse to push if origin already has a tag at this name
+# pointing to a different commit (rewound tag elsewhere, parallel release race).
+# Without this check, `git push --follow-tags` SILENTLY skips updating the
+# tag on origin (the tag exists, no fast-forward happens). The main push
+# reports success, but origin's tag stays at the old SHA -- and the later
+# `gh release create` step then creates a GitHub release linked to that
+# stale commit while npm carries the new one.
+ORIGIN_TAG_SHA=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}')
+if [ -n "$ORIGIN_TAG_SHA" ]; then
+  LOCAL_TAG_SHA=$(git rev-parse "v${VERSION}")
+  if [ "$ORIGIN_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
+    fail "Tag v${VERSION} exists on origin at $ORIGIN_TAG_SHA but local tag points to $LOCAL_TAG_SHA -- resolve the drift before re-running"
+  fi
+fi
+
+git push origin main --follow-tags
+info "Pushed to origin"
+
 step 5 "Publish to npm"
-# Two publish paths, picked by environment:
-#   1. IS_CI=true   -> We are running inside CI (GITHUB_REF_NAME set the
-#                      version above). NODE_AUTH_TOKEN is set by the
-#                      workflow; publish with --provenance for sigstore.
-#   2. IS_CI=false  -> Workstation is the publisher. Try locally with
-#                      EOTP retry for fresh WebAuthn sessions. (release.yml
-#                      was removed at v1.3.2; there is no CI handoff path.)
+# The workstation is the publisher (release.yml was removed at v1.3.2; there
+# is no CI publish path), with an EOTP retry for fresh WebAuthn sessions.
 if npm_version_live; then PUBLISHED_VERSION="$VERSION"; else PUBLISHED_VERSION=""; fi
 if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
   info "v${VERSION} already published on npm — skipping"
-elif [ "$IS_CI" = "true" ]; then
-  npm publish --access public --provenance
-  info "Published @yawlabs/aws-mcp@${VERSION} to npm (with provenance)"
 else
   # No CI publish path -- workstation is the publisher. Retry up to 3 times
   # on EOTP/EAUTH/OTP only (WebAuthn-fresh sessions sometimes need ~30s for
@@ -720,21 +723,43 @@ step 7 "Publish to MCP Registry"
 if [ ! -f server.json ]; then
   info "No server.json -- not an MCP server, skipping registry publish"
 else
-  # mcp-publisher binary cached at ~/.local/bin. Pinned to "latest" upstream;
-  # if the registry's CLI introduces a breaking change, the next release will
-  # surface it. The OS/arch detection handles Linux, macOS, and Git Bash on
-  # Windows (MINGW/MSYS uname -s starts with "mingw" / "msys").
-  MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher}"
+  # mcp-publisher is PINNED, and the tarball is checked against the sha256 the
+  # same release publishes in registry_<ver>_checksums.txt before it is
+  # extracted. It used to come from releases/latest with no check at all, and
+  # it is handed an org-scoped GitHub token below. The cache is keyed by
+  # version, so bumping MCP_PUBLISHER_VERSION fetches the new one instead of
+  # reusing whatever was downloaded first. v1.8.8 (2026-11-06) is the newest
+  # release more than two weeks old on 2026-11-22. MCP_PUBLISHER points at a
+  # binary of your own and skips the download (and the check). The OS/arch
+  # detection handles Linux, macOS, and Git Bash on Windows (MINGW/MSYS uname
+  # -s starts with "mingw" / "msys").
+  MCP_PUBLISHER_VERSION="1.8.8"
+  MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher-v${MCP_PUBLISHER_VERSION}}"
   if ! [ -x "$MP" ]; then
-    info "mcp-publisher not found at $MP -- downloading"
+    info "mcp-publisher not found at $MP -- downloading v${MCP_PUBLISHER_VERSION}"
     mkdir -p "$(dirname "$MP")"
     OS_RAW=$(uname -s | tr '[:upper:]' '[:lower:]')
     case "$OS_RAW" in mingw*|msys*|cygwin*) OS=windows ;; *) OS="$OS_RAW" ;; esac
     ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    MP_ASSET="mcp-publisher_${OS}_${ARCH}.tar.gz"
+    MP_BASE="https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}"
     TMP=$(mktemp -d)
-    curl -sL -o "$TMP/mp.tar.gz" \
-      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" \
-      || fail "Failed to download mcp-publisher (${OS}/${ARCH})"
+    # -f so a 404 fails here, not later as a confusing tar error.
+    curl -fsSL -o "$TMP/mp.tar.gz" "${MP_BASE}/${MP_ASSET}" \
+      || fail "Failed to download mcp-publisher v${MCP_PUBLISHER_VERSION} (${OS}/${ARCH})"
+    curl -fsSL -o "$TMP/sums.txt" "${MP_BASE}/registry_${MCP_PUBLISHER_VERSION}_checksums.txt" \
+      || fail "Failed to download the mcp-publisher v${MCP_PUBLISHER_VERSION} checksums file"
+    # Exact name match on the second column, so ${MP_ASSET}.sbom.json never
+    # stands in for the tarball. node does the hashing: it is already required,
+    # where sha256sum (GNU) and shasum (macOS) are each missing somewhere.
+    MP_WANT=$(awk -v f="$MP_ASSET" '$2 == f || $2 == "*" f { print $1; exit }' "$TMP/sums.txt")
+    [ -n "$MP_WANT" ] || fail "mcp-publisher v${MCP_PUBLISHER_VERSION} checksums file has no entry for ${MP_ASSET}"
+    MP_GOT=$(node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(process.argv[1])).digest("hex"))' "$TMP/mp.tar.gz")
+    if [ "$MP_GOT" != "$MP_WANT" ]; then
+      rm -rf "$TMP"
+      fail "mcp-publisher ${MP_ASSET} sha256 is ${MP_GOT}, but the v${MCP_PUBLISHER_VERSION} checksums file says ${MP_WANT} -- refusing to run it"
+    fi
+    info "mcp-publisher ${MP_ASSET} sha256 verified"
     tar xzf "$TMP/mp.tar.gz" -C "$TMP" || fail "Failed to extract mcp-publisher tarball"
     if [ -f "$TMP/mcp-publisher.exe" ]; then
       mv "$TMP/mcp-publisher.exe" "$MP"
@@ -746,7 +771,9 @@ else
   fi
 
   # OIDC auth (used by the old release.yml) only works inside Actions; locally
-  # we use a GitHub PAT via `login github -token <PAT>`. At login the registry
+  # we use a GitHub PAT via `login github`, which reads it from MCP_GITHUB_TOKEN
+  # (cmd/publisher/auth/github-at.go; present in 1.7.9 and the pinned 1.8.8) -- NOT `-token <PAT>`,
+  # which put the token on the command line where any process listing sees it. At login the registry
   # reads the org roles this token can see, and grants io.github.YawLabs/* only
   # to a YawLabs org Owner (read:org lets it read them; so do repo, user,
   # write:org and admin:org). It enforces the grant only at publish: a token
@@ -757,7 +784,8 @@ else
   if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
     fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
   fi
-  mcp_bounded "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null \
+  export MCP_GITHUB_TOKEN="$MCP_REGISTRY_TOKEN"
+  mcp_bounded "$MP" login github >/dev/null \
     || mcp_login_fail "mcp-publisher login failed -- its output is above. A 401 there is the registry refusing the token exchange: most often MCP_REGISTRY_TOKEN, or the gh CLI token it fell back to, is invalid or expired, though the registry answers 401 when GitHub's own API fails too. A 429, a 5xx or a connection error is the registry or the network. npm + GitHub release succeeded: retry the step (re-run the script) once the cause is fixed."
   # Up to four attempts, 30 s, 60 s, then 90 s apart, and ONLY for the
   # shape waiting cures. The npm gate above reads npm from THIS machine's
@@ -844,9 +872,9 @@ else
     fi
     # The not-found shape counts only when the validator's own "version '<v>'"
     # names this version. A bare version match is not enough: the registry's
-    # publisher after v1.8.1 (registry main) prints "Publishing <name>@<v> to"
-    # before any error, and this script downloads the latest release, so a
-    # missing-package 404 would then buy all the waits.
+    # publisher after v1.8.1 prints "Publishing <name>@<v> to" before any
+    # error, and the pinned v1.8.8 is such a release, so a missing-package 404
+    # would then buy all the waits.
     if ! { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "version '${VERSION}'" "$MCP_PUBLISH_LOG"; } \
         || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG" \
         || [ -n "$MCP_GATEWAY_STATUS" ] \
@@ -871,7 +899,7 @@ else
     # before its 504 arrives, so the waits plus four slow attempts can outlast
     # the token the login above issued -- and an expired token is a 401 that
     # fails the step.
-    mcp_bounded "$MP" login github -token "${MCP_REGISTRY_TOKEN:-}" >/dev/null \
+    mcp_bounded "$MP" login github >/dev/null \
       || warn "mcp-publisher login refresh failed -- the next attempt may be refused as unauthorized"
     MCP_ATTEMPT=$((MCP_ATTEMPT + 1))
   done

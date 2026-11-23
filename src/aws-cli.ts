@@ -222,7 +222,14 @@ const SHELL_SAFE_ARG_RE = /^[A-Za-z0-9_@+=:,./-]+$/;
  * spawned call.
  */
 export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.platform): string {
-  if (SHELL_SAFE_ARG_RE.test(arg)) return arg;
+  // A LEADING '@' is quoted even though '@' is in the safe set: PowerShell reads
+  // a bare @name as splatting, and an undefined variable splats to nothing.
+  // Measured on PowerShell 5.1: `--profile @prod --region us-east-1` reached a
+  // node argv echo with nothing between --profile and --region. isValidProfileName
+  // accepts '@prod', so this is reachable. A mid-token '@' (user@company.com) is
+  // plain text there and stays bare. Quoted on every platform: '@prod' is the same
+  // word in a POSIX shell, and one rule is easier to reason about than two.
+  if (SHELL_SAFE_ARG_RE.test(arg) && !arg.startsWith("@")) return arg;
   // The POSIX idiom for an embedded single quote -- close, escape, reopen --
   // is not merely wrong in PowerShell, it EXECUTES. PowerShell reads '...' as
   // literal text the way POSIX does, but has no backslash escape inside it, so
@@ -259,7 +266,7 @@ export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.p
  * non-ASCII character, so this never touches the structure.
  */
 export function toAsciiJson(json: string): string {
-  return json.replace(/[\u007f-￿]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return json.replace(/[\u007f-\uffff]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 /**
@@ -607,7 +614,8 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   //   - `prefixArgs` are test-only injection;
   //   - `service` and the operation tokens match SAFE_NAME_RE, which has no `/`.
   // Scanning opts.extraFlags rather than the assembled argv is also what keeps
-  // a future server-minted `--cli-input-json file://<temp>` transport out of it.
+  // the server-minted `--cli-input-json file://<temp>` transport for large
+  // params (built below) out of it.
   //
   // Both argv spellings are covered: `--flag value` as two entries, and
   // `--flag=value` as one, the second by the segment after the first `=` --
@@ -646,8 +654,18 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   const outputFormat = opts.outputFormat ?? "json";
   // Clamped, not rejected: a caller asking for more than 24.8 days wants "do not
   // time this out", and the clamp gives it -- where the raw value gave the
-  // opposite (see MAX_TIMEOUT_MS).
-  const timeoutMs = Math.min(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  // opposite (see MAX_TIMEOUT_MS). The low side gets the same treatment: NaN,
+  // zero or a negative value would reach setTimeout as ~1 ms and kill the call
+  // at once, so anything that is not a finite positive number means the default.
+  // Each tool's zod schema already demands a positive int; this covers direct
+  // callers, which bypass it.
+  const requestedTimeout = opts.timeoutMs;
+  const timeoutMs =
+    requestedTimeout !== undefined && Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(requestedTimeout, MAX_TIMEOUT_MS)
+      : requestedTimeout === Number.POSITIVE_INFINITY
+        ? MAX_TIMEOUT_MS
+        : DEFAULT_TIMEOUT_MS;
 
   // The --query length check, hoisted out of the argv block below so it runs
   // BEFORE the binary is resolved: an over-long JMESPath expression is the
@@ -668,6 +686,14 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
   // can't pass command/prefixArgs through the MCP-level handler signature, so
   // we honor these env vars as a fallback. Never set in production -- the
   // AWS_MCP_TEST_ prefix is unique enough that real env files won't collide.
+  // They are NOT gated to tests, though: a shipped server honors them too
+  // (~25 test files set them, and real-CLI suites run the built server, so a
+  // separate test marker would have to ride along everywhere). The command
+  // reaches resolveAwsCommand as `explicit`, which returns it verbatim -- no
+  // absolute-path, .exe or existence check -- so it is the one exception to
+  // "an absolute path or a refusal". Documented as such in the README's
+  // Environment table and the aws-spawn.ts header. Whoever sets the server's
+  // environment already controls the server, so this is no escalation.
   // Malformed JSON or non-string-array values fall back to the default
   // (real `aws` binary) rather than throwing, so a dev typo can't wedge
   // every aws call with a SyntaxError that bypasses the AwsCallResult
@@ -936,12 +962,13 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
         });
         return;
       }
+      // No PATH hint here: ENOENT never reaches this catch. Measured on node
+      // 22 and oam 0.21.1 (win32/arm64): a spawn of a missing absolute path
+      // emits ENOENT on 'error', and the async handler below owns that hint.
       resolve({
         ok: false,
         kind: "spawn_failure",
-        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}.${
-          code === "ENOENT" ? " Is the AWS CLI installed and on PATH?" : ""
-        }`,
+        error: `Failed to spawn '${command}': ${err instanceof Error ? err.message : String(err)}.`,
         command: displayCommand,
         commandArgv: displayArgv,
       });
@@ -1285,11 +1312,11 @@ export function runAwsCall(opts: AwsCallOptions): Promise<AwsCallResult> {
     // every pipe has been drained and closed, so it stays the NORMAL settle.
     //
     // What it is not is a GUARANTEED one, and sso.ts is the pattern that fixes
-    // that rather than the precedent for leaning on it. Its version probe does
-    // settle on 'close', but it also calls finish(true) from INSIDE its own
-    // timeout callback (sso.ts:284-293); its login path settles on 'exit'
-    // (sso.ts:591) and uses 'close' only as a start-failure fallback
-    // (sso.ts:646). Both sso.ts sites are bounded by something other than
+    // that rather than the precedent for leaning on it. Its version probe
+    // (probeCliVersion) does settle on 'close', but it also calls finish(true)
+    // from INSIDE its own timeout callback; its login path (doStartSsoLogin)
+    // settles on 'exit' and uses 'close' only as a start-failure fallback.
+    // Both sso.ts sites are bounded by something other than
     // 'close'. This was the only site whose timeout path depended on 'close'
     // alone -- which is exactly what let a descendant holding the pipes hang it
     // past its own timeout, forever. The bound now lives in armPipeCloseGrace.

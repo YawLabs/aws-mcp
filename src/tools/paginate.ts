@@ -1,7 +1,8 @@
 import { z } from "zod";
-import { runAwsCall } from "../aws-cli.js";
+import { type AwsCallFailure, runAwsCall } from "../aws-cli.js";
+import { CLI_PARSE_EXIT_CODE, cliParseFailureHint } from "./call.js";
 import { validateCursorToken } from "./resource.js";
-import type { Tool, ToolResult } from "./tool.js";
+import { failureToolResult, type Tool, type ToolResult } from "./tool.js";
 
 /**
  * When --max-items is passed and the underlying API truncates, the AWS CLI
@@ -43,11 +44,40 @@ export function wrapQueryForPagination(userQuery: string): string {
   return `{NextToken: NextToken, items: ${userQuery}}`;
 }
 
+const DEFAULT_MAX_ITEMS = 100;
+const MAX_MAX_ITEMS = 10_000;
+
+/**
+ * Defense-in-depth: the schema caps maxItems at 1-10_000 integers, but direct
+ * (non-MCP) callers bypass schema validation. A plain Math.min/Math.max clamp
+ * passes NaN and fractions straight through to `--max-items NaN` / `2.5`, a
+ * CLI parse error, so anything that is not a finite number falls back to the
+ * default and a fraction is truncated before the clamp.
+ */
+export function clampMaxItems(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return DEFAULT_MAX_ITEMS;
+  return Math.min(Math.max(1, Math.trunc(raw)), MAX_MAX_ITEMS);
+}
+
+// The CLI's answer to --max-items on an operation it does not paginate (`sts
+// get-caller-identity`, `s3api head-object`). Captured on real 2.34.3:
+//   "aws: [ERROR]: Unknown options: --max-items, --starting-token, abc, 100"
+// -- flags first, then their values, joined with ", ". The lookahead keeps a
+// longer flag name from matching.
+const UNKNOWN_MAX_ITEMS_RE = /Unknown options: (?:[^\r\n]*[ ,])?--max-items(?=[\s,"'\\|]|$)/;
+
+function notPaginatedHint(result: AwsCallFailure, service: string, operation: string): string | undefined {
+  if (result.kind !== "nonzero_exit" || result.suggestion !== undefined) return undefined;
+  if (result.exitCode !== CLI_PARSE_EXIT_CODE || !UNKNOWN_MAX_ITEMS_RE.test(result.rawStderr ?? "")) return undefined;
+  const op = operation.trim().split(/\s+/).filter(Boolean).join(" ");
+  return `\`aws ${service} ${op}\` is not a paginated operation: the CLI registers --max-items / --starting-token (which aws_paginate always sends) only on operations it can paginate. Call it through aws_call with the same service, operation and params.`;
+}
+
 export const paginateTools: readonly Tool[] = [
   {
     name: "aws_paginate",
     description:
-      "Fetch one page of a paginated AWS list/describe operation. Identical to aws_call plus `maxItems` (page size) and `startingToken` (resume cursor). When `query` is supplied it is wrapped server-side as {NextToken, items: <query>} so pagination survives a projection that would otherwise drop NextToken; the handler unwraps `items` before returning. Returns the parsed response, a `nextToken` (null when the list is exhausted), and `hasMore`. Call again with the returned nextToken as startingToken until hasMore is false. Use this instead of aws_call for operations that might exceed the 5 MB stdout cap: list-objects-v2, describe-instances, describe-log-streams, list-roles, etc.",
+      "Fetch one page of a paginated AWS list/describe operation. Takes aws_call's inputs (output is always JSON) plus `maxItems` (page size) and `startingToken` (resume cursor). Only for operations the CLI paginates: a non-paginated one (sts get-caller-identity) rejects --max-items, so call it with aws_call. When `query` is supplied it is wrapped server-side as {NextToken, items: <query>} so pagination survives a projection that would otherwise drop NextToken; the handler unwraps `items` before returning. Returns the parsed response, a `nextToken` (null when the list is exhausted), and `hasMore`. Call again with the returned nextToken as startingToken until hasMore is false. Use this instead of aws_call for operations that might exceed the 5 MB stdout cap: list-objects-v2, describe-instances, describe-log-streams, list-roles, etc.",
     annotations: {
       title: "Fetch one page of a paginated AWS operation",
       readOnlyHint: true,
@@ -107,18 +137,20 @@ export const paginateTools: readonly Tool[] = [
       // the tighter cap rejected page 2 of every list. The CLI wraps a raw
       // token as base64 JSON for --starting-token, so a documented 4096-char
       // NextToken arrives here as 5,484 characters.
-      if (i.startingToken !== undefined) {
-        const stErr = validateCursorToken(i.startingToken, "startingToken");
+      //
+      // An empty or whitespace-only token means "first page": models commonly
+      // send "" for an optional string on the first call, and refusing it as
+      // an invalid cursor failed a call that had nothing wrong with it.
+      const startingToken =
+        typeof i.startingToken === "string" && i.startingToken.trim() !== "" ? i.startingToken : undefined;
+      if (startingToken !== undefined) {
+        const stErr = validateCursorToken(startingToken, "startingToken");
         if (stErr) return { ok: false, error: stErr };
       }
 
-      // Defense-in-depth: the schema caps maxItems at 10_000, but direct
-      // (non-MCP) callers bypass schema validation -- clamp here for parity
-      // with the handler-level clamps in docs.ts.
-      const maxItems = Math.min(Math.max(1, i.maxItems ?? 100), 10_000);
-      const extraFlags: string[] = ["--max-items", String(maxItems)];
-      if (i.startingToken) {
-        extraFlags.push("--starting-token", i.startingToken);
+      const extraFlags: string[] = ["--max-items", String(clampMaxItems(i.maxItems))];
+      if (startingToken !== undefined) {
+        extraFlags.push("--starting-token", startingToken);
       }
 
       const userQuery = i.query?.trim();
@@ -137,17 +169,13 @@ export const paginateTools: readonly Tool[] = [
       });
 
       if (!result.ok) {
-        // Truthiness, not `??`: an empty-string stderr means "no stderr", and
-        // `??` would return that empty string and drop a stdout body that
-        // does carry the diagnostic. Same contract as call.ts and
-        // resource.ts's rawBodyOf.
-        return {
-          ok: false,
-          error: result.error,
-          errorKind: result.kind,
-          suggestion: result.suggestion,
-          rawBody: result.rawStderr ? result.rawStderr : result.rawStdout,
-        };
+        // aws_call's parse-failure remedies first: they explain the more
+        // fundamental problem (a command that cannot take params at all), and a
+        // hand-written command rejects --max-items in the same breath.
+        const hint =
+          cliParseFailureHint(result, { ...i, tool: "aws_paginate" }) ??
+          notPaginatedHint(result, i.service, i.operation);
+        return failureToolResult(result, hint);
       }
 
       let resultBody: unknown;

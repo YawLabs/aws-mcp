@@ -7,9 +7,11 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -533,6 +535,111 @@ describe("withLockedAtomicWrite", () => {
     assert.ok(Date.now() - t0 > 1_000, "the denials must outlast one grace window in total");
     assert.ok(calls > 3);
     assert.match(readFileSync(path, "utf-8"), /prod-Admin/);
+  });
+
+  // A lock older than the 30 s stale threshold (LOCK_STALE_AFTER_MS).
+  function plantStaleLock(lockPath: string): void {
+    writeFileSync(lockPath, "pid=99999 time=0\n");
+    const old = Math.floor(Date.now() / 1000) - 120;
+    utimesSync(lockPath, old, old);
+  }
+
+  it("a stale lock that cannot be removed fails in about a second without blocking the event loop", async () => {
+    // Before: the failed unlink was swallowed and the loop retried with no
+    // await, so the whole process froze for the 10 s LOCK_MAX_WAIT_MS (zero
+    // timer ticks) and then reported a misleading lock timeout.
+    const lockPath = `${path}.lock`;
+    plantStaleLock(lockPath);
+    let renames = 0;
+    const renameStale = (from: string) => {
+      renames++;
+      throw Object.assign(new Error(`EACCES: permission denied, rename '${from}'`), { code: "EACCES" });
+    };
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 20);
+    const t0 = Date.now();
+    try {
+      await assert.rejects(
+        withLockedAtomicWrite(path, append(PROD), { requirePrivate: false, lockSeam: { renameStale } }),
+        (err: Error) => {
+          assert.match(err.message, /is stale/);
+          assert.match(err.message, /could not be removed/);
+          assert.match(err.message, /EACCES/);
+          assert.ok(err.message.includes(lockPath), err.message);
+          assert.doesNotMatch(err.message, /failed to acquire lock/);
+          return true;
+        },
+      );
+    } finally {
+      clearInterval(timer);
+    }
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed >= 1_000 && elapsed < 5_000, `gave up after ${elapsed}ms`);
+    assert.ok(renames > 1, "the steal is retried within the grace window");
+    // The old busy-spin produced ZERO ticks; a loose floor keeps a slow or
+    // coarse-timer host (Windows rounds to ~15.6 ms) from flipping this.
+    assert.ok(ticks >= 3, `the event loop must keep running while waiting (ticks=${ticks})`);
+    assert.ok(!existsSync(path), "nothing may be written without the lock");
+  });
+
+  it("stale recovery is single-winner: a waiter with an out-of-date stale verdict never removes a live lock", async () => {
+    // The interleaving: we stat the orphan (stale); before our steal lands, a
+    // faster waiter steals it and creates a FRESH lock. Unlinking by path
+    // then deleted that live lock and both writers entered the critical
+    // section. The steal must instead notice the lock it moved is live, put
+    // it back, and wait for its holder.
+    const lockPath = `${path}.lock`;
+    plantStaleLock(lockPath);
+    let injected = 0;
+    let releasedAt = 0;
+    let liveLockSeenAfterSteal = false;
+    const renameStale = (from: string, to: string) => {
+      if (injected++ === 0) {
+        rmSync(lockPath);
+        writeFileSync(lockPath, "pid=1 time=now\n"); // the faster waiter's fresh lock
+        setTimeout(() => {
+          liveLockSeenAfterSteal = existsSync(lockPath) && readFileSync(lockPath, "utf-8") === "pid=1 time=now\n";
+          releasedAt = Date.now();
+          rmSync(lockPath, { force: true });
+        }, 300);
+      }
+      renameSync(from, to);
+    };
+    let transformedAt = 0;
+    await withLockedAtomicWrite(
+      path,
+      (text) => {
+        transformedAt = Date.now();
+        return planConfigUpserts(text, [PROD]).text;
+      },
+      { requirePrivate: false, lockSeam: { renameStale } },
+    );
+    assert.equal(injected, 1, "the interleaving was injected exactly once");
+    assert.ok(liveLockSeenAfterSteal, "the faster waiter's live lock must be back in place, unchanged");
+    assert.ok(releasedAt > 0 && transformedAt >= releasedAt, "the write must wait for the live holder to release");
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n !== "config"),
+      [],
+      "no lock and no moved-aside .stale-* file may remain",
+    );
+  });
+
+  it("stale recovery moves the orphan aside and deletes it, leaving nothing behind", async () => {
+    const lockPath = `${path}.lock`;
+    plantStaleLock(lockPath);
+    const moved: string[] = [];
+    const renameStale = (from: string, to: string) => {
+      moved.push(to);
+      renameSync(from, to);
+    };
+    const r = await withLockedAtomicWrite(path, append(PROD), { requirePrivate: false, lockSeam: { renameStale } });
+    assert.equal(r.changed, true);
+    assert.equal(moved.length, 1);
+    assert.ok(!existsSync(moved[0]), "the moved-aside orphan must be deleted");
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n !== "config"),
+      [],
+    );
   });
 
   it("non-Windows: EPERM on the lock create is a real error and is thrown at once", async () => {

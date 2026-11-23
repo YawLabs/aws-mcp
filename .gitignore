@@ -14,7 +14,8 @@ bin/*
 build-tmp/
 dist-release/
 
-# oam.js writes a bytecode cache here on any `oam run` / `oam check`
+# Older oam releases were documented as writing a bytecode cache here; 0.21.1
+# keeps its caches under ~/.oam instead (measured 2026-11-22). Kept as cheap insurance.
 oam/
 
 # npm auth token -- never commit (a project-local .npmrc can be

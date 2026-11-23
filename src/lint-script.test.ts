@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,8 +21,8 @@ const LINT_SCRIPT = join(repoRoot, "scripts", "lint.mjs");
  * Drive scripts/lint.mjs end to end with node itself standing in for biome.
  *
  * AWS_MCP_BIOME_BIN is returned by resolveBinary() before any detection happens,
- * so none of the expensive machinery runs: no biome.json read, no x64 package
- * provisioned, no ~30MB download. Everything after the resolve -- the spawn, the
+ * so none of the expensive machinery runs: no lockfile read for the biome
+ * version, no x64 package provisioned, no ~30MB download. Everything after the resolve -- the spawn, the
  * timeout branch, the crash classification, the exit -- runs exactly as it does
  * in a release. Arguments after the script path are forwarded verbatim to that
  * binary, so `node <args>` becomes a fake biome whose behavior the test dictates.
@@ -28,17 +30,20 @@ const LINT_SCRIPT = join(repoRoot, "scripts", "lint.mjs");
  * The wrapper spawns with `stdio: "inherit"`, so the fake biome's output flows
  * through the wrapper's own pipes and lands in the captured stdout/stderr here.
  */
-function runLint(fakeBiomeArgs: string[]): { status: number | null; stdout: string; stderr: string } {
+function runLint(
+  fakeBiomeArgs: string[],
+  biomeBin: string = process.execPath,
+): { status: number | null; stdout: string; stderr: string } {
   const run = spawnSync(process.execPath, [LINT_SCRIPT, ...fakeBiomeArgs], {
     cwd: repoRoot,
     encoding: "utf8",
-    env: { ...process.env, AWS_MCP_BIOME_BIN: process.execPath },
+    env: { ...process.env, AWS_MCP_BIOME_BIN: biomeBin },
   });
   return { status: run.status, stdout: String(run.stdout), stderr: String(run.stderr) };
 }
 
 describe("lint wrapper (scripts/lint.mjs)", () => {
-  // This pair is the whole reason the file has tests at all. release.sh:221 is
+  // This pair is the whole reason the file has tests at all. release.sh step 1 is
   // `npm run lint || fail "Lint failed"`, and this repo ships no CI by design --
   // so the wrapper's exit status IS the release gate, with nothing downstream to
   // catch it. Every other failure in scripts/lint.mjs is loud; this one is
@@ -79,13 +84,11 @@ describe("lint wrapper (scripts/lint.mjs)", () => {
     );
   });
 
-  // Pins `shell: needsShell` at the spawn: the shell is enabled ONLY for a
-  // .cmd/.bat target, and everything else stays shell-free so arguments reach
-  // biome verbatim. Turning it on unconditionally is the tempting "fix" for the
-  // EINVAL that .cmd targets throw on Node 22 -- and it would make cmd.exe
-  // re-split argv on whitespace, exactly the corruption the header records
-  // measuring against npm (`--prefix "C:\a b\c"` arriving as three arguments).
-  // A repo checked out under a path with a space is all it takes to hit it.
+  // Pins `shell: false` for a normal .exe target: arguments reach biome
+  // verbatim. Turning a shell on is the tempting "fix" for the EINVAL that .cmd
+  // targets throw on Node 22 -- and it would make cmd.exe re-split argv on
+  // whitespace, exactly the corruption the header records measuring against npm
+  // (`--prefix "C:\a b\c"` arriving as three arguments).
   it("passes arguments through without shell re-splitting", () => {
     const result = runLint(["-p", "JSON.stringify(process.argv.slice(1))", "check --write", "src/"]);
     assert.equal(result.status, 0, `fake biome should have exited 0; stderr was: ${result.stderr}`);
@@ -94,5 +97,32 @@ describe("lint wrapper (scripts/lint.mjs)", () => {
       ["check --write", "src/"],
       "an argument containing a space must arrive as one argument, not be split by a shell",
     );
+  });
+
+  // A .cmd/.bat target (the `.bin/biome.cmd` shim fallback, or an
+  // AWS_MCP_BIOME_BIN batch file) never gets a shell either: lint.mjs runs
+  // ComSpec itself with windowsVerbatimArguments and a command line it quotes,
+  // because `shell: true` leaves the binary path unquoted and cmd splits it at a
+  // space. The fake lives under a directory WITH a space, forwards an argument
+  // with a space, and exits 3 -- so a broken path, a re-split argument or a
+  // swallowed status each fail a different assertion.
+  it("runs a .cmd biome under a path with a space, arguments and status intact", {
+    skip: process.platform === "win32" ? false : ".cmd/.bat targets exist only on Windows",
+  }, () => {
+    const root = mkdtempSync(join(tmpdir(), "aws-mcp-lint-"));
+    try {
+      const dir = join(root, "lint space dir");
+      mkdirSync(dir);
+      const fake = join(dir, "fakebiome.cmd");
+      writeFileSync(
+        fake,
+        `@echo off\r\n"${process.execPath}" -e "console.log(JSON.stringify(process.argv.slice(1)))" -- %*\r\nexit /b 3\r\n`,
+      );
+      const result = runLint(["check --write", "src/"], fake);
+      assert.equal(result.status, 3, `the batch file's own status must come back; stderr was: ${result.stderr}`);
+      assert.deepEqual(JSON.parse(result.stdout.trim()), ["check --write", "src/"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

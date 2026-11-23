@@ -14,9 +14,9 @@
  * server's own User-Agent.
  *
  * Bodies are LF-only, matching the site, and are built by joining line arrays
- * rather than with template literals: the pages contain `$` sequences and
- * (in the slice-2 fixtures to come) triple-backtick fences, which a template
- * literal would need escaping for -- and an escape silently changes a fixture.
+ * rather than with template literals: the pages contain `$` sequences and can
+ * contain triple-backtick fences, which a template literal would need escaping
+ * for -- and an escape silently changes a fixture.
  */
 
 /**

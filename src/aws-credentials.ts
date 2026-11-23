@@ -9,8 +9,13 @@
  * One deliberate exception: when we MATCH the target profile (see
  * upsertProfileIntoText), its header is normalized to the canonical
  * `[name]` form (e.g. `[ mcp-dev ]` -> `[mcp-dev]`). Only the matched
- * managed profile's header is rewritten this way; unrelated and non-managed
- * sections keep their headers verbatim.
+ * managed profile's header is rewritten this way (a leading BOM on it is
+ * kept); unrelated and non-managed sections keep their headers verbatim.
+ *
+ * Line endings: the output uses the file's own line ending, judged by its
+ * first line break (detectEol), so a CRLF file stays CRLF. A file that MIXES
+ * endings comes back uniformly in that first one -- unlike the config editor
+ * (planConfigUpserts), this one does not keep per-line terminators.
  *
  * We write to a .tmp file first and rename on top of the original so a
  * crash mid-write can't leave the user with a truncated credentials file.
@@ -34,7 +39,7 @@
  * into a critical section.
  */
 
-import { sectionName, splitSections, withLockedAtomicWrite } from "./ini-file.js";
+import { detectEol, sectionName, splitSections, withLockedAtomicWrite } from "./ini-file.js";
 
 // Moved to ini-file.ts (shared with the config-file writer) and re-exported so
 // existing importers keep working.
@@ -104,11 +109,18 @@ function mergeProfileBody(existingBody: string, creds: AssumedCredentials): stri
 }
 
 export function upsertProfileIntoText(text: string, profile: string, creds: AssumedCredentials): string {
+  // splitSections works in LF; remember the file's own line ending (judged by
+  // its first line break, as the config editor does) and re-emit it, so a
+  // Windows user's CRLF credentials file does not come back as LF.
+  const eol = detectEol(text);
   const sections = splitSections(text);
   const targetHeader = `[${profile}]`;
   const idx = sections.findIndex((s) => s.header === targetHeader || (s.header && sectionName(s.header) === profile));
   if (idx >= 0) {
-    sections[idx].header = targetHeader;
+    // A BOM-prefixed file's first header carries the U+FEFF; normalizing the
+    // header must not drop it.
+    const bom = sections[idx].header?.startsWith("﻿") ? "﻿" : "";
+    sections[idx].header = `${bom}${targetHeader}`;
     sections[idx].body = mergeProfileBody(sections[idx].body, creds);
   } else {
     // Ensure at least one blank line between the previous section and ours.
@@ -118,10 +130,11 @@ export function upsertProfileIntoText(text: string, profile: string, creds: Assu
     }
     sections.push({ header: targetHeader, body: buildProfileBody(creds) });
   }
-  return sections
+  const lf = sections
     .map((s) => (s.header === null ? s.body : `${s.header}\n${s.body}`))
     .join("")
     .replace(/\n*$/, "\n");
+  return eol === "\n" ? lf : lf.replace(/\n/g, eol);
 }
 
 /**
@@ -168,6 +181,11 @@ export async function upsertProfile(
       requirePrivate: true,
       privateHint:
         "Point AWS_SHARED_CREDENTIALS_FILE at a path on a native filesystem, or unset it to use ~/.aws/credentials.",
+      // A HOME that never had ~/.aws (credentials from env vars or an instance
+      // role), or AWS_SHARED_CREDENTIALS_FILE naming a not-yet-created
+      // directory: create it 0700 rather than failing with a raw ENOENT on
+      // the .lock sidecar after STS already issued the session.
+      ensureDir: true,
     },
   );
   return { existed };

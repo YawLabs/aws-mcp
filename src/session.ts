@@ -30,17 +30,21 @@ let sessionRegion: string | undefined;
 //
 // The profile char set matches what aws_assume_role's sessionName schema
 // accepts ([\w+=,.@-]) plus `:` for SSO profile names like
-// 'org-name:account:role'. First char rules out leading `-` so the value
-// can't pose as a CLI flag, and rules out the few INI-special chars
-// (`[`, `]`, `=`, whitespace, newlines) so a malformed name can't break
-// `~/.aws/credentials` parsing when assume.ts writes a section header.
+// 'org-name:account:role'. The char set as a whole excludes the INI-special
+// chars (`[`, `]`, whitespace, newlines) so a malformed name can't break
+// `~/.aws/credentials` parsing when assume.ts writes a section header. The
+// FIRST char additionally rules out `-` (so the value can't pose as a CLI
+// flag) and `=`; `=` is allowed after the first char -- inside a `[...]`
+// header it is harmless.
 // Length capped at 128 to match AWS's profile name limit.
 export const PROFILE_NAME_RE = /^[A-Za-z0-9_+,.@:][A-Za-z0-9_+=,.@:-]{0,127}$/;
 
-// AWS region IDs: lowercase letters, digits, hyphens, must start with a
-// letter, must contain at least one hyphen-separated segment. Matches
-// us-east-1, eu-west-3, ap-northeast-1, us-gov-east-1, cn-north-1,
-// me-central-1. Mirrors REGION_RE in tools/multi-region.ts.
+// Argv-safety filter for region IDs, NOT a region-shape check: lowercase
+// letters, digits and hyphens, starting with a letter, 3-31 chars. That is
+// enough to keep a value from posing as a flag or smuggling shell/control
+// characters; it does not require a hyphen, so `useast1` passes here and is
+// left for the CLI / STS to reject as an unknown region. Real IDs (us-east-1,
+// eu-west-3, ap-northeast-1, us-gov-east-1, cn-north-1, me-central-1) all match.
 export const REGION_NAME_RE = /^[a-z][a-z0-9-]{2,30}$/;
 
 export function isValidProfileName(name: string): boolean {
@@ -56,11 +60,13 @@ export function isValidRegionName(name: string): boolean {
  * sites need it -- setProfile below, the pre-mutation validation in
  * tools/session.ts, and runAwsCall's post-resolution check in aws-cli.ts --
  * and they carried three hand-maintained near-copies that had already drifted
- * apart. `tail` is the call-site-specific hint appended after the shared rule
- * statement; omit it for the bare form.
+ * apart (aws_assume_role's sourceProfile / targetProfile checks use it too).
+ * `tail` is the call-site-specific hint appended after the shared rule
+ * statement; omit it for the bare form. `field` names the argument when it is
+ * not plain `profile` (e.g. "sourceProfile").
  */
-export function invalidProfileMessage(name: string, tail?: string): string {
-  const base = `Invalid profile name '${name}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`;
+export function invalidProfileMessage(name: string, tail?: string, field = "profile"): string {
+  const base = `Invalid ${field} name '${name}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='); no whitespace or shell metacharacters.`;
   return tail ? `${base} ${tail}` : base;
 }
 

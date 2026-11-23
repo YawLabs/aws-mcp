@@ -39,6 +39,7 @@ import {
   REAL_CLI_SLOW,
   startLoopbackStub,
 } from "../testing/real-cli.js";
+import { modeHonouringTmpBase } from "../testing/tmpdir-modes.js";
 import { lambdaTools } from "./lambda.js";
 
 const tool = lambdaTools.find((t) => t.name === "aws_lambda_invoke");
@@ -56,7 +57,10 @@ if (!tool) throw new Error("lambdaTools missing aws_lambda_invoke");
 // makes both the handler's dirs and the scan process-local. Set before
 // isolateAwsEnv: its snapshot then carries these three and restore() puts them
 // back (it scrubs only AWS_*, PYTHON* and the proxy names).
-const TMP_ROOT = mkdtempSync(join(tmpdir(), "aws-mcp-lambdatests-realcli-"));
+// The base honours modes (modeHonouringTmpBase), because lambda.ts refuses to
+// use a temp file it cannot verify 0600 -- a TMPDIR on a Windows drive under WSL
+// would otherwise fail every case here as spawn_failure.
+const TMP_ROOT = mkdtempSync(join(modeHonouringTmpBase() ?? tmpdir(), "aws-mcp-lambdatests-realcli-"));
 const TMP_SNAPSHOT = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
 process.env.TEMP = TMP_ROOT;
 process.env.TMP = TMP_ROOT;

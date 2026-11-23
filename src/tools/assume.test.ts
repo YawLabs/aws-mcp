@@ -27,21 +27,32 @@ let prevHome: string | undefined;
 let prevUserprofile: string | undefined;
 let fakeHome: string;
 
+// Ambient variables that would steer the handler away from the fake HOME:
+// AWS_SHARED_CREDENTIALS_FILE takes precedence over HOME, so leaving it set
+// wrote these tests' fake mcp-* sections into the developer's REAL credentials
+// file; AWS_PROFILE / AWS_DEFAULT_PROFILE pick the default sourceProfile; and
+// AWS_CONFIG_FILE is cleared for the same hermeticity (mirrors profiles.test.ts).
+const AMBIENT_VARS = ["AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"] as const;
+const prevAmbient = new Map<string, string | undefined>();
+
 before(() => {
   prevCommand = process.env.AWS_MCP_TEST_AWS_COMMAND;
   prevPrefixArgs = process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
   prevHome = process.env.HOME;
   prevUserprofile = process.env.USERPROFILE;
+  for (const k of AMBIENT_VARS) {
+    prevAmbient.set(k, process.env[k]);
+    delete process.env[k];
+  }
   process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
   process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
   // Redirect homedir() so upsertProfile writes into a throwaway tempdir
   // instead of the real ~/.aws/credentials. os.homedir() honors $HOME on
   // Unix and $USERPROFILE on Windows; setting both keeps the test portable.
+  // No .aws inside it: a HOME that never had one is a real install shape
+  // (credentials from env vars or an instance role), and the first write
+  // below exercises upsertProfile creating it.
   fakeHome = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-assume-test-"));
-  // upsertProfile expects the parent .aws directory to already exist (it
-  // writes a sibling .tmp- file). Real installs always have it; tests get
-  // a fresh tmpdir so we create the dir explicitly.
-  mkdirSync(join(fakeHome, ".aws"), { recursive: true });
   process.env.HOME = fakeHome;
   process.env.USERPROFILE = fakeHome;
 });
@@ -54,6 +65,10 @@ after(() => {
   else process.env.HOME = prevHome;
   if (prevUserprofile === undefined) delete process.env.USERPROFILE;
   else process.env.USERPROFILE = prevUserprofile;
+  for (const [k, v] of prevAmbient) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
   try {
     rmSync(fakeHome, { recursive: true, force: true });
   } catch {
@@ -179,20 +194,6 @@ describe("aws_assume_role schema", () => {
     });
     assert.equal(r.success, true);
   });
-
-  // C5: sessionName fallback no-double-prefix guard
-  it("sessionName='mcp-session' produces profile 'mcp-session', not 'mcp-mcp-session'", () => {
-    // resolveTargetProfile must not double-prefix when the sessionName already
-    // starts with 'mcp-'. The schema accepts mcp-session (valid chars); the
-    // profile returned must be exactly 'mcp-session'.
-    const r = tool.inputSchema.safeParse({
-      roleArn: "arn:aws:iam::123456789012:role/Admin",
-      sessionName: "mcp-session",
-    });
-    assert.equal(r.success, true, "schema should accept mcp-session as sessionName");
-    // The profile name is only visible in the handler response, but we can
-    // confirm the guard logic by checking the handler output directly.
-  });
 });
 
 describe("aws_assume_role handler (fake-aws integration)", () => {
@@ -314,7 +315,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // to refresh, so the sso_expired / expired_creds remedies are both wrong
     // advice here -- and the generic fallback says "profile 'x'", never
     // "source profile 'x'", which is the whole reason these arms exist.
-    process.env.AWS_MCP_FAKE_SCENARIO = "res2_invalid_creds_stderr";
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_invalid_creds";
     const r = await tool.handler({
       roleArn: "arn:aws:iam::123456789012:role/A",
       sessionName: "sess",
@@ -341,8 +342,8 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // caller that wants to branch on the failure class has nothing else to read.
     for (const [scenario, kind] of [
       ["call_sso_expired", "sso_expired"],
-      ["awscli_expired_token", "expired_creds"],
-      ["res2_invalid_creds_stderr", "invalid_creds"],
+      ["call_expired_token", "expired_creds"],
+      ["assume_role_invalid_creds", "invalid_creds"],
     ] as const) {
       process.env.AWS_MCP_FAKE_SCENARIO = scenario;
       const r = (await tool.handler({
@@ -449,12 +450,9 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // runAwsCall). The assume_role_echo_args fake writes the full argv to
     // AWS_MCP_FAKE_ARGV_OUT (side channel, since the handler discards
     // everything except Credentials/AssumedRoleUser) then emits a normal
-    // success payload. Modeled on iam-simulate.test.ts's iam_sim_echo_argv
+    // success payload. Modeled on iam-simulate.test.ts's iam_simulate_echo_argv
     // consumption: parse --cli-input-json, assert the PascalCase params reached
     // the CLI, and assert --profile carries the source profile.
-    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
     const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-assume-argv-out-"));
     const argvOutPath = join(sideChannelDir, "argv.json");
     process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
@@ -539,7 +537,7 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     assert.ok(elapsed < 4000, `expected fast timeout, got ${elapsed}ms`);
   });
 
-  it("returns a friendly ToolResult when ~/.aws is not writable (EACCES; skipped on Windows)", async () => {
+  it("returns a friendly ToolResult when ~/.aws is not writable (EACCES; skipped on Windows)", async (t) => {
     // STS returns valid creds; the failure is purely on the local write path.
     // The handler must catch the EACCES that propagates out of upsertProfile
     // and surface the friendly 'Cannot write ... permission denied' message
@@ -551,6 +549,13 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
     // only be simulated portably on Unix. The friendly-error mapping itself
     // is platform-agnostic and exercised by the production path on either OS.
     if (platform() === "win32") return;
+    // Also skipped as root (a default-root WSL distro, a container): uid 0
+    // ignores the chmod 000, the write succeeds, and the case would fail for
+    // a reason unrelated to the product.
+    if (process.getuid?.() === 0) {
+      t.skip("running as root: chmod 000 does not deny uid 0, so EACCES cannot be produced");
+      return;
+    }
 
     // Use an isolated HOME so the chmod cannot leak to other tests in this
     // file (the shared `fakeHome` in the before() block stays untouched).
@@ -595,17 +600,58 @@ describe("aws_assume_role handler (fake-aws integration)", () => {
 
 describe("aws_assume_role — credentials file location and overwrite warning", () => {
   let scratchDir: string;
-  let savedSharedFile: string | undefined;
 
   beforeEach(() => {
     scratchDir = mkdtempSync(join(PRIVATE_TMP_BASE, "aws-mcp-assume-shared-"));
-    savedSharedFile = process.env.AWS_SHARED_CREDENTIALS_FILE;
   });
 
   afterEach(() => {
-    if (savedSharedFile === undefined) delete process.env.AWS_SHARED_CREDENTIALS_FILE;
-    else process.env.AWS_SHARED_CREDENTIALS_FILE = savedSharedFile;
+    // The file-level before() already removed any ambient value (and after()
+    // restores it), so the state every case here starts from is UNSET --
+    // put it back to that, never to the developer's real path, or the suites
+    // that follow would write into it.
+    delete process.env.AWS_SHARED_CREDENTIALS_FILE;
     rmSync(scratchDir, { recursive: true, force: true });
+  });
+
+  it("creates a missing credentials directory instead of failing with a raw ENOENT after STS succeeded", async () => {
+    // A brand-new directory chain, as on a HOME that never had ~/.aws or an
+    // AWS_SHARED_CREDENTIALS_FILE naming a directory not created yet.
+    const target = join(scratchDir, "not", "yet", "credentials");
+    process.env.AWS_SHARED_CREDENTIALS_FILE = target;
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+
+    const r = await tool.handler({
+      roleArn: "arn:aws:iam::123456789012:role/Admin",
+      sessionName: "fresh-dir",
+    } as never);
+
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.match(readFileSync(target, "utf-8"), /\[mcp-fresh-dir\]/);
+  });
+
+  it("refuses a set-but-empty AWS_SHARED_CREDENTIALS_FILE BEFORE calling STS", async () => {
+    // Found after the call, the error was the same but a real session had
+    // been minted (CloudTrail, maybe an MFA / SAML prompt) and thrown away.
+    // The one progress report is emitted immediately before the STS call, so
+    // zero reports means STS was never reached.
+    process.env.AWS_SHARED_CREDENTIALS_FILE = "";
+    const argvOut = join(scratchDir, "argv.json");
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOut;
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_echo_args";
+    const reports: string[] = [];
+    try {
+      const r = await tool.handler(
+        { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "empty-file" },
+        { reportProgress: (_p, _t, m) => reports.push(m ?? "") },
+      );
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /AWS_SHARED_CREDENTIALS_FILE is set to an empty value/);
+      assert.deepEqual(reports, [], "no sts:AssumeRole may be announced");
+      assert.equal(existsSync(argvOut), false, "the fake aws CLI must never have run");
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+    }
   });
 
   it("writes to AWS_SHARED_CREDENTIALS_FILE when it is set, not to ~/.aws/credentials", async () => {
@@ -790,5 +836,24 @@ describe("aws_assume_role -- progress reporting", () => {
     assert.deepEqual(strip(reported), strip(bare), "the envelope must not depend on whether progress was reported");
     assert.equal((reported.data as { profile: string }).profile, "mcp-noop-a");
     assert.equal((bare.data as { profile: string }).profile, "mcp-noop-b");
+  });
+});
+
+describe("aws_assume_role -- cancellation", () => {
+  it("an already-cancelled request spawns no STS call and writes no profile", async () => {
+    // assume_role_success would answer ok:true and write [mcp-cancel-a], so
+    // either a spawn or a write fails this test.
+    process.env.AWS_MCP_FAKE_SCENARIO = "assume_role_success";
+    const ac = new AbortController();
+    ac.abort();
+    const r = await tool.handler(
+      { roleArn: "arn:aws:iam::123456789012:role/Admin", sessionName: "cancel-a" },
+      { reportProgress: () => {}, signal: ac.signal },
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.errorKind, "cancelled");
+    const credsPath = join(fakeHome, ".aws", "credentials");
+    const written = existsSync(credsPath) ? readFileSync(credsPath, "utf8") : "";
+    assert.ok(!written.includes("[mcp-cancel-a]"), "a cancelled assume must not write a profile");
   });
 });

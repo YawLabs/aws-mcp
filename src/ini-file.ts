@@ -25,6 +25,7 @@ import {
   closeSync,
   existsSync,
   fchmodSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -401,12 +402,86 @@ const LOCK_MAX_RETRY_MS = 250;
  * LOCK_MAX_WAIT_MS, so a read-only ~/.aws still fails fast with its real error.
  */
 const LOCK_WIN_DENIED_GRACE_MS = 1_000;
+/**
+ * How long an UNBROKEN run of failures to move a STALE lock aside is retried
+ * (with awaited backoff) before it is reported. Windows can refuse the rename
+ * for a moment while another waiter's stat handle is open on the file; a
+ * stale lock in a directory we cannot modify (read-only, sticky, a directory
+ * squatting on the lock name) never clears, and must fail in about a second,
+ * not after the full LOCK_MAX_WAIT_MS.
+ */
+const LOCK_STEAL_GRACE_MS = 1_000;
 
-/** Test seam for acquireLock: the platform and the exclusive lock-file create. */
+/** Test seam for acquireLock: the platform, the exclusive lock-file create,
+ *  and the rename that moves a stale lock aside. */
 export interface LockSeam {
   platform?: NodeJS.Platform;
   /** Stands in for `openSync(path, "wx")`; must return a real fd on success. */
   openExclusive?: (path: string) => number;
+  /** Stands in for `renameSync(from, to)` when stealing a stale lock. */
+  renameStale?: (from: string, to: string) => void;
+}
+
+type StealOutcome = "stolen" | "gone" | "live" | { error: unknown };
+
+/**
+ * Remove a lock judged stale, without ever removing a LIVE lock that replaced
+ * it after the judgement.
+ *
+ * Unlinking by path cannot do that: between our stat and our unlink, a faster
+ * waiter can steal the same stale lock and create a fresh one, and an unlink
+ * by path then deletes THAT -- two writers inside the critical section. So the
+ * lock is first RENAMED to a name only we know. A rename moves exactly one
+ * file and only one renamer can move it, so whatever lands at `aside` is ours
+ * alone to inspect. If it is still stale it was the orphan, and is deleted. If
+ * it is fresh, we grabbed a live lock by mistake: it is put back with a hard
+ * link, which (unlike a rename) never overwrites a lock someone created in the
+ * meantime.
+ */
+function stealStaleLock(lockPath: string, rename: (from: string, to: string) => void): StealOutcome {
+  const aside = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    rename(lockPath, aside);
+  } catch (err) {
+    // ENOENT: another waiter already moved it; just race the create again.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "gone";
+    return { error: err };
+  }
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(aside).mtimeMs;
+  } catch {
+    return "gone";
+  }
+  if (Date.now() - mtimeMs > LOCK_STALE_AFTER_MS) {
+    try {
+      unlinkSync(aside);
+    } catch {
+      // best-effort: the lock path itself is already clear
+    }
+    return "stolen";
+  }
+  // A live lock: give it back. linkSync fails with EEXIST rather than replace
+  // a lock a third writer took in the instant the path was empty; a filesystem
+  // without hard links falls back to a rename, guarded by an existence check.
+  try {
+    linkSync(aside, lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST" && !existsSync(lockPath)) {
+      try {
+        renameSync(aside, lockPath);
+        return "live";
+      } catch {
+        // fall through to the cleanup below
+      }
+    }
+  }
+  try {
+    unlinkSync(aside);
+  } catch {
+    // best-effort
+  }
+  return "live";
 }
 
 /**
@@ -416,14 +491,24 @@ export interface LockSeam {
  * retries.
  *
  * Stale-lock recovery: if the existing lock is older than
- * `LOCK_STALE_AFTER_MS`, the prior holder is presumed dead and we force-
- * unlink. The stat-then-unlink window is racy in the worst case: two
- * processes both stat the same stale lock and both unlink it (the second
- * unlink hits an already-gone file and swallows ENOENT). NEITHER claims the
- * lock on that iteration -- both just set shouldRetryImmediately and loop.
- * On the next iteration both race a fresh O_EXCL openSync, so one wins and
- * the other falls back to EEXIST. Recovery is clean, just one iteration
- * later than the wording above might suggest.
+ * `LOCK_STALE_AFTER_MS`, the prior holder is presumed dead and the lock is
+ * stolen via stealStaleLock (rename aside, verify, delete). Two waiters that
+ * both judge the same orphan stale cannot both remove it -- only one rename
+ * moves it -- and a waiter whose judgement went out of date (a faster waiter
+ * already replaced the orphan with a live lock) puts the live lock back
+ * instead of deleting it. NEITHER waiter claims the lock in the steal itself;
+ * both loop and race a fresh O_EXCL create, so exactly one wins.
+ *
+ * What remains: putting a mistakenly-moved live lock back is not atomic with
+ * the move, so a THIRD writer that creates the lock in that microsecond gap
+ * shares the critical section with the live holder. That needs an orphaned
+ * lock plus three simultaneous writers; it is not otherwise reachable. A
+ * holder that is alive but slower than LOCK_STALE_AFTER_MS is treated as dead
+ * by design.
+ *
+ * Every wait is awaited, so a lock that cannot be taken never blocks the
+ * event loop; a stale lock that cannot be moved aside is reported after
+ * LOCK_STEAL_GRACE_MS instead of spinning out the full LOCK_MAX_WAIT_MS.
  *
  * Limitation: a process killed (SIGKILL, power loss) leaves a lock that
  * blocks new writers for up to `LOCK_STALE_AFTER_MS` before recovery kicks
@@ -433,11 +518,14 @@ export interface LockSeam {
 async function acquireLock(lockPath: string, seam: LockSeam = {}): Promise<void> {
   const platform = seam.platform ?? process.platform;
   const openExclusive = seam.openExclusive ?? ((p: string) => openSync(p, "wx"));
+  const renameStale = seam.renameStale ?? renameSync;
   const start = Date.now();
   let attempt = 0;
   // Start of the current unbroken run of Windows EPERM/EACCES on the lock
   // create (see the catch below); null when the last attempt was not one.
   let deniedSince: number | null = null;
+  // Start of the current unbroken run of failures to move a stale lock aside.
+  let stealFailedSince: number | null = null;
   while (true) {
     // Timeout check at the top of the loop so EVERY iteration -- including
     // the stale-recovery and stat-failed `continue` paths below -- is bounded
@@ -445,7 +533,7 @@ async function acquireLock(lockPath: string, seam: LockSeam = {}): Promise<void>
     // the lock between our openSync and statSync could starve us forever.
     if (Date.now() - start > LOCK_MAX_WAIT_MS) {
       throw new Error(
-        `upsertProfile: failed to acquire lock at ${lockPath} after ${LOCK_MAX_WAIT_MS}ms. If a previous writer crashed, remove the lock file manually.`,
+        `Timed out: failed to acquire lock at ${lockPath} after ${LOCK_MAX_WAIT_MS}ms. If a previous writer crashed, remove the lock file manually.`,
       );
     }
     // Phase 1: try to atomically claim the lock file. The catch only fires
@@ -510,24 +598,44 @@ async function acquireLock(lockPath: string, seam: LockSeam = {}): Promise<void>
         throw err;
       }
     }
-    let shouldRetryImmediately = false;
+    let lockMtimeMs: number;
     try {
-      const st = statSync(lockPath);
-      if (Date.now() - st.mtimeMs > LOCK_STALE_AFTER_MS) {
-        try {
-          unlinkSync(lockPath);
-        } catch {
-          // Someone else already unlinked this stale lock (swallowed ENOENT).
-          // We don't claim it here -- just loop and race openSync fresh.
-        }
-        shouldRetryImmediately = true;
-      }
+      lockMtimeMs = statSync(lockPath).mtimeMs;
     } catch {
       // Lock removed under us between EEXIST and statSync; loop and race
       // openSync fresh (we don't claim it on this iteration).
-      shouldRetryImmediately = true;
+      continue;
     }
-    if (shouldRetryImmediately) continue;
+    if (Date.now() - lockMtimeMs > LOCK_STALE_AFTER_MS) {
+      const outcome = stealStaleLock(lockPath, renameStale);
+      if (outcome === "stolen" || outcome === "gone") {
+        // The path is clear (or was cleared by another waiter): race the
+        // O_EXCL create again at once. We don't claim the lock here.
+        stealFailedSince = null;
+        continue;
+      }
+      if (typeof outcome === "object") {
+        // Could not move the stale lock aside. Never loop on this without
+        // awaiting: that spin held the event loop for the whole
+        // LOCK_MAX_WAIT_MS. Back off below, and once the failure has lasted
+        // LOCK_STEAL_GRACE_MS report it -- it is the real problem, and no
+        // amount of waiting fixes a lock we are not allowed to remove.
+        stealFailedSince ??= Date.now();
+        if (Date.now() - stealFailedSince > LOCK_STEAL_GRACE_MS) {
+          const e = outcome.error;
+          const why = e instanceof Error ? e.message : String(e);
+          throw new Error(
+            `The lock at ${lockPath} is stale (older than ${LOCK_STALE_AFTER_MS / 1000}s) but could not be removed (${why}). Remove the lock file manually.`,
+            { cause: e },
+          );
+        }
+      } else {
+        // "live": someone else holds a fresh lock; wait for it like any other.
+        stealFailedSince = null;
+      }
+    } else {
+      stealFailedSince = null;
+    }
     const cappedAttempt = Math.min(attempt, 8);
     const baseDelay = Math.min(LOCK_BASE_RETRY_MS * (1 + cappedAttempt), LOCK_MAX_RETRY_MS);
     await delay(baseDelay + Math.random() * baseDelay);
@@ -573,7 +681,7 @@ function writeAllSync(fd: number, text: string): void {
     const n = writeSync(fd, buf, written, buf.byteLength - written);
     if (n <= 0) {
       throw new Error(
-        `upsertProfile: write stalled after ${written} of ${buf.byteLength} bytes; refusing to rename a truncated credentials file.`,
+        `Write stalled after ${written} of ${buf.byteLength} bytes; refusing to rename a truncated file over the original.`,
       );
     }
     written += n;

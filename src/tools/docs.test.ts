@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { beforeEach, describe, it, mock } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import {
   CLI_S3API_INDEX_HTML,
   JSV3_SHELL_HTML,
@@ -12,16 +12,20 @@ import {
   buildDocsTools,
   classifyFinalDocsUrl,
   DOC_CACHE_MAX_ENTRIES,
+  DOC_CACHE_TTL_MS,
   describeFetchFailure,
   detectUnrenderablePage,
+  docCacheKey,
   docsTools,
   docTerms,
   extractMainContent,
+  FETCH_TIMEOUT_MS,
   type FetchEnvFacts,
   htmlToMarkdown,
   isValidDocsUrl,
   LOW_RELEVANCE_OVERLAP,
   makeDocCache,
+  noProxyCovers,
   paginateContent,
   parseSearchResults,
   queryTerms,
@@ -54,8 +58,25 @@ function fakeResponse(opts: {
   textThrows?: boolean;
   url?: string;
   bodyChunks?: Array<string | Uint8Array>;
+  /**
+   * With bodyChunks: once the chunks are used up, read() never settles (a
+   * server that sent headers and some body, then went quiet) and this is
+   * called as the stalled read begins.
+   */
+  onStall?: () => void;
+  /** json() never settles; this is called as it begins. */
+  onJsonStall?: () => void;
+  /**
+   * Called when the body is cancelled, through the stream or its reader. Set
+   * without bodyChunks, it gives the response a cancel-only body, so the text()
+   * path is still the one a read takes.
+   */
+  onCancel?: () => void;
 }): Response {
   const contentType = opts.contentType ?? "text/html; charset=utf-8";
+  const cancel = async () => {
+    opts.onCancel?.();
+  };
   return {
     ok: opts.ok ?? true,
     status: opts.status ?? 200,
@@ -68,22 +89,31 @@ function fakeResponse(opts: {
     ...(opts.bodyChunks !== undefined
       ? {
           body: {
+            cancel,
             getReader: () => {
               const encoder = new TextEncoder();
               const chunks = opts.bodyChunks as Array<string | Uint8Array>;
               let n = 0;
               return {
                 read: async () => {
-                  if (n >= chunks.length) return { done: true, value: undefined };
+                  if (n >= chunks.length) {
+                    if (opts.onStall) {
+                      opts.onStall();
+                      return new Promise<never>(() => {});
+                    }
+                    return { done: true, value: undefined };
+                  }
                   const chunk = chunks[n++];
                   return { done: false, value: typeof chunk === "string" ? encoder.encode(chunk) : chunk };
                 },
-                cancel: async () => {},
+                cancel,
               };
             },
           },
         }
-      : {}),
+      : opts.onCancel !== undefined
+        ? { body: { cancel } }
+        : {}),
     headers: {
       get: (name: string) => {
         const key = name.toLowerCase();
@@ -93,6 +123,10 @@ function fakeResponse(opts: {
       },
     },
     json: async () => {
+      if (opts.onJsonStall) {
+        opts.onJsonStall();
+        return new Promise<never>(() => {});
+      }
       if (opts.json === undefined) throw new Error("no json body");
       return opts.json;
     },
@@ -103,20 +137,31 @@ function fakeResponse(opts: {
   } as unknown as Response;
 }
 
-/** A fetch impl that aborts -- mimics AbortController firing the timeout. */
-const abortingFetch = (async (_url: string, init: RequestInit) => {
-  if (init.signal?.aborted) {
-    const e = new Error("This operation was aborted");
-    e.name = "AbortError";
-    throw e;
-  }
-  // Simulate the timeout firing: the AbortController in fetchWithTimeout
-  // calls abort() after FETCH_TIMEOUT_MS; reproduce that synchronously by
-  // throwing an AbortError-named error.
-  const e = new Error("This operation was aborted");
-  e.name = "AbortError";
-  throw e;
+/**
+ * A fetch impl that rejects with an AbortError at once. It proves only the
+ * handlers' timed-out wording; the real timer wiring is driven through
+ * `hangingFetch` under mock timers in the "fetch timeout" block.
+ */
+const abortingFetch = (async () => {
+  throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
 }) as unknown as typeof fetch;
+
+/**
+ * A fetch impl that never answers on its own: it settles only when the signal
+ * it was handed aborts, rejecting with that signal's own reason -- what Node's
+ * fetch does. `seen` receives the signal so a case can inspect it.
+ */
+function hangingFetch(seen?: (signal: AbortSignal) => void): typeof fetch {
+  return ((_url: string, init: RequestInit) =>
+    new Promise((_resolve, reject) => {
+      const signal = init.signal as AbortSignal;
+      seen?.(signal);
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    })) as unknown as typeof fetch;
+}
+
+/** Resolve on the next macrotask, so pending handler microtasks run first. */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("parseSearchResults", () => {
   it("flattens textExcerptSuggestion entries", () => {
@@ -211,6 +256,14 @@ describe("isValidDocsUrl", () => {
     assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/asset.pdf"), false);
   });
 
+  it("rejects a non-.html path whose query or fragment ends in .html", () => {
+    // The path class used to span `?` and `#`, so the suffix could live outside
+    // the path: a PDF, an asset, and a directory all passed.
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/pdfs/lambda/latest/dg/lambda-dg.pdf#x.html"), false);
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/asset.pdf?x=.html"), false);
+    assert.equal(isValidDocsUrl("https://docs.aws.amazon.com/lambda/latest/dg/?a.html"), false);
+  });
+
   it("rejects http (non-TLS)", () => {
     assert.equal(isValidDocsUrl("http://docs.aws.amazon.com/x.html"), false);
   });
@@ -276,8 +329,9 @@ describe("classifyFinalDocsUrl", () => {
 
   it("lets a directory request land on any docs directory", () => {
     // A directory was never a claim about a particular page, so a directory
-    // landing cannot be "that page does not exist". (Directory input arrives in
-    // 2.4.0; the classifier is written for it now so it cannot mis-report then.)
+    // landing cannot be "that page does not exist". (aws_docs_read accepts only
+    // .html input, so this arm is forward-looking: it keeps the classifier
+    // correct should directory input ever be accepted.)
     assert.equal(classifyFinalDocsUrl(`${D}/lambda/latest/dg/`, `${D}/lambda/latest/dg/`), "page");
     assert.equal(classifyFinalDocsUrl(`${D}/a/`, `${D}/b/`), "page");
   });
@@ -559,6 +613,55 @@ describe("describeFetchFailure", () => {
     assert.doesNotMatch(s, /NODE_USE_ENV_PROXY/);
   });
 
+  it("points at a used proxy on a causeless failure without convicting it", () => {
+    // A timeout behind a HEALTHY proxy (a slow upstream) looks exactly like
+    // this, so the remedy may say where to look first but not that the proxy
+    // is what failed.
+    const s = describeFetchFailure(aborted(), {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: true,
+      oamVersion: null,
+    });
+    assert.match(s, /check that proxy first/);
+    assert.match(s, /through to docs\.aws\.amazon\.com/);
+    assert.doesNotMatch(s, /it is that proxy, not/);
+  });
+
+  it("names the host the request was for", () => {
+    const s = describeFetchFailure(
+      fetchFailed("connect ECONNREFUSED 127.0.0.1:3128", "ECONNREFUSED"),
+      { proxyUrl: "http://127.0.0.1:3128", envProxyEnabled: true, oamVersion: null },
+      "proxy.search.docs.aws.com",
+    );
+    assert.match(s, /that proxy, not proxy\.search\.docs\.aws\.com, that did not answer/);
+  });
+
+  it("gives no proxy remedy for a host NO_PROXY exempts", () => {
+    // That request went direct whatever HTTPS_PROXY says, so neither "Node
+    // ignored your proxy" nor "your proxy did not answer" is what happened.
+    for (const envProxyEnabled of [false, true]) {
+      const s = describeFetchFailure(fetchFailed("connect ECONNREFUSED 10.1.2.3:443", "ECONNREFUSED"), {
+        proxyUrl: "http://proxy.corp.example:3128",
+        envProxyEnabled,
+        oamVersion: null,
+        noProxy: "localhost,.amazon.com",
+      });
+      assert.equal(
+        s,
+        " Underlying failure: connect ECONNREFUSED 10.1.2.3:443 (ECONNREFUSED).",
+        String(envProxyEnabled),
+      );
+    }
+    // ...and a NO_PROXY that covers some other host changes nothing.
+    const other = describeFetchFailure(aborted(), {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: false,
+      oamVersion: null,
+      noProxy: "internal.corp.example",
+    });
+    assert.match(other, /NODE_USE_ENV_PROXY=1/);
+  });
+
   it("redacts credentials out of the proxy URL and the cause message", () => {
     const s = describeFetchFailure(
       fetchFailed("connect ECONNREFUSED http://bob:hunter2@proxy.corp.example:3128", "ECONNREFUSED"),
@@ -622,6 +725,23 @@ describe("describeFetchFailure", () => {
   });
 });
 
+describe("noProxyCovers", () => {
+  it("matches the host and its subdomains, with or without a leading dot or *.", () => {
+    for (const list of ["docs.aws.amazon.com", ".amazon.com", "*.amazon.com", "amazon.com", "AMAZON.COM:443"]) {
+      assert.equal(noProxyCovers(list, "docs.aws.amazon.com"), true, list);
+    }
+    assert.equal(noProxyCovers("*", "docs.aws.amazon.com"), true);
+    assert.equal(noProxyCovers("localhost, 127.0.0.1 .aws.amazon.com", "docs.aws.amazon.com"), true);
+  });
+
+  it("does not match a different host that merely shares a suffix", () => {
+    assert.equal(noProxyCovers("zon.com", "docs.aws.amazon.com"), false);
+    assert.equal(noProxyCovers("docs.aws.amazon.com", "proxy.search.docs.aws.com"), false);
+    assert.equal(noProxyCovers("", "docs.aws.amazon.com"), false);
+    assert.equal(noProxyCovers(null, "docs.aws.amazon.com"), false);
+  });
+});
+
 describe("readFetchEnvFacts", () => {
   // The names and precedence the remedies above are built on. Every case passes a
   // plain object, so nothing here touches process.env -- this is one long-lived
@@ -651,6 +771,32 @@ describe("readFetchEnvFacts", () => {
     // "1" exactly, which is what Node itself accepts.
     assert.equal(readFetchEnvFacts({ NODE_USE_ENV_PROXY: "0" }, {}).envProxyEnabled, false);
     assert.equal(readFetchEnvFacts({}, {}).envProxyEnabled, false);
+  });
+
+  it("treats an empty proxy variable as unset, so it cannot shadow a real one", () => {
+    // `HTTPS_PROXY=` is the usual way to switch a proxy off; with `??` it
+    // counted as a configured proxy (earning advice to enable a proxy that does
+    // not exist) and hid a real lower-case https_proxy.
+    assert.equal(readFetchEnvFacts({ HTTPS_PROXY: "" }, {}, []).proxyUrl, null);
+    assert.equal(readFetchEnvFacts({ HTTPS_PROXY: "  " }, {}, []).proxyUrl, null);
+    assert.equal(
+      readFetchEnvFacts({ HTTPS_PROXY: "", https_proxy: "http://real:3128" }, {}, []).proxyUrl,
+      "http://real:3128",
+    );
+  });
+
+  it("reads the --use-env-proxy flag when it is a plain node argument", () => {
+    // `"args": ["--use-env-proxy", "dist/index.js"]` in an MCP config puts the
+    // flag in execArgv, where NODE_OPTIONS never sees it.
+    assert.equal(readFetchEnvFacts({}, {}, ["--use-env-proxy"]).envProxyEnabled, true);
+    assert.equal(readFetchEnvFacts({}, {}, ["--use-env-proxy-something"]).envProxyEnabled, false);
+    assert.equal(readFetchEnvFacts({}, {}, []).envProxyEnabled, false);
+  });
+
+  it("reads NO_PROXY / no_proxy, empty as unset", () => {
+    assert.equal(readFetchEnvFacts({ NO_PROXY: ".amazon.com" }, {}, []).noProxy, ".amazon.com");
+    assert.equal(readFetchEnvFacts({ NO_PROXY: "", no_proxy: "localhost" }, {}, []).noProxy, "localhost");
+    assert.equal(readFetchEnvFacts({}, {}, []).noProxy, null);
   });
 
   it("treats the oam runtime as the opt-in, with no variable set at all", () => {
@@ -712,6 +858,25 @@ describe("htmlToMarkdown", () => {
     const html = `<html><body><main><a href="/diagram.html"><img src="/arch.png" alt="architecture"></a></main></body></html>`;
     const md = htmlToMarkdown(html);
     assert.match(md, /diagram\.html/);
+  });
+
+  it("absolutizes relative links against the page URL, so each one is readable", () => {
+    // The site writes its links relative, and aws_docs_read refuses a relative
+    // target as an invalid url.
+    const base = "https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html";
+    const html =
+      '<html><body><main><p><a href="create-bucket-overview.md">md twin</a> <a href="../API/Welcome.html#x">api</a> ' +
+      '<a href="#limits">here</a> <a href="mailto:aws@example.com">mail</a></p></main></body></html>';
+    const md = htmlToMarkdown(html, base);
+    assert.match(
+      md,
+      /\[md twin\]\(https:\/\/docs\.aws\.amazon\.com\/AmazonS3\/latest\/userguide\/create-bucket-overview\.html\)/,
+    );
+    assert.match(md, /\[api\]\(https:\/\/docs\.aws\.amazon\.com\/AmazonS3\/latest\/API\/Welcome\.html#x\)/);
+    assert.match(md, /\[here\]\(#limits\)/, "a fragment-only link stays in-page");
+    assert.match(md, /\[mail\]\(mailto:aws@example\.com\)/);
+    // Without a base nothing is rewritten.
+    assert.match(htmlToMarkdown(html), /\]\(create-bucket-overview\.md\)/);
   });
 });
 
@@ -784,6 +949,51 @@ describe("aws_docs_search handler", () => {
     const r = await search.handler({ query: "x" });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /503/);
+  });
+
+  it("releases the body of an HTTP error it does not read", async () => {
+    let cancelled = 0;
+    const fetchImpl = (async () =>
+      fakeResponse({
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
+        onCancel: () => cancelled++,
+      })) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl);
+    assert.equal((await search.handler({ query: "x" })).ok, false);
+    assert.equal(cancelled, 1);
+  });
+
+  it("names the search host, not docs.aws.amazon.com, in the proxy remedy", async () => {
+    // A firewall can allow one and block the other, so naming the wrong host
+    // sends whoever is debugging to the wrong rule.
+    const fetchImpl = (async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443"), { code: "ECONNREFUSED" }),
+      });
+    }) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl, {
+      proxyUrl: "http://proxy.corp.example:3128",
+      envProxyEnabled: false,
+      oamVersion: null,
+    });
+    const r = await search.handler({ query: "x" });
+    assert.match(r.error ?? "", /tried to reach proxy\.search\.docs\.aws\.com directly/);
+    assert.doesNotMatch(r.error ?? "", /reach docs\.aws\.amazon\.com/);
+  });
+
+  it("always carries termsMatchedNowhere, even for a query with no comparable terms", async () => {
+    // The key used to vanish for a punctuation-only query alone -- a shape
+    // difference no caller was told about.
+    const fetchImpl = (async () =>
+      fakeResponse({
+        json: { suggestions: [{ textExcerptSuggestion: { link: "https://docs.aws.amazon.com/x.html", title: "t" } }] },
+      })) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl);
+    const r = await search.handler({ query: "???" });
+    assert.equal(r.ok, true);
+    assert.deepEqual((r.data as { termsMatchedNowhere: unknown }).termsMatchedNowhere, []);
   });
 
   it("surfaces the CAUSE of a network failure, and stops blaming the backend for it", async () => {
@@ -1032,6 +1242,74 @@ describe("aws_docs_read handler", () => {
     }
   });
 
+  it("returns links a caller can pass straight back to aws_docs_read", async () => {
+    // The s3api index writes `href="abort-multipart-upload.html"`, and it was
+    // served from the directory it landed on -- so that directory, not the
+    // requested index.html, is what the links resolve against.
+    const fetchImpl = (async () =>
+      fakeResponse({
+        url: "https://docs.aws.amazon.com/cli/latest/reference/s3api/",
+        text: CLI_S3API_INDEX_HTML,
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const r = await read.handler({
+      url: "https://docs.aws.amazon.com/cli/latest/reference/s3api/index.html",
+      maxLength: 20_000,
+    });
+    assert.equal(r.ok, true, r.error ?? "");
+    const content = (r.data as { content: string }).content;
+    assert.match(
+      content,
+      /\[abort-multipart-upload\]\(https:\/\/docs\.aws\.amazon\.com\/cli\/latest\/reference\/s3api\/abort-multipart-upload\.html\)/,
+    );
+    assert.match(content, /\(https:\/\/docs\.aws\.amazon\.com\/cli\/latest\/reference\/index\.html#cli-aws\)/);
+    const target = /\[create-bucket\]\(([^)]+)\)/.exec(content)?.[1] ?? "";
+    assert.equal(isValidDocsUrl(target), true, `link target '${target}' must pass the read-side allowlist`);
+  });
+
+  it("serves a URL that differs only by fragment from the cache", async () => {
+    // fetch never sends the fragment, so these are one document -- and search
+    // results and in-page links routinely carry one.
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount++;
+      return fakeResponse({ text: `<html><body><main><p>${"q".repeat(300)}</p></main></body></html>` });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl);
+    const base = "https://docs.aws.amazon.com/lambda/latest/dg/welcome.html";
+    assert.equal((await read.handler({ url: `${base}#limits` })).ok, true);
+    const second = await read.handler({ url: `${base}#quotas` });
+    assert.equal((second.data as { cached: boolean; url: string }).cached, true);
+    assert.equal((second.data as { url: string }).url, `${base}#quotas`, "the response still echoes the URL as typed");
+    assert.equal((await read.handler({ url: base })).ok, true);
+    assert.equal(fetchCount, 1);
+    // A query string IS sent, so it stays part of the key.
+    assert.notEqual(docCacheKey(`${base}?a=1`), docCacheKey(base));
+    assert.equal(docCacheKey(`${base}#x`), base);
+  });
+
+  it("releases the body on every early return that does not read it", async () => {
+    // Left open, undici pins the socket and keeps buffering until the Response
+    // is collected -- and a soft 404 is an expected, repeatable input.
+    const D = "https://docs.aws.amazon.com";
+    const cases: Array<[string, Parameters<typeof fakeResponse>[0], RegExp]> = [
+      ["http error", { ok: false, status: 404, statusText: "Not Found" }, /404/],
+      ["off allowlist", { url: "https://evil.example.com/x.html" }, /outside the AWS documentation allowlist/],
+      ["soft 404", { url: `${D}/lambda/latest/dg/` }, /does not exist/],
+      ["not html", { contentType: "application/pdf" }, /not text\/html/],
+      ["content-length over cap", { contentLength: String(6 * 1024 * 1024) }, /more than 5 MB/],
+    ];
+    for (const [name, opts, expected] of cases) {
+      let cancelled = 0;
+      const fetchImpl = (async () => fakeResponse({ ...opts, onCancel: () => cancelled++ })) as unknown as typeof fetch;
+      const [, read] = buildDocsTools(fetchImpl);
+      const r = await read.handler({ url: `${D}/lambda/latest/dg/no-such.html` });
+      assert.equal(r.ok, false, name);
+      assert.match(r.error ?? "", expected, name);
+      assert.equal(cancelled, 1, `${name}: the unread body must be cancelled`);
+    }
+  });
+
   it("says a guessed page name does not exist instead of returning the guide landing page", async () => {
     // docs.aws.amazon.com does not 404 a missing page inside a guide that
     // exists: it 302s to the guide's landing page. Accepting that would answer
@@ -1047,7 +1325,7 @@ describe("aws_docs_read handler", () => {
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /does not exist/);
     assert.match(r.error ?? "", /https:\/\/docs\.aws\.amazon\.com\/lambda\/latest\/dg\//);
-    // Slice 1 still refuses a URL ending in '/' as input, so the message must not
+    // aws_docs_read refuses a URL ending in '/' as input, so the message must not
     // tell the caller to read the landing page.
     assert.doesNotMatch(r.error ?? "", /aws_docs_read on/);
 
@@ -1144,6 +1422,102 @@ describe("aws_docs_read handler", () => {
   });
 });
 
+/**
+ * The REAL timeout wiring, not just its wording: the handlers' own
+ * AbortController and setTimeout, driven by mock timers. `abortingFetch` above
+ * throws an AbortError on its own, so with it alone deleting the signal, the
+ * timer, or clearing the timer at headers time all left the suite green.
+ */
+describe("fetch timeout -- the real AbortController", () => {
+  beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+  });
+  afterEach(() => {
+    mock.timers.reset();
+  });
+
+  it("aborts a read whose request never answers, at FETCH_TIMEOUT_MS and not before", async () => {
+    let signal: AbortSignal | undefined;
+    const [, read] = buildDocsTools(
+      hangingFetch((s) => {
+        signal = s;
+      }),
+      NO_PROXY_ENV,
+    );
+    const pending = read.handler({ url: "https://docs.aws.amazon.com/x.html" });
+    await settle();
+    assert.ok(signal, "the handler must hand fetch a signal");
+    mock.timers.tick(FETCH_TIMEOUT_MS - 1);
+    assert.equal(signal.aborted, false, "must not fire early");
+    mock.timers.tick(1);
+    const r = await pending;
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /timed out after 30s/);
+  });
+
+  it("aborts a search whose request never answers", async () => {
+    const [search] = buildDocsTools(hangingFetch(), NO_PROXY_ENV);
+    const pending = search.handler({ query: "x" });
+    await settle();
+    mock.timers.tick(FETCH_TIMEOUT_MS);
+    const r = await pending;
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /search timed out after 30s/);
+  });
+
+  it("still bounds a page body that stalls after its headers", async () => {
+    // fetch resolves at headers; the timer used to be cleared right there, so
+    // a body that went quiet held the call open until the runtime's own body
+    // timeout (undici's is 300 s).
+    let stalled!: () => void;
+    const reachedStall = new Promise<void>((resolve) => {
+      stalled = resolve;
+    });
+    let cancelled = 0;
+    const fetchImpl = (async () =>
+      fakeResponse({
+        bodyChunks: ["<html><body><main><p>first chunk"],
+        onStall: stalled,
+        onCancel: () => cancelled++,
+      })) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
+    const pending = read.handler({ url: "https://docs.aws.amazon.com/x.html" });
+    await reachedStall;
+    mock.timers.tick(FETCH_TIMEOUT_MS);
+    const r = await pending;
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /timed out after 30s/);
+    assert.equal(cancelled, 1, "the stalled stream is cancelled, not left open");
+  });
+
+  it("still bounds a search JSON body that stalls after its headers", async () => {
+    let stalled!: () => void;
+    const reachedStall = new Promise<void>((resolve) => {
+      stalled = resolve;
+    });
+    const fetchImpl = (async () => fakeResponse({ onJsonStall: stalled })) as unknown as typeof fetch;
+    const [search] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
+    const pending = search.handler({ query: "x" });
+    await reachedStall;
+    mock.timers.tick(FETCH_TIMEOUT_MS);
+    const r = await pending;
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /search timed out after 30s/);
+  });
+
+  it("disarms the timer once a read is done", async () => {
+    let signal: AbortSignal | undefined;
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      return fakeResponse({ text: `<html><body><main><p>${"d".repeat(300)}</p></main></body></html>` });
+    }) as unknown as typeof fetch;
+    const [, read] = buildDocsTools(fetchImpl, NO_PROXY_ENV);
+    assert.equal((await read.handler({ url: "https://docs.aws.amazon.com/x.html" })).ok, true);
+    mock.timers.tick(FETCH_TIMEOUT_MS * 2);
+    assert.equal(signal?.aborted, false, "a finished read must leave no timer behind to fire");
+  });
+});
+
 describe("aws_docs_* schema", () => {
   it("search rejects an empty query", () => {
     assert.equal(searchTool.inputSchema.safeParse({ query: "" }).success, false);
@@ -1179,7 +1553,7 @@ describe("aws_docs_* schema", () => {
 });
 
 /**
- * Cache contract pinned at docs.ts:293-318. Two behaviors matter:
+ * Cache contract of makeDocCache (docs.ts). Two behaviors matter:
  *   1. LRU eviction at the 64-entry cap (set() drops the oldest insertion).
  *   2. Move-to-end on read so the cache is true-LRU rather than insertion-
  *      ordered -- get() re-inserts the entry to make it the freshest.
@@ -1242,16 +1616,15 @@ describe("makeDocCache — LRU eviction and recency", () => {
 });
 
 /**
- * TTL expiry pinned at docs.ts:299 (`Date.now() - entry.storedAt >
+ * TTL expiry in makeDocCache's get() (`Date.now() - entry.storedAt >
  * DOC_CACHE_TTL_MS`). The cache reads the host `Date.now()` directly, so we
  * drive virtual time with node:test's MockTimers Date support: enable Date,
  * tick past the TTL, and assert the stale entry is evicted on get() (and that
- * a paginated read therefore re-fetches). DOC_CACHE_TTL_MS is 5 minutes
- * (docs.ts:53); it isn't exported, so the tick value is anchored to that
- * literal with a comment rather than imported.
+ * a paginated read therefore re-fetches). The tick value is the exported
+ * DOC_CACHE_TTL_MS itself, so a change to the TTL cannot leave these behind.
  */
 describe("makeDocCache — TTL expiry", () => {
-  const TTL_MS = 5 * 60_000; // mirror DOC_CACHE_TTL_MS (docs.ts:53)
+  const TTL_MS = DOC_CACHE_TTL_MS;
 
   it("evicts an entry older than DOC_CACHE_TTL_MS on get()", () => {
     mock.timers.enable({ apis: ["Date"] });
@@ -1354,6 +1727,28 @@ describe("parseSearchResults — schema-drift warning", () => {
       console.warn = original;
     }
     assert.equal(warned.length, 0, "an empty suggestions array is the no-match case, not a schema break");
+  });
+
+  it("warns once when suggestions arrive but none carries textExcerptSuggestion.link", () => {
+    // A renamed INNER field: the array survives, every entry is skipped, and
+    // without this the result was an empty list with nothing on stderr.
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    try {
+      const renamed = { suggestions: [{ textExcerpt: { link: "https://docs.aws.amazon.com/x.html" } }, {}] };
+      assert.deepEqual(parseSearchResults(renamed, 10), []);
+      parseSearchResults(renamed, 10);
+      // Links the allowlist drops are the backend's content, not drift.
+      _resetParseSearchSchemaWarn();
+      parseSearchResults({ suggestions: [{ textExcerptSuggestion: { link: "https://example.com/x.html" } }] }, 10);
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /none had the expected 'textExcerptSuggestion\.link'/);
   });
 });
 
@@ -1552,6 +1947,7 @@ describe("scoreSearchResults", () => {
     // is "this heuristic has no opinion".
     const r = scoreSearchResults("???", [LAMBDA_URL_HIT]);
     assert.equal(r.bestLexicalOverlap, null);
+    assert.deepEqual(r.termsMatchedNowhere, [], "present and empty, so the shape does not depend on the query");
     assert.equal(r.lowRelevance, false);
     assert.equal(r.results[0].lexicalMatch, null);
     assert.match(r.relevanceNote ?? "", /no comparable terms/);

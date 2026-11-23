@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { _resetSession } from "../session.js";
+import { _resetSession, setProfile } from "../session.js";
 import { _clearSessions, findActiveSessionByProfile, startSsoLogin } from "../sso.js";
 import {
   _resetStartSsoLoginImpl,
@@ -14,6 +14,13 @@ import {
   findCachedSsoToken,
 } from "./auth.js";
 import { resolveProfileStartUrl } from "./profiles.js";
+
+// Upper bound on the wait for a seeded fake login to print its URL. Only the
+// success paths use the default, so a generous value never slows a passing
+// test; 5000 failed seeds in a loaded full-suite run, where spawning the fake
+// alone costs 700-4200ms on Windows ARM64 (see sso.integration.test.ts).
+// Cases that need the wait to expire pass a short value explicitly.
+const SEED_URL_WAIT_MS = 30_000;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_AWS = join(__dirname, "..", "testing", "fake-aws.js");
@@ -375,7 +382,7 @@ describe("aws_login_start handler — reuse vs fresh-spawn (auth.ts:195-236)", (
   // `happy_hold` emits byte-identical URL+code stdout and then stays alive
   // until killed, so "live" is a property of the fake rather than a race.
   // afterEach's _clearSessions() SIGTERMs it, so teardown stays prompt.
-  function fakeOpts(scenario: string, urlWaitMs = 5000) {
+  function fakeOpts(scenario: string, urlWaitMs = SEED_URL_WAIT_MS) {
     return {
       command: process.execPath,
       prefixArgs: [FAKE_AWS],
@@ -530,7 +537,7 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
   // SEPARATE getCallerIdentity runAwsCall the handler makes after waitForLogin
   // resolves ok. That lets one test seed a `happy` SSO subprocess while pointing
   // the post-login identity check at a different fake scenario.
-  function fakeOpts(scenario: string, urlWaitMs = 5000) {
+  function fakeOpts(scenario: string, urlWaitMs = SEED_URL_WAIT_MS) {
     return {
       command: process.execPath,
       prefixArgs: [FAKE_AWS],
@@ -745,6 +752,42 @@ describe("aws_login_complete handler (auth.ts:294-328)", () => {
     assert.equal(r.ok, true);
     assert.equal(r.data?.ssoToken?.startUrl, startUrl);
   });
+
+  it("verifies against the profile the login was started for when only sessionId is passed", async () => {
+    // The README flow: aws_login_start({profile:'staging'}) then
+    // aws_login_complete({sessionId}) with no profile. The session's ACTIVE
+    // profile is a different SSO profile with its own cached token; defaulting
+    // to it would report the wrong profile and surface the wrong token.
+    const loginUrl = "https://login-target.awsapps.com/start";
+    const activeUrl = "https://active-profile.awsapps.com/start";
+    const dir = join(homeDir, ".aws");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "config"),
+      `[profile login-prof]\nsso_start_url = ${loginUrl}\nsso_region = us-east-1\nregion = us-east-1\n` +
+        `[profile active-prof]\nsso_start_url = ${activeUrl}\nsso_region = us-east-1\nregion = us-east-1\n`,
+    );
+    writeCachedToken(loginUrl);
+    writeFileSync(
+      join(dir, "sso", "cache", "active.json"),
+      JSON.stringify({
+        accessToken: "active",
+        expiresAt: new Date(Date.now() + 20 * 3600_000).toISOString(),
+        startUrl: activeUrl,
+      }),
+    );
+    setProfile("active-prof");
+
+    const sessionId = await seedSession("login-prof", "happy");
+    process.env.AWS_MCP_FAKE_SCENARIO = "sts_caller_identity_success";
+    const r = (await completeTool.handler({ sessionId })) as {
+      ok: boolean;
+      data?: { profile?: string; ssoToken?: { startUrl?: string } | null };
+    };
+    assert.equal(r.ok, true);
+    assert.equal(r.data?.profile, "login-prof");
+    assert.equal(r.data?.ssoToken?.startUrl, loginUrl);
+  });
 });
 
 describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
@@ -756,7 +799,7 @@ describe("aws_refresh_if_expiring_soon handler (auth.ts:350-407)", () => {
   // the fake-aws shim directly. `happy_hold` stays alive until killed so the
   // session's `completed` flag stays false deterministically (mirrors the
   // sso.integration.test.ts dedupe-helper test).
-  function fakeOpts(scenario: string, urlWaitMs = 5000) {
+  function fakeOpts(scenario: string, urlWaitMs = SEED_URL_WAIT_MS) {
     return {
       command: process.execPath,
       prefixArgs: [FAKE_AWS],

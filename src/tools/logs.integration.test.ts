@@ -1,6 +1,6 @@
 /**
  * Subprocess integration for aws_logs_tail: the handler driven end to end against
- * the fake CLI, one `logs-tail_*` scenario per CLI era.
+ * the fake CLI, one `logs_tail_*` scenario per CLI era.
  *
  * The scenarios answer like the real `aws logs filter-log-events` -- verbatim
  * captures, or an emulator whose every rule was measured against a real CLI
@@ -118,7 +118,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   // --- a CLI that has startFromHead (AWS CLI 2.35.8+) ---------------------------
 
   it("reads newest-first in ONE call and returns structured events", async () => {
-    const r = await tail("logs-tail_current_basic");
+    const r = await tail("logs_tail_current_basic");
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     const data = r.data as {
       logGroupName: string;
@@ -158,7 +158,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   });
 
   it("keeps the NEWEST maxEvents of a busy window and reports totalEvents:null", async () => {
-    const r = await tail("logs-tail_current_bulk");
+    const r = await tail("logs_tail_current_bulk");
     assert.equal(r.ok, true);
     const data = r.data as { eventCount: number; totalEvents: number | null; truncated: boolean; events: unknown[] };
     assert.equal(data.eventCount, DEFAULT_MAX_EVENTS);
@@ -169,7 +169,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   });
 
   it("honors an explicit maxEvents", async () => {
-    const r = await tail("logs-tail_current_bulk", { maxEvents: 10 });
+    const r = await tail("logs_tail_current_bulk", { maxEvents: 10 });
     assert.equal(r.ok, true);
     const data = r.data as { eventCount: number; events: unknown[] };
     assert.equal(data.eventCount, 10);
@@ -180,7 +180,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   it("treats exactly maxEvents as a complete window and flips one below it", async () => {
     // An off-by-one to `>=` would report truncated on a window that came back whole
     // -- and tell the caller to narrow a `since` that needed no narrowing.
-    const exact = await tail("logs-tail_current_bulk", { maxEvents: 1200 });
+    const exact = await tail("logs_tail_current_bulk", { maxEvents: 1200 });
     assert.equal(exact.ok, true);
     const exactData = exact.data as {
       eventCount: number;
@@ -193,7 +193,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     assert.equal(exactData.truncated, false);
     assert.equal(msg(exactData.events[0]), "event-0");
 
-    const one = await tail("logs-tail_current_bulk", { maxEvents: 1199 });
+    const one = await tail("logs_tail_current_bulk", { maxEvents: 1199 });
     assert.equal(one.ok, true);
     const oneData = one.data as {
       eventCount: number;
@@ -208,13 +208,13 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   });
 
   it("clamps an out-of-range maxEvents from a direct (non-schema) caller", async () => {
-    const low = await tail("logs-tail_current_bulk", { maxEvents: 0 });
+    const low = await tail("logs_tail_current_bulk", { maxEvents: 0 });
     assert.equal(low.ok, true);
     const lowData = low.data as { eventCount: number; events: unknown[] };
     assert.equal(lowData.eventCount, 1, "0 clamps up to 1");
     assert.equal(msg(lowData.events[0]), "event-1199", "and it is the newest event that survives");
 
-    const high = await tail("logs-tail_current_bulk", { maxEvents: 999_999 });
+    const high = await tail("logs_tail_current_bulk", { maxEvents: 999_999 });
     assert.equal(high.ok, true);
     const highData = high.data as { eventCount: number; truncated: boolean };
     assert.equal(highData.eventCount, 1200, `clamps down to ${MAX_MAX_EVENTS}, which exceeds the window`);
@@ -230,7 +230,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     // botocore refuses both before any request, so sending them would break calls
     // that work today. The emulator exits 2 if either reaches the payload.
     for (const input of [{ logStreamNames: [] }, { logStreamNamePrefix: "" }]) {
-      const r = await tail("logs-tail_current_empty", input);
+      const r = await tail("logs_tail_current_empty", input);
       assert.equal(r.ok, true, `${JSON.stringify(input)} must still be a valid call: ${r.error ?? ""}`);
       const params = invocations().at(-1)?.params ?? {};
       assert.equal("logStreamNames" in params, false);
@@ -243,7 +243,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     // `file://` into that file's contents, and a read-only tool must never do that.
     // Inside the payload the same string is sent literally.
     const filterPattern = "file://~/.aws/credentials";
-    const r = await tail("logs-tail_current_empty", { filterPattern, logStreamNamePrefix: "2026/09/" });
+    const r = await tail("logs_tail_current_empty", { filterPattern, logStreamNamePrefix: "2026/09/" });
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     const call = invocations().at(-1);
     assert.ok(call);
@@ -256,7 +256,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
 
   it("sends an ARN as logGroupIdentifier without the ':*' and echoes it back", async () => {
     for (const input of [ARN, `${ARN}:*`]) {
-      const r = await tail("logs-tail_echo_argv", { logGroupName: input });
+      const r = await tail("logs_tail_echo_argv", { logGroupName: input });
       assert.equal(r.ok, true, `expected ${input} to be accepted: ${r.error ?? ""}`);
       const data = r.data as { logGroupName: string; logGroupIdentifier: string | null };
       assert.equal(data.logGroupName, "/aws/lambda/my-fn", "the envelope still echoes the bare name");
@@ -270,7 +270,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   });
 
   it("sends a bare name as logGroupName with no identifier", async () => {
-    const r = await tail("logs-tail_echo_argv");
+    const r = await tail("logs_tail_echo_argv");
     assert.equal(r.ok, true);
     assert.equal((r.data as { logGroupIdentifier: string | null }).logGroupIdentifier, null);
     const params = invocations().at(-1)?.params ?? {};
@@ -281,7 +281,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   // --- a CLI that rejects startFromHead (before 2.35.8) ------------------------
 
   it("falls back to a whole-window read and pins the rejection for the process", async () => {
-    const first = await tail("logs-tail_legacy_bulk");
+    const first = await tail("logs_tail_legacy_bulk");
     assert.equal(first.ok, true, `handler failed: ${first.error ?? ""}`);
     const data = first.data as {
       eventCount: number;
@@ -304,27 +304,27 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     assert.match(calls[1].argv[calls[1].argv.indexOf("--query") + 1], /\(events \|\| `\[\]`\)\[-500:\]/);
 
     // The negative answer is cached, so a second call costs one invocation.
-    const second = await tail("logs-tail_legacy_bulk");
+    const second = await tail("logs_tail_legacy_bulk");
     assert.equal(second.ok, true);
     assert.equal(invocations().length, 3, "the second handler call made ONE invocation");
     assert.equal("startFromHead" in (invocations()[2].params ?? {}), false);
 
     // ...and the cache is per process, so a reset brings the detection back.
     _resetLogsTailCliModelCache();
-    const third = await tail("logs-tail_legacy_bulk");
+    const third = await tail("logs_tail_legacy_bulk");
     assert.equal(third.ok, true);
     assert.equal(invocations().length, 5, "after a reset it detects again: two invocations");
   });
 
   it("gets the boundaries right on the whole-window path too", async () => {
-    const exact = await tail("logs-tail_legacy_bulk", { maxEvents: 1200 });
+    const exact = await tail("logs_tail_legacy_bulk", { maxEvents: 1200 });
     assert.equal(exact.ok, true);
     const exactData = exact.data as { totalEvents: number | null; truncated: boolean };
     assert.equal(exactData.totalEvents, 1200);
     assert.equal(exactData.truncated, false);
 
     _resetLogsTailCliModelCache();
-    const one = await tail("logs-tail_legacy_bulk", { maxEvents: 1199 });
+    const one = await tail("logs_tail_legacy_bulk", { maxEvents: 1199 });
     assert.equal(one.ok, true);
     const oneData = one.data as { eventCount: number; totalEvents: number | null; truncated: boolean };
     assert.equal(oneData.eventCount, 1199);
@@ -333,9 +333,9 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   });
 
   it("parses the bytes the real CLI printed for a whole-window read", async () => {
-    // logs-tail_legacy_basic answers with a verbatim 2.34.3 capture rather than the
+    // logs_tail_legacy_basic answers with a verbatim 2.34.3 capture rather than the
     // emulator, and refuses any call but the one it was captured from.
-    const r = await tail("logs-tail_legacy_basic");
+    const r = await tail("logs_tail_legacy_basic");
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     const data = r.data as {
       eventCount: number;
@@ -352,14 +352,14 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     // AWS_CLI_ERROR_FORMAT=enhanced is pinned in every child environment, so this
     // is the CLI that ignores the pin. The detector reads the parameter name
     // through the escaped quotes.
-    const r = await tail("logs-tail_jsonfmt_bulk");
+    const r = await tail("logs_tail_jsonfmt_bulk");
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     assert.equal((r.data as { totalEvents: number | null }).totalEvents, 1200);
     assert.equal(invocations().length, 2);
   });
 
   it("refuses ARN input on a CLI that cannot address a group by ARN", async () => {
-    const r = await tail("logs-tail_ancient_basic", { logGroupName: ARN });
+    const r = await tail("logs_tail_ancient_basic", { logGroupName: ARN });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", new RegExp(`AWS CLI ${LOG_GROUP_IDENTIFIER_MIN_CLI.replaceAll(".", "\\.")}\\+`));
     assert.match(r.error ?? "", /Pass the bare name '\/aws\/lambda\/my-fn'/);
@@ -370,7 +370,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   });
 
   it("still serves a bare name on that same CLI, after one rejected attempt", async () => {
-    const r = await tail("logs-tail_ancient_basic");
+    const r = await tail("logs_tail_ancient_basic");
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     assert.equal((r.data as { eventCount: number }).eventCount, 6);
     assert.equal(invocations().length, 2);
@@ -381,7 +381,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
   it("re-reads the whole window when the endpoint ignored startFromHead", async () => {
     // Without the orientation check this returned the OLDEST events labelled as the
     // newest, with truncated:true -- a silently wrong answer.
-    const r = await tail("logs-tail_ignored_bulk");
+    const r = await tail("logs_tail_ignored_bulk");
     assert.equal(r.ok, true, `handler failed: ${r.error ?? ""}`);
     const data = r.data as { eventCount: number; totalEvents: number | null; truncated: boolean; events: unknown[] };
     assert.equal(data.eventCount, DEFAULT_MAX_EVENTS);
@@ -397,7 +397,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
 
     // NOT cached: the CLI supports the member, this endpoint does not, and
     // endpoints differ by region and profile.
-    const second = await tail("logs-tail_ignored_bulk");
+    const second = await tail("logs_tail_ignored_bulk");
     assert.equal(second.ok, true);
     assert.equal(invocations().length, 4, "the second handler call tries newest-first again");
   });
@@ -408,7 +408,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     // The regression pin for the defect 2.4.0 fixes: this text used to come back as
     // ok:true with the whole blob as `events`, eventCount and totalEvents null, and
     // maxEvents silently unapplied.
-    const r = await tail("logs-tail_real_tail_text");
+    const r = await tail("logs_tail_real_tail_text");
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /exited 0 but printed something other than the \{total, events\} document/);
     assert.match(r.error ?? "", /Refusing to guess/);
@@ -425,7 +425,7 @@ describe("aws_logs_tail handler — FilterLogEvents against the fake CLI", () =>
     // startFromHead, which says so in its ParamValidation text. An AccessDenied is
     // a real answer from the service, so it is reported at once -- a whole-window
     // retry would cost another CLI start and fail the same way.
-    const r = await tail("logs-tail_api_error");
+    const r = await tail("logs_tail_api_error");
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "nonzero_exit");
     assert.match(r.rawBody ?? "", /AccessDeniedException/);
@@ -558,6 +558,9 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
         queryString: "fields @timestamp",
         startTime: "1h",
         pollIntervalMs: 500,
+        // Pin the region: an ambient AWS_REGION other than us-east-1 would
+        // otherwise trip the ARN-region mismatch rejection.
+        region: "us-east-1",
       });
       assert.equal(r.ok, true, `expected ok, got: ${JSON.stringify(r)}`);
 
@@ -681,7 +684,7 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
     // message, so a recognized error code's remedy has to be added back or it
     // is lost from BOTH the message and the envelope -- contradicting README's
     // Stability promise that `suggestion` is duplicated in `error`.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lq2_poll_access_denied";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_poll_access_denied";
     const r = await queryTool.handler({ ...baseInput, pollIntervalMs: 500 });
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "nonzero_exit");
@@ -705,7 +708,7 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
     // at the loop's return value -- nothing exercised the message the caller
     // actually reads, which is the entire diagnostic for a query that produced
     // no rows.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lq2_terminal_status";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_terminal_status";
     const cases: Array<{ status: string | undefined; match: RegExp; resumeHint: boolean }> = [
       { status: "Failed", match: /failed server-side/, resumeHint: false },
       { status: "Timeout", match: /60-minute/, resumeHint: false },
@@ -742,7 +745,7 @@ describe("aws_logs_query — end to end against the fake CLI", () => {
     // drops the output member, an --output misconfiguration, or a proxy that
     // reshapes the response. isValidQueryId is unit-tested in isolation, but
     // nothing connected it to this call site.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lq2_start_bad_query_id";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_query_start_bad_query_id";
     const cases: Array<{ shape: string | undefined; typeName: string }> = [
       { shape: undefined, typeName: "undefined" },
       { shape: "number", typeName: "number" },
@@ -807,7 +810,7 @@ describe("aws_logs_tail handler -- errorKind / suggestion forwarding", () => {
     // Verbatim 2.34.3 stderr for FilterLogEvents refused by IAM (exit 254), where
     // errors.ts can name the principal and the action -- a better remedy than the
     // generic one above, on the exact text this tool's calls produce.
-    process.env.AWS_MCP_FAKE_SCENARIO = "logs-tail_api_error";
+    process.env.AWS_MCP_FAKE_SCENARIO = "logs_tail_api_error";
     const r = await handlerTool.handler({ logGroupName: "/aws/lambda/my-fn", region: "us-east-1" });
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "nonzero_exit");

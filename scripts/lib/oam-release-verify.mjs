@@ -27,16 +27,16 @@
 // pin, or an asset absent from (or listed twice in) the checksums is an error,
 // never a warning.
 
-import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const RELEASE_KEYS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'oam-release-keys');
-export const MANIFEST_HEADER = 'oam-release-manifest v1';
-export const SIGN_NAMESPACE = 'oam-release';
-const PRINCIPAL_PREFIX = 'oam-release-';
+export const RELEASE_KEYS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "oam-release-keys");
+export const MANIFEST_HEADER = "oam-release-manifest v1";
+export const SIGN_NAMESPACE = "oam-release";
+const PRINCIPAL_PREFIX = "oam-release-";
 /** The first signed release. Older tags have no manifest to verify. */
 export const FIRST_SIGNED = [0, 18, 0];
 
@@ -68,15 +68,15 @@ export function principalsForTag(rangesText, tag) {
   const v = parseTag(tag);
   if (!v) throw new Error(`'${tag}' is not a plain vX.Y.Z tag`);
   const out = [];
-  for (const raw of rangesText.split('\n')) {
+  for (const raw of rangesText.split("\n")) {
     const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!line || line.startsWith("#")) continue;
     const [id, from, to] = line.split(/\s+/);
-    const lo = parseTag(from ?? '');
+    const lo = parseTag(from ?? "");
     if (!id || !lo) continue;
     if (cmp(v, lo) < 0) continue;
-    if (to !== '-') {
-      const hi = parseTag(to ?? '');
+    if (to !== "-") {
+      const hi = parseTag(to ?? "");
       if (!hi || cmp(v, hi) > 0) continue;
     }
     out.push(`${PRINCIPAL_PREFIX}${id}`);
@@ -91,19 +91,21 @@ export function principalsForTag(rangesText, tag) {
  * attacker-controlled.
  */
 export function parseManifest(manifestText, tag) {
-  const want = `v${parseTag(tag)?.join('.')}`;
+  const want = `v${parseTag(tag)?.join(".")}`;
   const prefix = `${MANIFEST_HEADER}\ntag ${want}\n`;
   if (!manifestText.startsWith(prefix)) {
-    const [line1 = '', line2 = ''] = manifestText.split('\n');
-    if (line1.replace(/\r$/, '') !== MANIFEST_HEADER) {
+    const [line1 = "", line2 = ""] = manifestText.split("\n");
+    if (line1.replace(/\r$/, "") !== MANIFEST_HEADER) {
       throw new Error(`RELEASE-MANIFEST line 1 is '${line1}', not '${MANIFEST_HEADER}'`);
     }
-    if (/^tag /.test(line2) && line2.replace(/\r$/, '') !== `tag ${want}`) {
-      throw new Error(`RELEASE-MANIFEST is signed for '${line2.slice(4)}', not ${want} -- a replayed or misfiled release`);
+    if (/^tag /.test(line2) && line2.replace(/\r$/, "") !== `tag ${want}`) {
+      throw new Error(
+        `RELEASE-MANIFEST is signed for '${line2.slice(4)}', not ${want} -- a replayed or misfiled release`,
+      );
     }
     throw new Error(`RELEASE-MANIFEST's header is not byte-exact for ${want}`);
   }
-  return parseSums(manifestText.slice(prefix.length), 'RELEASE-MANIFEST');
+  return parseSums(manifestText.slice(prefix.length), "RELEASE-MANIFEST");
 }
 
 /**
@@ -111,16 +113,16 @@ export function parseManifest(manifestText, tag) {
  * line, or an asset listed twice, throws: the installers likewise refuse an
  * asset that is not listed exactly once. `what` names the source in errors.
  */
-export function parseSums(text, what = 'SHA256SUMS') {
+export function parseSums(text, what = "SHA256SUMS") {
   const sums = new Map();
-  for (const raw of text.split('\n')) {
+  for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
     const [hash, rawName] = line.split(/\s+/);
-    if (!/^[0-9a-f]{64}$/i.test(hash ?? '') || !rawName) {
+    if (!/^[0-9a-f]{64}$/i.test(hash ?? "") || !rawName) {
       throw new Error(`${what} has a malformed SHA256SUMS line: '${line}'`);
     }
-    const name = rawName.replace(/^\*/, '');
+    const name = rawName.replace(/^\*/, "");
     if (sums.has(name)) throw new Error(`${what} lists ${name} more than once`);
     sums.set(name, hash.toLowerCase());
   }
@@ -136,26 +138,26 @@ export function parseSums(text, what = 'SHA256SUMS') {
 export function verifyPresigningSums({ sumsBytes, tag, keysDir = RELEASE_KEYS_DIR }) {
   const v = parseTag(tag);
   if (!v) throw new Error(`'${tag}' is not a plain vX.Y.Z tag`);
-  const want = `v${v.join('.')}`;
-  const pinsPath = join(keysDir, 'presigning-sums');
+  const want = `v${v.join(".")}`;
+  const pinsPath = join(keysDir, "presigning-sums");
   let pinned = null;
-  for (const raw of readFileSync(pinsPath, 'utf-8').split('\n')) {
+  for (const raw of readFileSync(pinsPath, "utf-8").split("\n")) {
     const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!line || line.startsWith("#")) continue;
     const [t, hash] = line.split(/\s+/);
     if (t === want) {
-      pinned = (hash ?? '').toLowerCase();
+      pinned = (hash ?? "").toLowerCase();
       break;
     }
   }
   if (!pinned) {
     throw new Error(`${want} predates signed releases and has no pinned SHA256SUMS digest in ${pinsPath}`);
   }
-  const got = createHash('sha256').update(sumsBytes).digest('hex');
+  const got = createHash("sha256").update(sumsBytes).digest("hex");
   if (got !== pinned) {
     throw new Error(`SHA256SUMS for ${want} hashes to ${got}, but its pinned digest is ${pinned}`);
   }
-  return parseSums(Buffer.from(sumsBytes).toString('utf-8'));
+  return parseSums(Buffer.from(sumsBytes).toString("utf-8"));
 }
 
 /**
@@ -168,25 +170,25 @@ export function verifyManifestSignature({
   sigPath,
   tag,
   keysDir = RELEASE_KEYS_DIR,
-  sshKeygen = process.env.SSH_KEYGEN ?? 'ssh-keygen',
+  sshKeygen = process.env.SSH_KEYGEN ?? "ssh-keygen",
 }) {
-  const signersPath = join(keysDir, 'allowed_signers');
-  const principals = principalsForTag(readFileSync(join(keysDir, 'ranges'), 'utf-8'), tag);
+  const signersPath = join(keysDir, "allowed_signers");
+  const principals = principalsForTag(readFileSync(join(keysDir, "ranges"), "utf-8"), tag);
   if (principals.length === 0) {
-    throw new Error(`no key in ${join(keysDir, 'ranges')} may sign ${tag}`);
+    throw new Error(`no key in ${join(keysDir, "ranges")} may sign ${tag}`);
   }
   const manifest = readFileSync(manifestPath);
-  let last = '';
+  let last = "";
   for (const principal of principals) {
     try {
       execFileSync(
         sshKeygen,
-        ['-Y', 'verify', '-f', signersPath, '-I', principal, '-n', SIGN_NAMESPACE, '-s', sigPath],
-        { input: manifest, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
+        ["-Y", "verify", "-f", signersPath, "-I", principal, "-n", SIGN_NAMESPACE, "-s", sigPath],
+        { input: manifest, stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
       );
       return principal;
     } catch (err) {
-      if (err?.code === 'ENOENT') {
+      if (err?.code === "ENOENT") {
         throw new Error(
           `${sshKeygen} was not found; verifying an oam release needs ssh-keygen 8.1 or later (set SSH_KEYGEN to its path)`,
         );

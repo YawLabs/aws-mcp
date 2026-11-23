@@ -2,7 +2,7 @@ import { z } from "zod";
 import { runAwsCall, truncateForErrorMsg } from "../aws-cli.js";
 import { upsertProfile } from "../aws-credentials.js";
 import { resolveAwsCredentialsPath } from "../aws-paths.js";
-import { getProfile, getRegion, isValidProfileName } from "../session.js";
+import { getProfile, getRegion, invalidProfileMessage, isValidProfileName } from "../session.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
@@ -157,6 +157,9 @@ export async function assumeRoleCredentials(opts: {
   durationSeconds?: number;
   externalId?: string;
   timeoutMs?: number;
+  /** Cancels the in-flight assume (or skips the spawn if already aborted); the
+   * failure carries errorKind "cancelled" from runAwsCall. */
+  signal?: AbortSignal;
 }): Promise<AssumeRoleOutcome> {
   const { sourceProfile } = opts;
 
@@ -185,6 +188,7 @@ export async function assumeRoleCredentials(opts: {
     region: opts.region,
     outputFormat: "json",
     timeoutMs: opts.timeoutMs ?? DEFAULT_ASSUME_TIMEOUT_MS,
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
 
   if (!result.ok) {
@@ -358,19 +362,28 @@ export const assumeTools: readonly Tool[] = [
       if (!isValidProfileName(sourceProfile)) {
         return {
           ok: false,
-          error: `Invalid sourceProfile name '${sourceProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Check the 'sourceProfile' arg or AWS_PROFILE env var.`,
+          error: invalidProfileMessage(
+            sourceProfile,
+            "Check the 'sourceProfile' arg or AWS_PROFILE env var.",
+            "sourceProfile",
+          ),
         };
       }
       // The resolved name lands as a `[name]` section header in the shared
-      // credentials file. Reject INI-breakers (brackets, newlines, `=`) up
-      // front so a hostile or fat-fingered targetProfile can't corrupt the
-      // credentials file. useRegion is validated inside runAwsCall via
-      // isValidRegionName; this guards the remaining write path that
-      // doesn't pass through runAwsCall.
+      // credentials file. Reject INI-breakers (brackets, whitespace, newlines)
+      // up front so a hostile or fat-fingered targetProfile can't corrupt the
+      // credentials file. (`=` is allowed after the first character: inside a
+      // `[...]` header it is harmless.) useRegion is validated inside
+      // runAwsCall via isValidRegionName; this guards the remaining write path
+      // that doesn't pass through runAwsCall.
       if (!isValidProfileName(targetProfile)) {
         return {
           ok: false,
-          error: `Invalid targetProfile name '${targetProfile}'. Must be 1-128 chars from [A-Za-z0-9_+=,.@:-]; the first char must be a letter, digit, or one of _+,.@: (not '-' or '='). Pick a different targetProfile or sessionName.`,
+          error: invalidProfileMessage(
+            targetProfile,
+            "Pick a different targetProfile or sessionName.",
+            "targetProfile",
+          ),
         };
       }
       // Defense-in-depth ARN check: the schema regex already rejects obvious
@@ -385,6 +398,20 @@ export const assumeTools: readonly Tool[] = [
         return {
           ok: false,
           error: `Invalid roleArn '${i.roleArn}'. Must match arn:aws[partition]:iam::<12-digit-account>:role/<name>, e.g. 'arn:aws:iam::123456789012:role/CrossAccountAdmin'.`,
+        };
+      }
+
+      // Resolve the credentials FILE before the STS call: a set-but-empty
+      // AWS_SHARED_CREDENTIALS_FILE is knowable now, and finding it only after
+      // sts:AssumeRole would mint (and log in CloudTrail, and maybe MFA- or
+      // SAML-prompt for) a session that is then thrown away. The private-mode
+      // check needs the file itself, so it stays inside upsertProfile below.
+      const credentialsPath = resolveCredentialsPath();
+      if (credentialsPath === "") {
+        return {
+          ok: false,
+          error:
+            "AWS_SHARED_CREDENTIALS_FILE is set to an empty value, so there is no credentials file to write the assumed-role profile to. Unset it to use ~/.aws/credentials, or point it at a file.",
         };
       }
 
@@ -418,18 +445,12 @@ export const assumeTools: readonly Tool[] = [
         externalId: i.externalId,
         // Resolved above so the progress message quotes the same number.
         timeoutMs,
+        // A client cancel kills the STS call before any session is written.
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
       });
       if (!outcome.ok) return outcome.failure;
       const creds = outcome.credentials;
 
-      const credentialsPath = resolveCredentialsPath();
-      if (credentialsPath === "") {
-        return {
-          ok: false,
-          error:
-            "AWS_SHARED_CREDENTIALS_FILE is set to an empty value, so there is no credentials file to write the assumed-role profile to. Unset it to use ~/.aws/credentials, or point it at a file.",
-        };
-      }
       let existed = false;
       try {
         ({ existed } = await upsertProfile(credentialsPath, targetProfile, {

@@ -23,11 +23,11 @@ import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { modeHonouringTmpBase } from "../testing/tmpdir-modes.js";
-import { invokeChildEnv, invokeTimeouts, lambdaTools } from "./lambda.js";
+import { invokeChildEnv, invokeTimeouts, lambdaPrivateModeTestHook, lambdaTools } from "./lambda.js";
 
 // Not os.tmpdir(): these cases write files whose 0600 is enforced, and on a
-// filesystem that ignores chmod the product now refuses outright (see
-// private-file.ts). A base that honours modes keeps them exercising the behaviour
+// filesystem that ignores chmod the product refuses outright (lambda.ts's
+// createPrivateFile, via private-file.ts). A base that honours modes keeps them exercising the behaviour
 // they are about on a machine whose TMPDIR points into a Windows drive.
 const PRIVATE_TMP_BASE = modeHonouringTmpBase() ?? tmpdir();
 
@@ -148,6 +148,23 @@ describe("aws_lambda_invoke — progress reporting", () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_success";
     const bare = await tool.handler({ functionName: "my-fn" });
     assert.equal(bare.ok, true);
+
+    // The second half: a reportProgress that throws synchronously. The server's
+    // own buildToolContext cannot do that, but an embedder's ctx can, and the
+    // notification is advisory -- the invoke must still go out and succeed.
+    let calls = 0;
+    const throwing = (await tool.handler(
+      { functionName: "my-fn" },
+      {
+        reportProgress: () => {
+          calls++;
+          throw new Error("transport hiccup");
+        },
+      },
+    )) as InvokeResult;
+    assert.equal(calls, 1, "the notification was attempted");
+    assert.equal(throwing.ok, true, `a throwing reportProgress failed the invoke: ${throwing.error}`);
+    assert.deepEqual(throwing.data?.payload, { ok: true, greeting: "hello" });
   });
 });
 
@@ -419,7 +436,7 @@ describe("aws_lambda_invoke — result shaping (via fake-aws subprocess)", () =>
     // A "cleanup" to raw.toString("utf8").slice(0, MAX) would cut by UTF-16
     // unit and let ~300 KB through, blowing the budget the cap exists to
     // enforce while still reporting payloadTruncated: true.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lam2_invoke_multibyte_large_response";
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_multibyte_large_response";
     const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
     assert.equal(r.ok, true);
     assert.equal(r.data?.payloadTruncated, true);
@@ -461,7 +478,10 @@ describe("aws_lambda_invoke — argv construction (via fake-aws echo)", () => {
     process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
     process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
     process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_echo_argv";
-    argvOut = join(tmpdir(), `aws-mcp-lambda-argv-${process.pid}-${counter++}.json`);
+    // NOT the "aws-mcp-lambda-" prefix: lambdaTmpDirs() scans this same private
+    // root by that prefix, so a capture file under it would read as a leaked
+    // handler directory the moment a leak assertion ran in this describe.
+    argvOut = join(tmpdir(), `aws-mcp-argvecho-${process.pid}-${counter++}.json`);
     process.env.AWS_MCP_FAKE_ARGV_OUT = argvOut;
     _resetSession();
   });
@@ -723,6 +743,74 @@ describe("aws_lambda_invoke — temp files are cleaned up on every path", () => 
   });
 });
 
+describe("aws_lambda_invoke — temp files that cannot be made private are refused", () => {
+  // On WSL with TMPDIR under /mnt/c (and CIFS / FAT mounts) chmod succeeds and
+  // changes nothing, so both files would be 0777. The check is a no-op on
+  // Windows by design, so the mode-ignoring filesystem is simulated through the
+  // probe seam -- this drives the refusing branch on every host.
+  let argvOut: string;
+  beforeEach(() => {
+    process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
+    process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_echo_argv";
+    argvOut = join(tmpdir(), `aws-mcp-argvecho-${process.pid}-${counter++}.json`);
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOut;
+    _resetSession();
+  });
+  afterEach(() => {
+    lambdaPrivateModeTestHook.opts = undefined;
+    delete process.env.AWS_MCP_TEST_AWS_COMMAND;
+    delete process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS;
+    delete process.env.AWS_MCP_FAKE_SCENARIO;
+    delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+    rmSync(argvOut, { force: true });
+    _resetSession();
+  });
+
+  for (const withPayload of [true, false]) {
+    it(`fails as spawn_failure before spawning, and cleans up (${withPayload ? "with" : "without"} a payload)`, async () => {
+      const probed: number[] = [];
+      lambdaPrivateModeTestHook.opts = {
+        platform: "linux",
+        probe: (fd) => {
+          probed.push(fd);
+          return 0o777;
+        },
+      };
+      const before = lambdaTmpDirs();
+      const r = (await tool.handler({
+        functionName: "my-fn",
+        ...(withPayload ? { payload: { secret: "s3cr3t" } } : {}),
+      })) as InvokeResult;
+      assert.equal(r.ok, false);
+      assert.equal(r.errorKind, "spawn_failure");
+      assert.match(r.error ?? "", /does not honour file modes/);
+      assert.match(r.error ?? "", /0777/);
+      assert.ok(probed.length >= 1, "the mode was actually checked");
+      // The fake writes argvOut the moment it runs, so its absence proves the
+      // CLI was never spawned -- nothing was invoked through a world-open file.
+      assert.throws(() => readFileSync(argvOut), /ENOENT/);
+      assert.deepEqual(lambdaTmpDirs(), before);
+    });
+  }
+
+  it("still invokes when the probe reports 0600", async () => {
+    // The accepting half, so a check that refused EVERY file would fail here.
+    const probed: number[] = [];
+    lambdaPrivateModeTestHook.opts = {
+      platform: "linux",
+      probe: (fd) => {
+        probed.push(fd);
+        return 0o600;
+      },
+    };
+    const r = (await tool.handler({ functionName: "my-fn", payload: { k: 1 } })) as InvokeResult;
+    assert.equal(r.ok, true, `refused a private file: ${r.error}`);
+    assert.equal(probed.length, 2, "both the outfile and the payload file are checked");
+    assert.equal(JSON.parse(readFileSync(argvOut, "utf8")).payloadFile, JSON.stringify({ k: 1 }));
+  });
+});
+
 describe("aws_lambda_invoke — a failed invoke says whether it went out", () => {
   // Every scenario here prints stderr captured from aws-cli 2.34.3 under
   // AWS_MAX_ATTEMPTS=1, and each fake refuses (exit 2) to run without that
@@ -747,7 +835,7 @@ describe("aws_lambda_invoke — a failed invoke says whether it went out", () =>
     // The CLI exits 255 on its own read timeout, so before this the caller got
     // `nonzero_exit` and a bare "Read timeout on endpoint URL" -- the same shape
     // whether the function ran or not.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_read_timeout";
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_read_timeout";
     const before = lambdaTmpDirs();
     const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
     assert.equal(r.ok, false);
@@ -770,7 +858,7 @@ describe("aws_lambda_invoke — a failed invoke says whether it went out", () =>
     // produces the identical sentence with ZERO Invoke requests. Calling that
     // "the function may still be running" would stop a model retrying a call that
     // never ran.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_sts_read_timeout";
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_sts_read_timeout";
     const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "timeout");
@@ -785,7 +873,7 @@ describe("aws_lambda_invoke — a failed invoke says whether it went out", () =>
     // was safe for a throttle but is the same switch that re-sent invokes that
     // HAD reached the function. The remedy has to survive the
     // "(reached max retries: 0)" infix AWS_MAX_ATTEMPTS=1 adds.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_throttled";
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_throttled";
     const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "nonzero_exit");
@@ -797,7 +885,7 @@ describe("aws_lambda_invoke — a failed invoke says whether it went out", () =>
     // Sent three times on the CLI's defaults, and every re-send of an invoke
     // that reached Lambda is another run. The remedy comes from errors.ts, which
     // had no pattern for any transport failure before.
-    process.env.AWS_MCP_FAKE_SCENARIO = "lambda-invoke_connection_closed";
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_connection_closed";
     const r = (await tool.handler({ functionName: "my-fn" })) as InvokeResult;
     assert.equal(r.ok, false);
     assert.equal(r.errorKind, "nonzero_exit");
@@ -810,7 +898,7 @@ describe("aws_lambda_invoke — concurrent invokes stay isolated", () => {
   beforeEach(() => {
     process.env.AWS_MCP_TEST_AWS_COMMAND = process.execPath;
     process.env.AWS_MCP_TEST_AWS_PREFIX_ARGS = JSON.stringify([FAKE_AWS]);
-    process.env.AWS_MCP_FAKE_SCENARIO = "lam2_invoke_echo_payload";
+    process.env.AWS_MCP_FAKE_SCENARIO = "lambda_invoke_echo_payload";
     _resetSession();
   });
 

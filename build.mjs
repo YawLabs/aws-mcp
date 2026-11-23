@@ -6,8 +6,8 @@
  * npx downloads only the tarball and runs immediately.
  */
 
-import { build } from "esbuild";
 import { readFileSync } from "node:fs";
+import { build } from "esbuild";
 
 const pkg = JSON.parse(readFileSync("package.json", "utf-8"));
 

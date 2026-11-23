@@ -20,6 +20,8 @@ import {
   startSsoLogin,
   waitForLogin,
 } from "./sso.js";
+import { SSO2_TAIL } from "./testing/fake-aws-fixtures.js";
+import { splitHandshake } from "./testing/split-handshake.js";
 
 // This test file compiles to dist/sso.integration.test.js and the fake lives
 // at dist/testing/fake-aws.js. Resolve relative to the compiled location.
@@ -81,14 +83,21 @@ afterEach(() => {
 
 describe("startSsoLogin — happy path", () => {
   it("pairs the regional banner across URL and code chunks", async () => {
-    const start = await startSsoLogin("test-profile", fakeOpts("regional_device_split", 30_000));
-    assert.equal(start.ok, true);
-    if (!start.ok) return;
-    assert.equal(start.verificationUrl, "https://EU-West-1.SignIn.AWS/platform/authorize?client_id=synthetic");
-    assert.equal(start.userCode, "WXYZ-1234");
-    const completed = await waitForLogin(start.sessionId);
-    assert.equal(completed.ok, true);
-    assert.equal(completed.exitCode, 0);
+    // Three chunks, two boundaries, each guaranteed to be read separately.
+    const hs = splitHandshake(2);
+    try {
+      const opts = fakeOpts("regional_device_split", 30_000);
+      const start = await hs.run(startSsoLogin("test-profile", { ...opts, env: { ...opts.env, ...hs.env } }));
+      assert.equal(start.ok, true);
+      if (!start.ok) return;
+      assert.equal(start.verificationUrl, "https://EU-West-1.SignIn.AWS/platform/authorize?client_id=synthetic");
+      assert.equal(start.userCode, "WXYZ-1234");
+      const completed = await waitForLogin(start.sessionId);
+      assert.equal(completed.ok, true);
+      assert.equal(completed.exitCode, 0);
+    } finally {
+      hs.cleanup();
+    }
   });
   for (const [scenario, expectedUrl] of [
     ["portal_device_url", "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH"],
@@ -107,13 +116,21 @@ describe("startSsoLogin — happy path", () => {
   }
 
   it("surfaces the whole URL when it is split across stdout chunks", async () => {
-    const start = await startSsoLogin("test-profile", fakeOpts("split_portal_url", 30_000));
-    assert.equal(start.ok, true);
-    if (!start.ok) return;
-    assert.equal(start.verificationUrl, "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH");
-    assert.equal(start.userCode, "ABCD-EFGH");
-    const completed = await waitForLogin(start.sessionId);
-    assert.equal(completed.ok, true);
+    // The first chunk ends inside the query string, and is guaranteed to be read
+    // on its own: a parser that kept the URL from that read loses `user_code`.
+    const hs = splitHandshake(1);
+    try {
+      const opts = fakeOpts("split_portal_url", 30_000);
+      const start = await hs.run(startSsoLogin("test-profile", { ...opts, env: { ...opts.env, ...hs.env } }));
+      assert.equal(start.ok, true);
+      if (!start.ok) return;
+      assert.equal(start.verificationUrl, "https://team-example.awsapps.com/start/#/device?user_code=ABCD-EFGH");
+      assert.equal(start.userCode, "ABCD-EFGH");
+      const completed = await waitForLogin(start.sessionId);
+      assert.equal(completed.ok, true);
+    } finally {
+      hs.cleanup();
+    }
   });
 
   it("parses URL + code from fake output and returns a session", async () => {
@@ -941,10 +958,9 @@ describe("clampRawOutput -- the raw `aws sso login` output forwarded to the mode
   // must be a conscious update rather than silently re-deriving whatever the
   // source now does.
   const MAX_RAW_OUTPUT_CHARS = 4_000;
-  // Mirrors the tail `sso2_raw_sized` / `sso2_raw_surrogate_boundary` append
-  // (src/testing/fake-aws.ts). Byte-for-byte, or the exact-equality assertions
-  // below fail -- which is the intended drift alarm.
-  const SSO2_TAIL = "\nhttps://device.sso.us-east-1.amazonaws.com/\nABCD-EFGH\n";
+  // SSO2_TAIL (imported from fake-aws-fixtures.ts) is the tail `sso2_raw_sized`
+  // and `sso2_raw_surrogate_boundary` append -- the fake's own constant, so the
+  // expected rawOutput cannot drift from what it prints.
 
   // startSsoLogin's options type is module-private; name it structurally rather
   // than re-declaring a parallel shape that could drift.

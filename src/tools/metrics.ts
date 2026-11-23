@@ -32,27 +32,44 @@ import type { Tool, ToolResult } from "./tool.js";
  * break and the semantic-tool sibling convention is the right one here.
  */
 
-// Statistic vocabulary CloudWatch accepts on a MetricStat.Stat field. The
-// extended stats (p99, p95, ...) are also accepted; we let through any
-// string matching the conservative shape so future percentile / TM-style
-// stats added by CloudWatch don't require a code change.
+// Statistic vocabulary CloudWatch accepts on a MetricStat.Stat field: the
+// simple stats below plus the extended stats documented at
+// https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Statistics-definitions.html
 const SIMPLE_STATS = ["Average", "Sum", "Maximum", "Minimum", "SampleCount"] as const;
-// Matches "p99", "p99.9", "tm95", "tc90", "wm99", etc. -- the extended-stat
-// shapes documented at https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Statistics-definitions.html
+// Shorthand extended stats: "p99", "p99.9", "tm95", "tc90", "wm99", "ts90". The
+// number is REQUIRED and is a percentage, so it is bounded to 0-100 in
+// isValidStatistic -- a bare 'p' / 'tm' or 'p999' passes no shape CloudWatch
+// accepts. Percentile rank (PR) has no shorthand at all; it only exists in the
+// range form below.
 //
 // IQM (interquartile mean) takes NO numeric suffix; CloudWatch rejects
-// 'iqm99' / 'iqm0.5' with a ValidationError. Split it out so it only matches
-// the bare token 'iqm' (case-insensitive). All other prefixes still accept
-// an optional d{1,3}(.d{1,3})? suffix.
-const EXTENDED_STAT_RE = /^((p|tm|tc|wm|pr|ts)(\d{1,3}(\.\d{1,3})?)?|iqm)$/i;
+// 'iqm99' / 'iqm0.5' with a ValidationError, so it only matches the bare
+// token 'iqm' (case-insensitive).
+const EXTENDED_STAT_RE = /^(?:(p|tm|tc|wm|ts)(\d{1,3}(?:\.\d{1,3})?)|iqm)$/i;
+// Range form: TM(10%:90%), TM(:95%), WM(150:1000), PR(:300), PR(10:200). Either
+// bound may be omitted, not both; a bound with '%' is a percentage (0-100), one
+// without is an absolute value. CloudWatch documents the prefix in upper case,
+// so canonicalizeStatistic upper-cases the prefix and leaves the bounds as typed.
+const RANGE_STAT_RE = /^(tm|tc|wm|ts|pr)\((\d+(?:\.\d+)?%?)?:(\d+(?:\.\d+)?%?)?\)$/i;
+
+function isPercentBound(b: string | undefined): boolean {
+  return b === undefined || !b.endsWith("%") || Number(b.slice(0, -1)) <= 100;
+}
 
 function isValidStatistic(s: string): boolean {
   // Case-fold the simple list so 'average', 'AVERAGE', 'Average' all pass --
-  // the extended-stat regex below is already case-insensitive (/i), so a
+  // the extended-stat regexes are already case-insensitive (/i), so a
   // case-sensitive simple list would reject 'average' while accepting 'p99'.
   const lower = s.toLowerCase();
   if (SIMPLE_STATS.some((stat) => stat.toLowerCase() === lower)) return true;
-  return EXTENDED_STAT_RE.test(s);
+  const ext = s.match(EXTENDED_STAT_RE);
+  if (ext) return ext[2] === undefined || Number(ext[2]) <= 100;
+  const range = s.match(RANGE_STAT_RE);
+  if (range) {
+    if (range[2] === undefined && range[3] === undefined) return false;
+    return isPercentBound(range[2]) && isPercentBound(range[3]);
+  }
+  return false;
 }
 
 /**
@@ -62,6 +79,9 @@ function isValidStatistic(s: string): boolean {
  *     ValidationError.
  *   - Extended stats want lowercase: 'p99' / 'tm95' are accepted, 'P99' /
  *     'Tm95' get a ValidationError.
+ *   - Range-form stats keep the upper-case prefix CloudWatch documents
+ *     ('TM(10%:90%)', 'PR(:300)'); only the prefix is folded, the bounds are
+ *     sent as typed.
  * isValidStatistic accepts case-folded forms on both branches (the simple
  * list is folded explicitly, the extended-stat regex carries /i), so the
  * schema doesn't reject 'average' or 'P99' -- but we MUST canonicalize
@@ -75,6 +95,10 @@ function canonicalizeStatistic(s: string): string {
     if (stat.toLowerCase() === lower) return stat;
   }
   if (EXTENDED_STAT_RE.test(s)) return lower;
+  if (RANGE_STAT_RE.test(s)) {
+    const open = s.indexOf("(");
+    return `${s.slice(0, open).toUpperCase()}${s.slice(open)}`;
+  }
   return s;
 }
 
@@ -96,18 +120,31 @@ const MAX_QUERIES = 100;
 // across the batch, since 100 queries of 100,000 points each pass individually
 // and blow the request cap together. Both the explicit-period and the
 // auto-picked-period paths are checked (see pickAutoPeriodSeconds below for why
-// the auto-pick is not safe by construction). CloudWatch also requires `period`
-// to be a positive multiple of 60.
+// the auto-pick is not safe by construction). `period` itself must be 1, 5, 10,
+// 20 or 30 (high-resolution metrics only) or a positive multiple of 60 -- the
+// rule in the CLI model's MetricStat.Period documentation (isValidPeriod).
 //
-// The estimate is derived from the REQUESTED period, which is only what
-// CloudWatch returns when the caller has NOT bounded the response. `MaxDatapoints`
-// (this tool's `maxDataPoints`) is exactly such a bound: CloudWatch widens the
-// period server-side until the series fits it and pages the remainder behind
-// NextToken, which this tool already surfaces as nextToken / hasMore. So the
+// The estimate is derived from the REQUESTED period, which is how many points
+// one response carries when the caller has NOT bounded it. `MaxDatapoints`
+// (this tool's `maxDataPoints`) is exactly such a bound: it is the PAGE SIZE --
+// "the maximum number of data points the request should return before
+// paginating" (CLI model, cloudwatch 2010-08-01) -- so CloudWatch returns at
+// most that many points and pages the remainder behind NextToken, which this
+// tool surfaces as nextToken / hasMore. It does NOT coarsen the period. So the
 // estimate is clamped to the caller's bound before it is compared -- otherwise a
-// batch the caller has ALREADY bounded, and that CloudWatch would serve happily,
-// gets rejected here on a count that never materializes.
+// batch the caller has ALREADY bounded, and that CloudWatch would serve page by
+// page, gets rejected here on a count that never arrives in one response.
 const CLOUDWATCH_MAX_DATAPOINTS = 100_800;
+
+// High-resolution (StorageResolution=1) metrics also accept these sub-minute
+// periods. CloudWatch additionally ties them to the StartTime's age (1s data is
+// only kept for 3 hours, for one); that rule is deliberately NOT mirrored here --
+// CloudWatch answers it itself.
+const HIGH_RESOLUTION_PERIODS: readonly number[] = [1, 5, 10, 20, 30];
+
+function isValidPeriod(period: number): boolean {
+  return HIGH_RESOLUTION_PERIODS.includes(period) || (period > 0 && period % 60 === 0);
+}
 
 // Pick a sane period granularity scaled to the requested range so a wide
 // window doesn't default to a needlessly fine resolution: minutes for a few
@@ -234,7 +271,7 @@ export const metricsTools: readonly Tool[] = [
   {
     name: "aws_metrics_query",
     description:
-      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept relative shorthand ('15m', '1h', '1d', '1w'), 'now', or ISO 8601 WITH an explicit offset ('2026-05-16T10:00:00Z' / '...-04:00' -- an offset-less date-time is rejected rather than silently read in the host's local zone; a date-only '2026-05-16' is read as UTC midnight); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to stay under CloudWatch's ~100,800-datapoint response cap. Returns {series: [{id, label?, timestamps, values, period?, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. Each series' `period` is the effective granularity for that query (its explicit period, or the auto-pick it inherited); it is omitted for an expression query that didn't set one. The top-level `periodSeconds` is always the auto-pick. When CloudWatch truncates a large response, `hasMore` is true and `nextToken` carries the resume cursor -- call again with `nextToken` set to fetch the next page (rare for typical agent queries that stay within the per-request cap). Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
+      "Query CloudWatch metrics via GetMetricData (the modern multi-metric / expression-capable API, not the legacy get-metric-statistics). Pass `queries` as a flat array of {id, namespace, metricName, dimensions?, statistic?, period?, expression?, label?}; the tool shapes them into MetricDataQueries for you. `startTime`/`endTime` accept relative shorthand ('15m', '1h', '1d', '1w'), 'now', or ISO 8601 WITH an explicit offset ('2026-05-16T10:00:00Z' / '...-04:00' -- an offset-less date-time is rejected rather than silently read in the host's local zone; a date-only '2026-05-16' is read as UTC midnight); endTime defaults to 'now'. Period is auto-picked from the time range when omitted (60s for <=3h, 300s for <=24h, 900s for <=15d, 3600s otherwise) to give a wide window a coarser default resolution; a request estimated above CloudWatch's ~100,800-datapoint response cap is rejected unless maxDataPoints is set. Returns {series: [{id, label?, timestamps, values, period?, statusCode?}], messages?, periodSeconds, profile, region, nextToken, hasMore}. Each series' `period` is the effective granularity for that query (its explicit period, or the auto-pick it inherited); it is omitted for an expression query that didn't set one. The top-level `periodSeconds` is always the auto-pick. Each call fetches ONE page: when CloudWatch has more (past maxDataPoints, or a large SEARCH expression), `hasMore` is true and `nextToken` carries the resume cursor -- call again with the same queries and `nextToken` set to fetch the next page. Use for 'show me the CPU on this instance for the last hour', 'sum lambda invocations across these 3 functions', or expression-based 'p99 latency divided by average latency' lookups.",
     annotations: {
       title: "Query CloudWatch metrics (GetMetricData)",
       readOnlyHint: true,
@@ -267,14 +304,16 @@ export const metricsTools: readonly Tool[] = [
               .string()
               .optional()
               .describe(
-                "Statistic: Average | Sum | Maximum | Minimum | SampleCount, or an extended stat like 'p99', 'p99.9', 'tm95'. Default 'Average'.",
+                "Statistic: Average | Sum | Maximum | Minimum | SampleCount, an extended stat like 'p99', 'p99.9', 'tm95', 'iqm', or a range form like 'TM(10%:90%)' / 'PR(:300)'. Default 'Average'. Metric-stat queries only; rejected on an expression query.",
               ),
             period: z
               .number()
               .int()
               .positive()
               .optional()
-              .describe("Period in seconds. Defaults to an auto-pick from the time range (60s/300s/900s/3600s)."),
+              .describe(
+                "Period in seconds: a positive multiple of 60, or 1, 5, 10, 20 or 30 for high-resolution metrics. Defaults to an auto-pick from the time range (60s/300s/900s/3600s).",
+              ),
             expression: z
               .string()
               .min(1)
@@ -293,7 +332,7 @@ export const metricsTools: readonly Tool[] = [
               .string()
               .optional()
               .describe(
-                "Restrict to a specific Unit (e.g. 'Seconds', 'Bytes'). Default: no filter. Only meaningful on metric-stat queries. Validated server-side by CloudWatch; malformed values surface as a downstream ValidationError rather than a local rejection.",
+                "Restrict to a specific Unit (e.g. 'Seconds', 'Bytes'). Default: no filter. Metric-stat queries only; rejected on an expression query. Validated server-side by CloudWatch; malformed values surface as a downstream ValidationError rather than a local rejection.",
               ),
           }),
         )
@@ -322,7 +361,7 @@ export const metricsTools: readonly Tool[] = [
         .positive()
         .optional()
         .describe(
-          "Target datapoint count. CloudWatch does not truncate to the first N points -- it widens (coarsens) the period server-side so the series aggregates down to fit this many points. CloudWatch's own ceiling is ~100,800; lower this to make CloudWatch return a coarser, smaller series. Setting it also tells this tool the response is bounded, so a wide range or large batch that would otherwise be rejected locally against that ceiling is passed through (a value ABOVE the ceiling bounds nothing and is still rejected). Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
+          "Page size: the most datapoints one response returns before CloudWatch paginates (default and ceiling ~100,800). It does NOT coarsen the period -- the remainder comes back behind `nextToken` / `hasMore: true`; widen `period` for a coarser series. Setting it also tells this tool the response is bounded, so a wide range or large batch that would otherwise be rejected locally against that ceiling is passed through and paged (a value ABOVE the ceiling bounds nothing and is still rejected). Forwarded as CloudWatch's MaxDatapoints (single 'p') field; the camelCase schema name follows this server's convention.",
         ),
       nextToken: z
         .string()
@@ -362,12 +401,20 @@ export const metricsTools: readonly Tool[] = [
         }
         seenIds.set(q.id, qi);
 
-        const hasMetricStat = q.namespace !== undefined || q.metricName !== undefined || q.dimensions !== undefined;
+        // statistic and unit are MetricStat members too: on an expression query
+        // buildMetricDataQueries has nowhere to put them, so they would be dropped
+        // without a word. Counting them here turns that into a rejection.
+        const hasMetricStat =
+          q.namespace !== undefined ||
+          q.metricName !== undefined ||
+          q.dimensions !== undefined ||
+          q.statistic !== undefined ||
+          q.unit !== undefined;
         const hasExpression = q.expression !== undefined;
         if (hasMetricStat && hasExpression) {
           return {
             ok: false,
-            error: `Query '${q.id}' mixes metric-stat fields (namespace/metricName/dimensions) with 'expression'. Pick one shape per query.`,
+            error: `Query '${q.id}' mixes metric-stat fields (namespace/metricName/dimensions/statistic/unit) with 'expression'. Pick one shape per query -- an expression's statistic comes from the metric-stat queries it references.`,
           };
         }
         if (!hasMetricStat && !hasExpression) {
@@ -385,7 +432,7 @@ export const metricsTools: readonly Tool[] = [
         if (q.statistic !== undefined && !isValidStatistic(q.statistic)) {
           return {
             ok: false,
-            error: `Query '${q.id}' has invalid statistic '${q.statistic}'. Use Average | Sum | Maximum | Minimum | SampleCount, or an extended stat like p99 / p99.9 / tm95.`,
+            error: `Query '${q.id}' has invalid statistic '${q.statistic}'. Use Average | Sum | Maximum | Minimum | SampleCount, an extended stat with a 0-100 percentage like p99 / p99.9 / tm95 (or iqm), or a range form like TM(10%:90%) / PR(:300).`,
           };
         }
       }
@@ -440,10 +487,10 @@ export const metricsTools: readonly Tool[] = [
           : "";
       let totalDatapoints = 0;
       for (const q of i.queries) {
-        if (q.period !== undefined && (q.period <= 0 || q.period % 60 !== 0)) {
+        if (q.period !== undefined && !isValidPeriod(q.period)) {
           return {
             ok: false,
-            error: `Query '${q.id}' has invalid period ${q.period}. CloudWatch requires period to be a positive multiple of 60 (seconds).`,
+            error: `Query '${q.id}' has invalid period ${q.period}. CloudWatch requires period to be a positive multiple of 60 (seconds), or 1, 5, 10, 20 or 30 for a high-resolution metric.`,
           };
         }
         // returnData:false computes an intermediate value for an expression
@@ -456,7 +503,7 @@ export const metricsTools: readonly Tool[] = [
             q.period !== undefined ? `period ${q.period}s` : `the auto-picked period ${effectivePeriod}s`;
           return {
             ok: false,
-            error: `Query '${q.id}' with ${periodPhrase} over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period, narrow the time range, or set maxDataPoints to let CloudWatch coarsen the series for you.${overCapHint}`,
+            error: `Query '${q.id}' with ${periodPhrase} over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}) would request ${datapoints} datapoints, exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. Widen the period, narrow the time range, or set maxDataPoints to have CloudWatch page the response (resume with nextToken).${overCapHint}`,
           };
         }
         totalDatapoints += datapoints;
@@ -464,7 +511,7 @@ export const metricsTools: readonly Tool[] = [
       if (Math.min(totalDatapoints, callerCap) > CLOUDWATCH_MAX_DATAPOINTS) {
         return {
           ok: false,
-          error: `These ${i.queries.length} queries would request ${totalDatapoints} datapoints in a single GetMetricData call over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}), exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. The cap applies to the whole request, not to each query. Widen the periods, narrow the time range, set maxDataPoints to let CloudWatch coarsen the series, or split the queries across calls.${overCapHint}`,
+          error: `These ${i.queries.length} queries would request ${totalDatapoints} datapoints in a single GetMetricData call over the requested range (${startDate.toISOString()} to ${endDate.toISOString()}), exceeding CloudWatch's per-request cap of ${CLOUDWATCH_MAX_DATAPOINTS}. The cap applies to the whole request, not to each query. Widen the periods, narrow the time range, set maxDataPoints to have CloudWatch page the response, or split the queries across calls.${overCapHint}`,
         };
       }
 
@@ -486,6 +533,14 @@ export const metricsTools: readonly Tool[] = [
       const effectiveProfile = i.profile ?? getProfile();
       const effectiveRegion = i.region ?? getRegion();
 
+      // --no-paginate, always: GetMetricData is a paginated operation in the CLI
+      // model (limit_key MaxDatapoints, token NextToken), so with neither member
+      // in the payload the CLI drains every page itself -- measured on aws-cli
+      // 2.34.3 against a loopback stub: three requests, no NextToken on stdout,
+      // and one query's data split into three MetricDataResults entries sharing
+      // its Id. With the flag the CLI sends one request and prints the page as
+      // CloudWatch returned it, NextToken included, so nextToken / hasMore mean
+      // the same thing on every call. A fixed literal, so not a paramfile concern.
       const result = await runAwsCall({
         service: "cloudwatch",
         operation: "get-metric-data",
@@ -494,16 +549,19 @@ export const metricsTools: readonly Tool[] = [
         timeoutMs: i.timeoutMs,
         outputFormat: "json",
         params,
+        extraFlags: ["--no-paginate"],
       });
 
       if (!result.ok) {
         // `||`, not `??`: an empty-string rawStderr is not nullish, so `??`
-        // would hand back "" instead of falling back to stdout.
+        // would hand back "" instead of falling back to stdout. Conditional
+        // spread so `suggestion` is absent rather than explicitly undefined,
+        // matching how aws-cli.ts builds the field.
         return {
           ok: false,
           error: result.error,
           errorKind: result.kind,
-          suggestion: result.suggestion,
+          ...(result.suggestion !== undefined ? { suggestion: result.suggestion } : {}),
           rawBody: result.rawStderr || result.rawStdout,
         };
       }

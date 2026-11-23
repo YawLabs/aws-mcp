@@ -82,6 +82,13 @@ describe("resolveTime", () => {
     assert.equal(resolveTime("h", NOW), null); // missing number
   });
 
+  it("returns null for a relative offset past Date's range instead of an Invalid Date", () => {
+    // '20000000w' is ~1.2e16 ms, beyond Date's +/-8.64e15: `new Date(now - ms)`
+    // is an Invalid Date, truthy, which used to slip past every `!date` guard.
+    assert.equal(resolveTime("20000000w", NOW), null);
+    assert.equal(resolveTime("99999999999999999999d", NOW), null);
+  });
+
   it("rejects a bare number instead of letting Date read it as a date", () => {
     // '5' fails the relative-time pattern (no unit) and used to fall through to
     // `new Date("5")`, which V8 parses as 2001-05-01 -- a dropped unit turned
@@ -331,6 +338,18 @@ describe("aws_metrics_query handler validation", () => {
     assert.match(r.error ?? "", /mixes metric-stat fields/);
   });
 
+  it("rejects statistic or unit on an expression query instead of dropping them", async () => {
+    // An expression has no MetricStat, so buildMetricDataQueries had nowhere to
+    // put either field and the caller got a series with no hint p99 was ignored.
+    for (const extra of [{ statistic: "p99" }, { unit: "Seconds" }]) {
+      const r = await tool.handler({
+        queries: [{ id: "e", expression: "m1*2", ...extra }],
+      } as never);
+      assert.equal(r.ok, false, JSON.stringify(extra));
+      assert.match(r.error ?? "", /mixes metric-stat fields/);
+    }
+  });
+
   it("rejects a query with neither metric-stat nor expression", async () => {
     const r = await tool.handler({ queries: [{ id: "empty" }] } as never);
     assert.equal(r.ok, false);
@@ -361,6 +380,40 @@ describe("aws_metrics_query handler validation", () => {
   it("accepts extended percentile statistics (p99, p99.9, tm95)", async () => {
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
     for (const stat of ["p99", "p99.9", "tm95", "tc90", "iqm"]) {
+      const r = await tool.handler({
+        queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
+      } as never);
+      assert.equal(r.ok, true, `expected stat '${stat}' to be accepted`);
+    }
+  });
+
+  it("rejects extended stats CloudWatch refuses: no suffix, a suffix over 100, PR shorthand", async () => {
+    // The old regex made the numeric suffix optional and unbounded, so all of
+    // these passed locally and bounced at CloudWatch.
+    for (const stat of ["p", "tm", "P", "p999", "p100.5", "tm101", "pr99", "TM(:)", "TM(10%:190%)", "p(1:2)"]) {
+      const r = await tool.handler({
+        queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
+      } as never);
+      assert.equal(r.ok, false, `expected stat '${stat}' to be rejected`);
+      assert.match(r.error ?? "", /invalid statistic/);
+    }
+  });
+
+  it("accepts the documented range forms and keeps their upper-case prefix", () => {
+    const stats = ["TM(10%:90%)", "TM(:95%)", "wm(150:1000)", "PR(:300)", "PR(10:200)", "tc(5%:)", "TS(80%:)"];
+    const built = buildMetricDataQueries(
+      stats.map((statistic, n) => ({ id: `q${n}`, namespace: "AWS/EC2", metricName: "CPUUtilization", statistic })),
+      60,
+    );
+    assert.deepEqual(
+      built.map((q) => q.MetricStat?.Stat),
+      ["TM(10%:90%)", "TM(:95%)", "WM(150:1000)", "PR(:300)", "PR(10:200)", "TC(5%:)", "TS(80%:)"],
+    );
+  });
+
+  it("lets a range-form statistic through the handler", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    for (const stat of ["TM(10%:90%)", "PR(:300)", "p100", "p0"]) {
       const r = await tool.handler({
         queries: [{ id: "x", namespace: "AWS/EC2", metricName: "CPUUtilization", statistic: stat }],
       } as never);
@@ -445,15 +498,26 @@ describe("aws_metrics_query handler validation", () => {
   });
 
   it("surfaces nextToken + hasMore=true when CloudWatch truncates", async () => {
+    // No maxDataPoints and no nextToken: the shape the AWS CLI auto-paginates.
+    // metrics_paginated models that drain (merged pages, duplicate ids, no
+    // NextToken), so this only sees the first page's cursor because the call
+    // passes --no-paginate.
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_paginated";
     const r = await tool.handler({
       queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
     } as never);
     assert.equal(r.ok, true);
-    const data = r.data as { nextToken: string | null; hasMore: boolean; series: Array<{ values: number[] }> };
+    const data = r.data as {
+      nextToken: string | null;
+      hasMore: boolean;
+      series: Array<{ values: number[] }>;
+      commandArgv: string[];
+    };
+    assert.ok(data.commandArgv.includes("--no-paginate"), data.commandArgv.join(" "));
     assert.equal(data.hasMore, true);
     assert.equal(typeof data.nextToken, "string");
     assert.ok((data.nextToken as string).length > 0);
+    assert.equal(data.series.length, 1, "one page, one series entry per query id");
     assert.equal(data.series[0].values.length, 2);
   });
 
@@ -540,6 +604,40 @@ describe("aws_metrics_query handler validation", () => {
     assert.match(r.error ?? "", /positive multiple of 60/);
   });
 
+  it("accepts the high-resolution periods 1, 5, 10, 20 and 30", async () => {
+    // CloudWatch accepts these for StorageResolution=1 metrics (CLI model,
+    // MetricStat.Period); the old multiple-of-60 rule refused them locally.
+    // The StartTime-age restriction on sub-minute periods is CloudWatch's to
+    // enforce, so nothing here adds one.
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
+    for (const period of [1, 5, 10, 20, 30]) {
+      const r = await tool.handler({
+        queries: [{ id: "cpu", namespace: "Custom/App", metricName: "Latency", period }],
+        startTime: "15m",
+      } as never);
+      assert.equal(r.ok, true, `period ${period}: ${r.error}`);
+    }
+    for (const period of [2, 15, 45, 90]) {
+      const r = await tool.handler({
+        queries: [{ id: "cpu", namespace: "Custom/App", metricName: "Latency", period }],
+        startTime: "15m",
+      } as never);
+      assert.equal(r.ok, false, `period ${period}`);
+      assert.match(r.error ?? "", new RegExp(`invalid period ${period}`));
+    }
+  });
+
+  it("rejects an oversized relative startTime with the invalid-startTime message, not a RangeError", async () => {
+    // '20000000w' resolved to an Invalid Date that passed every guard, and
+    // startDate.toISOString() then threw "Invalid time value".
+    const r = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+      startTime: "20000000w",
+    } as never);
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? "", /Invalid startTime '20000000w'/);
+  });
+
   it("rejects an explicit period+range that would exceed CloudWatch's datapoint cap", async () => {
     // 71 days at period=60s -> ceil(6,134,400 / 60) = 102,240 datapoints,
     // over the ~100,800 per-request ceiling.
@@ -555,10 +653,10 @@ describe("aws_metrics_query handler validation", () => {
 
   it("accepts an over-cap query when maxDataPoints bounds the response", async () => {
     // Same 71-day / 60s shape as the case above -- 102,240 estimated points --
-    // but the caller set maxDataPoints, so CloudWatch coarsens the period
-    // server-side and pages the rest behind NextToken. The estimate describes a
-    // response that never materializes; rejecting on it refuses a call
-    // CloudWatch serves happily.
+    // but the caller set maxDataPoints, which is CloudWatch's page size: at most
+    // that many points come back and the rest is paged behind NextToken. The
+    // estimate describes no single response; rejecting on it refuses a call
+    // CloudWatch serves page by page.
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
     const r = await tool.handler({
       queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 60 }],
@@ -620,7 +718,8 @@ describe("aws_metrics_query handler validation", () => {
 
   it("still rejects an invalid period even when maxDataPoints is set", async () => {
     // The bound excuses the datapoint ESTIMATE, not the period-shape check --
-    // CloudWatch rejects a non-multiple-of-60 period regardless.
+    // CloudWatch rejects 45 (neither a high-resolution period nor a multiple of
+    // 60) regardless.
     const r = await tool.handler({
       queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization", period: 45 }],
       maxDataPoints: 100,
@@ -712,7 +811,7 @@ describe("aws_metrics_query handler validation", () => {
   it("treats maxDataPoints AT the cap as a real bound and one above it as no bound", async () => {
     // The clamp is Math.min(estimate, callerCap) > CLOUDWATCH_MAX_DATAPOINTS.
     // Both arms of the boundary matter: 100,800 clamps the estimate down TO the
-    // ceiling (allowed -- CloudWatch coarsens and pages), 100,801 clamps to one
+    // ceiling (allowed -- CloudWatch pages at that size), 100,801 clamps to one
     // point ABOVE it and bounds nothing CloudWatch will honour.
     // Same 71-day / 60s shape as the rejection case above: 102,240 estimated.
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_empty";
@@ -859,6 +958,15 @@ describe("aws_metrics_query handler (fake-aws integration)", () => {
   });
 
   it("surfaces an error envelope on a ValidationError from CloudWatch", async () => {
+    process.env.AWS_MCP_FAKE_SCENARIO = "metrics_opaque_failure";
+    const opaque = await tool.handler({
+      queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],
+    } as never);
+    assert.equal(opaque.ok, false);
+    // Absent, not an own key holding undefined -- the convention aws-cli.ts and
+    // aws_logs_query follow. `r.suggestion === undefined` cannot tell them apart.
+    assert.equal(Object.hasOwn(opaque, "suggestion"), false, "suggestion key must be absent");
+
     process.env.AWS_MCP_FAKE_SCENARIO = "metrics_bad_metric";
     const r = await tool.handler({
       queries: [{ id: "cpu", namespace: "AWS/EC2", metricName: "CPUUtilization" }],

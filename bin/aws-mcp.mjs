@@ -619,9 +619,15 @@ async function launchChild(cmd, args, onLaunchFailed) {
 async function handOffToNode(reason) {
   const node = findNodeOnPath();
   if (!node) {
+    // An empty reason is AWS_MCP_RUNTIME=node on a supported oam host: the user
+    // asked for Node, so updating oam is no remedy -- the host is already at the
+    // floor -- and there is no below-floor clause to splice in.
     await errSync(
-      `aws-mcp: ${reason}, and no Node was found on PATH to run the server instead.\n` +
-        `${selfUpdateAdvice()}, or launch this command with node.\n`,
+      reason
+        ? `aws-mcp: ${reason}, and no Node was found on PATH to run the server instead.\n` +
+            `${selfUpdateAdvice()}, or launch this command with node.\n`
+        : "aws-mcp: AWS_MCP_RUNTIME=node was requested, but no Node was found on PATH to run the server.\n" +
+            "Put node on PATH, or unset AWS_MCP_RUNTIME to serve on this oam.\n",
     );
     process.exit(1);
   }
@@ -632,13 +638,16 @@ async function handOffToNode(reason) {
   });
 }
 
-/** No usable oam, under a mode that allows Node. */
-async function fallBackToNode(hostOam) {
+/**
+ * No usable oam, under a mode that allows Node. `why` finishes the below-floor
+ * reason: discovery found no newer oam, or the one it chose failed to launch.
+ */
+async function fallBackToNode(hostOam, why = "no newer oam was found") {
   if (hostOam === undefined) {
     await runInProcess();
     return;
   }
-  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and no newer oam was found`);
+  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`);
 }
 
 const mode = (process.env.AWS_MCP_RUNTIME ?? "auto").toLowerCase();
@@ -654,7 +663,9 @@ if (plan === "in-process") {
   const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
 
   if (chosen) {
-    if (overrideNote) await errSync(`aws-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+    if (overrideNote) {
+      await errSync(`aws-mcp: ${overrideNote}; using ${chosen.path} (oam ${chosen.version.join(".")}).\n`);
+    }
     // `--` separates oam's own flags from the script's argv, so `aws-mcp
     // --version` and any host-supplied flags survive the hop unchanged.
     await launchChild(chosen.path, ["run", SERVER_ENTRY, "--", ...process.argv.slice(2)], async (err) => {
@@ -663,7 +674,7 @@ if (plan === "in-process") {
         process.exit(1);
       }
       await errSync(`aws-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using Node instead.\n`);
-      await fallBackToNode(hostOam);
+      await fallBackToNode(hostOam, `the newer oam at ${chosen.path} could not be launched`);
     });
   } else {
     const shim = findOamShim();
@@ -671,7 +682,9 @@ if (plan === "in-process") {
       ...(overrideNote ? [overrideNote] : []),
       ...skipped,
       ...(shim
-        ? [`found ${shim}, but Node cannot execute a .cmd/.bat directly -- install the native oam binary, or point OAM_BIN at one`]
+        ? [
+            `found ${shim}, but Node cannot execute a .cmd/.bat directly -- install the native oam binary, or point OAM_BIN at one`,
+          ]
         : []),
     ];
     if (mode === "oam") {

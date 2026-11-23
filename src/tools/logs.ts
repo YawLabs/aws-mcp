@@ -51,11 +51,11 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
  * schema level would have Zod-OK'd an input the CLI then errored on. aws_logs_tail
  * now resolves the window itself and sends an epoch-millisecond startTime, so
  * nothing downstream parses these strings any more; the vocabulary is kept
- * unchanged so an existing input still means what it meant. metrics.ts mirrors
- * the same shorthand so an agent learns it once, and IMPORTS these rather than
- * re-declaring them: the pattern used to exist byte-identically in both files,
- * which is the drift risk multi-region.ts already removed by centralizing its
- * region regex in session.ts.
+ * unchanged so an existing input still means what it meant. aws_metrics_query and
+ * aws_logs_query take the same shorthand through resolveTime below, which
+ * metrics.ts imports (it imports nothing else from here): the pattern used to
+ * exist byte-identically in both files, which is the drift risk multi-region.ts
+ * already removed by centralizing its region regex in session.ts.
  */
 const RELATIVE_TIME_RE = /^\d+[smhdw]$/;
 const RELATIVE_TIME_UNIT_MS: Record<string, number> = {
@@ -89,7 +89,7 @@ function relativeTimeMs(input: string): number | null {
 // fat-fingered case.
 const MAX_SINCE_MS = 30 * 24 * 60 * 60 * 1000;
 
-// --- moved verbatim from metrics.ts, see the note left in its place there ---
+// --- moved from metrics.ts, see the note left in its place there ---
 
 // A bare number is the trap this rejects. "5" fails RELATIVE_TIME_RE (no unit)
 // and would fall through to `new Date("5")`, which V8 reads as 2001-05-01 -- a
@@ -118,14 +118,21 @@ const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9
  * Everything else -- an offset-less date-time, a bare number, free text --
  * returns null rather than being handed to Date's permissive parser.
  *
- * Shared by aws_metrics_query (which re-exports it under its old name) and
+ * Shared by aws_metrics_query (which re-exports it for its tests) and
  * aws_logs_query, so the two observability tools take the same window vocabulary.
  */
 export function resolveTime(input: string, now: number): Date | null {
   if (input === "now") return new Date(now);
   if (RELATIVE_TIME_RE.test(input)) {
     const ms = relativeTimeMs(input);
-    return ms === null ? null : new Date(now - ms);
+    if (ms === null) return null;
+    // An oversized offset ('20000000w') lands outside Date's +/-8.64e15 ms range
+    // and yields an Invalid Date: truthy, so it passed every `!date` guard, and
+    // every comparison against its NaN is false, so it slipped past the range
+    // checks too -- aws_metrics_query then threw a RangeError from toISOString
+    // and aws_logs_query skipped its 90-day cost cap. Null, like the ISO branch.
+    const t = new Date(now - ms);
+    return Number.isNaN(t.getTime()) ? null : t;
   }
   if (BARE_NUMBER_RE.test(input)) return null;
   if (!ISO_DATE_ONLY_RE.test(input) && !ISO_DATE_TIME_RE.test(input)) return null;
@@ -169,8 +176,10 @@ const LOG_GROUP_ARN_RE = /^arn:[a-z0-9-]{1,32}:logs:[a-z0-9-]{1,32}:[0-9]{12}:lo
  * null when neither shape validates (the extracted ARN name is held to the same
  * LOG_GROUP_RE argv-safety contract as a directly-supplied name).
  *
- * aws_logs_query's path, which sends bare names. aws_logs_tail uses
- * parseLogGroupArn instead, so an ARN there addresses the group it actually names.
+ * aws_logs_query's path, which sends bare names and checks the discarded region
+ * itself (through parseLogGroupArn) so a cross-region ARN is rejected rather than
+ * resolved. aws_logs_tail uses parseLogGroupArn instead, so an ARN there
+ * addresses the group it actually names.
  */
 function resolveLogGroupName(input: string): string | null {
   const arn = input.match(LOG_GROUP_ARN_RE);
@@ -538,7 +547,7 @@ function describeShape(x: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// aws_logs_query support. Place this block above `export const logsTools` (:140).
+// aws_logs_query support.
 // ---------------------------------------------------------------------------
 
 /**
@@ -925,7 +934,11 @@ export const logsTools: readonly Tool[] = [
       title: "Fetch recent CloudWatch Logs events for a log group",
       readOnlyHint: true,
       destructiveHint: false,
-      idempotentHint: false,
+      // A pure read that starts nothing and bills nothing per call, like
+      // aws_metrics_query: repeating it has no further effect on the account.
+      // (aws_logs_query is the one read tool that says false -- each call starts
+      // and pays for a new Insights query.)
+      idempotentHint: true,
       openWorldHint: true,
     },
     inputSchema: z.object({
@@ -1039,7 +1052,10 @@ export const logsTools: readonly Tool[] = [
           error: `since '${since}' asks for a ${Math.round(sinceMs / 86_400_000)}-day window; the maximum is ${MAX_SINCE_MS / 86_400_000} days. A window this wide spends FilterLogEvents call after call and then fails on the timeout instead of returning events. Narrow the window, or add a filterPattern and tail it in slices.`,
         };
       }
-      if (i.logStreamNames && i.logStreamNamePrefix) {
+      // `?.length`, not truthiness: an empty logStreamNames is "no stream filter"
+      // everywhere else (buildTailParams drops it), so `[]` beside a prefix is not
+      // a conflict.
+      if (i.logStreamNames?.length && i.logStreamNamePrefix) {
         return {
           ok: false,
           error: "Pass either logStreamNames or logStreamNamePrefix, not both (mirrors aws CLI).",
@@ -1055,11 +1071,11 @@ export const logsTools: readonly Tool[] = [
           }
         }
       }
-      // A prefix is a partial stream name, so the same validator applies:
-      // reject a leading hyphen (argv-injection defense -- the value is
-      // appended after --log-stream-name-prefix as its own argv entry),
-      // control characters, and the AWS-forbidden ':'/'*'. A legitimate
-      // prefix like '2026/04/21/' passes cleanly.
+      // A prefix is a partial stream name, so the same validator applies: a
+      // leading hyphen, control characters, and the AWS-forbidden ':'/'*' are
+      // rejected. The prefix now travels inside --cli-input-json, so the hyphen
+      // rule is no longer an argv concern; it stays so this tool keeps accepting
+      // the same inputs. A legitimate prefix like '2026/04/21/' passes cleanly.
       if (i.logStreamNamePrefix && !isValidLogStreamName(i.logStreamNamePrefix)) {
         return {
           ok: false,
@@ -1153,7 +1169,8 @@ export const logsTools: readonly Tool[] = [
           ok: false,
           error,
           errorKind: failure.kind,
-          suggestion: failure.suggestion,
+          // Absent rather than explicitly undefined, as aws-cli.ts builds it.
+          ...(failure.suggestion !== undefined ? { suggestion: failure.suggestion } : {}),
           rawBody: failure.rawStderr || failure.rawStdout,
         };
       };
@@ -1269,7 +1286,7 @@ export const logsTools: readonly Tool[] = [
   {
     name: "aws_logs_query",
     description:
-      "Run a CloudWatch Logs Insights query and wait for it to finish -- StartQuery, poll GetQueryResults until the query reaches a terminal status, return the rows -- in ONE call, replacing the three-step start/poll/interpret-status dance you would otherwise write with aws_call. `logGroupNames` takes 1-50 bare group names ('/aws/lambda/my-fn'); a log-group ARN is accepted and its NAME extracted, which DISCARDS the ARN's account, so a cross-account ARN queries the same-named group in your own account -- real cross-account queries need logGroupIdentifiers, which this tool does not send. `queryString` is Logs Insights QL, e.g. 'fields @timestamp, @message | filter @message like /ERROR/ | sort @timestamp desc | limit 20' or 'stats count(*) by bin(5m)'. `startTime`/`endTime` take the same vocabulary as aws_logs_tail and aws_metrics_query -- relative shorthand ('15m', '1h', '1d', '1w'), 'now', or ISO 8601 with an explicit offset -- defaulting to the last hour, and the window is capped at 90 days. Returns {queryId, status, rows, rowCount, fields, statistics, truncated, ...}: rows are FLATTENED from the API's [{field, value}] pairs into plain objects, so a row reads {'@timestamp': '...', '@message': '...', '@ptr': '...'}. `statistics.recordsMatched` counts everything the query matched and can be far larger than `rowCount` when `limit` (default 1000, max 10000) clipped the result -- `truncated` is true when it did. BILLING: Insights charges by the uncompressed bytes SCANNED, so a wide window across many log groups costs money whether or not anything matches; narrow the window and add a `filter` before widening either. Waits up to `maxWaitMs` (default 120000, max 900000) and reports one progress update per poll; on timeout or client cancellation the query is NEVER stopped -- it keeps running and the error hands back `queryId`, whose results stay retrievable for 7 days. For plain 'show me recent log lines' with no aggregation, aws_logs_tail is cheaper and simpler.",
+      "Run a CloudWatch Logs Insights query and wait for it to finish -- StartQuery, poll GetQueryResults until the query reaches a terminal status, return the rows -- in ONE call, replacing the three-step start/poll/interpret-status dance you would otherwise write with aws_call. `logGroupNames` takes 1-50 bare group names ('/aws/lambda/my-fn'); a log-group ARN is accepted and its NAME extracted, which DISCARDS the ARN's account, so a cross-account ARN queries the same-named group in your own account -- real cross-account queries need logGroupIdentifiers, which this tool does not send. An ARN whose region differs from the call's region is rejected. `queryString` is Logs Insights QL, e.g. 'fields @timestamp, @message | filter @message like /ERROR/ | sort @timestamp desc | limit 20' or 'stats count(*) by bin(5m)'. `startTime`/`endTime` take the same vocabulary as aws_metrics_query -- relative shorthand ('15m', '1h', '1d', '1w'), 'now', or ISO 8601 with an explicit offset -- defaulting to the last hour, and the window is capped at 90 days. Returns {queryId, status, rows, rowCount, fields, statistics, truncated, ...}: rows are FLATTENED from the API's [{field, value}] pairs into plain objects, so a row reads {'@timestamp': '...', '@message': '...', '@ptr': '...'}. `statistics.recordsMatched` counts everything the query matched and can be far larger than `rowCount` when `limit` (default 1000, max 10000) clipped the result -- `truncated` is true when it did. BILLING: Insights charges by the uncompressed bytes SCANNED, so a wide window across many log groups costs money whether or not anything matches; narrow the window and add a `filter` before widening either. Waits up to `maxWaitMs` (default 120000, max 900000) and reports one progress update per poll; on timeout or client cancellation the query is NEVER stopped -- it keeps running and the error hands back `queryId`, whose results stay retrievable for 7 days. For plain 'show me recent log lines' with no aggregation, aws_logs_tail is cheaper and simpler.",
     annotations: {
       title: "Run a CloudWatch Logs Insights query and wait for results",
       // Reads log data and mutates nothing: StartQuery creates no AWS resource
@@ -1301,7 +1318,7 @@ export const logsTools: readonly Tool[] = [
         .min(1)
         .max(MAX_QUERY_LOG_GROUPS)
         .describe(
-          `1-${MAX_QUERY_LOG_GROUPS} log group names, e.g. ['/aws/lambda/my-fn'] -- StartQuery caps a query at ${MAX_QUERY_LOG_GROUPS}. A full log-group ARN is accepted and its name extracted; that discards the ARN's account, so a cross-account ARN queries the same-named group in YOUR account.`,
+          `1-${MAX_QUERY_LOG_GROUPS} log group names, e.g. ['/aws/lambda/my-fn'] -- StartQuery caps a query at ${MAX_QUERY_LOG_GROUPS}. A full log-group ARN is accepted and its name extracted; that discards the ARN's account, so a cross-account ARN queries the same-named group in YOUR account. An ARN in a different region than this call is rejected.`,
         ),
       queryString: z
         .string()
@@ -1381,9 +1398,16 @@ export const logsTools: readonly Tool[] = [
         timeoutMs?: number;
       };
 
-      // Same accept-a-name-or-an-ARN resolution aws_logs_tail uses, and the same
-      // argv-safety contract: StartQuery's own logGroupNames pattern is
-      // [\.\-_/#A-Za-z0-9]+ at 1-512 chars, which is exactly LOG_GROUP_RE.
+      // Accepts a bare name or a log-group ARN, like aws_logs_tail, but sends
+      // bare names only (logGroupNames, not logGroupIdentifiers): an ARN is cut to
+      // its name, which discards its account. Its REGION is not discarded
+      // silently: StartQuery is regional, so an ARN for another region would
+      // start a billed query over a same-named group in this call's region (or
+      // fail ResourceNotFound). Rejected before any spawn, with aws_logs_tail's
+      // message shape. Names are held to the same argv-safety contract:
+      // StartQuery's own logGroupNames pattern is [\.\-_/#A-Za-z0-9]+ at 1-512
+      // chars, which is exactly LOG_GROUP_RE.
+      const effectiveRegion = i.region ?? getRegion();
       const logGroupNames: string[] = [];
       for (const raw of i.logGroupNames) {
         const name = resolveLogGroupName(raw);
@@ -1391,6 +1415,13 @@ export const logsTools: readonly Tool[] = [
           return {
             ok: false,
             error: `Invalid logGroupName '${raw}'. Pass a bare group name -- starting with alphanumeric/dot/slash/underscore/hash and containing only [.\\-_/#A-Za-z0-9] -- or a full log-group ARN like 'arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-fn' (an optional trailing ':*' is allowed).`,
+          };
+        }
+        const arn = parseLogGroupArn(raw);
+        if (arn && arn.region !== effectiveRegion) {
+          return {
+            ok: false,
+            error: `logGroupNames entry '${raw}' is a log-group ARN in region '${arn.region}', but this call runs in '${effectiveRegion}'${i.region === undefined ? " (the session/default region)" : ""}. StartQuery is regional, so the ARN cannot be queried from there. Pass region: '${arn.region}' (all groups in one query share a region), or pass the bare name '${arn.name}' to query the same-named group in '${effectiveRegion}'.`,
           };
         }
         logGroupNames.push(name);
@@ -1444,8 +1475,8 @@ export const logsTools: readonly Tool[] = [
 
       // Mirror runAwsCall's resolution so the response echoes the EFFECTIVE
       // profile/region rather than the caller's (possibly undefined) input.
+      // effectiveRegion is resolved above, for the ARN region check.
       const effectiveProfile = i.profile ?? getProfile();
-      const effectiveRegion = i.region ?? getRegion();
 
       const started = await runAwsCall({
         service: "logs",
@@ -1600,15 +1631,12 @@ export const logsTools: readonly Tool[] = [
   },
 ];
 
-// Exported for tests, plus the time vocabulary metrics.ts imports
-// (RELATIVE_TIME_RE / RELATIVE_TIME_UNIT_MS / relativeTimeMs / resolveTime) so
-// the shorthand and the window parser are defined once for all three tools.
-// aws_logs_query's own helpers (isValidQueryId, flattenQueryRows, resolveTime)
-// are exported at their definitions.
+// Exported for tests. metrics.ts imports only resolveTime, which -- like
+// aws_logs_query's own helpers (isValidQueryId, flattenQueryRows) -- is exported
+// at its definition.
 export {
   DEFAULT_MAX_EVENTS,
   DEFAULT_QUERY_LIMIT,
-  LOG_GROUP_ARN_RE,
   LOG_GROUP_RE,
   LOG_STREAM_NAME_RE,
   MAX_MAX_EVENTS,
@@ -1617,7 +1645,6 @@ export {
   MAX_QUERY_RANGE_MS,
   MAX_SINCE_MS,
   RELATIVE_TIME_RE,
-  RELATIVE_TIME_UNIT_MS,
   relativeTimeMs,
   resolveLogGroupName,
 };

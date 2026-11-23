@@ -2,8 +2,13 @@
 // Build a self-contained single-file binary of the @yawlabs/aws-mcp sidecar
 // using `oam compile`.
 //
-// Output path is bin/<platform>-<arch>/<binName>[.exe], which is what
-// scripts/stage-release-asset.mjs and the release flow consume.
+// Output path is bin/<target>/<binName>[.exe], where <target> is
+// AWS_MCP_BINARY_TARGET or the host's <platform>-<arch>. That is what
+// scripts/stage-release-asset.mjs reads, keyed the same way.
+//
+// MANUAL and UNWIRED: release.sh does not run this, nor the staging and
+// manifest scripts after it, and releases carry no binary assets. Run it by
+// hand when a binary is wanted.
 //
 // `oam compile` embeds a pre-bundled file into oam's runtime carrier and writes
 // the finished executable directly: no blob generation, no injection step, no
@@ -22,37 +27,39 @@
 // build-tmp/ and bin/<platform>-<arch>/. It does NOT mutate package.json,
 // package-lock.json, src/, or node_modules, and it never runs `npm install`.
 
-import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import esbuild from 'esbuild';
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import esbuild from "esbuild";
 import {
   parseManifest,
   predatesSigning,
   verifyManifestSignature,
   verifyPresigningSums,
-} from './lib/oam-release-verify.mjs';
+} from "./lib/oam-release-verify.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(__dirname, '..');
+const repoRoot = resolve(__dirname, "..");
 
-const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
+const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
 const { version } = pkg;
 // Binary name = the package's first `bin` command, so this script stays
 // copy-paste generic across @yawlabs/* servers -- no per-repo rename.
-const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split('/').pop();
-const binEntry = Object.values(pkg.bin ?? {})[0] ?? pkg.main ?? 'dist/index.js';
+const binName = Object.keys(pkg.bin ?? {})[0] ?? pkg.name.split("/").pop();
 // Resolve the TypeScript entry directly rather than deriving it from `bin`.
 // `bin` points at the oam runtime LAUNCHER (bin/<name>.mjs), so the old
 // derivation produced `bin/<name>.ts` -- a path that has never existed -- and
 // esbuild failed with "Could not resolve". Prefer the conventional source
 // entry, falling back to the dist path for a repo that does not use it.
-const distEntry = pkg.main ?? 'dist/index.js';
-const srcEntry = existsSync(join(repoRoot, 'src/index.ts'))
-  ? 'src/index.ts'
-  : distEntry.replace(/^\.\//, '').replace(/^dist\//, 'src/').replace(/\.[cm]?js$/, '.ts');
+const distEntry = pkg.main ?? "dist/index.js";
+const srcEntry = existsSync(join(repoRoot, "src/index.ts"))
+  ? "src/index.ts"
+  : distEntry
+      .replace(/^\.\//, "")
+      .replace(/^dist\//, "src/")
+      .replace(/\.[cm]?js$/, ".ts");
 
 // The target being built for. Everything downstream -- the bin/<platform-arch>/
 // directory, the .exe suffix, the carrier -- keys off THIS, not the build host,
@@ -63,18 +70,18 @@ const srcEntry = existsSync(join(repoRoot, 'src/index.ts'))
 const HOST_TARGET = `${process.platform}-${process.arch}`;
 const TARGET = (process.env.AWS_MCP_BINARY_TARGET ?? HOST_TARGET).toLowerCase();
 const isCross = TARGET !== HOST_TARGET;
-const targetIsWin = TARGET.startsWith('win32-');
+const targetIsWin = TARGET.startsWith("win32-");
 
 const platformDir = TARGET;
-const binDir = join(repoRoot, 'bin', platformDir);
-const tmpDir = join(repoRoot, 'build-tmp');
-const bundlePath = join(tmpDir, 'oam-bundle.cjs');
+const binDir = join(repoRoot, "bin", platformDir);
+const tmpDir = join(repoRoot, "build-tmp");
+const bundlePath = join(tmpDir, "oam-bundle.cjs");
 const exeName = targetIsWin ? `${binName}.exe` : binName;
 const outExe = join(binDir, exeName);
 
 function run(cmd, args, opts = {}) {
-  console.log(`> ${cmd} ${args.join(' ')}`);
-  return execFileSync(cmd, args, { stdio: 'inherit', cwd: repoRoot, ...opts });
+  console.log(`> ${cmd} ${args.join(" ")}`);
+  return execFileSync(cmd, args, { stdio: "inherit", cwd: repoRoot, ...opts });
 }
 
 function fmtSize(p) {
@@ -91,15 +98,16 @@ mkdirSync(binDir, { recursive: true });
 await esbuild.build({
   entryPoints: [join(repoRoot, srcEntry)],
   bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  target: 'node20',
+  platform: "node",
+  format: "cjs",
+  // Same target as build.mjs (and engines: node >=22), so the binary bundle
+  // is lowered exactly as the npm bundle is.
+  target: "node22",
   // esbuild leaves import.meta.url EMPTY in cjs output, so a server that reads
   // it (createRequire(import.meta.url) to find package.json) would crash at
   // load. Polyfill it to the carrier's own path.
   banner: { js: "const __oamImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
-  define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__oamImportMetaUrl' },
-  external: ['cpu-features'],
+  define: { __VERSION__: JSON.stringify(version), "import.meta.url": "__oamImportMetaUrl" },
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);
@@ -133,17 +141,17 @@ rmSync(outExe, { force: true });
 // scripts/oam-release-keys/presigning-sums, as oam's installers check it -- and
 // says so.
 const OAM_ASSETS = {
-  'win32-x64': 'oam-x86_64-pc-windows-msvc.exe',
-  'win32-arm64': 'oam-aarch64-pc-windows-msvc.exe',
-  'darwin-arm64': 'oam-aarch64-apple-darwin',
-  'darwin-x64': 'oam-x86_64-apple-darwin',
-  'linux-x64': 'oam-x86_64-unknown-linux-gnu',
+  "win32-x64": "oam-x86_64-pc-windows-msvc.exe",
+  "win32-arm64": "oam-aarch64-pc-windows-msvc.exe",
+  "darwin-arm64": "oam-aarch64-apple-darwin",
+  "darwin-x64": "oam-x86_64-apple-darwin",
+  "linux-x64": "oam-x86_64-unknown-linux-gnu",
 };
 
 /** The launcher's floor, `const OAM_MIN = [x, y, z]` in the bin, as a tag. */
 function launcherFloorTag() {
   const launcher = join(repoRoot, Object.values(pkg.bin ?? {})[0] ?? `bin/${binName}.mjs`);
-  const m = /const OAM_MIN = \[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(readFileSync(launcher, 'utf-8'));
+  const m = /const OAM_MIN = \[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(readFileSync(launcher, "utf-8"));
   if (!m) {
     console.error(`build-binary-oam: could not read OAM_MIN from ${launcher}; set OAM_VERSION=vX.Y.Z`);
     process.exit(1);
@@ -155,7 +163,9 @@ async function download(url, dest) {
   console.log(`> fetch ${url}`);
   const res = await fetch(url);
   if (!res.ok) {
-    console.error(`build-binary-oam: downloading ${url} failed (HTTP ${res.status}); refusing to use an unverified carrier`);
+    console.error(
+      `build-binary-oam: downloading ${url} failed (HTTP ${res.status}); refusing to use an unverified carrier`,
+    );
     process.exit(1);
   }
   const buf = Buffer.from(await res.arrayBuffer());
@@ -169,7 +179,7 @@ async function fetchOamCarrier(target) {
   if (!asset) {
     console.error(
       `build-binary-oam: no oam release asset known for target '${target}'.\n` +
-        `Known targets: ${Object.keys(OAM_ASSETS).join(', ')}`,
+        `Known targets: ${Object.keys(OAM_ASSETS).join(", ")}`,
     );
     process.exit(1);
   }
@@ -178,7 +188,7 @@ async function fetchOamCarrier(target) {
   // 'latest', which would let a rebuild silently acquire a newer runtime and
   // has no fixed tag for the manifest to be checked against.
   const rawTag = process.env.OAM_VERSION ?? launcherFloorTag();
-  const tag = rawTag.startsWith('v') ? rawTag : `v${rawTag}`;
+  const tag = rawTag.startsWith("v") ? rawTag : `v${rawTag}`;
   let unsigned;
   try {
     unsigned = predatesSigning(tag);
@@ -209,7 +219,7 @@ async function fetchOamCarrier(target) {
     await download(`${base}/RELEASE-MANIFEST.sig`, sigPath);
     try {
       const principal = verifyManifestSignature({ manifestPath, sigPath, tag });
-      want = parseManifest(readFileSync(manifestPath, 'utf-8'), tag).get(asset);
+      want = parseManifest(readFileSync(manifestPath, "utf-8"), tag).get(asset);
       console.log(`  RELEASE-MANIFEST ${tag} signed by ${principal}`);
     } catch (err) {
       console.error(`build-binary-oam: ${err.message}; refusing to use an unverified carrier`);
@@ -218,11 +228,11 @@ async function fetchOamCarrier(target) {
   }
   if (!want) {
     console.error(
-      `build-binary-oam: ${asset} has no entry in the ${unsigned ? 'pinned SHA256SUMS' : 'signed manifest'} for ${tag}; refusing to use an unverified carrier`,
+      `build-binary-oam: ${asset} has no entry in the ${unsigned ? "pinned SHA256SUMS" : "signed manifest"} for ${tag}; refusing to use an unverified carrier`,
     );
     process.exit(1);
   }
-  const got = createHash('sha256').update(readFileSync(dest)).digest('hex');
+  const got = createHash("sha256").update(readFileSync(dest)).digest("hex");
   if (got !== want) {
     console.error(`build-binary-oam: SHA256 mismatch for ${asset}\n  expected ${want}\n  got      ${got}`);
     process.exit(1);
@@ -237,8 +247,33 @@ async function fetchOamCarrier(target) {
   return dest;
 }
 
-const carrierArgs = isCross ? ['--carrier', await fetchOamCarrier(TARGET)] : [];
-run('oam', ['compile', bundlePath, '-o', outExe, ...carrierArgs]);
+/**
+ * A host build embeds whatever `oam` is on PATH as the carrier, so hold it to
+ * the same floor the cross path pins (OAM_MIN): below it, the binary would ship
+ * a runtime this server is not verified on.
+ */
+function assertHostOamAtFloor() {
+  const floor = launcherFloorTag();
+  let out = "";
+  try {
+    out = execFileSync("oam", ["--version"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch (err) {
+    console.error(`build-binary-oam: could not run \`oam --version\` (${err.message}); install oam ${floor} or newer`);
+    process.exit(1);
+  }
+  const have = /(\d+)\.(\d+)\.(\d+)/.exec(out)?.slice(1).map(Number);
+  const want = floor.slice(1).split(".").map(Number);
+  const cmp = have ? (have.map((v, i) => v - want[i]).find((d) => d !== 0) ?? 0) : -1;
+  if (cmp < 0) {
+    const seen = have ? have.join(".") : `unreadable (${out.trim()})`;
+    console.error(`build-binary-oam: oam on PATH is ${seen}, older than the floor ${floor}; run \`oam self-update\``);
+    process.exit(1);
+  }
+}
+
+if (!isCross) assertHostOamAtFloor();
+const carrierArgs = isCross ? ["--carrier", await fetchOamCarrier(TARGET)] : [];
+run("oam", ["compile", bundlePath, "-o", outExe, ...carrierArgs]);
 if (isCross) {
   // Building it is proven for every target; RUNNING it is only proven where we
   // can execute it. Say which one happened rather than implying both.
@@ -256,12 +291,12 @@ if (!targetIsWin) chmodSync(outExe, 0o755);
 // if oam already emits a signed binary this is a harmless no-op. `--force`
 // replaces any residual signature; `--timestamp=none` keeps it offline and
 // reproducible.
-if (process.platform === 'darwin') {
+if (process.platform === "darwin") {
   try {
-    run('codesign', ['--sign', '-', '--force', '--timestamp=none', outExe]);
-    run('codesign', ['--verify', '--verbose', outExe]);
+    run("codesign", ["--sign", "-", "--force", "--timestamp=none", outExe]);
+    run("codesign", ["--verify", "--verbose", outExe]);
   } catch {
-    console.log('(codesign step failed -- continuing; verify the binary launches before shipping)');
+    console.log("(codesign step failed -- continuing; verify the binary launches before shipping)");
   }
 }
 
@@ -280,18 +315,18 @@ if (process.platform === 'darwin') {
 // only way a macOS binary can exist at all: this was the whole path to that
 // asset, not an edge of it.
 if (isCross) {
-  console.log('SKIP smoke: ' + TARGET + ' cannot run on ' + HOST_TARGET + '. Run --version on that target: ' + outExe);
+  console.log(`SKIP smoke: ${TARGET} cannot run on ${HOST_TARGET}. Run --version on that target: ${outExe}`);
 } else {
-  run(outExe, ['--version']);
+  run(outExe, ["--version"]);
 }
 
-console.log('');
+console.log("");
 console.log(`OK  ${outExe}`);
 console.log(`    ${fmtSize(outExe)}`);
-console.log('');
-console.log('NOTE: this binary embeds oam\'s runtime (V8, ICU and others). If you');
+console.log("");
+console.log("NOTE: this binary embeds oam's runtime (V8, ICU and others). If you");
 console.log("      redistribute it, ship oam's LICENSE, NOTICE and THIRD_PARTY_LICENSES.md");
-console.log('      alongside it.');
-console.log('');
-console.log('Verify with:');
+console.log("      alongside it.");
+console.log("");
+console.log("Verify with:");
 console.log(`    "${outExe}" --version`);

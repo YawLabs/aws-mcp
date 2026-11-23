@@ -1,5 +1,6 @@
 /**
- * Live aws_docs_read checks against docs.aws.amazon.com.
+ * Live aws_docs_read checks against docs.aws.amazon.com, and one aws_docs_search
+ * shape check against the backend behind its search box.
  *
  * NO CREDENTIALS, NO AWS API, NO SUBPROCESS. The docs tools are the only tools
  * in this server that do raw HTTP instead of shelling out to the aws CLI, so
@@ -27,12 +28,14 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { docsTools } from "./docs.js";
+import { docsTools, isValidDocsUrl } from "./docs.js";
 
 const LIVE = process.env.AWS_MCP_LIVE_DOCS === "1" || process.env.AWS_MCP_LIVE_TESTS === "1";
 
 const read = docsTools.find((t) => t.name === "aws_docs_read");
 if (!read) throw new Error("docsTools missing aws_docs_read");
+const search = docsTools.find((t) => t.name === "aws_docs_search");
+if (!search) throw new Error("docsTools missing aws_docs_search");
 
 const DOCS = "https://docs.aws.amazon.com";
 
@@ -77,5 +80,27 @@ describe("aws_docs_read -- live docs.aws.amazon.com", { skip: !LIVE }, () => {
     });
     assert.equal(r.ok, false);
     assert.match(r.error ?? "", /rendered in the browser by JavaScript/);
+  });
+});
+
+describe("aws_docs_search -- live proxy.search.docs.aws.com", { skip: !LIVE }, () => {
+  it("(e) still answers in the shape parseSearchResults reads", async () => {
+    // The backend is undocumented: the POST body and
+    // suggestions[].textExcerptSuggestion.{link,title,summary,suggestionBody}
+    // are otherwise exercised only by hand-built fixtures. A renamed field makes
+    // the parser return [] -- which every fixture-driven test still passes.
+    const r = await search.handler({ query: "S3 bucket naming rules" });
+    assert.equal(r.ok, true, r.error ?? "");
+    const data = r.data as {
+      count: number;
+      lowRelevance: boolean;
+      results: Array<{ title: string; url: string }>;
+    };
+    assert.ok(data.count > 0, "an on-topic query must come back with results");
+    for (const hit of data.results) {
+      assert.equal(isValidDocsUrl(hit.url), true, hit.url);
+      assert.ok(hit.title.length > 0, hit.url);
+    }
+    assert.equal(data.lowRelevance, false, "an on-topic query must not be flagged");
   });
 });

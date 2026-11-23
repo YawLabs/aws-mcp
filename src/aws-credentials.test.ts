@@ -153,6 +153,43 @@ aws_access_key_id = PROD-KEY
   });
 });
 
+describe("upsertProfileIntoText — line endings and BOM", () => {
+  it("keeps a CRLF file CRLF when appending a profile", () => {
+    const existing = "[default]\r\naws_access_key_id = X\r\naws_secret_access_key = Y\r\n";
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    assert.equal(
+      out,
+      "[default]\r\naws_access_key_id = X\r\naws_secret_access_key = Y\r\n\r\n" +
+        "[mcp-dev]\r\naws_access_key_id = AKIA-NEW-1\r\naws_secret_access_key = secret-new-1\r\naws_session_token = token-new-1\r\n",
+    );
+  });
+
+  it("keeps a CRLF file CRLF when updating a profile in place", () => {
+    const existing = "[mcp-dev]\r\naws_access_key_id = OLD\r\nregion = eu-west-1\r\n";
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    assert.doesNotMatch(out, /[^\r]\n/, "no bare LF may appear in a CRLF file");
+    assert.match(out, /aws_access_key_id = AKIA-NEW-1\r\n/);
+    assert.match(out, /region = eu-west-1\r\n/);
+  });
+
+  it("an LF file stays LF", () => {
+    const out = upsertProfileIntoText("[default]\naws_access_key_id = X\n", "mcp-dev", CREDS);
+    assert.ok(!out.includes("\r"));
+  });
+
+  it("keeps the BOM when the matched profile is the file's first header", () => {
+    const existing = "﻿[mcp-dev]\naws_access_key_id = OLD\n";
+    const out = upsertProfileIntoText(existing, "mcp-dev", CREDS);
+    assert.ok(out.startsWith("﻿[mcp-dev]\n"), JSON.stringify(out.slice(0, 20)));
+    assert.equal((out.match(/\[mcp-dev\]/g) ?? []).length, 1);
+  });
+
+  it("keeps the BOM ahead of an unrelated first header", () => {
+    const out = upsertProfileIntoText("﻿[default]\naws_access_key_id = X\n", "mcp-dev", CREDS);
+    assert.ok(out.startsWith("﻿[default]\n"));
+  });
+});
+
 // Measured, not assumed: on a filesystem that ignores chmod, upsertProfile now
 // REFUSES to write rather than leave an access key, a secret key and a session
 // token in a world-readable and world-writable file. Every case in the
@@ -196,10 +233,14 @@ describe("upsertProfile — a filesystem that cannot hold a private file", {
   });
 });
 
+// Skipped only when there is NO mode-honouring base to write under: these
+// cases use PRIVATE_TMP_BASE like the suites below, so a mode-ignoring
+// os.tmpdir() alone is no reason to skip them.
 describe("upsertProfile — filesystem round-trip", {
-  skip: TMPDIR_IGNORES_MODES
-    ? "os.tmpdir() ignores chmod, so upsertProfile correctly refuses to write there -- see the suite above"
-    : false,
+  skip:
+    TMPDIR_IGNORES_MODES && modeHonouringTmpBase() === null
+      ? "no temp base honours chmod, so upsertProfile correctly refuses to write there -- see the suite above"
+      : false,
 }, () => {
   let dir: string;
   let path: string;
@@ -271,7 +312,7 @@ aws_secret_access_key = default-secret
  * non-EEXIST propagation, and tmp-file cleanup -- without needing two forked
  * children.
  *
- * The LOCK_* constants are not exported from aws-credentials.ts; the values
+ * The LOCK_* constants live in ini-file.ts and are not exported; the values
  * mirrored here (10_000ms max wait, 30_000ms stale threshold) are duplicated
  * from the source. If those constants change, these tests must change too --
  * an intentional coupling so a wait/stale-window edit is a conscious update.
@@ -332,6 +373,9 @@ describe("upsertProfile — lock subsystem", () => {
         (err: Error) => {
           assert.match(err.message, /failed to acquire lock/);
           assert.match(err.message, new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+          // Shared with the config-file writers: the message names the path,
+          // not a function that may not be the one running.
+          assert.doesNotMatch(err.message, /upsertProfile/);
           return true;
         },
         "upsertProfile should reject with the lock-timeout error when the lock is held the whole window",
@@ -344,21 +388,20 @@ describe("upsertProfile — lock subsystem", () => {
     }
   });
 
-  it("propagates the real errno (ENOENT) instead of a lock-timeout when the lock dir is missing", async () => {
-    // Point at a path whose PARENT directory does not exist. openSync on
-    // `<path>.lock` then fails with ENOENT (non-EEXIST), which acquireLock
-    // rethrows immediately -- it must NOT mask it as "failed to acquire lock"
-    // after a 10s wait.
-    const missingParent = join(dir, "does-not-exist", "credentials");
-    await assert.rejects(upsertProfile(missingParent, "mcp-dev", CREDS), (err: NodeJS.ErrnoException) => {
-      assert.equal(err.code, "ENOENT", `expected ENOENT, got ${err.code}`);
-      assert.doesNotMatch(
-        err.message,
-        /failed to acquire lock/,
-        "non-EEXIST openSync failure must surface the real errno, not a misleading lock-timeout",
-      );
-      return true;
-    });
+  it("creates a missing parent directory (0700 on POSIX) instead of failing with ENOENT on the lock", async () => {
+    // A HOME that never had ~/.aws (credentials from env vars or an instance
+    // role) used to fail here with a raw ENOENT naming credentials.lock --
+    // after aws_assume_role had already minted the session. The real-errno
+    // propagation of acquireLock itself is pinned in ini-file.test.ts
+    // ("without ensureDir a missing directory surfaces the real error").
+    const parent = join(dir, "home", ".aws");
+    const missingParent = join(parent, "credentials");
+    await upsertProfile(missingParent, "mcp-dev", CREDS);
+    assert.match(readFileSync(missingParent, "utf-8"), /\[mcp-dev\]/);
+    if (platform() !== "win32") {
+      const mode = statSync(parent).mode & 0o777;
+      assert.equal(mode & 0o077, 0, `the created directory must be private, got ${mode.toString(8)}`);
+    }
   });
 
   it("leaves no .tmp-* file behind after a successful upsert (atomic-write cleanup)", async () => {
@@ -675,11 +718,7 @@ import { upsertProfile } from ${JSON.stringify(credsModuleUrl)};
       const b = await spawn(profileB, `AKIA-${profileB.toUpperCase()}-${trial}`);
       // Wait until both are imported and listening.
       await Promise.all([a.ready, b.ready]);
-      // Capture both exits before signalling. On POSIX both children
-      // should succeed; on Windows one child's renameSync can lose to the
-      // other's with EPERM ("operation not permitted, rename ..."). That
-      // failure mode IS the documented race surfacing -- we treat it as a
-      // valid "child lost the race" outcome rather than a test error.
+      // Capture both exits before signalling.
       const collect = (child: ReturnType<typeof fork>) =>
         new Promise<{ code: number; stderr: string }>((resolve) => {
           let stderr = "";

@@ -158,8 +158,9 @@ region = us-east-1
   });
 
   it("only emits [default] and [profile X]; every other section is ignored (allowlist)", () => {
-    // parseAwsConfig must match `aws configure list-profiles`: ONLY default +
-    // profile sections are profiles. Services/plugins endpoint blocks, [preview],
+    // Within the config file, ONLY default + profile sections are profiles (as
+    // in `aws configure list-profiles`, which additionally lists credentials-
+    // file profiles; this parser reads the config file alone). Services/plugins endpoint blocks, [preview],
     // arbitrary/unknown sections, and any casing variant must NOT surface. A
     // skipped section's keys must also not leak onto an adjacent profile.
     const text = `
@@ -246,6 +247,48 @@ region = us-west-2
     );
     assert.equal(profiles.find((p) => p.name === "default")?.region, "us-east-1");
     assert.equal(profiles.find((p) => p.name === "real")?.region, "us-west-2");
+  });
+
+  it("reads keys case-insensitively, agreeing with parseSsoSessions on the same text", () => {
+    // botocore lowercases option names. The hand-rolled loop compared keys
+    // case-sensitively, so parseSsoSessions saw this start URL and
+    // parseAwsConfig did not.
+    const text = `[sso-session acme]
+SSO_START_URL = https://acme.awsapps.com/start
+Sso_Region = us-east-1
+
+[profile dev]
+SSO_SESSION = acme
+REGION = eu-west-1
+`;
+    assert.equal(parseSsoSessions(text)[0]?.ssoStartUrl, "https://acme.awsapps.com/start");
+    const [dev] = parseAwsConfig(text);
+    assert.equal(dev.ssoSession, "acme");
+    assert.equal(dev.region, "eu-west-1");
+    assert.equal(dev.isSso, true);
+    assert.equal(dev.ssoStartUrl, "https://acme.awsapps.com/start");
+    assert.equal(dev.ssoRegion, "us-east-1");
+  });
+
+  it("an indented [header] is not a section header (same rule as the config writer)", () => {
+    // botocore reads an indented line as a continuation, never a header; the
+    // writer (readSections / planConfigUpserts) agrees. Treating it as one
+    // listed a profile the writer would not find.
+    const text = "[default]\nregion = us-east-1\n  [profile indented]\nregion = eu-west-1\n";
+    const profiles = parseAwsConfig(text);
+    assert.deepEqual(
+      profiles.map((p) => p.name),
+      ["default"],
+    );
+    assert.equal(profiles[0].region, "eu-west-1");
+  });
+
+  it("normalizes [profile  x] spacing like the writer does", () => {
+    const profiles = parseAwsConfig("[profile   spaced]\nregion = us-east-1\n");
+    assert.deepEqual(
+      profiles.map((p) => p.name),
+      ["spaced"],
+    );
   });
 });
 

@@ -96,11 +96,13 @@ const ARN_RE = /^arn:[a-z0-9-]{1,32}:[a-z0-9-]{1,32}:[a-z0-9-]{0,32}:(?:[0-9]{12
 // Scoped to assumed-role sessions; federated-user sessions are rare here.
 const STS_ASSUMED_ROLE_RE = /^arn:[a-z0-9-]{1,32}:sts::[0-9]{12}:assumed-role\/([^/\s]+)\/\S+$/;
 
-// IAM action format: `<service>:<Action>` -- service is lowercase
-// kebab/alphanumeric; action is PascalCase or wildcard. Defensive but
-// generous: lets through anything that looks structurally valid, AWS
-// gives a clearer error for the rest.
-const ACTION_RE = /^[a-z][a-z0-9-]{0,32}:[A-Za-z0-9*]{1,128}$/;
+// IAM action format: `<service>:<Action>` -- service is kebab/alphanumeric;
+// action is PascalCase, optionally with the `*` and `?` wildcards IAM policy
+// grammar allows. Both halves are case-insensitive to IAM ('S3:GetObject' is
+// 's3:GetObject'), so neither is held to a case here. Defensive but generous:
+// lets through anything that looks structurally valid, AWS gives a clearer
+// error for the rest.
+const ACTION_RE = /^[A-Za-z][A-Za-z0-9-]{0,32}:[A-Za-z0-9*?]{1,128}$/;
 
 // Context entry types accepted by the IAM Policy Simulator. Same set the
 // CLI accepts -- we mirror it as a Zod enum so a bad type fails fast in
@@ -125,15 +127,17 @@ const CONTEXT_KEY_TYPES = [
 // the README promises those count as `unknown` rather than as a deny.
 const KNOWN_DECISIONS: ReadonlySet<string> = new Set(["allowed", "explicitDeny", "implicitDeny"]);
 
-// Caps on the request shape. The evaluated result count is actions x
-// resources, and every param travels in ONE argv entry (aws-cli.ts:317 pushes
-// `--cli-input-json <json>` as a single argument). Linux caps a single argv
-// entry at 128 KB and Windows caps the WHOLE command line at ~32 KB, so an
-// unbounded resource list doesn't fail validation -- it fails as an opaque
-// spawn error. MAX_RESOURCES mirrors the 50-entry actions cap; the byte guard
-// below it covers the other axis, since one ARN may be up to 2048 chars.
+// Cap on the resource list. The simulator evaluates actions x resources, and
+// this tool returns one row per pair, so the two list caps together bound a
+// response at 50 x 50 = 2,500 rows. It is this tool's own bound: IAM's model
+// (botocore iam 2010-05-08, as shipped in aws-cli 2.34.3) puts no length on
+// ResourceArns, only 1-2048 chars on each ARN (ResourceNameType). The size of
+// the serialized request is not bounded here -- runAwsCall moves any params
+// JSON over INLINE_CLI_INPUT_JSON_MAX_CHARS into a temp file rather than argv,
+// so a long batch cannot overflow the command line, and anything IAM itself
+// finds too large comes back as IAM's own error.
 const MAX_RESOURCES = 50;
-const MAX_ARGV_JSON_CHARS = 24_000;
+const MAX_RESOURCE_CHARS = 2048;
 
 interface SimulationResult {
   action: string;
@@ -361,14 +365,14 @@ export const iamSimulateTools: readonly Tool[] = [
         .min(1)
         .max(50)
         .describe(
-          "IAM action names to test, e.g. ['lambda:CreateFunction', 's3:GetObject']. 1-50 entries. Wildcards (e.g. 's3:*') are accepted.",
+          "IAM action names to test, e.g. ['lambda:CreateFunction', 's3:GetObject']. 1-50 entries. Wildcards (e.g. 's3:*', 's3:Get?bject') are accepted.",
         ),
       resources: z
         .array(z.string().min(1))
         .max(MAX_RESOURCES)
         .optional()
         .describe(
-          `Resource ARNs to test against, e.g. ['arn:aws:s3:::my-bucket/*']. Up to ${MAX_RESOURCES} entries -- the simulator evaluates actions x resources, and the whole request travels as a single argv entry, so a larger batch dies as an opaque spawn error rather than a result. Split bigger batches across calls. When omitted, AWS applies its own default of ['*'] server-side (best-case 'is this action ever allowed?') -- this tool does not inject a ['*'] itself.`,
+          `Resource ARNs to test against, e.g. ['arn:aws:s3:::my-bucket/*']. Up to ${MAX_RESOURCES} entries of at most ${MAX_RESOURCE_CHARS} chars each -- the simulator evaluates every action against every resource and this tool returns one entry per pair, so the cap bounds a response at actions x ${MAX_RESOURCES} rows. Split bigger batches across calls. When omitted, AWS applies its own default of ['*'] server-side (best-case 'is this action ever allowed?') -- this tool does not inject a ['*'] itself.`,
         ),
       contextEntries: z
         .array(
@@ -424,14 +428,14 @@ export const iamSimulateTools: readonly Tool[] = [
       if (!ARN_RE.test(i.principalArn)) {
         return {
           ok: false,
-          error: `Invalid principalArn '${i.principalArn}'. Expected ARN shape 'arn:<partition>:<service>:<region>:<account>:<resource>', e.g. 'arn:aws:iam::123:user/jeff'.`,
+          error: `Invalid principalArn '${i.principalArn}'. Expected ARN shape 'arn:<partition>:<service>:<region>:<account>:<resource>', e.g. 'arn:aws:iam::123456789012:user/jeff'.`,
         };
       }
       for (const a of i.actions) {
         if (!ACTION_RE.test(a)) {
           return {
             ok: false,
-            error: `Invalid action '${a}'. Expected '<service>:<Action>' (e.g. 'lambda:CreateFunction', 's3:*'). Service is kebab-case alphanumeric; action is alphanumeric or '*'.`,
+            error: `Invalid action '${a}'. Expected '<service>:<Action>' (e.g. 'lambda:CreateFunction', 's3:*', 's3:Get?bject'). Service is alphanumeric with hyphens; action is alphanumeric with '*' / '?' wildcards.`,
           };
         }
       }
@@ -439,17 +443,21 @@ export const iamSimulateTools: readonly Tool[] = [
         if (i.resources.length > MAX_RESOURCES) {
           return {
             ok: false,
-            error: `Too many resources: ${i.resources.length} requested, max ${MAX_RESOURCES}. The simulator evaluates actions x resources and the request travels as one argv entry; split the batch across calls.`,
+            error: `Too many resources: ${i.resources.length} requested, max ${MAX_RESOURCES}. The simulator evaluates every action against every resource; split the batch across calls.`,
           };
         }
         for (const r of i.resources) {
           // Permissive resource shape: an ARN, '*', or a placeholder string
-          // the agent passes through. AWS validates server-side. We only
-          // catch leading-hyphen + length so it can't pose as an argv flag.
-          if (r.startsWith("-") || r.length > 2048) {
+          // the agent passes through. AWS validates server-side. A shape check
+          // only, not argv safety -- resources travel inside the
+          // --cli-input-json payload, never as argv entries of their own. The
+          // length cap is IAM's own ResourceNameType maximum; a leading '-' is
+          // no ARN and no wildcard, so it is caught here with a clearer error
+          // than IAM's.
+          if (r.startsWith("-") || r.length > MAX_RESOURCE_CHARS) {
             return {
               ok: false,
-              error: `Invalid resource '${r.slice(0, 60)}'. Must not start with '-' and be < 2048 chars.`,
+              error: `Invalid resource '${r.slice(0, 60)}'. Must not start with '-' and must be at most ${MAX_RESOURCE_CHARS} chars.`,
             };
           }
         }
@@ -473,19 +481,8 @@ export const iamSimulateTools: readonly Tool[] = [
         params.Marker = i.marker;
       }
 
-      // The count caps above bound the LISTS; this bounds the BYTES they
-      // serialize to. 50 resources at the 2048-char ceiling is ~100 KB in one
-      // argv entry -- past both the Linux per-entry limit and the Windows
-      // whole-command-line limit. Catch it here so the caller gets a reason
-      // instead of a spawn failure with no useful message.
-      const payloadChars = JSON.stringify(params).length;
-      if (payloadChars > MAX_ARGV_JSON_CHARS) {
-        return {
-          ok: false,
-          error: `Request too large: the simulation parameters serialize to ${payloadChars} characters, over the ${MAX_ARGV_JSON_CHARS} limit. They travel as a single argv entry (--cli-input-json), which the OS caps well below this. Use shorter/fewer resource ARNs, fewer actions, or split the batch across calls.`,
-        };
-      }
-
+      // No byte cap on the serialized params: runAwsCall sends a large
+      // --cli-input-json through a temp file, not argv (see MAX_RESOURCES).
       const result = await runAwsCall({
         service: "iam",
         operation: "simulate-principal-policy",

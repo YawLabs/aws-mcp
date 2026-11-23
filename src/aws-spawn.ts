@@ -21,6 +21,13 @@
  * PATH -- are also the ones where `aws` is on no PATH at all, and until now the
  * only override was a test-only env var. resolveAwsCommand answers both: an
  * absolute path or a refusal, never a bare name.
+ *
+ * The one exception is the `explicit` command: opts.command, or the
+ * AWS_MCP_TEST_AWS_COMMAND test seam that runAwsCall falls back to. It is
+ * returned verbatim, and the env var is not gated to tests -- a shipped server
+ * honors it too (see the README's Environment table). Whoever sets the server's
+ * environment already controls the server, so that is a documented seam, not an
+ * escalation.
  */
 
 import { accessSync, constants, statSync } from "node:fs";
@@ -249,22 +256,6 @@ function isAbsoluteFor(value: string, platform: NodeJS.Platform): boolean {
   return platform === "win32" ? WIN32_DRIVE_ABSOLUTE_RE.test(value) || WIN32_UNC_RE.test(value) : value.startsWith("/");
 }
 
-/**
- * Resolve the aws binary to an absolute path, or explain why we will not run
- * anything. Never falls back to the bare name `aws`: that fallback is exactly
- * the planted-binary case on a host with no CLI on PATH.
- *
- * Precedence: `explicit` (the opts.command / AWS_MCP_TEST_AWS_COMMAND test
- * seams, passed through verbatim so every existing test keeps its shape) >
- * AWS_MCP_AWS_CLI > a walk of the child environment's PATH. The child's PATH,
- * not the parent's, because that is the one libuv would have searched (measured:
- * a bare name resolved out of a directory that appeared only in the child env's
- * PATH).
- *
- * Not cached. A walk of this host's 58-entry PATH costs 0.47-1.16 ms (20 runs,
- * median 0.56), against a CLI start of hundreds of milliseconds, and an uncached
- * walk cannot go stale after an install or an `aws update`.
- */
 // Warn once per distinct misspelling, so a misconfigured host does not put a
 // line on stderr for every aws call.
 const warnedMiscasedOverride = new Set<string>();
@@ -312,6 +303,22 @@ function warnIfOverrideMiscased(env: NodeJS.ProcessEnv, platform: NodeJS.Platfor
   }
 }
 
+/**
+ * Resolve the aws binary to an absolute path, or explain why we will not run
+ * anything. Never falls back to the bare name `aws`: that fallback is exactly
+ * the planted-binary case on a host with no CLI on PATH.
+ *
+ * Precedence: `explicit` (the opts.command / AWS_MCP_TEST_AWS_COMMAND test
+ * seams, passed through verbatim so every existing test keeps its shape) >
+ * AWS_MCP_AWS_CLI > a walk of the child environment's PATH. The child's PATH,
+ * not the parent's, because that is the one libuv would have searched (measured:
+ * a bare name resolved out of a directory that appeared only in the child env's
+ * PATH).
+ *
+ * Not cached. A walk of this host's 58-entry PATH costs 0.47-1.16 ms (20 runs,
+ * median 0.56), against a CLI start of hundreds of milliseconds, and an uncached
+ * walk cannot go stale after an install or an `aws update`.
+ */
 export function resolveAwsCommand(opts: {
   explicit?: string;
   env?: NodeJS.ProcessEnv;

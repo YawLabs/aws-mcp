@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { _resetSession, setProfile } from "../session.js";
-import { multiAccountTools } from "./multi-account.js";
+import { multiAccountTools, partitionForRegion } from "./multi-account.js";
 import type { ToolContext } from "./tool.js";
 
 const tool = multiAccountTools.find((t) => t.name === "aws_multi_account");
@@ -88,7 +89,7 @@ const BASE_NO_PROFILE = {
   region: BASE.region,
 };
 
-// The three credential values every macct / macct2 scenario mints for account
+// The three credential values every multi_account_* scenario mints for account
 // 111111111111, encoded so they are greppable in a serialized response.
 const MINTED_SECRETS_111 = ["ASIAFAKE111111111111", "fake-secret-111111111111", "fake-token-111111111111"];
 
@@ -153,7 +154,7 @@ describe("aws_multi_account -- credential plumbing", () => {
     // so if `--profile` ever came back, every account would answer as the
     // OPERATOR's identity. That is a wrong answer, not an error: no failure
     // assertion anywhere else would catch it.
-    await withScenario("macct_success", async () => {
+    await withScenario("multi_account_success", async () => {
       const res = await tool.handler({ ...BASE, accounts: ["111111111111", "222222222222"] } as never);
       assert.equal(res.ok, true);
       const data = res.data as Envelope;
@@ -176,7 +177,7 @@ describe("aws_multi_account -- credential plumbing", () => {
   it("does not name a profile in the returned command string", async () => {
     // Envelope-level counterpart to SawProfileFlag above: the caller can see for
     // itself that the call ran without a profile.
-    await withScenario("macct_success", async () => {
+    await withScenario("multi_account_success", async () => {
       const res = await tool.handler({ ...BASE, accounts: ["111111111111"] } as never);
       const data = res.data as Envelope;
       const cmd = data.results[0]?.command ?? "";
@@ -203,7 +204,7 @@ describe("aws_multi_account -- credential plumbing", () => {
     const prev = process.env.AWS_SHARED_CREDENTIALS_FILE;
     process.env.AWS_SHARED_CREDENTIALS_FILE = credentialsPath;
     try {
-      await withScenario("macct_success", async () => {
+      await withScenario("multi_account_success", async () => {
         const res = await tool.handler({ ...BASE, accounts: ["111111111111", "222222222222"] } as never);
         assert.equal(res.ok, true);
         assert.equal((res.data as Envelope).okCount, 2, "the batch really ran");
@@ -212,11 +213,11 @@ describe("aws_multi_account -- credential plumbing", () => {
 
       // The half the claim is actually about, and the half that was untested:
       // an all-success batch has nothing to cache for a retry, so the
-      // interesting case is the sweep that dies partway. macct_partial_failure
+      // interesting case is the sweep that dies partway. multi_account_partial_failure
       // loses 222222222222 at the ASSUME (no credentials ever minted) and
       // 333333333333 at the OPERATION -- the only failure path where a live
       // session existed and could have been written down "for the retry".
-      await withScenario("macct_partial_failure", async () => {
+      await withScenario("multi_account_partial_failure", async () => {
         const res = await tool.handler({
           ...BASE,
           accounts: ["111111111111", "222222222222", "333333333333"],
@@ -237,11 +238,11 @@ describe("aws_multi_account -- credential plumbing", () => {
 
 describe("aws_multi_account -- credential hygiene", () => {
   it("keeps the assumed credentials out of command, error and rawBody even when the CLI dumps them", async () => {
-    // macct_leaky_stderr writes the credentials it was handed to BOTH stdout and
+    // multi_account_leaky_stderr writes the credentials it was handed to BOTH stdout and
     // stderr and then exits non-zero. Nothing real behaves that way; the point
     // is that the invariant holds against text this server is forwarding rather
     // than only against text it constructs.
-    await withScenario("macct_leaky_stderr", async () => {
+    await withScenario("multi_account_leaky_stderr", async () => {
       const res = await tool.handler({ ...BASE, accounts: ["111111111111"] } as never);
       assert.equal(res.ok, true);
       const data = res.data as Envelope;
@@ -278,9 +279,9 @@ describe("aws_multi_account -- credential hygiene", () => {
     // is the one arm where dropping the redactSecrets wrapper would put minted
     // credentials in front of the model.
     //
-    // Complement to macct_leaky_stderr above, which is worded so the failure
+    // Complement to multi_account_leaky_stderr above, which is worded so the failure
     // classifies as nonzero_exit precisely to AVOID this branch.
-    await withScenario("macct2_expired_after_assume", async () => {
+    await withScenario("multi_account_expired_after_assume", async () => {
       const res = await tool.handler({ ...BASE, accounts: ["111111111111"] } as never);
       assert.equal(res.ok, true);
       const data = res.data as Envelope;
@@ -357,7 +358,7 @@ describe("aws_multi_account -- per-account child environment", () => {
     process.env.AWS_PROFILE = "operator-sso";
     process.env.AWS_DEFAULT_PROFILE = "operator-sso-legacy";
     try {
-      await withScenario("macct2_env_probe", async () => {
+      await withScenario("multi_account_env_probe", async () => {
         // BASE passes profile:'default' explicitly, so the AWS_PROFILE set
         // above cannot perturb sourceProfile resolution -- this test is about
         // the CHILD's environment, not the assuming identity.
@@ -392,6 +393,52 @@ describe("aws_multi_account -- per-account child environment", () => {
       }
     }
   });
+
+  it("strips the aliases in ANY casing on Windows, where the child reads them case-insensitively", {
+    skip: process.platform !== "win32" && "Windows-only: POSIX env names are case-sensitive",
+  }, async () => {
+    // `{...process.env}` keeps each key's own spelling, so `delete
+    // env.AWS_SECURITY_TOKEN` missed an inherited `Aws_Security_Token` -- and
+    // the Windows child still saw it as AWS_SECURITY_TOKEN. PowerShell users
+    // routinely set these in lower case.
+    const mixed = ["Aws_Security_Token", "aws_credential_expiration", "aws_profile", "Aws_Default_Profile"] as const;
+    const canonical = mixed.map((k) => k.toUpperCase());
+    const prev = canonical.map((k) => [k, process.env[k]] as const);
+    for (const k of canonical) delete process.env[k];
+    process.env.Aws_Security_Token = "inherited-legacy-session-token";
+    process.env.aws_credential_expiration = "2000-01-01T00:00:00Z";
+    process.env.aws_profile = "operator-lower";
+    process.env.Aws_Default_Profile = "operator-legacy";
+    try {
+      // Precondition: the spread really carries the non-canonical spelling,
+      // which is what made the old exact-name delete a no-op.
+      const keys = Object.keys({ ...process.env });
+      for (const k of mixed) assert.ok(keys.includes(k), `precondition: process.env spread keeps '${k}'`);
+
+      await withScenario("multi_account_env_probe", async () => {
+        const res = await tool.handler({ ...BASE, accounts: ["111111111111"] } as never);
+        const entry = (res.data as Envelope).results[0];
+        assert.equal(entry?.ok, true, `the probe spawn must have run, got: ${entry?.error}`);
+        const payload = entry?.data as {
+          SawSecurityToken: boolean;
+          SawCredExpiration: boolean;
+          SawProfile: boolean;
+          SawDefaultProfile: boolean;
+          SessionTokenMatches: boolean;
+        };
+        assert.equal(payload.SessionTokenMatches, true, "positive control: the minted session reached the child");
+        assert.equal(payload.SawSecurityToken, false, "Aws_Security_Token is AWS_SECURITY_TOKEN to the child");
+        assert.equal(payload.SawCredExpiration, false);
+        assert.equal(payload.SawProfile, false);
+        assert.equal(payload.SawDefaultProfile, false);
+      });
+    } finally {
+      for (const k of canonical) delete process.env[k];
+      for (const [key, value] of prev) {
+        if (value !== undefined) process.env[key] = value;
+      }
+    }
+  });
 });
 
 describe("aws_multi_account -- assuming identity resolution", () => {
@@ -402,7 +449,7 @@ describe("aws_multi_account -- assuming identity resolution", () => {
   // the whole batch -- loud when 'default' is unprivileged, silently wrong when
   // it is not.
   it("assumes from the SESSION profile when the argument is omitted", async () => {
-    await withScenario("macct2_source_profile", async () => {
+    await withScenario("multi_account_source_profile", async () => {
       setProfile("ops-sso");
       const res = await tool.handler({ ...BASE_NO_PROFILE, accounts: ["111111111111"] } as never);
       assert.equal(res.ok, true);
@@ -419,7 +466,7 @@ describe("aws_multi_account -- assuming identity resolution", () => {
   });
 
   it("lets an explicit profile argument override the session profile", async () => {
-    await withScenario("macct2_source_profile", async () => {
+    await withScenario("multi_account_source_profile", async () => {
       setProfile("ops-sso");
       const res = await tool.handler({ ...BASE, profile: "other", accounts: ["111111111111"] } as never);
       assert.equal(res.ok, true);
@@ -460,7 +507,7 @@ describe("aws_multi_account -- operation arguments reach the per-account spawn",
     // the scenario's phase 1 exits non-zero if the AssumeRole payload carries
     // anything beyond RoleArn / RoleSessionName / DurationSeconds, or a
     // --query. Reaching ok:true here IS that half of the assertion.
-    await withScenario("macct2_echo_args", async () => {
+    await withScenario("multi_account_echo_args", async () => {
       const params = { Filters: [{ Name: "instance-state-name", Values: ["running"] }] };
       const query = "Reservations[].Instances[].InstanceId";
       const res = await tool.handler({
@@ -497,7 +544,7 @@ describe("aws_multi_account -- operation arguments reach the per-account spawn",
 
 describe("aws_multi_account handler", () => {
   it("surfaces an assume failure and an operation failure side by side with a success", async () => {
-    await withScenario("macct_partial_failure", async () => {
+    await withScenario("multi_account_partial_failure", async () => {
       const res = await tool.handler({
         ...BASE,
         accounts: ["111111111111", "222222222222", "333333333333"],
@@ -529,7 +576,7 @@ describe("aws_multi_account handler", () => {
   });
 
   it("fails a malformed account ID on its own entry without poisoning the batch", async () => {
-    await withScenario("macct_success", async () => {
+    await withScenario("multi_account_success", async () => {
       const res = await tool.handler({ ...BASE, accounts: ["111111111111", "not-an-account"] } as never);
       assert.equal(res.ok, true);
       const data = res.data as Envelope;
@@ -546,7 +593,7 @@ describe("aws_multi_account handler", () => {
   });
 
   it("collapses duplicate account IDs, first occurrence wins", async () => {
-    await withScenario("macct_success", async () => {
+    await withScenario("multi_account_success", async () => {
       const res = await tool.handler({
         ...BASE,
         accounts: ["111111111111", "222222222222", "111111111111"],
@@ -562,10 +609,126 @@ describe("aws_multi_account handler", () => {
   });
 });
 
+describe("aws_multi_account -- role ARN partition follows the region", () => {
+  it("maps each partition's region shape to its ARN partition", () => {
+    assert.equal(partitionForRegion("us-east-1"), "aws");
+    assert.equal(partitionForRegion("eu-west-2"), "aws");
+    assert.equal(partitionForRegion("us-gov-west-1"), "aws-us-gov");
+    assert.equal(partitionForRegion("cn-north-1"), "aws-cn");
+    assert.equal(partitionForRegion("cn-northwest-1"), "aws-cn");
+    assert.equal(partitionForRegion("us-iso-east-1"), "aws-iso");
+    assert.equal(partitionForRegion("us-isob-east-1"), "aws-iso-b");
+    assert.equal(partitionForRegion("eu-isoe-west-1"), "aws-iso-e");
+    assert.equal(partitionForRegion("us-isof-south-1"), "aws-iso-f");
+    assert.equal(partitionForRegion("eusc-de-east-1"), "aws-eusc");
+  });
+
+  for (const [region, partition] of [
+    ["us-gov-west-1", "aws-us-gov"],
+    ["cn-north-1", "aws-cn"],
+    ["us-east-1", "aws"],
+  ] as const) {
+    it(`assumes arn:${partition}:iam::... for region ${region}`, async () => {
+      // multi_account_partial_failure fails 222222222222's ASSUME, and that error names
+      // the exact ARN the handler built. Hardcoding arn:aws: made every
+      // GovCloud / China sweep fail at sts:AssumeRole.
+      await withScenario("multi_account_partial_failure", async () => {
+        const res = await tool.handler({ ...BASE, region, accounts: ["222222222222"] } as never);
+        assert.equal(res.ok, true);
+        const entry = (res.data as Envelope).results[0];
+        assert.ok(
+          entry?.error?.startsWith(`Could not assume arn:${partition}:iam::222222222222:role/`),
+          `expected the ${partition} partition in the role ARN, got: ${entry?.error}`,
+        );
+      });
+    });
+  }
+});
+
+describe("aws_multi_account -- cancellation", () => {
+  it("a client cancel kills accounts whose OPERATION is in flight instead of waiting out the timeout", async () => {
+    const readyPath = join(tmpdir(), `aws-mcp-macct-abort-${process.pid}-${randomUUID()}`);
+    const prevReady = process.env.AWS_MCP_FAKE_READY_OUT;
+    process.env.AWS_MCP_FAKE_READY_OUT = readyPath;
+    try {
+      await withScenario("multi_account_abort_hang", async () => {
+        const pids = (): string[] =>
+          existsSync(readyPath) ? readFileSync(readyPath, "utf-8").split("\n").filter(Boolean) : [];
+        const ac = new AbortController();
+        const pending = tool.handler({ ...BASE, accounts: ["111111111111", "222222222222"] } as never, {
+          reportProgress: () => {},
+          signal: ac.signal,
+        });
+        // Both accounts assumed and in phase 2, so neither is the never-started
+        // kind onCancelled reports -- the kill is what has to produce it.
+        const deadline = Date.now() + 20_000;
+        while (pids().length < 2) {
+          if (Date.now() > deadline) throw new Error("both accounts' operation children never announced themselves");
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+        const abortedAt = Date.now();
+        ac.abort();
+        const res = await pending;
+        const elapsed = Date.now() - abortedAt;
+        // multi_account_abort_hang outlives the 60s default timeout, so only the kill
+        // settles this quickly.
+        assert.ok(elapsed < 15_000, `settled ${elapsed}ms after the abort`);
+        const data = res.data as Envelope;
+        assert.equal(data.results.length, 2);
+        assert.equal(data.errorCount, 2);
+        for (const r of data.results) {
+          assert.equal(r.ok, false, r.accountId);
+          assert.equal(r.errorKind, "cancelled", r.accountId);
+        }
+      });
+    } finally {
+      if (prevReady === undefined) delete process.env.AWS_MCP_FAKE_READY_OUT;
+      else process.env.AWS_MCP_FAKE_READY_OUT = prevReady;
+      rmSync(readyPath, { force: true });
+    }
+  });
+
+  it("a cancel before the batch starts reports every account as not attempted and spawns nothing", async () => {
+    const readyPath = join(tmpdir(), `aws-mcp-macct-preabort-${process.pid}-${randomUUID()}`);
+    const prevReady = process.env.AWS_MCP_FAKE_READY_OUT;
+    process.env.AWS_MCP_FAKE_READY_OUT = readyPath;
+    try {
+      // multi_account_abort_hang announces from phase 2 only, and multi_account_success would
+      // answer ok:true -- so either a spawned assume (ok, then a hang) or a
+      // spawned operation (a pid on disk) would fail this test.
+      await withScenario("multi_account_abort_hang", async () => {
+        const ac = new AbortController();
+        ac.abort();
+        const res = await tool.handler(
+          { ...BASE, accounts: ["111111111111", "222222222222", "333333333333"] } as never,
+          {
+            reportProgress: () => {},
+            signal: ac.signal,
+          },
+        );
+        assert.equal(res.ok, true);
+        const data = res.data as Envelope;
+        assert.equal(data.accountCount, 3);
+        assert.equal(data.errorCount, 3, "every requested account is represented, none silently dropped");
+        for (const r of data.results) {
+          assert.equal(r.errorKind, "cancelled", r.accountId);
+          assert.match(r.error ?? "", /No role was assumed/, r.accountId);
+          assert.equal(r.command, undefined, `${r.accountId}: nothing was spawned`);
+        }
+        assert.equal(existsSync(readyPath), false, "no operation child ever started");
+      });
+    } finally {
+      if (prevReady === undefined) delete process.env.AWS_MCP_FAKE_READY_OUT;
+      else process.env.AWS_MCP_FAKE_READY_OUT = prevReady;
+      rmSync(readyPath, { force: true });
+    }
+  });
+});
+
 describe("aws_multi_account -- handler-level input guards", () => {
   // These bounds also exist in the schema; the handler re-checks them because
-  // direct callers (the aws_script bridge, tests, future internal callers) never
-  // pass through it.
+  // direct callers (tests, future internal callers) never pass through it. The
+  // aws_script bridge does: it runs inputSchema.parse before every handler.
   it("rejects more accounts than the cap, counting the RAW list", async () => {
     const accounts = Array.from({ length: 33 }, (_, n) => String(100000000000 + n));
     const res = await tool.handler({ ...BASE, accounts } as never);
@@ -614,10 +777,10 @@ describe("aws_multi_account -- handler-level input guards", () => {
 
 describe("aws_multi_account -- aggregate cap", () => {
   it("drops over-budget payloads, names the accounts, and still counts what the CALLS did", async () => {
-    // macct_big_payload emits ~2.75 MB per account (under the 5 MB per-CALL
+    // multi_account_big_payload emits ~2.75 MB per account (under the 5 MB per-CALL
     // stdout cap), so the second and third accounts cross the 5 MB aggregate
     // budget this tool shares with aws_multi_region.
-    await withScenario("macct_big_payload", async () => {
+    await withScenario("multi_account_big_payload", async () => {
       const res = await tool.handler({
         ...BASE,
         accounts: ["111111111111", "222222222222", "333333333333"],
@@ -665,7 +828,7 @@ describe("aws_multi_account -- progress reporting", () => {
   };
 
   it("reports once per DEDUPED account, monotonically, with that count as the total", async () => {
-    await withScenario("macct_success", async () => {
+    await withScenario("multi_account_success", async () => {
       const { ctx, calls } = recordingCtx();
       const res = await tool.handler(
         { ...BASE, accounts: ["111111111111", "222222222222", "111111111111"] } as never,
@@ -697,7 +860,7 @@ describe("aws_multi_account -- progress reporting", () => {
     // runWithConcurrency's contract is that `fn` must always resolve; a throw
     // out of reportProgress would abandon every other in-flight account over a
     // notification.
-    await withScenario("macct_success", async () => {
+    await withScenario("multi_account_success", async () => {
       const ctx: ToolContext = {
         reportProgress: () => {
           throw new Error("client hung up");

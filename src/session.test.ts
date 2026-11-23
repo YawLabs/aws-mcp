@@ -18,6 +18,15 @@ import {
 // Restore env across tests so one test's mutation doesn't leak into another.
 const savedEnv = { ...process.env };
 
+// Restore per key rather than `process.env = { ...savedEnv }`: reassigning
+// swaps Node's env proxy for a plain object, so later writes would stop
+// reaching the real environment and Windows' case-insensitive lookup would be
+// gone for the rest of the file.
+function restoreEnv(): void {
+  for (const k of Object.keys(process.env)) if (!(k in savedEnv)) delete process.env[k];
+  for (const [k, v] of Object.entries(savedEnv)) if (process.env[k] !== v) process.env[k] = v;
+}
+
 beforeEach(() => {
   _resetSession();
   delete process.env.AWS_PROFILE;
@@ -28,7 +37,7 @@ beforeEach(() => {
 
 afterEach(() => {
   _resetSession();
-  process.env = { ...savedEnv };
+  restoreEnv();
 });
 
 describe("getProfile", () => {
@@ -162,6 +171,15 @@ describe("invalidProfileMessage / invalidRegionMessage", () => {
     assert.match(withTail, /Check the 'profile' arg or AWS_PROFILE env var\.$/);
   });
 
+  it("names a non-default field when one is given, keeping the shared rule text", () => {
+    const msg = invalidProfileMessage("-x", "Check the 'sourceProfile' arg.", "sourceProfile");
+    assert.ok(msg.startsWith("Invalid sourceProfile name '-x'."), msg);
+    // Same rule statement as the plain form -- one source, no drift.
+    const rule = invalidProfileMessage("-x").slice("Invalid profile name '-x'.".length);
+    assert.ok(msg.includes(rule), "field form must carry the shared rule text");
+    assert.match(msg, /Check the 'sourceProfile' arg\.$/);
+  });
+
   it("omits the separator when no tail is given", () => {
     assert.doesNotMatch(invalidRegionMessage("bad"), / $/);
     assert.match(invalidRegionMessage("bad", "Extra."), /\)\. Extra\.$/);
@@ -258,6 +276,15 @@ describe("isValidRegionName", () => {
   it("rejects uppercase and whitespace", () => {
     assert.equal(isValidRegionName("US-EAST-1"), false);
     assert.equal(isValidRegionName("us east 1"), false);
+  });
+
+  it("is an argv-safety filter, not a region-shape check: no hyphen is required", () => {
+    // Pinned so the comment and the regex cannot drift apart again: a
+    // hyphen-less token is argv-safe and left for the CLI to reject.
+    assert.equal(isValidRegionName("useast1"), true);
+    assert.equal(isValidRegionName("abc"), true);
+    // ...but the length floor still holds.
+    assert.equal(isValidRegionName("ab"), false);
   });
 });
 

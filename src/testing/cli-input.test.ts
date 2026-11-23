@@ -101,11 +101,13 @@ describe("readCliInputJson", () => {
 
   it("names the file when it cannot be read", () => {
     const missing = join(dir, "not-written.json");
-    assert.throws(() => readCliInputJson(argvWith(`file://${missing}`)), {
-      message: new RegExp(
-        `^fake-aws: could not read the --cli-input-json file:// file '${missing.replace(/\\/g, "\\\\")}'`,
-      ),
-    });
+    // A prefix compare rather than a RegExp built from the path: a temp dir
+    // holding +, ( or [ would make such a pattern miss, or not compile.
+    const prefix = `fake-aws: could not read the --cli-input-json file:// file '${missing}'`;
+    assert.throws(
+      () => readCliInputJson(argvWith(`file://${missing}`)),
+      (err: unknown) => err instanceof Error && err.message.startsWith(prefix),
+    );
   });
 
   it("names the origin when the JSON is malformed, inline or in a file", () => {

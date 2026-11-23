@@ -2,8 +2,10 @@
  * Read the `--cli-input-json` payload out of a fake-aws argv, whether it was
  * passed inline or as a `file://` / `fileb://` path.
  *
- * Test-only, and shared on purpose: several fake scenarios and the real-CLI
- * suites need the same answer, and the payload can arrive two ways.
+ * Test-only, and shared on purpose: the fakes -- fake-aws.ts's scenarios that
+ * read params (spawn-hardening_read_input_file, the sso_list* family,
+ * iam_simulate_truncated, the multi_account_* family) and logs-tail-fake.ts --
+ * need the same answer, and the payload can arrive two ways.
  * `runAwsCall` sends params inline, but past a threshold it writes them to a
  * private temp file and passes `--cli-input-json file://<path>` instead, so a
  * scenario that only ever did `argv[argv.indexOf("--cli-input-json") + 1]`

@@ -5,10 +5,12 @@ import { fileURLToPath } from "node:url";
 import { _resetSession } from "../session.js";
 import { CLI_PARSE_EXIT_CODE, callTools, cliArgParseHint } from "./call.js";
 
-// Direct handler-level tests for aws_call (src/tools/call.ts:55-91). The two
-// branches under test are the post-runAwsCall envelope shaping:
-//   - success  -> { ok: true,  data: { command, result } }
-//   - failure  -> { ok: false, error, rawBody: rawStderr ?? rawStdout }
+// Direct handler-level tests for aws_call (the `handler` in src/tools/call.ts).
+// The two branches under test are the post-runAwsCall envelope shaping:
+//   - success  -> { ok: true,  data: { command, commandArgv, result } }
+//   - failure  -> failureToolResult (tools/tool.ts): { ok: false, error,
+//                 errorKind, suggestion, rawBody: rawStderr, or rawStdout when
+//                 stderr is empty -- truthiness, not `??` }
 //
 // The handler calls runAwsCall directly and exposes no command/prefixArgs knob
 // (that would surface argv injection through the MCP surface), so we route the
@@ -203,7 +205,7 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
   // --- the CLI parse-failure hint (cliArgParseHint), through the handler ---
 
   it("explains that s3api get-object cannot run here, instead of blaming the params that were sent", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "new-tools_argparse_required_bucket_key";
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_argparse_required_bucket_key";
     const r = (await tool.handler({
       service: "s3api",
       operation: "get-object",
@@ -226,7 +228,7 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     // Same scenario, same bytes: head-object with no params is what the real CLI
     // emits identically to get-object WITH params. Only `sentParams` separates
     // the two branches.
-    process.env.AWS_MCP_FAKE_SCENARIO = "new-tools_argparse_required_bucket_key";
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_argparse_required_bucket_key";
     const r = (await tool.handler({ service: "s3api", operation: "head-object" })) as {
       ok: boolean;
       suggestion?: string;
@@ -236,7 +238,7 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
   });
 
   it("treats an EMPTY params object as no params, matching the --cli-input-json condition", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "new-tools_argparse_required_bucket_key";
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_argparse_required_bucket_key";
     const r = (await tool.handler({ service: "s3api", operation: "head-object", params: {} })) as {
       suggestion?: string;
     };
@@ -244,13 +246,13 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
   });
 
   it("names the positional outfile case unreachable even with no params sent", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "new-tools_argparse_required_outfile";
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_argparse_required_outfile";
     const r = (await tool.handler({ service: "s3api", operation: "get-object" })) as { suggestion?: string };
     assert.match(r.suggestion ?? "", /cannot run through aws_call/);
   });
 
   it("points a logs tail call at aws_logs_tail on the Unknown-options shape", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "new-tools_unknown_cli_input_json";
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_unknown_cli_input_json";
     const r = (await tool.handler({
       service: "logs",
       operation: "tail",
@@ -298,7 +300,7 @@ describe("aws_call handler — success envelope vs rawBody fallback (fake-aws)",
     // older CLI argparse rejects it (exit 252) with text that reads like a typo.
     // The remedy comes from parseAwsError, not cliArgParseHint -- which is why
     // `suggestion` being set here also proves the two never stack.
-    process.env.AWS_MCP_FAKE_SCENARIO = "readme-positioning_cli_invalid_choice";
+    process.env.AWS_MCP_FAKE_SCENARIO = "call_cli_invalid_choice";
     const r = (await tool.handler({
       service: "batch",
       operation: "cancel-jobs",

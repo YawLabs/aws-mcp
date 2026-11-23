@@ -137,11 +137,82 @@ describe("check-oam-floor catches drift", () => {
     assert.equal(r.code, 0, r.out);
   });
 
+  it("flags a sandbox note re-measured against an oam other than the floor", () => {
+    // "re-measured against oam X.Y.Z" is a current claim -- the sandbox check is
+    // re-run on every bump -- and HISTORICAL used to exempt it outright, so
+    // src/tools/script.ts sat at 0.18.0 three floors later with no drift reported.
+    const stale = fixture({ readme: "Re-measured against oam 0.15.2 and still divergent.\n" });
+    const r = runChecker(stale);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /README\.md:1 +says 0\.15\.2/);
+    const current = fixture({ readme: "Re-measured against oam 0.16.3 and still divergent.\n" });
+    assert.equal(runChecker(current).code, 0);
+  });
+
   it("fails loudly when OAM_MIN cannot be found at all", () => {
     const root = fixture({ launcher: "// somebody renamed the constant\n" });
     const r = runChecker(root);
     assert.notEqual(r.code, 0, r.out);
     assert.match(r.out, /OAM_MIN/);
+  });
+});
+
+describe("check-compliance grades the oam the launcher would choose", () => {
+  // The oam leg used to probe bare `oam` on PATH, while the launcher it grades
+  // looks in OAM_BIN, OAM_INSTALL_DIR and the installed dirs too and takes the
+  // newest at or above the floor. chooseLegOam mirrors the launcher instead.
+  type Choose = (opts: {
+    env: Record<string, string>;
+    floor: number[];
+    home: string;
+    isWin: boolean;
+    probe: (p: string) => number[] | null;
+    exists: (p: string) => boolean;
+  }) => { path: string; version: number[] } | null;
+  const load = async () =>
+    (
+      (await import(pathToFileURL(join(repoRoot, "scripts", "check-compliance.mjs")).href)) as {
+        chooseLegOam: Choose;
+      }
+    ).chooseLegOam;
+  const floor = [0, 21, 1];
+  // POSIX-shaped paths, joined with the host's separator, so the case runs the
+  // same on every platform: only `exists` and `probe` decide what is "there".
+  const home = join(tmpdir(), "home");
+  const installed = join(home, ".oam", "bin", "oam");
+  const onPath = join(tmpdir(), "pathdir", "oam");
+  const env = { PATH: dirname(onPath) };
+  const world = (versions: Record<string, number[] | null>) => ({
+    env,
+    floor,
+    home,
+    isWin: false,
+    probe: (p: string) => versions[p] ?? null,
+    exists: (p: string) => p in versions,
+  });
+
+  it("finds an oam that is installed but not on PATH", async () => {
+    const choose = await load();
+    assert.equal(choose(world({ [installed]: [0, 21, 1] }))?.path, installed);
+  });
+
+  it("treats a below-floor oam as no oam (a skip), not as one to grade", async () => {
+    const choose = await load();
+    assert.equal(choose(world({ [onPath]: [0, 21, 0] })), null);
+  });
+
+  it("takes the newest usable oam across locations, and a usable OAM_BIN as given", async () => {
+    const choose = await load();
+    const both = world({ [installed]: [0, 21, 1], [onPath]: [0, 22, 0] });
+    assert.deepEqual(choose(both), { path: onPath, version: [0, 22, 0] });
+    const pinned = join(tmpdir(), "pinned", "oam");
+    const withBin = {
+      ...both,
+      env: { ...env, OAM_BIN: pinned },
+      exists: (p: string) => p === pinned || both.exists(p),
+      probe: (p: string) => (p === pinned ? [0, 21, 1] : both.probe(p)),
+    };
+    assert.equal(choose(withBin)?.path, pinned, "a usable OAM_BIN wins even over a newer discovered oam");
   });
 });
 

@@ -5,7 +5,7 @@
  *
  * Why this lives beside fake-aws.ts rather than inside it: the emulator needs a
  * few hundred lines and three model variants, and fake-aws.ts is a shared file
- * every package edits. Its `logs-tail_*` cases are a one-line dynamic import of
+ * every package edits. Its `logs_tail_*` cases are a one-line dynamic import of
  * runLogsTailScenario, so no other scenario pays for any of this at startup.
  *
  * The rule the file exists to enforce: THE FAKE MAY ONLY SAY WHAT THE REAL CLI
@@ -398,19 +398,19 @@ export function emulateFilterLogEvents(
 
 /** Every scenario name fake-aws.ts routes here. */
 export type LogsTailScenario =
-  | "logs-tail_current_basic"
-  | "logs-tail_current_bulk"
-  | "logs-tail_current_empty"
-  | "logs-tail_current_unicode"
-  | "logs-tail_legacy_basic"
-  | "logs-tail_legacy_bulk"
-  | "logs-tail_legacy_empty"
-  | "logs-tail_ancient_basic"
-  | "logs-tail_ignored_bulk"
-  | "logs-tail_jsonfmt_bulk"
-  | "logs-tail_echo_argv"
-  | "logs-tail_api_error"
-  | "logs-tail_real_tail_text";
+  | "logs_tail_current_basic"
+  | "logs_tail_current_bulk"
+  | "logs_tail_current_empty"
+  | "logs_tail_current_unicode"
+  | "logs_tail_legacy_basic"
+  | "logs_tail_legacy_bulk"
+  | "logs_tail_legacy_empty"
+  | "logs_tail_ancient_basic"
+  | "logs_tail_ignored_bulk"
+  | "logs_tail_jsonfmt_bulk"
+  | "logs_tail_echo_argv"
+  | "logs_tail_api_error"
+  | "logs_tail_real_tail_text";
 
 /**
  * True when this call is semantically the one legacyBasicStdout was captured
@@ -426,7 +426,7 @@ function isCapturedLegacyBasicCall(argv: readonly string[], payload: Record<stri
 }
 
 /**
- * Dispatch for the `logs-tail_*` fake-aws scenarios. `env` carries the argv
+ * Dispatch for the `logs_tail_*` fake-aws scenarios. `env` carries the argv
  * side channel: AWS_MCP_FAKE_LOGS_TAIL_ARGV_LOG names a file this APPENDS one
  * `{argv, params}` JSON line to per invocation -- append, because one handler
  * call can invoke the CLI twice and the whole point is to see both.
@@ -449,50 +449,50 @@ export function runLogsTailScenario(
   }
 
   switch (scenario) {
-    case "logs-tail_current_basic":
+    case "logs_tail_current_basic":
       return emulateFilterLogEvents(argv, "current", BASIC_EVENTS);
-    case "logs-tail_current_bulk":
+    case "logs_tail_current_bulk":
       return emulateFilterLogEvents(argv, "current", bulkEvents());
-    case "logs-tail_current_empty":
+    case "logs_tail_current_empty":
       return emulateFilterLogEvents(argv, "current", []);
-    case "logs-tail_current_unicode":
+    case "logs_tail_current_unicode":
       return emulateFilterLogEvents(argv, "current", UNICODE_EVENTS);
-    case "logs-tail_legacy_basic": {
+    case "logs_tail_legacy_basic": {
       // The one scenario that answers with captured BYTES rather than the
       // emulator, so the handler's parser meets the real CLI's exact output.
       let payload: Record<string, unknown> = {};
       try {
         payload = (readCliInputJson(argv)?.params ?? {}) as Record<string, unknown>;
       } catch {
-        return fail("logs-tail_legacy_basic could not read --cli-input-json");
+        return fail("logs_tail_legacy_basic could not read --cli-input-json");
       }
       if ("startFromHead" in payload) return paramValidation(REAL_CLI_CAPTURES.startFromHeadRejectStderr);
       if (!isCapturedLegacyBasicCall(argv, payload)) {
         return fail(
-          "logs-tail_legacy_basic serves the captured whole-window read (no startFromHead, no --max-items, the [-500:] slice); this call asked for something else",
+          "logs_tail_legacy_basic serves the captured whole-window read (no startFromHead, no --max-items, the [-500:] slice); this call asked for something else",
         );
       }
       return { stdout: REAL_CLI_CAPTURES.legacyBasicStdout, stderr: "", exitCode: 0 };
     }
-    case "logs-tail_legacy_bulk":
+    case "logs_tail_legacy_bulk":
       return emulateFilterLogEvents(argv, "legacy", bulkEvents());
-    case "logs-tail_legacy_empty":
+    case "logs_tail_legacy_empty":
       return emulateFilterLogEvents(argv, "legacy", []);
-    case "logs-tail_ancient_basic":
+    case "logs_tail_ancient_basic":
       return emulateFilterLogEvents(argv, "ancient", BASIC_EVENTS);
-    case "logs-tail_ignored_bulk":
+    case "logs_tail_ignored_bulk":
       return emulateFilterLogEvents(argv, "current", bulkEvents(), { ignoresStartFromHead: true });
-    case "logs-tail_jsonfmt_bulk":
+    case "logs_tail_jsonfmt_bulk":
       return emulateFilterLogEvents(argv, "legacy", bulkEvents(), { errorFormat: "json" });
-    case "logs-tail_echo_argv":
+    case "logs_tail_echo_argv":
       // The payload is what such a test reads, out of the argv log above; the
       // handler still needs a well-formed answer to get past its parser.
       return { stdout: `${JSON.stringify({ total: 0, events: [] }, null, 4)}\n`, stderr: "", exitCode: 0 };
-    case "logs-tail_api_error":
+    case "logs_tail_api_error":
       // A real answer from the service. The handler must report it at once: a
       // whole-window retry would cost another CLI start and fail the same way.
       return { stdout: "", stderr: REAL_CLI_CAPTURES.accessDeniedStderr, exitCode: 254 };
-    case "logs-tail_real_tail_text":
+    case "logs_tail_real_tail_text":
       return { stdout: REAL_CLI_CAPTURES.tailFormatJsonStdout, stderr: "", exitCode: 0 };
   }
 }

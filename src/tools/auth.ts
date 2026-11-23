@@ -582,7 +582,9 @@ export const authTools: readonly Tool[] = [
       profile: z
         .string()
         .optional()
-        .describe("Profile to verify identity against after login. Defaults to $AWS_PROFILE or 'default'."),
+        .describe(
+          "Profile to verify identity against after login. Defaults to the profile the login was started for, else the session profile / $AWS_PROFILE / 'default'.",
+        ),
       region: z.string().optional().describe("Region for the post-login identity check."),
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
@@ -621,7 +623,11 @@ export const authTools: readonly Tool[] = [
         };
       }
 
-      const useProfile = profile || getProfile();
+      // Default to the profile the login was started FOR (aws_login_start /
+      // aws_refresh_if_expiring_soon with an explicit profile), not the
+      // session's active profile: completing a 'staging' login with sessionId
+      // only must verify 'staging', not whatever AWS_PROFILE points at.
+      const useProfile = profile || (target?.kind === "profile" ? target.name : getProfile());
       const useRegion = region || getRegion();
       const identity = await getCallerIdentity(useProfile, useRegion);
       if (!identity.ok) {

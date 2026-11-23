@@ -258,13 +258,13 @@ describe("aws_multi_region handler", () => {
 
   it("propagates per-region runAwsCall failures through the result envelope (partial failure)", async () => {
     // End-to-end: the handler invokes runAwsCall per region. The
-    // mr_partial_failure scenario routes us-west-2 to sso_expired and any
+    // multi_region_partial_failure scenario routes us-west-2 to sso_expired and any
     // other region to a successful JSON payload. The result envelope must
     // surface okCount=1, errorCount=1, and each entry's {region, ok,
     // errorKind?, error?, command} shape -- the "partial failure is
     // expected and surfaced" contract the tool's docstring leans on.
     const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
-    process.env.AWS_MCP_FAKE_SCENARIO = "mr_partial_failure";
+    process.env.AWS_MCP_FAKE_SCENARIO = "multi_region_partial_failure";
     try {
       const result = await tool.handler({
         service: "s3api",
@@ -281,6 +281,7 @@ describe("aws_multi_region handler", () => {
           ok: boolean;
           data?: unknown;
           command?: string;
+          commandArgv?: string[];
           error?: string;
           errorKind?: string;
         }[];
@@ -288,6 +289,16 @@ describe("aws_multi_region handler", () => {
       assert.equal(data.regionCount, 2);
       assert.equal(data.okCount, 1);
       assert.equal(data.errorCount, 1);
+      // README: every envelope that carries `command` also carries
+      // `commandArgv` -- on BOTH arms of a fan-out entry, as aws_multi_account
+      // already does. The success arm used to drop it.
+      for (const entry of data.results) {
+        assert.ok(
+          Array.isArray(entry.commandArgv) && entry.commandArgv.length > 0,
+          `${entry.region} (ok=${entry.ok}) must carry commandArgv alongside command`,
+        );
+        assert.ok(entry.commandArgv.includes(entry.region), `${entry.region}: commandArgv is this region's own call`);
+      }
 
       const east = data.results.find((r) => r.region === "us-east-1");
       const west = data.results.find((r) => r.region === "us-west-2");
@@ -316,10 +327,11 @@ describe("aws_multi_region handler", () => {
     }
   });
 
-  it("catches synchronous throws from runAwsCall when input bypasses Zod (aws_script bridge case)", async () => {
-    // The aws_script bridge (script.ts) unwraps and re-dispatches without
-    // Zod re-validation, so a script can hand the handler an input shape
-    // that Zod would have rejected -- e.g. `operation` missing entirely.
+  it("catches synchronous throws from runAwsCall on a direct, unvalidated handler call", async () => {
+    // A direct handler caller (a test, a future internal caller) skips the
+    // Zod schema -- the aws_script bridge does not, it parses first -- so the
+    // handler can be handed an input shape Zod would have rejected, e.g.
+    // `operation` missing entirely.
     // runAwsCall does `opts.operation.trim()` before its bad-input check,
     // which throws synchronously when operation is undefined. Without the
     // per-task try/catch in the region worker, that rejection escapes
@@ -328,7 +340,7 @@ describe("aws_multi_region handler", () => {
     // surfaces ok:false, errorKind:'unexpected'.
     const result = await tool.handler({
       service: "s3api",
-      // operation deliberately omitted -- mirrors aws_script bypassing Zod
+      // operation deliberately omitted -- a shape only a direct call can send
       regions: ["us-east-1", "us-west-2"],
     } as never);
     assert.equal(result.ok, true);
@@ -365,9 +377,36 @@ describe("aws_multi_region handler", () => {
 });
 
 describe("aws_multi_region input bounds (regression)", () => {
+  it("rejects a bad profile ONCE for the batch rather than once per region", async () => {
+    // The profile is shared by every region, so a bad one is a batch-level
+    // input error. Left to runAwsCall it came back as N identical bad_input
+    // entries inside an ok:true envelope.
+    const res = await tool.handler({
+      service: "s3api",
+      operation: "list-buckets",
+      regions: ["us-east-1", "us-west-2"],
+      profile: "--query=evil",
+    });
+    assert.equal(res.ok, false, "a batch-wide input error is a batch-level failure, not N per-region ones");
+    assert.match(res.error ?? "", /Invalid profile name '--query=evil'/);
+  });
+
+  it("checks the RESOLVED profile, so a bad AWS_PROFILE fails once too", async () => {
+    const prev = process.env.AWS_PROFILE;
+    process.env.AWS_PROFILE = "--query=evil";
+    try {
+      const res = await tool.handler({ service: "s3api", operation: "list-buckets", regions: ["us-east-1"] });
+      assert.equal(res.ok, false);
+      assert.match(res.error ?? "", /Invalid profile name '--query=evil'/);
+    } finally {
+      if (prev === undefined) delete process.env.AWS_PROFILE;
+      else process.env.AWS_PROFILE = prev;
+    }
+  });
+
   // These bounds live in the Zod schema, which only runs at the MCP boundary
-  // (index.ts registers via inputSchema.shape). Handlers reached directly --
-  // the aws_script bridge, tests, internal callers -- never saw them. A
+  // (index.ts registers via inputSchema.shape) and in the aws_script bridge.
+  // Handlers reached directly -- tests, internal callers -- never saw them. A
   // concurrency of 0 made runWithConcurrency spawn zero workers, so
   // Promise.all([]) resolved instantly and every slot of `results` stayed a
   // hole: the caller got ok:true plus a full-length array of nulls, having run
@@ -443,10 +482,10 @@ describe("aws_multi_region input bounds (regression)", () => {
     // The schema test above proves the boundary accepts 34; this one proves the
     // HANDLER's own bound does too, and that all 34 regions actually dispatch.
     // At the default concurrency (8), which is gentler on a parallel node --test
-    // run than raising it. mr_partial_failure branches on --region, so us-west-2
+    // run than raising it. multi_region_partial_failure branches on --region, so us-west-2
     // fails by design and the other 33 succeed.
     const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
-    process.env.AWS_MCP_FAKE_SCENARIO = "mr_partial_failure";
+    process.env.AWS_MCP_FAKE_SCENARIO = "multi_region_partial_failure";
     try {
       const res = await tool.handler({
         service: "sts",
@@ -523,6 +562,16 @@ describe("capAggregateResults -- aggregate response budget", () => {
     assert.equal(oneByteShort.results[1].truncated, true);
   });
 
+  it("is first-fit, not a suffix cut: a small entry after a dropped big one keeps its payload", () => {
+    // The tool description says entries that do not FIT lose their data, not
+    // "later entries". Pin that so the wording and the code cannot drift.
+    const big = (region: string): RegionResult => ({ region, ok: true, data: { blob: "x".repeat(6000) } });
+    const small: RegionResult = { region: "eu-west-1", ok: true, data: { n: 1 } };
+    const out = capAggregateResults([big("us-east-1"), big("us-west-2"), small], 7_000, (r) => r.region);
+    assert.deepEqual(out.truncatedIds, ["us-west-2"]);
+    assert.deepEqual(out.results[2].data, { n: 1 }, "the small last entry still fits and keeps its data");
+  });
+
   it("never drops an error entry -- losing the reason a region failed is worse than the bytes", () => {
     const input: RegionResult[] = [
       okEntry("us-east-1"),
@@ -576,12 +625,12 @@ describe("aws_multi_region aggregate cap -- end-to-end envelope", () => {
     // own wiring -- the real 5 MB constant, the top-level envelope, and the
     // ordering of the okCount/errorCount tally against the cap -- was not.
     //
-    // obs2_mr_big_payload emits ~2.75 MB per successful region (under the 5 MB
+    // multi_region_big_payload emits ~2.75 MB per successful region (under the 5 MB
     // per-CALL stdout cap) and fails us-west-2 with an expired SSO token. Three
     // regions in dedup'd input order: us-east-1 fits, the error entry is small
     // and never dropped, and eu-west-1 pushes the aggregate past 5 MB.
     const prevScenario = process.env.AWS_MCP_FAKE_SCENARIO;
-    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_mr_big_payload";
+    process.env.AWS_MCP_FAKE_SCENARIO = "multi_region_big_payload";
     try {
       const res = await tool.handler({
         service: "s3api",
@@ -686,10 +735,10 @@ describe("aws_multi_region -- progress reporting", () => {
 
   it("reports on COMPLETION, not dispatch -- each message carries the region's settled outcome", async () => {
     // The real proof that the report fires after the region settles: the
-    // ok/failed label is unknowable at dispatch time. mr_partial_failure fails
+    // ok/failed label is unknowable at dispatch time. multi_region_partial_failure fails
     // us-west-2 (expired SSO) and succeeds everywhere else, so a
     // dispatch-time report could not produce these two different labels.
-    await withScenario("mr_partial_failure", async () => {
+    await withScenario("multi_region_partial_failure", async () => {
       const { ctx, calls } = recordingCtx();
       const res = await tool.handler(
         { service: "s3api", operation: "list-buckets", regions: ["us-east-1", "us-west-2"], profile: "default" },

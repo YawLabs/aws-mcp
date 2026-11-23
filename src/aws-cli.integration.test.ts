@@ -5,13 +5,23 @@
 
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { INLINE_CLI_INPUT_JSON_MAX_CHARS, runAwsCall, shellQuoteArg } from "./aws-cli.js";
 import { _resetSession, setProfile, setRegion } from "./session.js";
+import { splitHandshake } from "./testing/split-handshake.js";
 import { tmpdirIgnoresModes } from "./testing/tmpdir-modes.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -486,7 +496,7 @@ describe("runAwsCall — failure paths", () => {
       service: "s3api",
       operation: "list-buckets",
       profile: "assume-prof",
-      ...fakeOpts("awscli_expired_token"),
+      ...fakeOpts("call_expired_token"),
     });
     assert.equal(r.ok, false);
     if (r.ok) return;
@@ -540,7 +550,7 @@ describe("runAwsCall — failure paths", () => {
     // call_fail_stdout_only writes to stdout and exits 1 with EMPTY stderr.
     // classifyAuthError(new Error("")) -> "other", so kind=nonzero_exit; the
     // empty trimmed stderr is falsy, so baseMsg falls back to the
-    // "exited with code N and no stderr" string (aws-cli.ts:345). parseAwsError("")
+    // "exited with code N and no stderr" string (runAwsCall's nonzero_exit baseMsg). parseAwsError("")
     // returns {} so no Suggestion is appended.
     const r = await runAwsCall({
       service: "s3api",
@@ -559,7 +569,7 @@ describe("runAwsCall — failure paths", () => {
   it("appends a recognized Suggestion onto a nonzero_exit error", async () => {
     // call_access_denied emits the canonical AccessDenied stderr. parseAwsError
     // recognizes code=AccessDenied with no User: line, so it appends the generic
-    // IAM suggestion (errors.ts:137) after a blank-line separator.
+    // IAM suggestion (parseAwsError's AccessDenied branch) after a blank-line separator.
     const r = await runAwsCall({
       service: "s3api",
       operation: "list-buckets",
@@ -573,7 +583,7 @@ describe("runAwsCall — failure paths", () => {
   });
 
   it("includes the truncated stderr after 'Underlying error: ' for no_creds", async () => {
-    // The no_creds branch (aws-cli.ts:342) suffixes the underlying stderr so the
+    // The no_creds branch of runAwsCall's exit classification suffixes the underlying stderr so the
     // agent can see WHY creds resolution failed, not just that it did.
     const r = await runAwsCall({
       service: "s3api",
@@ -654,7 +664,7 @@ describe("runAwsCall — failure paths", () => {
     // 'error' event asynchronously (ENOENT). The sync-throw codepath fires
     // only for argument-shape errors (e.g. invalid options), not for ENOENT.
     // The message variants differ: sync-throw produces "Failed to spawn ...";
-    // the async handler at aws-cli.ts:263-271 produces "Failed to run ...".
+    // the async proc.on("error") handler in runAwsCall produces "Failed to run ...".
     // Asserting the async-variant text pins the async handler.
     const r = await runAwsCall({
       service: "s3api",
@@ -678,17 +688,26 @@ describe("runAwsCall — failure paths", () => {
 
   it("decodes a multi-byte UTF-8 codepoint split across two stdout 'data' chunks (StringDecoder coverage)", async () => {
     // The fake writes the 4-byte sequence for U+20BB7 split across two
-    // process.stdout.write() calls with a 50ms sleep in between, so the
-    // parent's stdout.on('data') handler fires twice and the StringDecoder
-    // at aws-cli.ts:221 must buffer the partial sequence across calls. If
-    // the decoder is replaced by a naive chunk.toString(), the second
-    // decoded chunk starts with U+FFFD (replacement) and JSON.parse fails
-    // or the resulting string contains replacement characters.
-    const r = await runAwsCall({
-      service: "s3api",
-      operation: "list-buckets",
-      ...fakeOpts("awscli_utf8_split"),
-    });
+    // process.stdout.write() calls and holds the second back until this process
+    // has read the first (splitHandshake), so the parent's stdout.on('data')
+    // handler fires twice and the StringDecoder (runAwsCall's stdoutDecoder)
+    // must buffer the partial sequence across calls. If the decoder is replaced
+    // by a naive chunk.toString(), the second decoded chunk starts with U+FFFD
+    // (replacement) and JSON.parse fails or the resulting string contains
+    // replacement characters.
+    const hs = splitHandshake(1);
+    let r: Awaited<ReturnType<typeof runAwsCall>>;
+    try {
+      r = await hs.run(
+        runAwsCall({
+          service: "s3api",
+          operation: "list-buckets",
+          ...fakeOpts("call_utf8_split", { env: hs.env }),
+        }),
+      );
+    } finally {
+      hs.cleanup();
+    }
     assert.equal(r.ok, true);
     if (!r.ok) return;
     const data = r.data as { name: string };
@@ -1021,6 +1040,20 @@ describe("spawn-hardening: params too long for a command line", () => {
     });
     assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
   });
+
+  it("uses the default timeout, not an instant one, for a zero, negative or NaN timeoutMs", async () => {
+    // Direct callers bypass each tool's zod schema. setTimeout treats 0, a
+    // negative and NaN all as ~1 ms, so these used to kill the call at once and
+    // report it as timed out.
+    for (const timeoutMs of [0, -1, Number.NaN]) {
+      const r = await runAwsCall({
+        service: "s3api",
+        operation: "list-buckets",
+        ...fakeOpts("call_json_success", { timeoutMs }),
+      });
+      assert.equal(r.ok, true, r.ok ? "" : `timeoutMs=${timeoutMs} -> ${r.kind}: ${r.error}`);
+    }
+  });
 });
 
 describe("spawn-hardening: which binary runs", () => {
@@ -1101,8 +1134,11 @@ describe("spawn-hardening: which binary runs", () => {
         assert.equal(r.ok, true, r.ok ? "" : `${r.kind}: ${r.error}`);
         if (!r.ok) return;
         const { execPath } = r.data as { execPath: string };
-        assert.equal(execPath, legit.binary, "the binary that ran must be the one on PATH");
-        assert.notEqual(execPath, plant.binary);
+        // Both sides through realpath: libuv's exepath resolves symlinks (macOS
+        // os.tmpdir() is under /var, a link to /private/var; a symlinked TMPDIR
+        // on Linux does the same through /proc/self/exe).
+        assert.equal(realpathSync(execPath), realpathSync(legit.binary), "the binary that ran must be the one on PATH");
+        assert.notEqual(realpathSync(execPath), realpathSync(plant.binary));
       });
     } finally {
       process.chdir(cwd);
@@ -1200,17 +1236,17 @@ describe("runAwsCall — invalid_creds: credentials resolved and the service ref
 
   const CASES: Array<{ scenario: string; code: string; operation: string }> = [
     {
-      scenario: "awscli2_invalid_creds_unrecognized_client",
+      scenario: "call_invalid_creds_unrecognized_client",
       code: "UnrecognizedClientException",
       operation: "ListBuckets",
     },
     {
-      scenario: "awscli2_invalid_creds_client_token_id",
+      scenario: "call_invalid_creds_client_token_id",
       code: "InvalidClientTokenId",
       operation: "GetCallerIdentity",
     },
     {
-      scenario: "awscli2_invalid_creds_signature_mismatch",
+      scenario: "call_invalid_creds_signature_mismatch",
       code: "SignatureDoesNotMatch",
       operation: "ListObjectsV2",
     },
@@ -1357,7 +1393,7 @@ describe("runAwsCall — a descendant holding the stdio pipes must not hang the 
       // ~2-4s past timeoutMs. 30s leaves room for a starved machine; a hang
       // still fails, because the orphan outlives the bound.
       const settleBoundMs = timeoutMs + 30_000;
-      const { opts, pidPath } = orphanOpts("awscli_orphan_holds_pipes", timeoutMs, {
+      const { opts, pidPath } = orphanOpts("call_orphan_holds_pipes", timeoutMs, {
         AWS_MCP_FAKE_READY_OUT: readyPath,
         AWS_MCP_FAKE_ORPHAN_HOLD_MS: String(settleBoundMs + 10_000),
         AWS_MCP_FAKE_ORPHAN_SPAWN_BEFORE: String(Date.now() + timeoutMs / 2),
@@ -1405,7 +1441,7 @@ describe("runAwsCall — a descendant holding the stdio pipes must not hang the 
     // run in 5. The margins are now wide, and the ordering is what still gates.
     const settleBoundMs = 60_000;
     const timeoutMs = 120_000;
-    const { opts, pidPath } = orphanOpts("awscli_orphan_outlives_exit", timeoutMs, {
+    const { opts, pidPath } = orphanOpts("call_orphan_outlives_exit", timeoutMs, {
       AWS_MCP_FAKE_ORPHAN_HOLD_MS: "180000",
     });
     const started = Date.now();
@@ -1507,10 +1543,12 @@ describe("commandArgv: the unambiguous form of the display command", () => {
   });
 
   it("carries backslashes exactly, which fish's single quotes do not", async () => {
-    // The F7 case: fish treats \ and \' as escapes inside single quotes, so
-    // a\b arrived as a\b -- silent corruption in the one POSIX shell the string
-    // form is wrong for. argv is byte-exact.
-    const value = "C:logsa\\b";
+    // The F7 case: fish treats \\ and \' as escapes inside single quotes, so
+    // a\\b arrived as a\b and a\'b as a'b -- silent corruption in the one POSIX
+    // shell the string form is wrong for. argv is byte-exact: a Windows path with
+    // several separators, a doubled backslash, and a backslash-quote all survive.
+    const value = "C:\\logs\\a\\\\b\\'c";
+    assert.equal(value, String.raw`C:\logs\a\\b\'c`, "the fixture itself must hold the backslashes");
     const r = await runAwsCall({
       service: "s3api",
       operation: "list-buckets",
@@ -1550,16 +1588,14 @@ describe("commandArgv: the unambiguous form of the display command", () => {
     const r = await runAwsCall({
       service: "s3api",
       operation: "list-buckets",
-      ...fakeOpts("call_nonzero_exit"),
+      ...fakeOpts("call_access_denied"),
     });
     assert.equal(r.ok, false);
     if (r.ok) return;
-    assert.equal(
-      r.command === undefined,
-      r.commandArgv === undefined,
-      "command and commandArgv must be present or absent together",
-    );
-    if (r.command === undefined || r.commandArgv === undefined) return;
+    assert.equal(r.kind, "nonzero_exit", `${r.kind}: ${r.error}`);
+    // This call spawned, so both forms must be there -- not merely agree.
+    assert.ok(r.command !== undefined, "a spawned call's failure must carry command");
+    assert.ok(r.commandArgv !== undefined, "a spawned call's failure must carry commandArgv");
     assert.equal(r.command, r.commandArgv.map((entry) => shellQuoteArg(entry)).join(" "));
   });
 });

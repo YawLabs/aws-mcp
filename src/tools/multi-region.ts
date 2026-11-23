@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
-import { isValidRegionName, REGION_NAME_RE } from "../session.js";
+import {
+  getProfile,
+  invalidProfileMessage,
+  isValidProfileName,
+  isValidRegionName,
+  REGION_NAME_RE,
+} from "../session.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
@@ -37,13 +43,15 @@ const MAX_CONCURRENCY = 32;
 export const MAX_REGIONS = 64;
 
 // Per-CALL output is capped (aws-cli.ts kills a subprocess whose stdout passes
-// 5 MB), but the BATCH had no ceiling of its own: 64 regions x 5 MB each is
-// 320 MB held in `results` and then JSON-serialized into a single MCP response.
-// Cap the aggregate at the same 5 MB one call is allowed. Entries are kept in
-// order and counted until the budget is spent; past it, an entry's `data` is
-// DROPPED (not string-truncated, which would emit unparseable JSON) and the
-// entry is flagged `truncated: true` so the caller can see exactly which
-// regions to re-run on their own or narrow with `query` / `params`.
+// 5 MB), but the BATCH had no ceiling of its own: 64 regions x 5 MB each is up
+// to 320 MB serialized into a single MCP response. Cap the RESPONSE at the same
+// 5 MB one call is allowed. This bounds what is sent, not peak memory: every
+// payload is still held in `results` until the cap runs. Entries are walked in
+// order, first fit: one whose payload does not fit the remaining budget has its
+// `data` DROPPED (not string-truncated, which would emit unparseable JSON) and
+// is flagged `truncated: true`, while a smaller entry after it can still fit.
+// The caller sees exactly which regions to re-run on their own or narrow with
+// `query` / `params`.
 const MAX_TOTAL_RESULT_BYTES = 5 * 1024 * 1024;
 
 // Region validation comes from session.ts (REGION_NAME_RE / isValidRegionName)
@@ -86,8 +94,10 @@ export interface RegionResult extends CappableResult {
 /**
  * Enforce the aggregate response budget across a batch of per-item results.
  *
- * Walks entries in order, charging each one its serialized size, and once the
- * budget is spent drops `data` from any entry that carries one. Error entries
+ * Walks entries in order, charging each one its serialized size, and drops
+ * `data` from any entry that does not fit what is left of the budget -- first
+ * fit, so a small entry after a dropped big one can still keep its payload. A
+ * dropped entry is charged only its trimmed size. Error entries
  * are left intact: their text is already bounded (aws-cli.ts truncates error
  * messages at 8 KB) and losing the reason an item failed is worse than the
  * bytes it costs. Returns the ids whose data was dropped so the handler can
@@ -213,7 +223,7 @@ export const multiRegionTools: readonly Tool[] = [
     description:
       // Templated on the constants so the numbers the model is told cannot drift
       // from the ones the schema and the handler enforce.
-      `Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes \`regions: string[]\` instead of \`region\`, up to ${MAX_REGIONS} per call with at most ${MAX_CONCURRENCY} in flight. Returns an array of \`{region, ok, data?, command?, error?, errorKind?}\` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so \`results.length\` may be less than \`regions.length\`; use the returned \`regionCount\` for the actual count run. The whole batch is capped at 5 MB of results: if it would exceed that, later entries keep their status but lose \`data\` and are flagged \`truncated: true\`, with the affected regions listed in a top-level \`truncatedRegions\` -- re-run those regions individually or narrow with \`query\`/\`params\`. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.`,
+      `Run the same AWS API operation across multiple regions in parallel. Same shape as aws_call (service, operation, params?, query?, outputFormat?, timeoutMs?) but takes \`regions: string[]\` instead of \`region\`, up to ${MAX_REGIONS} per call with at most ${MAX_CONCURRENCY} in flight. Returns an array of \`{region, ok, data?, command?, commandArgv?, error?, errorKind?}\` -- partial failure is expected (services aren't everywhere, perms may be region-scoped). Duplicate regions in the input are collapsed (first occurrence wins), so \`results.length\` may be less than \`regions.length\`; use the returned \`regionCount\` for the actual count run. The whole batch is capped at 5 MB of results: walked in order, any successful entry whose payload no longer fits the remaining budget keeps its status but loses \`data\` and is flagged \`truncated: true\`, with the affected regions listed in a top-level \`truncatedRegions\` -- re-run those regions individually or narrow with \`query\`/\`params\`. Use for fleet-wide reads: 'describe-instances across all our regions', 'list buckets in every region', 'check IAM password policy everywhere'.`,
     annotations: {
       title: "Run an AWS operation across multiple regions in parallel",
       // Same reasoning as aws_call (see call.ts), and strictly more so: this
@@ -268,9 +278,9 @@ export const multiRegionTools: readonly Tool[] = [
 
       // Defense-in-depth, matching the handler-level clamps in paginate.ts and
       // docs.ts: the schema bounds regions at MAX_REGIONS and concurrency at
-      // 1..MAX_CONCURRENCY, but callers that reach the handler directly (the
-      // aws_script bridge before it began parsing, tests, future internal
-      // callers) never see those bounds.
+      // 1..MAX_CONCURRENCY, but callers that reach the handler directly (tests,
+      // future internal callers) never see those bounds. The aws_script bridge
+      // is not one of them: it runs inputSchema.parse before every handler.
       //
       // Bound the RAW list, BEFORE the dedup below, for two reasons:
       //   - The schema's .max(MAX_REGIONS) also applies to the raw array.
@@ -286,6 +296,21 @@ export const multiRegionTools: readonly Tool[] = [
         return {
           ok: false,
           error: `Too many regions: ${i.regions.length} requested, max ${MAX_REGIONS}. Split the batch.`,
+        };
+      }
+
+      // The profile is one value shared by the whole batch, so a bad one is a
+      // batch-level input error, checked once here -- the same reasoning as
+      // aws_multi_account's up-front check. Left to runAwsCall it would come
+      // back as the same bad_input once per region inside an ok:true envelope,
+      // reading like a fleet-wide outage where there is a typo. Resolved with
+      // `??`, exactly as runAwsCall resolves it, so this accepts and refuses
+      // the same values the per-region call would.
+      const profile = i.profile ?? getProfile();
+      if (!isValidProfileName(profile)) {
+        return {
+          ok: false,
+          error: invalidProfileMessage(profile, "Check the 'profile' arg or AWS_PROFILE env var."),
         };
       }
 
@@ -346,7 +371,7 @@ export const multiRegionTools: readonly Tool[] = [
               errorKind: r.kind,
             };
           }
-          return { region, ok: true, command: r.command, data: r.data };
+          return { region, ok: true, command: r.command, commandArgv: r.commandArgv, data: r.data };
         } catch (err) {
           return {
             region,

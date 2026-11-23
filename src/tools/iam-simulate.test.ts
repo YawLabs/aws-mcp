@@ -136,7 +136,33 @@ describe("aws_iam_simulate handler validation", () => {
     assert.equal(r.suggestion, undefined);
   });
 
-  it("rejects resources with leading hyphen (argv-injection defense)", async () => {
+  it("accepts the '?' wildcard and a non-lowercase service prefix in actions", async () => {
+    // IAM action names are case-insensitive and its policy grammar has two
+    // wildcards, '*' and '?'. The old ACTION_RE refused 'S3:GetObject' and
+    // 's3:Get?bject' as "Invalid action" before IAM ever saw them.
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
+    for (const action of ["S3:GetObject", "s3:Get?bject", "IAM:List*"]) {
+      const r = await tool.handler({
+        principalArn: "arn:aws:iam::123456789012:user/x",
+        actions: [action],
+      } as never);
+      assert.equal(r.ok, true, `${action}: ${r.error}`);
+    }
+  });
+
+  it("offers an example principalArn that its own check accepts", async () => {
+    // The invalid-principalArn error used to suggest 'arn:aws:iam::123:user/jeff',
+    // which the same 12-digit-account check rejects. Feed the example back in.
+    const r = await tool.handler({ principalArn: "not-an-arn", actions: ["s3:GetObject"] } as never);
+    assert.equal(r.ok, false);
+    const example = /e\.g\. '([^']+)'/.exec(r.error ?? "")?.[1];
+    assert.ok(example, `the error should carry an example ARN, got: ${r.error}`);
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
+    const again = await tool.handler({ principalArn: example, actions: ["s3:GetObject"] } as never);
+    assert.doesNotMatch(again.error ?? "", /Invalid principalArn/);
+  });
+
+  it("rejects resources with a leading hyphen (shape check)", async () => {
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/x",
       actions: ["s3:GetObject"],
@@ -698,7 +724,8 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
   });
 
   it("accepts a 2048-char resource and rejects a 2049-char one (length cap boundary)", async () => {
-    // iam-simulate.ts:204 rejects resources longer than 2048 chars. The cap is
+    // The handler's resource check rejects resources longer than
+    // MAX_RESOURCE_CHARS (2048, IAM's ResourceNameType maximum). The cap is
     // inclusive: exactly 2048 passes validation, 2049 fails. Both strings
     // start with a non-hyphen char so only the length branch is under test.
     process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_advisory_and_filter";
@@ -721,17 +748,19 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     } as never);
     assert.equal(rejected.ok, false);
     assert.match(rejected.error ?? "", /Invalid resource/);
+    // The message states the inclusive bound the check enforces, not "< 2048".
+    assert.match(rejected.error ?? "", /at most 2048 chars/);
   });
 
   it("translates contextEntries camelCase -> PascalCase in the CLI argv (regression guard)", async () => {
     // The schema accepts contextEntries: [{ contextKeyName, contextKeyType,
     // contextKeyValues }] from the model; the AWS CLI requires PascalCase
     // ContextKeyName / ContextKeyType / ContextKeyValues inside
-    // --cli-input-json. iam-simulate.ts:221-225 does the case translation.
+    // --cli-input-json. The handler's ContextEntries map does the case translation.
     // A refactor dropping the map would leave camelCase in the CLI payload;
     // the CLI would silently produce missingContextValues for every
     // tag-based policy sim -- a quiet false negative. We capture the argv
-    // via the iam_sim_echo_argv fake-aws scenario (side-channel via
+    // via the iam_simulate_echo_argv fake-aws scenario (side-channel via
     // AWS_MCP_FAKE_ARGV_OUT, since the handler discards data.argv) and
     // assert the --cli-input-json JSON is PascalCase.
     const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
@@ -740,7 +769,7 @@ describe("aws_iam_simulate handler (fake-aws integration)", () => {
     const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-argv-out-"));
     const argvOutPath = join(sideChannelDir, "argv.json");
     process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam_sim_echo_argv";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_echo_argv";
     try {
       const r = await tool.handler({
         principalArn: "arn:aws:iam::123456789012:user/jeff",
@@ -792,7 +821,7 @@ describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 sh
   // loopback stub. They are what the handler now has to answer correctly, and
   // what no fixture in the block above could show.
   it("answers per resource for a 2-action x 3-resource call", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_rsr_split";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_rsr_split";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:role/newshape",
       actions: ["s3:GetObject", "s3:ListAllMyBuckets"],
@@ -843,7 +872,7 @@ describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 sh
   it("attributes an SCP deny to the requested ARN, with no statement to name", async () => {
     // The shape behind the description's SCP caveat: explicitDeny with EMPTY
     // MatchedStatements, and AllowedByOrganizations:false the only tell.
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_scp_deny";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_scp_deny";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:role/scpdeny",
       actions: ["ec2:RunInstances"],
@@ -861,7 +890,7 @@ describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 sh
   });
 
   it("reads each row's own permissions-boundary verdict", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_rsr_boundary";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_rsr_boundary";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:role/boundary",
       actions: ["s3:GetObject"],
@@ -881,7 +910,7 @@ describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 sh
   it("reports '*' for a resource-less call, even when AWS answers with an ARN template", async () => {
     // Pins the handler's resourcesOmitted wiring. Without it the commonest call
     // shape -- "can I do this at all?" -- would answer with IAM's ARN template.
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_nores_template";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_nores_template";
     const omitted = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:role/nores",
       actions: ["s3:GetObject"],
@@ -893,7 +922,7 @@ describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 sh
     // still reach the row.
     assert.deepEqual(omittedData.results[0].missingContextValues, ["s3:ExistingObjectTag/env"]);
 
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam-simulate_nores_template";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_nores_template";
     const named = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:role/nores",
       actions: ["s3:GetObject"],
@@ -909,9 +938,9 @@ describe("aws_iam_simulate handler -- per-resource rows (fake-aws, 2026-07-30 sh
 });
 
 describe("aws_iam_simulate request bounds", () => {
-  // Results are actions x resources and the whole request travels in ONE argv
-  // entry (--cli-input-json). Without a cap, a plausible 300-ARN batch died as
-  // an opaque spawn error instead of a validation message.
+  // Results are actions x resources, one row per pair, so the resource cap is
+  // what bounds the response. The serialized REQUEST is not capped: runAwsCall
+  // moves a large --cli-input-json into a temp file rather than argv.
   it("rejects more than 50 resources at both the schema and the handler", async () => {
     const resources = Array.from({ length: 51 }, (_, n) => `arn:aws:s3:::bucket-${n}/*`);
     assert.equal(
@@ -932,21 +961,34 @@ describe("aws_iam_simulate request bounds", () => {
     assert.match(r.error ?? "", /Too many resources: 51 requested, max 50/);
   });
 
-  it("rejects a payload that would overflow the single argv entry, even within the count caps", async () => {
-    // 50 resources is legal by count, but at ~2000 chars each the serialized
-    // --cli-input-json is ~100 KB -- past the Linux per-entry limit and far
-    // past the Windows whole-command-line limit. Each ARN is under the
-    // per-resource 2048-char cap, so only the byte guard can catch this.
+  it("sends a large request within the count caps to the CLI instead of refusing it", async () => {
+    // 50 resources is legal by count, and at ~2000 chars each the serialized
+    // --cli-input-json is ~100 KB. A former byte guard refused anything over
+    // 24,000 chars as an argv overflow, but runAwsCall carries params over
+    // INLINE_CLI_INPUT_JSON_MAX_CHARS in a temp file, so the request must reach
+    // the spawn and IAM decides whether it is too large.
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
     const resources = Array.from({ length: 50 }, (_, n) => `arn:aws:s3:::bucket-${n}/${"a".repeat(1980)}`);
     for (const r of resources) assert.ok(r.length <= 2048, "precondition: each ARN is under the per-resource cap");
-    const r = await tool.handler({
-      principalArn: "arn:aws:iam::123456789012:user/jeff",
-      actions: ["s3:GetObject"],
-      resources,
-    } as never);
-    assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /Request too large/);
-    assert.match(r.error ?? "", /single argv entry/);
+    const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-argv-out-"));
+    const argvOutPath = join(sideChannelDir, "argv.json");
+    process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_echo_argv";
+    try {
+      const r = await tool.handler({
+        principalArn: "arn:aws:iam::123456789012:user/jeff",
+        actions: ["s3:GetObject"],
+        resources,
+      } as never);
+      assert.equal(r.ok, true, `the request must reach the CLI, got: ${r.error}`);
+      const argv = JSON.parse(readFileSync(argvOutPath, "utf-8")) as string[];
+      const cliInput = argv[argv.indexOf("--cli-input-json") + 1] ?? "";
+      assert.ok(cliInput.startsWith("file://"), "a request this large travels by temp file, not argv");
+    } finally {
+      delete process.env.AWS_MCP_FAKE_ARGV_OUT;
+      rmSync(sideChannelDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -984,7 +1026,7 @@ describe("aws_iam_simulate pagination -- merged first call and resume", () => {
   // local stub (iam-simulate planning, 2026-09-19); the fake models the CLI's
   // output, not IAM's, because the fake's job is to stand in for the CLI.
   it("reports a first call as complete -- the CLI already merged IAM's pages", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_truncated";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/jeff",
       actions: ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
@@ -1009,7 +1051,7 @@ describe("aws_iam_simulate pagination -- merged first call and resume", () => {
   it("reports a resumed page that is itself truncated, and echoes IAM's Marker verbatim", async () => {
     // Same scenario: the fake switches on the Marker in --cli-input-json, so
     // every page is driven through the real handler in one self-contained set.
-    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_truncated";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/jeff",
       actions: ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
@@ -1033,7 +1075,7 @@ describe("aws_iam_simulate pagination -- merged first call and resume", () => {
   });
 
   it("reports the last page as complete", async () => {
-    process.env.AWS_MCP_FAKE_SCENARIO = "obs2_iam_sim_truncated";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_truncated";
     const r = await tool.handler({
       principalArn: "arn:aws:iam::123456789012:user/jeff",
       actions: ["s3:GetObject", "s3:DeleteObject", "s3:PutObject"],
@@ -1054,17 +1096,17 @@ describe("aws_iam_simulate pagination -- merged first call and resume", () => {
   it("forwards `marker` to the CLI as PascalCase Marker inside --cli-input-json", async () => {
     // The resume input is only useful if it reaches IAM. The schema takes
     // camelCase `marker`; the CLI requires PascalCase `Marker` in the
-    // --cli-input-json payload (iam-simulate.ts:298-300). A refactor dropping
+    // --cli-input-json payload (the handler's `params.Marker` assignment). A refactor dropping
     // that assignment would leave the tool advertising a resume cursor it never
     // sends -- every "next page" call would silently re-fetch page 1. Captured
-    // via the iam_sim_echo_argv side channel, as the contextEntries case does.
+    // via the iam_simulate_echo_argv side channel, as the contextEntries case does.
     const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-marker-out-"));
     const argvOutPath = join(sideChannelDir, "argv.json");
     process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam_sim_echo_argv";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_echo_argv";
     try {
       const r = await tool.handler({
         principalArn: "arn:aws:iam::123456789012:user/jeff",
@@ -1094,7 +1136,7 @@ describe("aws_iam_simulate pagination -- merged first call and resume", () => {
     const sideChannelDir = mkdtempSync(join(tmpdir(), "aws-mcp-nomarker-out-"));
     const argvOutPath = join(sideChannelDir, "argv.json");
     process.env.AWS_MCP_FAKE_ARGV_OUT = argvOutPath;
-    process.env.AWS_MCP_FAKE_SCENARIO = "iam_sim_echo_argv";
+    process.env.AWS_MCP_FAKE_SCENARIO = "iam_simulate_echo_argv";
     try {
       const r = await tool.handler({
         principalArn: "arn:aws:iam::123456789012:user/jeff",

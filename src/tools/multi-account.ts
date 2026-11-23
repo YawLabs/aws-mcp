@@ -41,8 +41,10 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
  *     which is where most operators run this from, so shipping it as the
  *     headline path would fail for the majority.
  *   - `ouId`, to scope such a discovery to one organizational unit.
- *   - `regions[]`, for the accounts x regions cross-product. MAX_TOTAL_TASKS
- *     below is where that would be bounded.
+ *   - `regions[]`, for the accounts x regions cross-product. It multiplies the
+ *     task count without changing the account count, so it will need a ceiling
+ *     on dispatched tasks of its own; today one account is one task and
+ *     MAX_ACCOUNTS is that ceiling.
  *   - `externalId` / `durationSeconds` pass-through to the assume, for
  *     third-party roles and long-running operations.
  */
@@ -51,21 +53,10 @@ const DEFAULT_CONCURRENCY = 8;
 const MAX_CONCURRENCY = 32;
 const MAX_ACCOUNTS = 32;
 
-// Ceiling on the number of dispatched units of work, checked after dedup.
-//
-// Today one account is one task, so with MAX_ACCOUNTS above this cannot fire --
-// and it is here anyway, as the single place the fan-out WIDTH is bounded. The
-// deferred accounts x regions cross-product multiplies the task count without
-// changing the account count, and when it lands it needs a ceiling that already
-// exists rather than one invented at that point (and applied, at that point, to
-// a handler that had been unbounded). Kept as a real runtime check rather than a
-// comment because handler-level guards are the only ones a direct, non-MCP
-// caller passes through at all.
-const MAX_TOTAL_TASKS = 32;
-
 // Same aggregate budget aws_multi_region enforces, for the same reason: a single
 // call's stdout is capped at 5 MB in aws-cli.ts, but 32 of them summed into one
-// MCP response is not. Entries past the budget keep their status and lose their
+// MCP response is not. It bounds the response, not peak memory. Entries whose
+// payload does not fit the remaining budget keep their status and lose their
 // `data` -- dropped whole, never string-truncated, which would emit unparseable
 // JSON.
 const MAX_TOTAL_RESULT_BYTES = 5 * 1024 * 1024;
@@ -170,17 +161,62 @@ function redactSecrets(text: string, creds: AssumedRoleCredentials): string {
  *     omitProfile suppresses), but an inherited SSO-backed profile name would
  *     still have the CLI resolving a token it has no reason to touch, and a
  *     child carrying a profile it must not use is a trap for the next reader.
+ *
+ * Every key is matched CASE-INSENSITIVELY. Windows environment names are
+ * case-insensitive, but the spread copy of process.env is a plain object that
+ * keeps each key's own spelling, so `delete env.AWS_SECURITY_TOKEN` misses an
+ * inherited `Aws_Security_Token` -- and the child still reads it as
+ * AWS_SECURITY_TOKEN. Dropping any spelling of the three credential names
+ * before setting them also keeps a stale lower-case duplicate from riding
+ * alongside the minted value. On POSIX a differently-cased name is a different
+ * variable that botocore never reads, so removing it there changes nothing.
  */
+const CHILD_ENV_STRIP: ReadonlySet<string> = new Set([
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_SECURITY_TOKEN",
+  "AWS_CREDENTIAL_EXPIRATION",
+  "AWS_PROFILE",
+  "AWS_DEFAULT_PROFILE",
+]);
+
 function credentialEnv(creds: AssumedRoleCredentials): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (CHILD_ENV_STRIP.has(key.toUpperCase())) delete env[key];
+  }
   env.AWS_ACCESS_KEY_ID = creds.accessKeyId;
   env.AWS_SECRET_ACCESS_KEY = creds.secretAccessKey;
   env.AWS_SESSION_TOKEN = creds.sessionToken;
-  delete env.AWS_SECURITY_TOKEN;
-  delete env.AWS_CREDENTIAL_EXPIRATION;
-  delete env.AWS_PROFILE;
-  delete env.AWS_DEFAULT_PROFILE;
   return env;
+}
+
+/**
+ * The ARN partition a region belongs to, so the role ARN this tool builds names
+ * the partition the target accounts actually live in. A GovCloud or China role
+ * is arn:aws-us-gov:... / arn:aws-cn:..., and an arn:aws: ARN for it fails
+ * every sts:AssumeRole in the batch.
+ *
+ * The patterns are botocore's own `regionRegex` per partition (partitions.json,
+ * as shipped in aws-cli 2.34.3). Anything that matches none of them is treated
+ * as commercial `aws`, which is botocore's default partition too.
+ */
+const PARTITION_BY_REGION: readonly (readonly [RegExp, string])[] = [
+  [/^us-gov-\w+-\d+$/, "aws-us-gov"],
+  [/^cn-\w+-\d+$/, "aws-cn"],
+  [/^us-iso-\w+-\d+$/, "aws-iso"],
+  [/^us-isob-\w+-\d+$/, "aws-iso-b"],
+  [/^eu-isoe-\w+-\d+$/, "aws-iso-e"],
+  [/^us-isof-\w+-\d+$/, "aws-iso-f"],
+  [/^eusc-de-\w+-\d+$/, "aws-eusc"],
+];
+
+export function partitionForRegion(region: string): string {
+  for (const [re, partition] of PARTITION_BY_REGION) {
+    if (re.test(region)) return partition;
+  }
+  return "aws";
 }
 
 /**
@@ -214,7 +250,7 @@ export const multiAccountTools: readonly Tool[] = [
   {
     name: "aws_multi_account",
     description:
-      "Run the same AWS API operation across multiple ACCOUNTS in parallel by assuming the same role name in each. Same shape as aws_call (service, operation, params?, query?, outputFormat?, region?, timeoutMs?) plus `accounts: string[]` of 12-digit account IDs and `roleName`. This is fan-out in one call, not new access: it is exactly what aws_assume_role in a loop would reach, minus the credentials-file churn -- each account's session is held in memory for the one subprocess that uses it and is NEVER written to ~/.aws/credentials, so a sweep that dies halfway leaves nothing on disk. If your org already runs a Config aggregator or Resource Explorer, those answer indexed inventory questions with less work; reach for this when you want an arbitrary API operation across accounts with no setup. Returns an array of `{accountId, ok, data?, command?, error?, errorKind?}` -- partial failure is expected and normal (the role may not exist in every account, trust policies differ, services vary). Duplicate account IDs collapse (first occurrence wins), so use the returned `accountCount`. The batch is capped at 5 MB of results: past that, entries keep their status but lose `data` and are flagged `truncated: true`, with the affected accounts listed in a top-level `truncatedAccounts`.",
+      "Run the same AWS API operation across multiple ACCOUNTS in parallel by assuming the same role name in each. Same shape as aws_call (service, operation, params?, query?, outputFormat?, region?, timeoutMs?) plus `accounts: string[]` of 12-digit account IDs and `roleName`. This is fan-out in one call, not new access: it is exactly what aws_assume_role in a loop would reach, minus the credentials-file churn -- each account's session is held in memory for the one subprocess that uses it and is NEVER written to ~/.aws/credentials, so a sweep that dies halfway leaves nothing on disk. If your org already runs a Config aggregator or Resource Explorer, those answer indexed inventory questions with less work; reach for this when you want an arbitrary API operation across accounts with no setup. Returns an array of `{accountId, ok, data?, command?, commandArgv?, error?, errorKind?}` -- partial failure is expected and normal (the role may not exist in every account, trust policies differ, services vary). Duplicate account IDs collapse (first occurrence wins), so use the returned `accountCount`. The batch is capped at 5 MB of results: walked in order, any successful entry whose payload no longer fits the remaining budget keeps its status but loses `data` and is flagged `truncated: true`, with the affected accounts listed in a top-level `truncatedAccounts`.",
     annotations: {
       title: "Run an AWS operation across multiple accounts in parallel",
       // Same reasoning as aws_call and aws_multi_region, and further still: the
@@ -246,7 +282,7 @@ export const multiAccountTools: readonly Tool[] = [
         .min(1)
         .max(MAX_ROLE_NAME_LENGTH)
         .describe(
-          "Name of the role to assume in EVERY target account (e.g. 'OrganizationAccountAccessRole', 'ReadOnlyAuditor'). Combined with each account ID into arn:aws:iam::<account>:role/<roleName>. Include the IAM path if the role has one ('engineering/Auditor').",
+          "Name of the role to assume in EVERY target account (e.g. 'OrganizationAccountAccessRole', 'ReadOnlyAuditor'). Combined with each account ID into arn:<partition>:iam::<account>:role/<roleName>, where the partition follows the region (e.g. aws-us-gov for us-gov-*, aws-cn for cn-*, and the ISO / sovereign partitions for their region prefixes; aws for commercial regions). Include the IAM path if the role has one ('engineering/Auditor').",
         ),
       params: z
         .record(z.string(), z.unknown())
@@ -304,8 +340,9 @@ export const multiAccountTools: readonly Tool[] = [
 
       // Defense-in-depth handler-level clamps, matching aws_multi_region: the
       // schema bounds `accounts` and `concurrency`, but callers that reach the
-      // handler directly (the aws_script bridge, tests, future internal
-      // callers) never see those bounds.
+      // handler directly (tests, future internal callers) never see those
+      // bounds. The aws_script bridge is not one: it parses with the schema
+      // before every handler call.
       //
       // Bound the RAW list BEFORE the dedup below, for the same two reasons
       // aws_multi_region does: checking the deduped count would make this
@@ -331,13 +368,6 @@ export const multiAccountTools: readonly Tool[] = [
           seen.add(a);
           accounts.push(a);
         }
-      }
-
-      if (accounts.length > MAX_TOTAL_TASKS) {
-        return {
-          ok: false,
-          error: `Too many tasks: ${accounts.length} account-operations requested, max ${MAX_TOTAL_TASKS}. Split the batch.`,
-        };
       }
 
       const roleName = i.roleName;
@@ -390,6 +420,23 @@ export const multiAccountTools: readonly Tool[] = [
       const total = accounts.length;
       let completed = 0;
 
+      // Every account in the batch shares the region, so they share its
+      // partition too.
+      const partition = partitionForRegion(region);
+
+      // runWithConcurrency checks the signal before it claims an account and
+      // then starts runAccount in the same synchronous step. An account that
+      // was never started gets this entry; one already started has the signal
+      // passed to both its assume and its operation call, so a cancel kills
+      // whichever half is in flight (errorKind "cancelled").
+      const cancelledEntry = (accountId: string): AccountResult => ({
+        accountId,
+        ok: false,
+        error:
+          "Not attempted: the client cancelled the request before this account was started. No role was assumed and nothing was sent to AWS for it -- re-run to include it.",
+        errorKind: "cancelled",
+      });
+
       const runAccount = async (accountId: string): Promise<AccountResult> => {
         try {
           if (!ACCOUNT_ID_RE.test(accountId)) {
@@ -400,7 +447,7 @@ export const multiAccountTools: readonly Tool[] = [
               errorKind: "bad_input",
             };
           }
-          const roleArn = `arn:aws:iam::${accountId}:role/${roleName}`;
+          const roleArn = `arn:${partition}:iam::${accountId}:role/${roleName}`;
 
           const assumed = await assumeRoleCredentials({
             roleArn,
@@ -408,6 +455,7 @@ export const multiAccountTools: readonly Tool[] = [
             sourceProfile,
             region,
             ...(i.timeoutMs !== undefined ? { timeoutMs: i.timeoutMs } : {}),
+            ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
           });
           if (!assumed.ok) {
             // The assume failed, so there are no credentials to redact against
@@ -441,8 +489,9 @@ export const multiAccountTools: readonly Tool[] = [
             // AwsCallOptions.omitProfile.
             env: credentialEnv(creds),
             omitProfile: true,
-            // A cancel kills an account still in flight, reported as errorKind
-            // "cancelled" like the accounts onCancelled covers below.
+            // A cancel kills this OPERATION call if it is in flight, reported as
+            // errorKind "cancelled" like the accounts onCancelled covers below.
+            // (The assume above takes the same signal.)
             signal: ctx?.signal,
           });
 
@@ -520,13 +569,7 @@ export const multiAccountTools: readonly Tool[] = [
           // results, accounts never claimed are represented rather than dropped.
           // It matters more here -- these entries never reached sts:AssumeRole, so
           // no credential was minted for them and there is nothing to redact.
-          onCancelled: (accountId: string): AccountResult => ({
-            accountId,
-            ok: false,
-            error:
-              "Not attempted: the client cancelled the request before this account was started. No role was assumed and nothing was sent to AWS for it -- re-run to include it.",
-            errorKind: "cancelled",
-          }),
+          onCancelled: cancelledEntry,
         },
       );
 

@@ -13,9 +13,11 @@
  * Nothing here may reach AWS or read the developer's own credentials:
  *   - startLoopbackStub listens on 127.0.0.1 only, and every call a suite makes
  *     is pointed at it with --endpoint-url.
- *   - isolateAwsEnv scrubs every AWS_* / PYTHON* variable and every proxy
- *     setting from process.env, points the CLI at throwaway config and
- *     credentials files holding fake static keys, and sends everything not
+ *   - isolateAwsEnv scrubs every AWS_* / PYTHON* variable, BOTO_CONFIG and
+ *     every proxy setting from process.env, points HOME / USERPROFILE (so every
+ *     ~/.aws cache the CLI reads or writes) and the config and credentials
+ *     files at a throwaway directory holding fake static keys, and sends
+ *     everything not
  *     bound for the loopback through a proxy on 127.0.0.1:1, where nothing
  *     listens. A request that escapes the endpoint override -- a credential
  *     provider, a region-derived hostname -- fails to connect instead of
@@ -241,7 +243,7 @@ const PROXY_VARS: ReadonlySet<string> = new Set(["HTTP_PROXY", "HTTPS_PROXY", "A
 const KEPT_AWS_VARS: ReadonlySet<string> = new Set(["AWS_MCP_AWS_CLI"]);
 
 export interface IsolatedAwsEnv {
-  /** Private temp directory holding the two files below; removed by restore(). */
+  /** Private temp directory holding the two files below, and HOME / USERPROFILE; removed by restore(). */
   dir: string;
   configFile: string;
   credentialsFile: string;
@@ -254,9 +256,11 @@ export interface IsolatedAwsEnv {
  * loopback, with fake credentials:
  *   1. delete every variable whose upper-case name starts with AWS_ (this
  *      covers AWS_MCP_TEST_*) or PYTHON, and every spelling of HTTP_PROXY,
- *      HTTPS_PROXY, ALL_PROXY and NO_PROXY -- except AWS_MCP_AWS_CLI, which
- *      names the binary to run rather than an identity (KEPT_AWS_VARS);
- *   2. set HTTP_PROXY and HTTPS_PROXY to DEAD_PROXY_URL, NO_PROXY to the
+ *      HTTPS_PROXY, ALL_PROXY and NO_PROXY, plus BOTO_CONFIG -- except
+ *      AWS_MCP_AWS_CLI, which names the binary to run rather than an identity
+ *      (KEPT_AWS_VARS);
+ *   2. set HOME and USERPROFILE to the private temp dir below, HTTP_PROXY and
+ *      HTTPS_PROXY to DEAD_PROXY_URL, NO_PROXY to the
  *      loopback, AWS_EC2_METADATA_DISABLED=true, AWS_REGION=us-east-1, an
  *      empty AWS_PAGER, and AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE to
  *      new files in a private temp dir -- `opts.config` / `opts.credentials`
@@ -285,11 +289,17 @@ export function isolateAwsEnv(
   for (const key of Object.keys(process.env)) {
     const upper = key.toUpperCase();
     if (KEPT_AWS_VARS.has(upper)) continue;
-    if (upper.startsWith("AWS_") || upper.startsWith("PYTHON") || PROXY_VARS.has(upper)) {
+    if (upper.startsWith("AWS_") || upper.startsWith("PYTHON") || PROXY_VARS.has(upper) || upper === "BOTO_CONFIG") {
       delete process.env[key];
     }
   }
   Object.assign(process.env, {
+    // The home directory too, not only the two files: the CLI also resolves
+    // ~/.aws/sso/cache, ~/.aws/cli/cache (where an answered assume-role would
+    // write its session), ~/.aws/cli/alias, ~/.aws/models and ~/.boto from it.
+    // Python's expanduser reads HOME on POSIX and USERPROFILE on Windows.
+    HOME: dir,
+    USERPROFILE: dir,
     HTTP_PROXY: DEAD_PROXY_URL,
     HTTPS_PROXY: DEAD_PROXY_URL,
     NO_PROXY: "127.0.0.1,localhost",

@@ -7,6 +7,7 @@ import {
   paramFileUriMessage,
   runAwsCall,
 } from "../aws-cli.js";
+import { parseAwsError } from "../errors.js";
 import { getProfile } from "../session.js";
 import { extractNextToken } from "./paginate.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
@@ -39,7 +40,9 @@ import type { Tool, ToolContext, ToolResult } from "./tool.js";
  */
 
 // <Namespace>::<Service>::<Resource> where each segment is PascalCase
-// alphanumeric. Matches AWS::*, Custom::*, and third-party registry types.
+// alphanumeric. Matches AWS::* and three-segment third-party registry types.
+// NOT CloudFormation custom resources: those are two segments
+// (`Custom::MyResource`) and are not addressable through Cloud Control anyway.
 export const TYPE_NAME_RE = /^[A-Z][A-Za-z0-9]*::[A-Z][A-Za-z0-9]*::[A-Z][A-Za-z0-9]*$/;
 
 /**
@@ -281,18 +284,73 @@ function unwrapProgressEvent(data: unknown): Record<string, unknown> | null {
 
 /**
  * The shared success shape for anything that returns a ProgressEvent: the
- * command, the flat-promoted fields, and the raw event. `extra` carries the
- * extra keys the awaited path adds.
+ * command and its argv, the flat-promoted fields, and the raw event. `extra`
+ * carries the extra keys the awaited path adds.
+ *
+ * `commandArgv` rides beside `command` here exactly as it does on get / list /
+ * diff: the README promises that every envelope carrying `command` also
+ * carries `commandArgv`, and these four verbs (create / update / delete /
+ * status) used to drop it although the argv was plumbed all the way here.
+ *
+ * `ok: true` reports that the CALL worked -- the mutation was accepted, or the
+ * status was read. Whether the MUTATION applied is `operationStatus`: FAILED
+ * and CANCEL_COMPLETE are still ok:true (they are a successfully observed
+ * terminal state) and mean the change did not apply.
  */
 function progressResponse(
   command: string,
+  commandArgv: string[],
   progressEvent: Record<string, unknown> | null,
   extra?: Record<string, unknown>,
 ): ToolResult {
   return {
     ok: true,
-    data: { command, ...extractProgressFields(progressEvent), progressEvent, ...extra },
+    data: { command, commandArgv, ...extractProgressFields(progressEvent), progressEvent, ...extra },
   };
+}
+
+/**
+ * How many CONSECUTIVE transient poll failures the awaited loop absorbs before
+ * it gives up. A throttled or timed-out get-resource-request-status says
+ * nothing about the mutation, so aborting a wait of up to 30 minutes on the
+ * first one threw away the whole wait. Small and consecutive on purpose: a
+ * streak that long is no longer "transient", and the AWS CLI has already
+ * retried each call itself before it reported the throttle.
+ */
+export const MAX_TRANSIENT_POLL_RETRIES = 3;
+
+// Rate-limit codes, the same set parseAwsError gives the backoff remedy to,
+// plus the 5xx codes CCAPI and its backing services answer with under load.
+const TRANSIENT_POLL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ThrottlingException",
+  "Throttling",
+  "RequestLimitExceeded",
+  "TooManyRequestsException",
+  "ServiceUnavailable",
+  "ServiceUnavailableException",
+  "InternalFailure",
+  "InternalServerError",
+  "InternalServiceError",
+]);
+// botocore's transport failures (ReadTimeoutError, ConnectTimeoutError,
+// ConnectionClosedError); see errors.ts READ_TIMEOUT_RE for the fmt strings.
+const TRANSIENT_TRANSPORT_RE =
+  /(?:Read|Connect) timeout on endpoint URL|Connection was closed before we received a valid response/;
+
+/**
+ * Is this failed poll worth retrying? Yes for our own per-call timeout, a
+ * spawn hiccup (the same binary just ran the mutation), a throttle / 5xx, or a
+ * transport timeout. Never for an auth kind (it needs the caller to act --
+ * buildMutationResponse gives those their own recovery hint), a cancellation,
+ * a validation error, or a malformed / oversized response.
+ */
+export function isTransientPollFailure(result: AwsCallFailure): boolean {
+  if (result.kind === "timeout" || result.kind === "spawn_failure") return true;
+  if (result.kind !== "nonzero_exit") return false;
+  const body = rawBodyOf(result) ?? "";
+  const code = parseAwsError(body).code;
+  if (code && TRANSIENT_POLL_ERROR_CODES.has(code)) return true;
+  return TRANSIENT_TRANSPORT_RE.test(body);
 }
 
 interface PollResult {
@@ -303,6 +361,8 @@ interface PollResult {
   commandArgv: string[];
   attempts: number;
   elapsedMs: number;
+  /** Transient poll failures absorbed and retried over the whole wait. */
+  transientRetries: number;
   error?: string;
   // Mirrors AwsCallFailureKind from runAwsCall when the underlying CLI call
   // fails. buildMutationResponse uses this to enrich the message with a
@@ -419,6 +479,10 @@ export async function pollUntilTerminal(
   // fresh result still reports the argv of the last call it made.
   let lastCommandArgv: string[] = [];
   let lastStatus: string | null = null;
+  // Consecutive transient failures (reset by any successful poll), and the
+  // running total reported back to the caller.
+  let transientStreak = 0;
+  let transientRetries = 0;
   const outOfBudget = (): PollResult => {
     const elapsed = Date.now() - start;
     return {
@@ -428,6 +492,7 @@ export async function pollUntilTerminal(
       commandArgv: lastCommandArgv,
       attempts,
       elapsedMs: elapsed,
+      transientRetries,
       error: `Polled for ${Math.round(elapsed / 1000)}s without reaching a terminal state (last status: ${lastStatus ?? "unknown"}). Increase maxWaitMs, or call aws_resource_status with requestToken='${opts.requestToken}' to keep checking.`,
     };
   };
@@ -445,6 +510,7 @@ export async function pollUntilTerminal(
       commandArgv: lastCommandArgv,
       attempts,
       elapsedMs: elapsed,
+      transientRetries,
       error: `Cancelled by the client after ${Math.round(elapsed / 1000)}s and ${attempts} poll(s) (last status: ${lastStatus ?? "unknown"}). Polling stopped; the AWS operation itself was NOT cancelled and is likely still running -- call aws_resource_status with requestToken='${opts.requestToken}' to check how it ended.`,
     };
   };
@@ -468,6 +534,27 @@ export async function pollUntilTerminal(
       extraFlags: ["--request-token", opts.requestToken],
     });
     if (!result.ok) {
+      // A throttled / timed-out / hiccuped poll says nothing about the
+      // mutation, so retry it -- a bounded number of times in a row, and only
+      // while a full poll interval still fits in the budget (so the retry
+      // cannot push the loop past maxWaitMs). Anything else, or a streak past
+      // the cap, ends the wait with this failure.
+      const elapsedNow = Date.now() - start;
+      if (
+        isTransientPollFailure(result) &&
+        transientStreak < MAX_TRANSIENT_POLL_RETRIES &&
+        elapsedNow + opts.pollIntervalMs < opts.maxWaitMs
+      ) {
+        transientStreak++;
+        transientRetries++;
+        opts.ctx?.reportProgress(
+          attempts,
+          undefined,
+          `Poll ${attempts}: transient failure (${result.kind}), retrying after ${Math.round(elapsedNow / 1000)}s`,
+        );
+        await sleep(opts.pollIntervalMs, opts.ctx?.signal);
+        continue;
+      }
       return {
         ok: false,
         progressEvent: lastEvent,
@@ -475,11 +562,13 @@ export async function pollUntilTerminal(
         commandArgv: result.commandArgv ?? lastCommandArgv,
         attempts,
         elapsedMs: Date.now() - start,
+        transientRetries,
         error: result.error,
         kind: result.kind,
         rawBody: rawBodyOf(result),
       };
     }
+    transientStreak = 0;
     lastCommand = result.command;
     lastCommandArgv = result.commandArgv;
     lastEvent = unwrapProgressEvent(result.data);
@@ -505,6 +594,7 @@ export async function pollUntilTerminal(
         commandArgv: lastCommandArgv,
         attempts,
         elapsedMs: Date.now() - start,
+        transientRetries,
       };
     }
     let waitMs = opts.pollIntervalMs;
@@ -616,9 +706,34 @@ async function buildMutationResponse(
       // exhaustion and the client-cancelled result -- and that is the correct
       // answer for both: nothing classified them, so the field is absent rather
       // than being given a manufactured value.
-      return { ok: false, error: polled.error ?? "Poll failed", errorKind: polled.kind, rawBody: polled.rawBody };
+      //
+      // Every OTHER CLI failure (a throttle that outlived the retries, a
+      // timeoutMs, a validation error, a malformed body) used to return the
+      // bare poll error here and DROP the requestToken -- the same defect the
+      // auth arms above were added to fix, on the more common failures. The
+      // mutation was already accepted, so the token is the caller's only
+      // handle on it: append the recovery clause and the last known progress.
+      // The budget / cancelled arms (no `kind`: no CLI call failed) build their
+      // own message that already carries the token; don't repeat it.
+      const pollError = polled.error ?? "Poll failed";
+      if (polled.kind === undefined) {
+        return { ok: false, error: pollError, errorKind: polled.kind, rawBody: polled.rawBody };
+      }
+      const last = extractProgressFields(polled.progressEvent ?? progressEvent);
+      const progressBits = [
+        `last status: ${last.operationStatus ?? "unknown"}`,
+        ...(last.identifier ? [`identifier: ${last.identifier}`] : []),
+        ...(last.errorCode ? [`errorCode: ${last.errorCode}`] : []),
+        ...(last.statusMessage ? [`statusMessage: ${last.statusMessage}`] : []),
+      ].join(", ");
+      const retried =
+        polled.transientRetries > 0
+          ? ` after ${polled.transientRetries} transient-failure retr${polled.transientRetries === 1 ? "y" : "ies"}`
+          : "";
+      const recoveryError = `Polling stopped after ${polled.attempts} attempt(s)${retried} while awaiting completion (${progressBits}). The mutation was already accepted and may still complete server-side -- call aws_resource_status with requestToken='${fields.requestToken}' to check how it ended. Underlying error: ${pollError}`;
+      return { ok: false, error: recoveryError, errorKind: polled.kind, rawBody: polled.rawBody };
     }
-    return progressResponse(polled.command, polled.progressEvent, {
+    return progressResponse(polled.command, polled.commandArgv, polled.progressEvent, {
       awaited: { attempts: polled.attempts, elapsedMs: polled.elapsedMs },
     });
   }
@@ -636,7 +751,7 @@ async function buildMutationResponse(
         }
       : undefined;
 
-  return progressResponse(initial.command, progressEvent, awaitSkipped);
+  return progressResponse(initial.command, initial.commandArgv, progressEvent, awaitSkipped);
 }
 
 const baseFields = {
@@ -646,17 +761,27 @@ const baseFields = {
 };
 
 /**
- * RFC 6902 defines `add` and `replace` as carrying a value; only `remove`
- * doesn't. `value: z.unknown().optional()` accepted an op without one, and
+ * RFC 6902 defines `add`, `replace` and `test` as carrying a `value`, and
+ * `move` / `copy` as carrying a `from`; only `remove` needs neither.
+ * `value: z.unknown().optional()` accepted an op without one, and
  * `{op: 'add', path: '/X'}` then produced `X: undefined` -- which disappears
  * on the next JSON serialization, so the "change" silently evaporated (sent
  * to CCAPI as a value-less patch on the update path, and dropped from the
- * simulated `after` document on the diff path). Reject it at the schema so
- * the model gets a field-level error instead of a no-op.
+ * simulated `after` document on the diff path). A value-less `test` or a
+ * from-less `move` / `copy` reached CCAPI and came back as a
+ * ValidationException. Reject all of them at the schema so the model gets a
+ * field-level error instead.
  */
 const patchOpHasValue = (op: { op: string; value?: unknown }): boolean =>
-  !(op.op === "add" || op.op === "replace") || op.value !== undefined;
-const PATCH_VALUE_REQUIRED = "ops 'add' and 'replace' require a 'value' field (use 'remove' to delete a path).";
+  !(op.op === "add" || op.op === "replace" || op.op === "test") || op.value !== undefined;
+const PATCH_VALUE_REQUIRED = "ops 'add', 'replace' and 'test' require a 'value' field (use 'remove' to delete a path).";
+const patchOpHasFrom = (op: { op: string; from?: string }): boolean =>
+  !(op.op === "move" || op.op === "copy") || typeof op.from === "string";
+const PATCH_FROM_REQUIRED = "ops 'move' and 'copy' require a 'from' field (the JSON Pointer to read from).";
+
+/** Appended to every mutation verb's description: what `ok` does and does not say. */
+const MUTATION_OK_NOTE =
+  " `ok: true` means the call succeeded (the request was accepted, or a terminal state was observed); whether the change applied is `operationStatus` -- FAILED or CANCEL_COMPLETE means it did NOT apply (see `errorCode` / `statusMessage`).";
 
 const awaitFields = {
   awaitCompletion: z
@@ -758,7 +883,9 @@ export const resourceTools: readonly Tool[] = [
       nextToken: z
         .string()
         .optional()
-        .describe("Resume cursor from the previous call's `nextToken`. Omit for the first page."),
+        .describe(
+          "Resume cursor from the previous call's `nextToken`. Omit (or pass an empty string) for the first page.",
+        ),
       ...baseFields,
     }),
     handler: async (input: unknown): Promise<ToolResult> => {
@@ -771,7 +898,11 @@ export const resourceTools: readonly Tool[] = [
         region?: string;
         timeoutMs?: number;
       };
-      const cursorErr = i.nextToken !== undefined ? validateCursorToken(i.nextToken, "nextToken") : null;
+      // An EMPTY nextToken is "no cursor" -- the first page -- on both the
+      // validation and the forwarding side. Validating on `!== undefined` but
+      // forwarding on truthiness rejected a model that echoed an empty cursor
+      // for page 1 with a length error that never said to omit the field.
+      const cursorErr = i.nextToken ? validateCursorToken(i.nextToken, "nextToken") : null;
       const vErr = validateCommonFields(i) ?? cursorErr;
       if (vErr) return { ok: false, error: vErr };
 
@@ -816,7 +947,8 @@ export const resourceTools: readonly Tool[] = [
   {
     name: "aws_resource_create",
     description:
-      "Create an AWS resource via Cloud Control API. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a `requestToken` (top-level) -- poll aws_resource_status with that token, or pass `awaitCompletion: true` to have the server poll for you and return the terminal event. `desiredState` is the resource properties JSON matching the CloudFormation schema for `typeName`.",
+      "Create an AWS resource via Cloud Control API. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a `requestToken` (top-level) -- poll aws_resource_status with that token, or pass `awaitCompletion: true` to have the server poll for you and return the terminal event. `desiredState` is the resource properties JSON matching the CloudFormation schema for `typeName`." +
+      MUTATION_OK_NOTE,
     annotations: {
       title: "Create an AWS resource (async via CCAPI)",
       readOnlyHint: false,
@@ -870,7 +1002,8 @@ export const resourceTools: readonly Tool[] = [
   {
     name: "aws_resource_update",
     description:
-      "Update an AWS resource via Cloud Control API using RFC 6902 JSON Patch. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Typical patch: [{op: 'replace', path: '/MemorySize', value: 512}].",
+      "Update an AWS resource via Cloud Control API using RFC 6902 JSON Patch. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Typical patch: [{op: 'replace', path: '/MemorySize', value: 512}]." +
+      MUTATION_OK_NOTE,
     annotations: {
       title: "Update an AWS resource (async via CCAPI)",
       // destructiveHint is true because a CCAPI update is not reliably
@@ -897,11 +1030,12 @@ export const resourceTools: readonly Tool[] = [
               value: z.unknown().optional(),
               from: z.string().optional(),
             })
-            .refine(patchOpHasValue, { message: PATCH_VALUE_REQUIRED, path: ["value"] }),
+            .refine(patchOpHasValue, { message: PATCH_VALUE_REQUIRED, path: ["value"] })
+            .refine(patchOpHasFrom, { message: PATCH_FROM_REQUIRED, path: ["from"] }),
         )
         .min(1)
         .describe(
-          "RFC 6902 JSON Patch document (array of operations). At least one entry. 'add' and 'replace' must carry a `value`.",
+          "RFC 6902 JSON Patch document (array of operations). At least one entry. 'add', 'replace' and 'test' must carry a `value`; 'move' and 'copy' must carry a `from`.",
         ),
       clientToken: z.string().optional().describe("Idempotency token (max 128 chars)."),
       ...baseFields,
@@ -947,7 +1081,8 @@ export const resourceTools: readonly Tool[] = [
   {
     name: "aws_resource_delete",
     description:
-      "Delete an AWS resource via Cloud Control API. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Destructive -- double-check `identifier` before calling.",
+      "Delete an AWS resource via Cloud Control API. Async by default: returns a ProgressEvent with OperationStatus=IN_PROGRESS and a top-level `requestToken`. Pass `awaitCompletion: true` to have the server poll until terminal. Destructive -- double-check `identifier` before calling." +
+      MUTATION_OK_NOTE,
     annotations: {
       title: "Delete an AWS resource (async via CCAPI)",
       readOnlyHint: false,
@@ -994,7 +1129,7 @@ export const resourceTools: readonly Tool[] = [
   {
     name: "aws_resource_status",
     description:
-      "Poll the status of an async Cloud Control API request (create/update/delete). Pass the `requestToken` returned by those tools. Returns the current ProgressEvent with OperationStatus: PENDING | IN_PROGRESS | SUCCESS | FAILED | CANCEL_IN_PROGRESS | CANCEL_COMPLETE.",
+      "Poll the status of an async Cloud Control API request (create/update/delete). Pass the `requestToken` returned by those tools. Returns the current ProgressEvent with OperationStatus: PENDING | IN_PROGRESS | SUCCESS | FAILED | CANCEL_IN_PROGRESS | CANCEL_COMPLETE. `ok: true` means the status was read; FAILED or CANCEL_COMPLETE means the mutation did NOT apply.",
     annotations: {
       title: "Get the status of an async CCAPI request",
       readOnlyHint: true,
@@ -1014,7 +1149,7 @@ export const resourceTools: readonly Tool[] = [
       const result = await ccapiCall("get-resource-request-status", ["--request-token", i.requestToken], i);
       if (!result.ok) return ccapiFailure(result);
 
-      return progressResponse(result.command, unwrapProgressEvent(result.data));
+      return progressResponse(result.command, result.commandArgv, unwrapProgressEvent(result.data));
     },
   },
 
@@ -1046,7 +1181,7 @@ export const resourceTools: readonly Tool[] = [
               op: z.enum(["add", "remove", "replace"]),
               path: z.string(),
               value: z.unknown().optional(),
-              from: z.string().optional(),
+              // No `from`: none of add/remove/replace reads one.
             })
             .refine(patchOpHasValue, { message: PATCH_VALUE_REQUIRED, path: ["value"] }),
         )
@@ -1135,7 +1270,6 @@ export interface SimulatedJsonPatchOp {
   op: "add" | "remove" | "replace";
   path: string;
   value?: unknown;
-  from?: string;
 }
 
 /**
@@ -1152,6 +1286,16 @@ export function parseJsonPointer(pointer: string): string[] {
     .slice(1)
     .split("/")
     .map((t) => t.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+/**
+ * RFC 6901 array index: `0`, or digits with no leading zero. Returns null for
+ * anything else. `Number.parseInt` used to stand in here and accepted `01`,
+ * `1abc`, `1.9` and `1e3` (all read as index 1), so the preview reported
+ * success for a patch the real update rejects.
+ */
+function parseArrayIndex(token: string): number | null {
+  return /^(?:0|[1-9][0-9]*)$/.test(token) ? Number(token) : null;
 }
 
 function clone<T>(v: T): T {
@@ -1196,8 +1340,16 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
       throw new Error(`op '${op.op}' at index ${i} is not implemented in aws_resource_diff (use add/remove/replace).`);
     }
     const tokens = parseJsonPointer(op.path);
+    // Only `__proto__` is an assignment hazard: on a plain object it is an
+    // accessor on Object.prototype, so `parent['__proto__'] = v` would swap
+    // the prototype instead of creating a key. `constructor` and `prototype`
+    // are ordinary keys to assign (an own property shadows the inherited
+    // one, and no prototype is touched), and every read here goes through
+    // Object.hasOwn, so an inherited member can never be mistaken for an
+    // existing key. Rejecting them refused legitimate patches -- an env var
+    // or tag-map key named `constructor` -- that aws_resource_update sends.
     for (const seg of tokens) {
-      if (seg === "__proto__" || seg === "constructor" || seg === "prototype") {
+      if (seg === "__proto__") {
         throw new Error(`Path '${op.path}' contains reserved segment '${seg}' at op index ${i}.`);
       }
     }
@@ -1227,8 +1379,8 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
     for (let t = 0; t < parentTokens.length; t++) {
       const segment = parentTokens[t];
       if (Array.isArray(parent)) {
-        const idx = Number.parseInt(segment, 10);
-        if (!Number.isInteger(idx) || idx < 0) {
+        const idx = parseArrayIndex(segment);
+        if (idx === null) {
           throw new Error(`Path '${op.path}' segment '${segment}' is not a valid array index at op index ${i}.`);
         }
         if (idx >= parent.length) {
@@ -1270,8 +1422,8 @@ function _applyJsonPatchInPlace(doc: unknown, ops: readonly JsonPatchOp[]): unkn
         parent.push(clone(op.value));
         continue;
       }
-      const idx = Number.parseInt(lastToken, 10);
-      if (!Number.isInteger(idx) || idx < 0) {
+      const idx = parseArrayIndex(lastToken);
+      if (idx === null) {
         throw new Error(`Path '${op.path}' has non-integer array index '${lastToken}' at index ${i}.`);
       }
       if (op.op === "add") {
@@ -1365,7 +1517,13 @@ export function summarizePatch(ops: readonly SimulatedJsonPatchOp[], before: unk
     // here -- no unimplemented-op branch is needed. The runtime throw in
     // _applyJsonPatchInPlace remains the defense for any caller that widens to
     // JsonPatchOp.
-    const beforeAt = resolvePointer(before, op.path);
+    let beforeAt = resolvePointer(before, op.path);
+    // Whether this op lands in an ARRAY, judged on the document the op will
+    // actually apply to (the working copy, before it applies) -- an earlier op
+    // may have created or replaced the container.
+    const slash = op.path.lastIndexOf("/");
+    const parentIsArray =
+      slash >= 0 && Array.isArray(resolvePointer(replayOk ? working : after, op.path.slice(0, slash)));
 
     let afterAt: unknown;
     if (replayOk) {
@@ -1390,9 +1548,18 @@ export function summarizePatch(ops: readonly SimulatedJsonPatchOp[], before: unk
       afterAt = resolvePointer(after, op.path);
     }
 
-    // `remove` succeeded means the value is gone from the working copy.
-    // resolvePointer returns undefined, which is exactly what we want to
-    // surface -- no special-casing.
+    // A `remove` has no after value, ever. Re-resolving the path is only
+    // undefined for an OBJECT key: removing a non-tail ARRAY element shifts
+    // its right-hand neighbour into the same index, and reading that back
+    // reported `remove /Tags/0` on [a, b, c] as {before: a, after: b} -- a
+    // replace of a with b, which is not what the patch does.
+    if (op.op === "remove") afterAt = undefined;
+
+    // An `add` into an ARRAY inserts; it overwrites nothing. The original
+    // document's value at that index is the element the insert displaces to
+    // the right, and reporting it as `before` made `add /Tags/0` read as a
+    // replace. (An `add` on an object key does overwrite, so `before` stays.)
+    if (op.op === "add" && parentIsArray) beforeAt = undefined;
 
     // RFC 6901 reserves "-" as the position past the last array element. It
     // names a target slot, not a value, so resolvePointer naturally returns
@@ -1424,17 +1591,16 @@ export function resolvePointer(doc: unknown, pointer: string): unknown {
   for (const t of tokens) {
     if (Array.isArray(cur)) {
       if (t === "-") return undefined;
-      const idx = Number.parseInt(t, 10);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return undefined;
+      const idx = parseArrayIndex(t);
+      if (idx === null || idx >= cur.length) return undefined;
       cur = cur[idx];
     } else if (isObj(cur)) {
       // Object.hasOwn, not `in`: `in` walks the prototype chain, so a pointer
       // like '/constructor' or '/toString' would resolve to an INHERITED value
-      // instead of undefined. Not reachable through aws_resource_diff (the
-      // reserved-segment guard in _applyJsonPatchInPlace throws on those paths
-      // first), but summarizePatch and resolvePointer are both exported, and a
-      // direct caller shouldn't be able to read prototype members out of a
-      // document that doesn't own them.
+      // instead of undefined. Reachable through aws_resource_diff too, since a
+      // `constructor` key is a legitimate patch target there (only __proto__
+      // is refused), and from any direct caller of these exported helpers: a
+      // document must never yield prototype members it doesn't own.
       if (!Object.hasOwn(cur, t)) return undefined;
       cur = cur[t];
     } else {

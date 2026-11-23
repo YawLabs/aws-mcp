@@ -366,9 +366,10 @@ describe("runAwsCall — input validation (no spawn)", () => {
     assert.match(r.error, /a command-line argument/);
   });
 
-  it("closes aws_logs_tail's filterPattern, which has no field-level reject of its own", async () => {
-    // logs.ts passes filterPattern as an extraFlags entry, so until that tool
-    // moves it into --cli-input-json this backstop is the whole defense for it.
+  it("names the flag of a file:// value that follows a positional entry", async () => {
+    // A positional, then a flag and its value: the guard must name the flag,
+    // not report the positional. (aws_logs_tail once passed filterPattern this
+    // way; it now travels inside --cli-input-json, but the shape is generic.)
     const r = await runAwsCall({
       service: "logs",
       operation: "tail",
@@ -600,6 +601,18 @@ describe("shellQuoteArg", () => {
     const quoted = shellQuoteArg("x'; echo PWNED #", "win32");
     assert.doesNotMatch(quoted, /\\/, "no backslashes, so bash has nothing to escape out of");
     assert.ok(quoted.startsWith("'") && quoted.endsWith("'"), quoted);
+  });
+
+  it("quotes a leading '@', which PowerShell would splat away", () => {
+    // Measured on PowerShell 5.1: a bare `--profile @prod` lost the token
+    // entirely -- @prod is a splat of an undefined variable. isValidProfileName
+    // accepts '@prod', so the display string must quote it.
+    assert.equal(shellQuoteArg("@prod", "win32"), "'@prod'");
+    assert.equal(shellQuoteArg("@prod", "linux"), "'@prod'");
+    assert.equal(shellQuoteArg("@", "darwin"), "'@'");
+    // A mid-token '@' is plain text in every shell and stays bare.
+    assert.equal(shellQuoteArg("user@company.com", "win32"), "user@company.com");
+    assert.equal(shellQuoteArg("a@b", "linux"), "a@b");
   });
 
   it("quotes an empty argv entry so it stays visible", () => {

@@ -46,7 +46,14 @@ const REPO_ROOT =
 const OAM_RELEASES_API = "https://api.github.com/repos/YawLabs/oam/releases/latest";
 const FETCH_TIMEOUT_MS = 10_000;
 
-/** Files that quote the floor, with the line-level rules applied below. */
+/**
+ * Files that quote the floor, with the line-level rules applied below.
+ *
+ * src/tools/script.ts -- the file the header names -- belongs here too, and is
+ * left out only until its own "re-measured against oam" note (still 0.18.0 on
+ * 2026-11-22) is brought up to the floor; adding it first would fail every
+ * `npm test`.
+ */
 const SCANNED = ["bin/aws-mcp.mjs", "README.md", "src/launcher.test.ts"];
 
 /**
@@ -69,11 +76,21 @@ const ABOUT_OAM = /\boam\b|OAM_MIN|OAM_BIN/i;
 /**
  * ...unless the line is talking about the PAST, in which case an old version on
  * it is the point. Every one of these is a real sentence in the repo: the startup
- * numbers "taken with oam 0.8.2, long before the current floor", the sandbox note
- * "re-measured against oam X.Y.Z", and the launcher comment about a bug where it
- * "bound to 0.9.0" despite a newer oam being on PATH.
+ * numbers "taken with oam 0.8.2, long before the current floor", and the
+ * launcher comment about a bug where it "bound to 0.9.0" despite a newer oam
+ * being on PATH. ("re-measured" is here only so the general scan skips that
+ * line; REMEASURED below holds it to the floor.)
  */
 const HISTORICAL = /taken with|re-measured|long before|used to|bound to|before 0\.9\.0/i;
+
+/**
+ * ...except "re-measured against oam X.Y.Z", which reads as history but is a
+ * CURRENT claim: re-running the aws_script sandbox check is part of every floor
+ * bump (see MINIMUM OAM VERSION in the launcher), so the version it names has to
+ * move with the floor. HISTORICAL above used to exempt it outright, which is how
+ * a sandbox note could sit three floors behind with the scan reporting no drift.
+ */
+const REMEASURED = /re-measured against oam (\d+\.\d+\.\d+)/gi;
 
 const VERSION_RE = /(\d+)\.(\d+)\.(\d+)/g;
 
@@ -123,6 +140,9 @@ export function findDrift(root, floor) {
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i];
+      for (const m of raw.matchAll(REMEASURED)) {
+        if (m[1] !== want) problems.push({ file: rel, line: i + 1, found: m[1], text: raw.trim().slice(0, 110) });
+      }
       if (!FLOOR_CLAIM.test(raw) || !ABOUT_OAM.test(raw) || HISTORICAL.test(raw)) continue;
       const line = raw.replaceAll("\\", "");
       // A HOST version beside the floor is not a floor claim: "this process is oam

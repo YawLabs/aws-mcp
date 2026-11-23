@@ -31,8 +31,9 @@ import type { Tool, ToolContext, ToolResult } from "./tools/tool.js";
  * The MCP tool-call result shape this server emits.
  *
  * Not exported: toMcpResult / errorToMcpResult are the surface, and no .d.ts
- * ships (the published `files` list is dist/index.js alone), so nothing
- * outside this module needs to name the type.
+ * ships (the published `files` list carries the bin/aws-mcp.mjs launcher and
+ * the dist/index.js bundle plus its map, no declarations), so nothing outside
+ * this module needs to name the type.
  */
 interface McpResult {
   // Index signature so this is assignable to the MCP SDK's CallToolResult

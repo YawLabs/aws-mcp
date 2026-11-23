@@ -9,8 +9,8 @@
  *
  *   1. It takes the response body as a REQUIRED POSITIONAL outfile. aws_call
  *      reaches argv only through `service` + `operation`, and every operation
- *      token is checked against SAFE_NAME_RE (`/^[a-z0-9][a-z0-9-]*$/`,
- *      aws-cli.ts:59). So `operation: "invoke out.json"` is rejected on the
+ *      token is checked against SAFE_NAME_RE (`/^[a-z0-9][a-z0-9-]*$/`, in
+ *      aws-cli.ts). So `operation: "invoke out.json"` is rejected on the
  *      token `out.json` before anything spawns, with a kebab-case complaint
  *      that gives the caller nowhere to go.
  *
@@ -70,12 +70,13 @@
  *     scripting is a separate change to tools/script.ts.
  */
 
-import { chmodSync, closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, mkdtempSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { runAwsCall } from "../aws-cli.js";
 import { READ_TIMEOUT_RE } from "../errors.js";
+import { assertPrivateMode, type ModeProbe } from "../private-file.js";
 import type { Tool, ToolContext, ToolResult } from "./tool.js";
 
 /**
@@ -262,6 +263,36 @@ function testSpawnTimeoutOverride(): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * Test seam for the mode check in createPrivateFile: the platform + mode probe
+ * handed to assertPrivateMode, so the mode-ignoring-filesystem branch is
+ * drivable from any host (on Windows the real check is a no-op). Same shape as
+ * ini-file.ts's `privateModeOpts`. Never set in production.
+ */
+export const lambdaPrivateModeTestHook: { opts?: { platform?: NodeJS.Platform; probe?: ModeProbe } } = {};
+
+/**
+ * Create `path` exclusively at 0600, fchmod it on the fd, VERIFY the mode, and
+ * only then write `content` (if any). Throws -- before any byte of `content`
+ * reaches disk -- when the file cannot be made private. The same sequence
+ * aws-cli.ts uses for its params file and sso-discovery.ts for its token file.
+ */
+function createPrivateFile(path: string, content?: string): void {
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    assertPrivateMode(
+      fd,
+      path,
+      "Point TMPDIR, TMP or TEMP at a native filesystem such as /tmp.",
+      lambdaPrivateModeTestHook.opts ?? {},
+    );
+    if (content !== undefined) writeSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -486,7 +517,9 @@ export const lambdaTools: readonly Tool[] = [
       // 0700 on POSIX. On Windows those mode bits are ignored, but os.tmpdir()
       // there is the per-user %LOCALAPPDATA%\Temp, so the containing directory
       // is already ACL'd to this user -- the confidentiality property holds on
-      // both platforms, by different mechanisms.
+      // both platforms, by different mechanisms. On POSIX the 0700 is only real
+      // on a filesystem that honours modes, which is why each file inside is
+      // also VERIFIED 0600 below rather than assumed.
       const dir = mkdtempSync(join(tmpdir(), "aws-mcp-lambda-"));
       try {
         // Pre-create the outfile 0600 with "wx" (exclusive), so that on POSIX
@@ -499,14 +532,38 @@ export const lambdaTools: readonly Tool[] = [
         // On a failed invoke the CLI writes nothing and this stays a 0-byte
         // file, which is fine: it is only read on the success path.
         //
-        // chmodSync, not openSync's mode argument alone: oam before 0.19.1
+        // fchmodSync, not openSync's mode argument alone: oam before 0.19.1
         // dropped the creation mode (measured 2026-09-20 on Windows, oam 0.16.2 --
         // a file opened 0o400 came back writable there, where node marks it
         // read-only). oam 0.19.1 and later, the launcher's floor among them, honour it, so the chmod
         // is now defense in depth, for an `oam run` that bypasses the floor.
+        //
+        // Then VERIFIED (assertPrivateMode, via createPrivateFile), exactly like
+        // runAwsCall's params file: on a filesystem with no inode mode (TMPDIR on
+        // a Windows drive under WSL, CIFS, FAT) mkdtemp yields 0777 and the chmod
+        // succeeds while changing nothing, so without the check the event and the
+        // response would sit world-readable -- and the payload world-WRITABLE,
+        // swappable before the CLI reads it. A file that cannot be made private
+        // is not used: the call fails as spawn_failure before anything is sent.
         const outPath = join(dir, "response.json");
-        closeSync(openSync(outPath, "wx", 0o600));
-        chmodSync(outPath, 0o600);
+        let payloadArg: string | undefined;
+        try {
+          createPrivateFile(outPath);
+          if (i.payload !== undefined) {
+            // The event body is caller data and can hold anything, so the same
+            // verified-0600 sequence as the outfile, and the bytes go in only
+            // after the check passed.
+            const payloadPath = join(dir, "payload.json");
+            createPrivateFile(payloadPath, JSON.stringify(i.payload));
+            payloadArg = `fileb://${payloadPath}`;
+          }
+        } catch (err) {
+          return {
+            ok: false,
+            errorKind: "spawn_failure",
+            error: `Could not create the Lambda invoke temp files: ${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
 
         // The payload goes through a FILE (`--payload fileb://...`), not an
         // argv value, for three separate reasons:
@@ -532,17 +589,7 @@ export const lambdaTools: readonly Tool[] = [
         // server-minted path, so it is exempted by its exact value below; every
         // other value in the same call (`--qualifier`, the function name) stays
         // guarded.
-        let payloadArg: string | undefined;
-        if (i.payload !== undefined) {
-          const payloadPath = join(dir, "payload.json");
-          // The event body is caller data and can hold anything, so the same
-          // chmodSync as the outfile above: before 0.19.1 oam dropped
-          // writeFileSync's `mode` exactly the way it dropped openSync's.
-          writeFileSync(payloadPath, JSON.stringify(i.payload), { mode: 0o600 });
-          chmodSync(payloadPath, 0o600);
-          payloadArg = `fileb://${payloadPath}`;
-          extraFlags.push("--payload", payloadArg);
-        }
+        if (payloadArg !== undefined) extraFlags.push("--payload", payloadArg);
         if (i.qualifier !== undefined) extraFlags.push("--qualifier", i.qualifier);
         // Always Tail: the decoded log is this tool's whole reason for existing,
         // and the API caps it at 4 KB, so there is no payload-size argument for
@@ -570,14 +617,23 @@ export const lambdaTools: readonly Tool[] = [
         // no honest denominator, and manufacturing fake phases would be worse
         // than one line that says what is being waited on. Same shape as
         // aws_assume_role's single starting notification.
-        ctx?.reportProgress(
-          0,
-          undefined,
-          // waitS, not i.timeoutMs: name the bound that is actually in force, so
-          // the line is useful on the default path and honest when the value was
-          // clamped to Lambda's 15-minute ceiling.
-          `Invoking ${label} (timeout ${waitS}s)`,
-        );
+        //
+        // Guarded like multi-region.ts's per-region notification: progress is
+        // advisory, so a reportProgress that throws (an embedder's own ctx --
+        // the server's buildToolContext cannot throw synchronously) must not
+        // fail an invoke before it is sent.
+        try {
+          ctx?.reportProgress(
+            0,
+            undefined,
+            // waitS, not i.timeoutMs: name the bound that is actually in force, so
+            // the line is useful on the default path and honest when the value was
+            // clamped to Lambda's 15-minute ceiling.
+            `Invoking ${label} (timeout ${waitS}s)`,
+          );
+        } catch {
+          // Swallowed: see above.
+        }
 
         const result = await runAwsCall({
           service: "lambda",

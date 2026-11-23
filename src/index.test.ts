@@ -208,7 +208,7 @@ describe("toMcpResult — ok:true (success) branches", () => {
     assert.equal(r.content[0].text, JSON.stringify({ only: 1 }, null, 2));
   });
 
-  it("still uses the { success: true } fallback when data is null AND rawBody is present", () => {
+  it("emits rawBody alone, without the { success: true } fallback, when data is null", () => {
     // null data is "no data" (matching the old `?? { success: true }`), so the
     // rawBody is the only part -- not `null\n\nraw`.
     const r = toMcpResult({ ok: true, data: null, rawBody: "raw" });
@@ -434,8 +434,9 @@ describe("tool registry snapshot", () => {
 
 /**
  * The host text budget. `allTools` here comes from ./index.js -- the esbuild
- * bundle that ships -- so this measures the descriptions a real host receives,
- * not a pre-build copy of them.
+ * bundle that ships, as long as esbuild ran after tsc (index.integration.test.ts
+ * fails loud when dist/index.js is tsc output instead) -- so this measures the
+ * descriptions a real host receives, not a pre-build copy of them.
  *
  * A description over the cap is not cosmetic: Claude Code cuts it from the END
  * and tells nobody (see HOST_TEXT_CAP_BYTES for the measurement), so what

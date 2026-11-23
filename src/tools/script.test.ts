@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { MAX_REGIONS } from "./multi-region.js";
 import { paginateTools } from "./paginate.js";
-import { buildPaginateAll, runScript, type ScriptHandlers, scriptTools } from "./script.js";
+import { buildPaginateAll, runScript, type ScriptHandlers, type ScriptTimers, scriptTools } from "./script.js";
 import type { Tool } from "./tool.js";
 
 /**
@@ -380,9 +380,11 @@ describe("runScript realm intrinsic contract", () => {
   //   2. "NOT injected" globals (URL, TextEncoder, crypto, ...) -- a BARE
   //      reference throws ReferenceError. (typeof would mask this as
   //      "undefined", so we reference each without typeof.)
-  //   3. explicitly shadowed globals (setTimeout, clearInterval, global, ...)
-  //      -- actively set to `undefined` in the context, so `typeof X` is
-  //      "undefined". Membership read off the shadow block in script.ts.
+  //   3. absent-or-shadowed globals (setInterval, clearTimeout, global,
+  //      globalThis, ...) -- `typeof X` is "undefined". Only `globalThis` is
+  //      actually shadowed (set to undefined in the context); the rest were
+  //      never injected by createContext. `typeof` cannot tell those two
+  //      cases apart, and this contract does not need it to.
   it("exposes the available intrinsics (Intl/Atomics/SharedArrayBuffer/WebAssembly)", async () => {
     const { handlers } = makeMockHandlers();
     const r = await runScript(
@@ -467,9 +469,10 @@ describe("runScript realm intrinsic contract", () => {
     }
   });
 
-  it("leaves the explicitly shadowed globals undefined", async () => {
-    // These are actively set to `undefined` in the context (the shadow block
-    // in script.ts), so `typeof` is "undefined" rather than a ReferenceError.
+  it("reports the absent-or-shadowed globals as typeof 'undefined'", async () => {
+    // `globalThis` is shadowed to undefined in the context (script.ts's
+    // Object.assign onto ctx); the others are simply absent from a bare
+    // createContext({}). Either way `typeof` reports "undefined".
     const { handlers } = makeMockHandlers();
     const r = await runScript(
       {
@@ -491,7 +494,7 @@ describe("runScript realm intrinsic contract", () => {
     );
     const out = plain(r.data) as Record<string, string>;
     for (const [name, t] of Object.entries(out)) {
-      assert.equal(t, "undefined", `${name} must be shadowed to undefined`);
+      assert.equal(t, "undefined", `${name} must be absent or shadowed to undefined`);
     }
   });
 });
@@ -566,7 +569,8 @@ describe("runScript paginateAll", () => {
   });
 
   it("terminates when a page reports hasMore:true but a null nextToken", async () => {
-    // The loop breaks on `!data.hasMore || !data.nextToken` (script.ts:165).
+    // The loop in buildPaginateAll breaks on a false hasMore OR a missing
+    // nextToken.
     // A page that claims hasMore:true but hands back a null nextToken would
     // loop forever on the same token if the nextToken guard were missing --
     // assert it stops after the first page.
@@ -597,7 +601,7 @@ describe("runScript paginateAll", () => {
   });
 
   it("clamps a caller maxPages above MAX_PAGES_HARD_CAP (1000)", async () => {
-    // maxPages is `Math.min(input.maxPages ?? 50, 1000)` (script.ts:146). A
+    // buildPaginateAll clamps maxPages to [1, MAX_PAGES_HARD_CAP]. A
     // caller asking for 5000 pages against an endless paginator must be
     // clamped to exactly 1000 calls -- the hard cap, not the requested value.
     let paginateCalls = 0;
@@ -652,8 +656,102 @@ describe("runScript paginateAll", () => {
       },
       customHandlers,
     );
-    assert.deepEqual(plain(r.data), { items: ["a"], pages: 1, count: 1 });
+    assert.deepEqual(plain(r.data), { items: ["a"], pages: 1, count: 1, hasMore: false, nextToken: null });
     assert.equal(paginateCalls, 1);
+  });
+
+  /** A paginator that always has another page, so only maxPages can stop it. */
+  function endlessPaginator(): { tool: Tool; calls: () => number } {
+    let n = 0;
+    return {
+      calls: () => n,
+      tool: {
+        name: "aws_paginate",
+        description: "",
+        annotations: {},
+        inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+        handler: async () => {
+          n++;
+          return { ok: true, data: { result: [n], nextToken: `t${n}`, hasMore: true } };
+        },
+      },
+    };
+  }
+
+  it("says hasMore:true with the resume token when it stops at maxPages", async () => {
+    // The silent truncation: at the default 50 pages x 100 items a large
+    // bucket came back as exactly 5000 keys with nothing saying it was partial.
+    const p = endlessPaginator();
+    const out = (await buildPaginateAll(p.tool)({ service: "s3api", operation: "list-objects-v2", maxPages: 3 })) as {
+      count: number;
+      hasMore: boolean;
+      nextToken: string | null;
+    };
+    assert.equal(out.count, 3);
+    assert.equal(out.hasMore, true, "a capped run must report that more pages exist");
+    assert.equal(out.nextToken, "t3", "the token of the LAST page fetched, so the caller can resume");
+  });
+
+  it("stops at the documented default of 50 pages and reports it", async () => {
+    const p = endlessPaginator();
+    const out = (await buildPaginateAll(p.tool)({ service: "s3api", operation: "list-objects-v2" })) as {
+      pages: number;
+      hasMore: boolean;
+    };
+    assert.equal(out.pages, 50);
+    assert.equal(p.calls(), 50);
+    assert.equal(out.hasMore, true);
+  });
+
+  it("reports hasMore:false and nextToken:null when the list really ended", async () => {
+    let page = 0;
+    const pages = [
+      { result: ["a"], nextToken: "t1", hasMore: true },
+      { result: ["b"], nextToken: null, hasMore: false },
+    ];
+    const t: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({}) as unknown as Tool["inputSchema"],
+      handler: async () => ({ ok: true, data: pages[page++] }),
+    };
+    const out = await buildPaginateAll(t)({ service: "s3api", operation: "list-objects-v2" });
+    assert.deepEqual(out, { items: ["a", "b"], pages: 2, count: 2, hasMore: false, nextToken: null });
+  });
+
+  it("falls back to the default for a non-finite maxPages instead of fetching nothing", async () => {
+    // Math.max(1, Math.min(NaN, 1000)) is NaN and `i < NaN` is false, so a
+    // NaN (cfg.limit * 2 with no cfg.limit) used to return {items: [],
+    // pages: 0} as a success without any AWS call -- the case the floor of 1
+    // was meant to close.
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, "5" as unknown as number]) {
+      const p = endlessPaginator();
+      const out = (await buildPaginateAll(p.tool)({
+        service: "s3api",
+        operation: "list-objects-v2",
+        maxPages: bad,
+      })) as { pages: number };
+      assert.equal(out.pages, 50, `maxPages ${String(bad)} must fall back to the default`);
+    }
+  });
+
+  it("turns a missing argument into the paginate schema's error, not a host TypeError", async () => {
+    const t: Tool = {
+      name: "aws_paginate",
+      description: "",
+      annotations: {},
+      inputSchema: z.object({ service: z.string(), operation: z.string() }) as unknown as Tool["inputSchema"],
+      handler: async () => ({ ok: true, data: { result: [], nextToken: null, hasMore: false } }),
+    };
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      {
+        code: `try { await aws.paginateAll(); return "NO THROW"; } catch (e) { return e.message; }`,
+      },
+      { ...handlers, paginateAll: buildPaginateAll(t) },
+    );
+    assert.match(String(r.data), /Invalid input for 'aws_paginate'.*service/);
   });
 });
 
@@ -750,7 +848,7 @@ describe("runScript cross-realm error bridging", () => {
     // wrapForRealm is applied to every nested binding too, not just the
     // top-level aws.call. An error thrown from aws.resource.get must arrive
     // in-realm as `instanceof Error` with its custom props (rawBody,
-    // toolName) copied -- same contract as aws.call (script.ts:355-362).
+    // toolName) copied -- same contract as aws.call (runScript's wrapForRealm).
     const { handlers } = makeMockHandlers({
       resource: {
         get: async () => {
@@ -1135,44 +1233,52 @@ describe("runScript additional aws.* bindings", () => {
 });
 
 describe("runScript timer cleanup on normal completion", () => {
-  it("does not leak the wall-clock setTimeout handle when a script completes well before timeoutMs", async () => {
-    // Load-bearing: the finally-block `clearTimeout(timer)` must release the
-    // pending timer so a long-running process running many scripts back-to-
-    // back doesn't accumulate one pending handle per call. We assert the
-    // active-handle count is stable across N sequential runs with a very
-    // large timeoutMs -- without clearTimeout the timers would all stay
-    // pending and the handle count would climb by ~N.
-    //
-    // Some Node builds keep a small set of background handles unrelated to
-    // our script (test reporter, GC, etc.); we tolerate a slack of 2.
+  // The finally-block clear must release the wall-clock timer so a long-lived
+  // server running many scripts doesn't accumulate one pending timer per call.
+  // Observed through runScript's timer seam rather than a handle count: the
+  // timer is unref'd, so neither process._getActiveHandles() nor
+  // getActiveResourcesInfo() ever lists it (probed) -- the count-based test
+  // this replaces stayed green with the clear deleted.
+  function spyTimers(): { timers: ScriptTimers; armed: unknown[]; cleared: unknown[] } {
+    const armed: unknown[] = [];
+    const cleared: unknown[] = [];
+    return {
+      armed,
+      cleared,
+      timers: {
+        setTimeout: (fn, ms) => {
+          const h = setTimeout(fn, ms);
+          armed.push(h);
+          return h;
+        },
+        clearTimeout: (h) => {
+          cleared.push(h);
+          clearTimeout(h as ReturnType<typeof setTimeout>);
+        },
+      },
+    };
+  }
+
+  it("clears the wall-clock timer it armed, on every run that completes before timeoutMs", async () => {
     const { handlers } = makeMockHandlers();
-    // Prime: one warm-up run so any first-call lazy-init handles settle
-    // (require resolution caches, vm context init, etc.) before we measure.
-    await runScript({ code: "return 1;", timeoutMs: 300_000 }, handlers);
-
-    // process._getActiveHandles is a Node internal. If a future Node version
-    // removes it, skip rather than fail -- the cleanup behavior itself is
-    // still pinned indirectly by overall suite handle hygiene (Node's
-    // built-in runner reports unsettled timers on exit). When the API is
-    // present (current Node 22+ ships it), use it for the direct signal.
-    const getHandles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles;
-    if (typeof getHandles !== "function") return;
-
-    const before = getHandles.call(process).length;
+    const spy = spyTimers();
     const RUNS = 20;
     for (let i = 0; i < RUNS; i++) {
-      // timeoutMs much larger than the script's actual runtime. If the
-      // finally-block clearTimeout were removed, each iteration would leak
-      // one pending setTimeout handle.
-      const r = await runScript({ code: "return 1 + 1;", timeoutMs: 300_000 }, handlers);
+      const r = await runScript({ code: "return 1 + 1;", timeoutMs: 300_000, timers: spy.timers }, handlers);
       assert.equal(r.data, 2);
     }
-    const after = getHandles.call(process).length;
-    const delta = after - before;
-    assert.ok(
-      delta < RUNS / 2,
-      `expected no growth in active handles across ${RUNS} script runs (clearTimeout in finally), got delta=${delta}`,
+    assert.equal(spy.armed.length, RUNS, "one timer armed per run");
+    assert.deepEqual(spy.cleared, spy.armed, "every armed timer is cleared, each exactly once");
+  });
+
+  it("clears the timer when the script throws, too", async () => {
+    const { handlers } = makeMockHandlers();
+    const spy = spyTimers();
+    await assert.rejects(
+      runScript({ code: `throw new Error("boom");`, timeoutMs: 300_000, timers: spy.timers }, handlers),
     );
+    assert.equal(spy.armed.length, 1);
+    assert.deepEqual(spy.cleared, spy.armed);
   });
 });
 
@@ -1203,19 +1309,26 @@ describe("runScript timeouts", () => {
     await new Promise((resolve) => setTimeout(resolve, 250));
     assert.ok(caught, "expected runScript to throw on timeout");
     assert.ok(caught.message.includes("timed out"), `expected timeout message, got: ${caught.message}`);
+    // In milliseconds: the seconds rendering rounded every timeoutMs under 500
+    // down to "0s".
+    assert.match(caught.message, /timed out after 100ms/);
   });
 
   it("kills a synchronous infinite loop via vm timeout", async () => {
+    const started = Date.now();
     const handlerResult = await tool.handler({
       code: "while (true) { /* no yield */ }",
       timeoutMs: 200,
     });
+    const elapsed = Date.now() - started;
     assert.equal(handlerResult.ok, false);
-    // vm sync-timeout surfaces as "Script execution timed out after Xms";
-    // our wall-clock Promise.race fallback would surface "Script timed out
-    // after Ns". Either path is acceptable -- we just need ok:false with a
-    // non-empty message.
-    assert.ok(handlerResult.error && handlerResult.error.length > 0);
+    // A spin loop holds the thread, so only the vm layer can stop it; its
+    // message is "Script execution timed out after 200ms". Matching the
+    // configured 200ms and bounding the elapsed time (well under the 60s
+    // default) is what proves the 200ms limit fired, rather than the call
+    // failing for some unrelated reason.
+    assert.match(handlerResult.error ?? "", /timed out after 200ms/);
+    assert.ok(elapsed < 10_000, `took ${elapsed}ms -- the 200ms limit did not fire`);
   });
 
   it("returns the console lines captured before the timeout", async () => {
@@ -1511,5 +1624,58 @@ describe("buildPaginateAll against the REAL aws_paginate tool (regression)", () 
       maxPages: 1,
     })) as { pages: number };
     assert.equal(out.pages, 1);
+  });
+});
+
+describe("aws_script console capture and return-value edge cases", () => {
+  it("renders undefined, a function and a symbol instead of an empty slot", async () => {
+    // JSON.stringify RETURNS undefined for these (no throw), and join() then
+    // renders the slot as "" -- `console.log("v:", undefined)` read "v: ".
+    const { handlers } = makeMockHandlers();
+    const r = await runScript(
+      { code: `console.log("v:", undefined); console.log(function named() {}); console.log(Symbol("s")); return 1;` },
+      handlers,
+    );
+    assert.equal(r.logs[0], "[log] v: undefined");
+    assert.match(r.logs[1] ?? "", /^\[log\] function named\(\) \{\}$/);
+    assert.equal(r.logs[2], "[log] Symbol(s)");
+  });
+
+  for (const [label, code, pattern] of [
+    ["a BigInt", `console.log("step 1"); return 10n;`, /BigInt/],
+    ["a circular object", `console.log("step 1"); const o = {}; o.self = o; return o;`, /circular/i],
+  ] as const) {
+    it(`fails cleanly, keeping the logs, when the script returns ${label}`, async () => {
+      // index.ts stringifies the response; this used to throw there and reach
+      // the model as a generic handler error with the logs lost.
+      const r = await tool.handler({ code });
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /not JSON-serializable/);
+      assert.match(r.error ?? "", pattern);
+      assert.match(r.rawBody ?? "", /step 1/);
+      assert.ok((r.data as { logs?: string[] })?.logs?.some((l) => l.includes("step 1")));
+    });
+  }
+
+  it("still returns a JSON-serializable result (undefined included) as ok:true", async () => {
+    const r = await tool.handler({ code: `return undefined;` });
+    assert.equal(r.ok, true);
+  });
+});
+
+describe("aws_script description names what is NOT bound", () => {
+  const codeDescription =
+    (tool.inputSchema.shape as unknown as { code: { description?: string } }).code.description ?? "";
+
+  it("lists every unbound data-plane tool, so aws.lambdaInvoke's 'is not a function' has a pointer", () => {
+    for (const name of ["aws_lambda_invoke", "aws_logs_query", "aws_multi_account", "aws_list_profiles"]) {
+      assert.ok(codeDescription.includes(name), `code description must name ${name} as not bound`);
+    }
+  });
+
+  it("documents paginateAll's maxPages default and its hasMore signal", () => {
+    assert.match(codeDescription, /maxPages \(default 50, max 1000\)/);
+    assert.match(codeDescription, /hasMore/);
+    assert.match(tool.description, /default 50/);
   });
 });

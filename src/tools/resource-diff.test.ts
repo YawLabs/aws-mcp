@@ -247,6 +247,76 @@ describe("summarizePatch", () => {
   });
 });
 
+describe("summarizePatch -- array index ops", () => {
+  // Re-resolving the op path after the op runs is only right for OBJECT keys.
+  // In an array, a non-tail remove shifts the right-hand neighbour into the
+  // index, and an indexed add pushes the old occupant right -- both used to be
+  // rendered as a replace.
+  const run = (ops: Parameters<typeof summarizePatch>[0]) => {
+    const before = { Tags: ["a", "b", "c"] };
+    return summarizePatch(ops, before, applyJsonPatch(before, ops));
+  };
+
+  it("remove /Tags/0 has no `after` (not the shifted neighbour)", () => {
+    assert.deepEqual(run([{ op: "remove", path: "/Tags/0" }]), [
+      { op: "remove", path: "/Tags/0", before: "a", after: undefined },
+    ]);
+  });
+
+  it("add /Tags/0 has no `before` (an insert displaces, it does not overwrite)", () => {
+    assert.deepEqual(run([{ op: "add", path: "/Tags/0", value: "z" }]), [
+      { op: "add", path: "/Tags/0", before: undefined, after: "z" },
+    ]);
+  });
+
+  it("tail controls: remove of the last element and add at length", () => {
+    assert.deepEqual(run([{ op: "remove", path: "/Tags/2" }]), [
+      { op: "remove", path: "/Tags/2", before: "c", after: undefined },
+    ]);
+    assert.deepEqual(run([{ op: "add", path: "/Tags/3", value: "z" }]), [
+      { op: "add", path: "/Tags/3", before: undefined, after: "z" },
+    ]);
+  });
+
+  it("replace in an array still reports both sides, and add on an object key keeps `before`", () => {
+    assert.deepEqual(run([{ op: "replace", path: "/Tags/1", value: "q" }]), [
+      { op: "replace", path: "/Tags/1", before: "b", after: "q" },
+    ]);
+    const objBefore = { A: 1 };
+    const ops = [{ op: "add" as const, path: "/A", value: 2 }];
+    assert.deepEqual(summarizePatch(ops, objBefore, applyJsonPatch(objBefore, ops)), [
+      { op: "add", path: "/A", before: 1, after: 2 },
+    ]);
+  });
+});
+
+describe("RFC 6901 array indices", () => {
+  // Number.parseInt accepted all of these as index 1, so the preview reported
+  // success for a patch the real update rejects.
+  const doc = { Tags: ["a", "b", "c"] };
+  for (const bad of ["01", "1abc", "1.5", "1e3", "+1", " 1"]) {
+    it(`rejects '${bad}' as a final array index`, () => {
+      assert.throws(() => applyJsonPatch(doc, [{ op: "replace", path: `/Tags/${bad}`, value: "x" }]), /array index/);
+      assert.throws(() => applyJsonPatch(doc, [{ op: "remove", path: `/Tags/${bad}` }]), /array index/);
+      assert.throws(() => applyJsonPatch(doc, [{ op: "add", path: `/Tags/${bad}`, value: "x" }]), /array index/);
+    });
+  }
+
+  it("rejects a non-canonical INTERMEDIATE index", () => {
+    assert.throws(
+      () => applyJsonPatch({ L: [{ K: 1 }] }, [{ op: "replace", path: "/L/00/K", value: 2 }]),
+      /not a valid array index/,
+    );
+  });
+
+  it("resolvePointer returns undefined for non-canonical indices", () => {
+    assert.equal(resolvePointer(doc, "/Tags/01"), undefined);
+    assert.equal(resolvePointer(doc, "/Tags/1abc"), undefined);
+    assert.equal(resolvePointer(doc, "/Tags/1"), "b");
+    assert.equal(resolvePointer(doc, "/Tags/0"), "a");
+  });
+});
+
 describe("applyJsonPatch -- add auto-creates missing object parents", () => {
   it("creates intermediate objects when adding through a missing parent", () => {
     // CCAPI accepts /Environment/Variables/NEW even when /Environment is
@@ -561,29 +631,55 @@ describe("aws_resource_diff schema", () => {
 
 describe("applyJsonPatch -- prototype pollution defense", () => {
   // Proven at v1.5.1: applyJsonPatch({}, [{op:'add', path:'/__proto__/polluted', value:'PWNED'}])
-  // wrote 'PWNED' onto host Object.prototype. The denylist + hasOwnProperty
-  // guards block all three reserved segments at every position. Each test
-  // re-asserts ({} as any).polluted === undefined so a regression in the
-  // denylist surfaces as a leakage assertion rather than only a missing throw.
-  const reserved = ["__proto__", "constructor", "prototype"] as const;
+  // wrote 'PWNED' onto host Object.prototype. `__proto__` is the one segment
+  // that is an assignment hazard (an accessor on Object.prototype), so it is
+  // refused at every position. The intermediate case also re-asserts
+  // ({} as any).polluted === undefined, which is where a denylist regression
+  // would actually leak; for the final-position cases only the throw is
+  // meaningful (assigning a string to __proto__ is a no-op either way).
+  it("rejects 'add' on a final-position '__proto__' segment", () => {
+    assert.throws(() => applyJsonPatch({}, [{ op: "add", path: "/__proto__", value: "PWNED" }]), /reserved segment/);
+  });
 
-  for (const seg of reserved) {
-    it(`rejects 'add' on a final-position '${seg}' segment without polluting Object.prototype`, () => {
-      assert.throws(() => applyJsonPatch({}, [{ op: "add", path: `/${seg}`, value: "PWNED" }]), /reserved segment/);
+  it("rejects 'add' on an intermediate-position '__proto__' segment without polluting Object.prototype", () => {
+    assert.throws(
+      () => applyJsonPatch({}, [{ op: "add", path: "/__proto__/polluted", value: "PWNED" }]),
+      /reserved segment/,
+    );
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+  });
+
+  it("rejects 'replace' on a final-position '__proto__' segment", () => {
+    assert.throws(
+      () => applyJsonPatch({}, [{ op: "replace", path: "/__proto__", value: "PWNED" }]),
+      /reserved segment/,
+    );
+  });
+
+  // `constructor` and `prototype` used to be refused too, which rejected real
+  // keys -- an env var or a tag-map key with that name -- that
+  // aws_resource_update happily sends. Assigning them creates an OWN key and
+  // touches no prototype.
+  for (const seg of ["constructor", "prototype"] as const) {
+    it(`accepts '${seg}' as an ordinary own key, final and intermediate, without touching any prototype`, () => {
+      const out = applyJsonPatch({ Environment: { Variables: {} } }, [
+        { op: "add", path: `/Environment/Variables/${seg}`, value: "x" },
+        { op: "add", path: `/${seg}/polluted`, value: "PWNED" },
+      ]) as { Environment: { Variables: Record<string, unknown> } } & Record<string, unknown>;
+      assert.equal(Object.hasOwn(out.Environment.Variables, seg), true);
+      assert.equal(out.Environment.Variables[seg], "x");
+      assert.deepEqual(out[seg], { polluted: "PWNED" });
       assert.equal(({} as Record<string, unknown>).polluted, undefined);
+      assert.equal(Object.prototype.constructor, Object);
+      assert.equal(Object.hasOwn(Object.prototype, "prototype"), false);
     });
 
-    it(`rejects 'add' on an intermediate-position '${seg}' segment without polluting Object.prototype`, () => {
-      assert.throws(
-        () => applyJsonPatch({}, [{ op: "add", path: `/${seg}/polluted`, value: "PWNED" }]),
-        /reserved segment/,
-      );
-      assert.equal(({} as Record<string, unknown>).polluted, undefined);
-    });
-
-    it(`rejects 'replace' on a final-position '${seg}' segment without polluting Object.prototype`, () => {
-      assert.throws(() => applyJsonPatch({}, [{ op: "replace", path: `/${seg}`, value: "PWNED" }]), /reserved segment/);
-      assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    it(`'replace' / 'remove' on a '${seg}' key the document does not own fail as a missing key`, () => {
+      // hasOwn, not `in`: the inherited Object.prototype.constructor must not
+      // count as an existing key to replace or remove.
+      assert.throws(() => applyJsonPatch({}, [{ op: "replace", path: `/${seg}`, value: 1 }]), /missing key/);
+      assert.throws(() => applyJsonPatch({}, [{ op: "remove", path: `/${seg}` }]), /missing key/);
+      assert.deepEqual(applyJsonPatch({ [seg]: 1 }, [{ op: "replace", path: `/${seg}`, value: 2 }]), { [seg]: 2 });
     });
   }
 });
@@ -591,9 +687,10 @@ describe("applyJsonPatch -- prototype pollution defense", () => {
 describe("resolvePointer prototype safety (regression)", () => {
   // resolvePointer used `t in cur`, which walks the prototype chain -- so
   // '/constructor' resolved to Object's constructor function rather than
-  // undefined. aws_resource_diff never reaches it (applyJsonPatch rejects
-  // reserved segments first), but resolvePointer and summarizePatch are both
-  // exported, so a direct caller could read inherited members off a document.
+  // undefined. aws_resource_diff reaches it too now that a `constructor` key
+  // is a legitimate patch target, and resolvePointer and summarizePatch are
+  // both exported, so a direct caller could read inherited members off a
+  // document.
   for (const seg of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
     it(`returns undefined for an inherited '${seg}' segment`, () => {
       assert.equal(resolvePointer({ Real: 1 }, `/${seg}`), undefined);

@@ -249,7 +249,7 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
 
     // Parity with whichever fake scenario models the path this CLI took.
     const fake = await tailFake(
-      CLI_HAS_START_FROM_HEAD ? "logs-tail_current_basic" : "logs-tail_legacy_basic",
+      CLI_HAS_START_FROM_HEAD ? "logs_tail_current_basic" : "logs_tail_legacy_basic",
       "/stub/basic",
     );
     assert.equal(fake.ok, true, `fake failed: ${fake.error ?? ""}`);
@@ -272,7 +272,7 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
     assert.equal(bodies[0].limit, 6, "--page-size became the request's limit: maxEvents + 1");
     assert.equal("nextToken" in bodies[0], false);
 
-    const fake = await tailFake("logs-tail_current_bulk", "/stub/bulk", { maxEvents: 5 });
+    const fake = await tailFake("logs_tail_current_bulk", "/stub/bulk", { maxEvents: 5 });
     assert.equal(fake.ok, true, `fake failed: ${fake.error ?? ""}`);
     parity(data, fake.data as TailEnvelope, "case 2");
   });
@@ -293,7 +293,7 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
     assert.equal(bodies.length, 3, "the rejected newest-first attempt reached the endpoint zero times");
     for (const body of bodies) assert.equal("startFromHead" in body, false);
 
-    const fake = await tailFake("logs-tail_legacy_bulk", "/stub/bulk", { maxEvents: 5 });
+    const fake = await tailFake("logs_tail_legacy_bulk", "/stub/bulk", { maxEvents: 5 });
     assert.equal(fake.ok, true, `fake failed: ${fake.error ?? ""}`);
     parity(data, fake.data as TailEnvelope, "case 3");
   });
@@ -333,7 +333,7 @@ describe(`aws_logs_tail -- installed AWS CLI${detected.ok ? ` (${detected.cli.ve
     assert.equal("startFromHead" in bodies[1], false, "the second read asks for the whole window");
     assert.equal(bodies.length, 4, "one newest-first page plus three whole-window pages");
 
-    const fake = await tailFake("logs-tail_ignored_bulk", "/stub/ignored", { maxEvents: 3 });
+    const fake = await tailFake("logs_tail_ignored_bulk", "/stub/ignored", { maxEvents: 3 });
     assert.equal(fake.ok, true, `fake failed: ${fake.error ?? ""}`);
     parity(data, fake.data as TailEnvelope, "case 4");
   });
