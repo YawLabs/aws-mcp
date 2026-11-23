@@ -11,6 +11,8 @@ major-version bump. From 1.0 onward the public tool shapes (see the README
 
 ## [Unreleased]
 
+## [2.7.4] — 2026-11-23
+
 ### Fixed
 - **`aws_login_complete` called with only `sessionId` now verifies identity, and looks up the SSO token, for the profile the login was started for.** It used the active session profile, `AWS_PROFILE` or `default`, so completing a login for a non-active profile could fail the identity check or report another profile's account. Logins started by `aws_refresh_if_expiring_soon({profile})` get the same fix.
 - **`aws_logs_query` rejects a log-group ARN whose region differs from the call's region** before starting a billed query; it used to drop the ARN's region and query the same-named group in the call's region. An oversized relative `startTime` (e.g. `20000000w`) now gets the invalid-startTime error in `aws_logs_query` and `aws_metrics_query` (the 90-day cap was skipped, or a RangeError was thrown).
@@ -1236,7 +1238,8 @@ changes vs 0.9.10; the 1.0 designation is the contract, not a rewrite.
   `aws_call`, `aws_session_set`, `aws_session_get`. SSO device-code flow
   via `aws sso login --no-browser`.
 
-[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.3...HEAD
+[Unreleased]: https://github.com/YawLabs/aws-mcp/compare/v2.7.4...HEAD
+[2.7.4]: https://github.com/YawLabs/aws-mcp/compare/v2.7.3...v2.7.4
 [2.7.3]: https://github.com/YawLabs/aws-mcp/compare/v2.7.2...v2.7.3
 [2.7.2]: https://github.com/YawLabs/aws-mcp/compare/v2.7.1...v2.7.2
 [2.7.1]: https://github.com/YawLabs/aws-mcp/compare/v2.7.0...v2.7.1
